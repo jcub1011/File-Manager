@@ -14,91 +14,122 @@ namespace FileManager.Core.Files;
 /// </summary>
 public sealed class FileSystemService(ILogger<FileSystemService> logger) : IFileSystemService
 {
-    public Result<FileSystemResults, string> GetEntries(string path)
+    public IEnumerable<Result<FileSystemEntry, EnumerationFault>> EnumerateEntries(string path)
     {
+        // `yield return` is not allowed inside a try/catch, so the enumerator is driven manually:
+        // each MoveNext is guarded and the result is yielded outside the catch.
+        IEnumerator<FileSystemInfo> enumerator = null!;
+        EnumerationFault? setupFault = null;
         try
         {
-            DirectoryInfo dir;
-            dir = new DirectoryInfo(path);
-            if (!dir.Exists) return "Directory does not exist.";
-
-            var entries = new List<FileSystemEntry>();
-            var failures = new List<string>();
-
-            // Enumerate directories then files. Each access is guarded individually so a
-            // single unreadable entry doesn't abort the whole listing.
-            try
-            {
-                foreach (var sub in dir.EnumerateDirectories())
-                {
-                    try
-                    {
-                        entries.Add(new FileSystemEntry(sub.Name, sub.FullName, true, 0, sub.LastWriteTime));
-                    }
-                    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-                    {
-                        logger.LogWarning(ex, "Unable to read directory.");
-                        failures.Add(ex.Message);
-                    }
-                }
-
-                foreach (var file in dir.EnumerateFiles())
-                {
-                    try
-                    {
-                        entries.Add(new FileSystemEntry(file.Name, file.FullName, false, file.Length, file.LastWriteTime));
-                    }
-                    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-                    {
-                        logger.LogWarning(ex, "Unable to read file.");
-                        failures.Add(ex.Message);
-                    }
-                }
-            }
-            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-            {
-                logger.LogWarning(ex, "Error occurred before all entries could be read.");
-                failures.Add(ex.Message);
-            }
-
-            return new FileSystemResults(entries, failures);
+            var dir = new DirectoryInfo(path);
+            if (!dir.Exists)
+                setupFault = new EnumerationFault("Directory does not exist.", EnumerationSeverity.Fatal);
+            else
+                enumerator = dir.EnumerateFileSystemInfos().GetEnumerator();
         }
         catch (Exception ex)
         {
             logger.LogError(ex, "Retrieving entries failed.");
-            return ex.Message;
+            setupFault = new EnumerationFault(ex.Message, EnumerationSeverity.Fatal);
+        }
+
+        if (setupFault is { } sf)
+        {
+            yield return sf;
+            yield break;
+        }
+
+        using (enumerator)
+        {
+            while (true)
+            {
+                FileSystemInfo current;
+                EnumerationFault? fault = null;
+                try
+                {
+                    if (!enumerator.MoveNext())
+                        break;
+                    current = enumerator.Current;
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                {
+                    // A throwing enumerator is spent, so this fault is terminal.
+                    logger.LogWarning(ex, "Error occurred before all entries could be read.");
+                    fault = new EnumerationFault(ex.Message, EnumerationSeverity.Fatal);
+                    current = null!;
+                }
+
+                if (fault is { } f)
+                {
+                    yield return f;
+                    yield break;
+                }
+
+                Result<FileSystemEntry, EnumerationFault>? mapped = null;
+                try
+                {
+                    mapped = current is DirectoryInfo
+                        ? new FileSystemEntry(current.Name, current.FullName, true, 0, current.LastWriteTime)
+                        : new FileSystemEntry(current.Name, current.FullName, false, ((FileInfo)current).Length, current.LastWriteTime);
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                {
+                    logger.LogWarning(ex, "Unable to read entry.");
+                    mapped = new EnumerationFault(ex.Message, EnumerationSeverity.Warning);
+                }
+
+                yield return mapped.Value;
+            }
         }
     }
 
-    public Result<FileSystemResults, string> GetRoots()
+    public IEnumerable<Result<FileSystemEntry, EnumerationFault>> EnumerateRoots()
     {
-        var roots = new List<FileSystemEntry>();
-        var failedRoots = new List<string>();
-
         string home = GetHomeDirectory().Match(path => path, error => string.Empty);
 
         if (!string.IsNullOrEmpty(home) && Directory.Exists(home))
-            roots.Add(new FileSystemEntry("Home", home, true, 0, SafeModified(home, logger)));
+            yield return new FileSystemEntry("Home", home, true, 0, SafeModified(home, logger));
 
+        DriveInfo[] drives = [];
+        EnumerationFault? drivesFault = null;
         try
         {
-            foreach (var drive in DriveInfo.GetDrives())
+            drives = DriveInfo.GetDrives();
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "Unable to read drives.");
+            drivesFault = new EnumerationFault(ex.Message, EnumerationSeverity.Fatal);
+        }
+
+        if (drivesFault is { } df)
+        {
+            yield return df;
+            yield break;
+        }
+
+        foreach (var drive in drives)
+        {
+            Result<FileSystemEntry, EnumerationFault>? mapped = null;
+            try
             {
                 if (!drive.IsReady)
                     continue;
 
                 // On Windows this is "C:\", "D:\"; on Linux the single ready root is "/".
                 string rootPath = drive.RootDirectory.FullName;
-                roots.Add(new FileSystemEntry(rootPath, rootPath, true, 0, SafeModified(rootPath, logger)));
+                mapped = new FileSystemEntry(rootPath, rootPath, true, 0, SafeModified(rootPath, logger));
             }
-        }
-        catch (Exception ex)
-        {
-            logger.LogError(ex, "Unable to read root directory.");
-            failedRoots.Add(ex.Message);
-        }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                logger.LogWarning(ex, "Unable to read drive.");
+                mapped = new EnumerationFault(ex.Message, EnumerationSeverity.Warning);
+            }
 
-        return new FileSystemResults(roots, failedRoots);
+            if (mapped is { } m)
+                yield return m;
+        }
     }
 
     public Result<string, string> GetHomeDirectory()
