@@ -1,3 +1,27 @@
 <Solution>
-  <Project Path="FileManager.UI/FileManager.UI.csproj" />
+  <Folder Name="/docs/" />
+  <Folder Name="/docs/specs/">
+    <File Path="docs/specs/spec-draft-v1.md" />
+    <File Path="docs/specs/spec-draft-v2.md" />
+  </Folder>
+  <Folder Name="/docs/specs/spec-v2-implementation/">
+    <File Path="docs/specs/spec-v2-implementation/milestone-0-foundations.md" />
+    <File Path="docs/specs/spec-v2-implementation/milestone-1-job-engine.md" />
+    <File Path="docs/specs/spec-v2-implementation/milestone-2-transformer-pipeline.md" />
+    <File Path="docs/specs/spec-v2-implementation/milestone-3-data-safety.md" />
+    <File Path="docs/specs/spec-v2-implementation/milestone-4-journal-recovery.md" />
+    <File Path="docs/specs/spec-v2-implementation/milestone-5-triggers-concurrency.md" />
+    <File Path="docs/specs/spec-v2-implementation/milestone-6-service-ipc.md" />
+    <File Path="docs/specs/spec-v2-implementation/milestone-7-gui-dryrun.md" />
+    <File Path="docs/specs/spec-v2-implementation/milestone-8-shell-integration.md" />
+    <File Path="docs/specs/spec-v2-implementation/milestone-9-security-network-acceptance.md" />
+    <File Path="docs/specs/spec-v2-implementation/progress.md" />
+    <File Path="docs/specs/spec-v2-implementation/README.md" />
+  </Folder>
+  <Folder Name="/src/">
+    <Project Path="src/FileManager.UI/FileManager.UI.csproj" />
+  </Folder>
+  <Folder Name="/test/">
+    <Project Path="tests/FileManager.UI.Tests/FileManager.UI.Tests.csproj" />
+  </Folder>
 </Solution>
