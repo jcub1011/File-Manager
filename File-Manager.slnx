@@ -19,9 +19,11 @@
     <File Path="docs/specs/spec-v2-implementation/README.md" />
   </Folder>
   <Folder Name="/src/">
+    <Project Path="src/FileManager.Core/FileManager.Core.csproj" />
     <Project Path="src/FileManager.UI/FileManager.UI.csproj" />
   </Folder>
   <Folder Name="/test/">
+    <Project Path="tests/FileManager.Core.Tests/FileManager.Core.Tests.csproj" />
     <Project Path="tests/FileManager.UI.Tests/FileManager.UI.Tests.csproj" />
   </Folder>
 </Solution>
