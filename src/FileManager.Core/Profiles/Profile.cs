@@ -9,15 +9,15 @@ public sealed record Profile
     /// <summary>
     /// The version of this schema.
     /// </summary>
-    public required int SchemaVersion { get; init; }
+    public readonly required int SchemaVersion { get; init; }
 
     /// <summary>
     /// The unique identifier of this profile.
     /// </summary>
-    public required Guid Id { get; init; }
+    public readonly required Guid Id { get; init; }
 
     /// <summary>
     /// The name of this profile.
     /// </summary>
-    public required string Name { get; init; }
+    public readonly required string Name { get; init; }
 }
