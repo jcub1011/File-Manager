@@ -3,6 +3,7 @@
   <Folder Name="/docs/specs/">
     <File Path="docs/specs/spec-draft-v1.md" />
     <File Path="docs/specs/spec-draft-v2.md" />
+    <File Path="docs/specs/spec-draft-v3.md" />
   </Folder>
   <Folder Name="/src/">
     <Project Path="src/FileManager.Contracts/FileManager.Contracts.csproj" />
