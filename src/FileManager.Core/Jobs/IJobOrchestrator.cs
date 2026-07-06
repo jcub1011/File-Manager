@@ -1,5 +1,5 @@
 ﻿using FileManager.Contracts.IPC;
-using FileManager.Core.Primitives;
+using FileManager.Contracts.Primitives;
 using System.Threading.Tasks;
 
 namespace FileManager.Core.Jobs;

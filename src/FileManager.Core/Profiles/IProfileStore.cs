@@ -1,6 +1,6 @@
 ﻿using FileManager.Contracts.IPC;
 using FileManager.Contracts.Profiles;
-using FileManager.Core.Primitives;
+using FileManager.Contracts.Primitives;
 using System;
 using System.Collections.Generic;
 

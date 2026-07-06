@@ -1,7 +1,7 @@
 using System;
 using System.Diagnostics.CodeAnalysis;
 
-namespace FileManager.Core.Primitives;
+namespace FileManager.Contracts.Primitives;
 
 /// <summary>A success with no value, or a failure carrying a message. For void operations.</summary>
 public readonly struct Result

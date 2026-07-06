@@ -1,7 +1,7 @@
 ﻿using FileManager.Contracts.Profiles;
 using FileManager.Core.Files;
 using FileManager.Core.Jobs;
-using FileManager.Core.Primitives;
+using FileManager.Contracts.Primitives;
 using System.Collections.Generic;
 
 namespace FileManager.Core.Watching;

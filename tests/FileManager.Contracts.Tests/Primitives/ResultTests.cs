@@ -1,7 +1,7 @@
 using System;
-using FileManager.Core.Primitives;
+using FileManager.Contracts.Primitives;
 
-namespace FileManager.Core.Tests.Primitives;
+namespace FileManager.Contracts.Tests.Primitives;
 
 public class ResultTests
 {

@@ -3,7 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using FileManager.Core.Files;
-using FileManager.Core.Primitives;
+using FileManager.Contracts.Primitives;
 using Microsoft.Extensions.Logging.Abstractions;
 
 namespace FileManager.Core.Tests.Files;

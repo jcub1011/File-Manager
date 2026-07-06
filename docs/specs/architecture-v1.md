@@ -67,13 +67,20 @@ obvious from the spec cross-reference.
 **Conventions carried from the existing code** (stated once, applied everywhere):
 
 - Errors are values. Expected failures return the existing `Result` / `Result<TValue, TError>`
-  (`FileManager.Core.Primitives`); exceptions signal programmer error only.
+  (`FileManager.Contracts.Primitives`); exceptions signal programmer error only. It lives in
+  Contracts, not Core, so Contracts-only client plumbing (`IpcClient`, `ServiceLauncher`,
+  `IpcFrameCodec`, §4.9) can return it too without Contracts needing a reference to Core.
 - Types are `sealed`. Snapshot DTOs are positional records; config-like DTOs use
   `required` + `init`. Interfaces are `I`-prefixed. Namespaces mirror folders, file-scoped.
 - Every engine service takes `ILogger<T>` via a primary constructor. Signatures below omit the
   logger parameter for brevity; assume it on every concrete class.
 - All code is AOT-safe and reflection-free: source-generated `System.Text.Json` contexts, no
   runtime codegen, COM via `[GeneratedComInterface]`.
+- No raw C# `event` fields. In-process notifications are `IDisposable Subscribe(Action<T> handler)`
+  — disposing the returned handle unsubscribes — never `event Action<T> X`. This avoids the easy
+  leak of a subscriber that forgets to detach. Applies to every interface below, including
+  `IWatcherService`, `ISettleTracker`, `ISchedulerService`, `IPauseStateService`,
+  `IProfileCatalog`, and `IEngineEventBus`.
 
 **Review checklist for §0** — you should be able to answer: What wins on a conflict? What does
 `[reserved]` require the validator to do? Where does platform variance live?
@@ -133,7 +140,7 @@ interfaces live vs. their implementations? What serializer style is mandatory?
 
 | Project | Kind | Status | References | Contents |
 | --- | --- | --- | --- | --- |
-| `FileManager.Contracts` | lib, AOT/trim | exists (empty stub) | — | Profile schema records + all config enums (§5.1), IPC envelope/messages/events (§5.2), `DryRunReport` (§5.3), shared read models, `FileManagerJsonContext`, `IpcFrameCodec`/`IpcClient`/`ServiceLauncher` (§4.9) |
+| `FileManager.Contracts` | lib, AOT/trim | exists (empty stub) | — | `Result`/`Result<TValue,TError>` (`Contracts.Primitives`, relocated per §2.2), Profile schema records + all config enums (§5.1), IPC envelope/messages/events (§5.2), `DryRunReport` (§5.3), shared read models, `FileManagerJsonContext`, `IpcFrameCodec`/`IpcClient`/`ServiceLauncher` (§4.9) |
 | `FileManager.Core` | lib, AOT/trim | exists | Contracts | The engine: every service in §4, the journal, jobs, IPC *server*, platform interfaces (`Core.Platform`) |
 | `FileManager.Platform.Windows` | lib, AOT/trim | **new** | Core | Windows implementations of the `Core.Platform` interfaces (§4.11) |
 | `FileManager.Service` | exe, PublishAot | **new** | Core, Platform.Windows, Contracts | Core Service host: DI graph, startup sequence, lifetime |
@@ -160,7 +167,7 @@ graph BT
 
 | Existing type | Fate |
 | --- | --- |
-| `Result`, `Result<TValue,TError>` (`Core.Primitives`) | **Reused unchanged**, everywhere. |
+| `Result`, `Result<TValue,TError>` (`Core.Primitives`) | **Relocated** to `FileManager.Contracts.Primitives` (Contracts has zero project references, so Contracts-only IPC client plumbing — `IpcClient`, `ServiceLauncher`, `IpcFrameCodec`, §4.9 — can't otherwise return it without either duplicating it or referencing Core). Core keeps using the same type via its existing reference to Contracts; every existing Core call site is updated to the new namespace, no behavior change. |
 | `IFileSystemService`, `FileSystemService`, `FileSystemEntry`, `EnumerationFault` (`Core.Files`) | **Reused unchanged** — the enumeration backbone of `ISourceScanner` (§4.2), watcher rescan, and dry-run. |
 | `FileMetadata` (`Core.Files`) | **Reused unchanged** — the Job's source snapshot and the filter input (§4.4). |
 | `IFilter` (`Core.Filtering`) | **Extended in place** from empty marker to the §4.4 design. |
@@ -325,8 +332,8 @@ Exhaustive validation codes (the GUI keys messages off these; tests assert them)
 
 #### IProfileCatalog
 
-**Responsibility:** in-memory authoritative set of loaded profiles; raises `Changed` so
-watchers/scheduler re-arm.
+**Responsibility:** in-memory authoritative set of loaded profiles; notifies subscribers via
+`Subscribe` so watchers/scheduler re-arm.
 **Collaborators:** `IProfileStore`. **Spec:** §5.1.
 
 ```csharp
@@ -334,7 +341,7 @@ public interface IProfileCatalog
 {
     IReadOnlyList<Profile> All { get; }
     IReadOnlyList<Profile> Active { get; }
-    event Action Changed;
+    IDisposable Subscribe(Action changeHandler);
     Result Reload();
 }
 ```
@@ -365,7 +372,7 @@ raw change events out. Recovers from buffer overflow (`Error` event /
 `ReadDirectoryChangesW` overrun, spec §11) by a full rescan of the affected root via
 `ISourceScanner`. Never emits paths under `.pipeline_tmp/` or `.fm_staging/` (spec §3.2.3
 rule 3) — checked here *and* at settle time.
-**Collaborators:** `IProfileCatalog` (re-arm on `Changed`), `ISourceScanner`,
+**Collaborators:** `IProfileCatalog` (re-arms on `Subscribe` notifications), `ISourceScanner`,
 `ISelfWriteSuppressionRegistry` (defense-in-depth pre-filter).
 **Spec:** §3.2, §3.2.3, §11. **Failure semantics:** a root that cannot be watched (missing,
 access denied) logs and surfaces an engine event; other roots keep running.
@@ -375,7 +382,7 @@ public interface IWatcherService
 {
     Result Start();
     void Stop();
-    event Action<FileChangeEvent> Changed;   // raw, pre-settle
+    IDisposable Subscribe(Action<FileChangeEvent> changeHandler);   // raw, pre-settle
 }
 
 public readonly record struct FileChangeEvent(
@@ -394,7 +401,7 @@ emits a `Payload` when both spec §3.2.1 conditions hold. Consults
 public interface ISettleTracker
 {
     void Observe(FileChangeEvent change);
-    event Action<Payload> FileReady;
+    IDisposable SubscribeToReady(Action<Payload> readyHandler);
 }
 ```
 
@@ -434,7 +441,7 @@ public interface ISchedulerService
 {
     Result Start();
     void Stop();
-    event Action<ScheduleTick> Due;
+    IDisposable Subscribe(Action<ScheduleTick> dueHandler);
 }
 
 public readonly record struct ScheduleTick(Guid ProfileId, DateTimeOffset ScheduledFor, bool IsCatchUp);
@@ -485,7 +492,7 @@ public interface IPauseStateService
 {
     bool IsPaused { get; }
     Result SetPaused(bool paused);
-    event Action<bool> Changed;
+    IDisposable Subscribe(Action<bool> pauseHandler);
 }
 ```
 
@@ -2435,7 +2442,7 @@ implementation.
 | `Payload` / `TriggerKind` | `Core.Jobs` | Core | §5.4 |
 | `PolicySettings` / all profile enums | `Contracts.Profiles` | Contracts | §5.1 |
 | `Profile` / `SourceConfig` / `TargetConfig` / `TransformerStep` / `TriggerSettings` / `ScheduleSettings` | `Contracts.Profiles` | Contracts | §5.1 |
-| `Result` / `Result<TValue,TError>` | `Core.Primitives` | Core (existing) | §2.2 |
+| `Result` / `Result<TValue,TError>` | `Contracts.Primitives` | Contracts (relocated from Core) | §2.2 |
 | `SelfWriteSuppressionRegistry` / `SuppressionToken` | `Core.Locking` | Core | §4.3 |
 | `SourcePriorityRegistry` | `Core.Placement` | Core | §4.6 |
 | `ValidationIssue` / `ValidationSeverity` | `Contracts.Ipc` | Contracts | §5.2 |
