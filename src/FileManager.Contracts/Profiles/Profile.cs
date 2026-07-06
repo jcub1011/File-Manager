@@ -17,25 +17,9 @@ public sealed record Profile
     /// </summary>
     [JsonPropertyName("ProfileId")]
     public required Guid Id { get; init; }
-
-    /// <summary>
-    /// The name of this profile.
-    /// </summary>
     public required string Name { get; init; }
-
-    /// <summary>
-    /// If this profile is active.
-    /// </summary>
     public required bool Active { get; init; }
-
-    /// <summary>
-    /// The synchronization mode of this profile.
-    /// </summary>
     public required SyncMode SyncMode { get; init; }
-
-    /// <summary>
-    /// The target layout for this profile.
-    /// </summary>
     public required TargetLayout TargetLayout { get; init; }
     public required TriggerSettings Triggers { get; init; }
     public required IReadOnlyList<SourceConfig> Sources { get; init; }
