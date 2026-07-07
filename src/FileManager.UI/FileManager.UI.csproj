@@ -10,9 +10,30 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <Folder Include="Models\" />
     <AvaloniaResource Include="Assets\**" />
   </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\FileManager.Contracts\FileManager.Contracts.csproj" />
+    <!-- Build-order + copy-output only, NOT an assembly reference (§1 rule 3: the UI references
+         Contracts only). ServiceLauncher resolves FileManager.Service.exe beside the UI exe —
+         the publish layout — so the dev build must lay the files out the same way. -->
+    <ProjectReference Include="..\FileManager.Service\FileManager.Service.csproj"
+                      ReferenceOutputAssembly="false"
+                      OutputItemType="ServiceHostAssembly"
+                      Private="false" />
+  </ItemGroup>
+
+  <!-- Copies the Service host's entire output (exe, dlls, runtimeconfig) into the UI's output
+       directory so ServiceLauncher's side-by-side probe works under F5 without env overrides. -->
+  <Target Name="CopyServiceHostOutput" AfterTargets="Build" Condition="'@(ServiceHostAssembly)' != ''">
+    <ItemGroup>
+      <ServiceHostFiles Include="%(ServiceHostAssembly.RootDir)%(ServiceHostAssembly.Directory)**\*" />
+    </ItemGroup>
+    <Copy SourceFiles="@(ServiceHostFiles)"
+          DestinationFiles="@(ServiceHostFiles->'$(OutDir)%(RecursiveDir)%(Filename)%(Extension)')"
+          SkipUnchangedFiles="true" />
+  </Target>
 
   <ItemGroup>
     <PackageReference Include="Avalonia" Version="12.0.5" />

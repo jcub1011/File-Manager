@@ -1,5 +1,4 @@
-﻿using Microsoft.Extensions.Logging;
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Text.Json.Serialization;
 
@@ -107,7 +106,7 @@ public sealed record AttributeFilterSettings
 
 public sealed record LoggingSettings
 {
-    public required LogLevel LogLevel { get; init; }
+    public required LogVerbosity Verbosity { get; init; }
     public required bool NotifyOnFailure { get; init; }
 }
 

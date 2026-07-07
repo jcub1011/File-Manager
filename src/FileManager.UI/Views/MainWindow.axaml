@@ -1,20 +1,36 @@
 <Window xmlns="https://github.com/avaloniaui"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:vm="using:FileManager.UI.ViewModels"
-        xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
-        xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
-        mc:Ignorable="d" d:DesignWidth="800" d:DesignHeight="450"
+        xmlns:v="using:FileManager.UI.Views"
         x:Class="FileManager.UI.Views.MainWindow"
         x:DataType="vm:MainWindowViewModel"
         Icon="/Assets/avalonia-logo.ico"
-        Title="FileManager.UI">
+        Width="1200" Height="760"
+        Title="File Manager">
 
-    <Design.DataContext>
-        <!-- This only sets the DataContext for the previewer in an IDE,
-             to set the actual DataContext for runtime, set the DataContext property in code (look at App.axaml.cs) -->
-        <vm:MainWindowViewModel/>
-    </Design.DataContext>
+    <DockPanel>
+        <v:StatusBarView DockPanel.Dock="Bottom" DataContext="{Binding StatusBar}" />
 
-    <TextBlock Text="{Binding Greeting}" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+        <Grid ColumnDefinitions="280,4,*">
+            <DockPanel Grid.Column="0" Margin="8">
+                <StackPanel DockPanel.Dock="Top" Orientation="Horizontal" Spacing="6" Margin="0,0,0,8">
+                    <Button Content="New profile" Command="{Binding NewProfileCommand}" />
+                    <Button Content="Refresh" Command="{Binding List.RefreshCommand}" />
+                </StackPanel>
+                <v:ProfileListView DataContext="{Binding List}" />
+            </DockPanel>
+
+            <GridSplitter Grid.Column="1" Background="Transparent" ResizeDirection="Columns" />
+
+            <TabControl Grid.Column="2" Margin="4,8,8,8" IsVisible="{Binding Editor.HasProfile}">
+                <TabItem Header="Profile">
+                    <v:ProfileEditorView DataContext="{Binding Editor}" />
+                </TabItem>
+                <TabItem Header="Dry Run" IsEnabled="{Binding DryRun.CanRun}">
+                    <v:DryRunView DataContext="{Binding DryRun}" />
+                </TabItem>
+            </TabControl>
+        </Grid>
+    </DockPanel>
 
 </Window>

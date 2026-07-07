@@ -1,0 +1,194 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:vm="using:FileManager.UI.ViewModels"
+             x:Class="FileManager.UI.Views.DryRunView"
+             x:DataType="vm:DryRunViewModel">
+
+    <UserControl.Styles>
+        <Style Selector="Border.chip">
+            <Setter Property="CornerRadius" Value="10" />
+            <Setter Property="Padding" Value="10,3" />
+            <Setter Property="Background" Value="{DynamicResource SystemControlBackgroundListLowBrush}" />
+        </Style>
+        <Style Selector="Border.chipDanger">
+            <Setter Property="Background" Value="#E53935" />
+        </Style>
+        <Style Selector="Border.chipDanger TextBlock">
+            <Setter Property="Foreground" Value="White" />
+        </Style>
+        <Style Selector="Border.chipAmber">
+            <Setter Property="Background" Value="#FFA000" />
+        </Style>
+        <Style Selector="Border.chipAmber TextBlock">
+            <Setter Property="Foreground" Value="Black" />
+        </Style>
+        <Style Selector="Border.chipSafe">
+            <Setter Property="Background" Value="#2E7D32" />
+        </Style>
+        <Style Selector="Border.chipSafe TextBlock">
+            <Setter Property="Foreground" Value="White" />
+        </Style>
+
+        <!-- per-target kind tags -->
+        <Style Selector="TextBlock.kind">
+            <Setter Property="FontSize" Value="11" />
+            <Setter Property="FontWeight" Value="SemiBold" />
+            <Setter Property="VerticalAlignment" Value="Center" />
+        </Style>
+        <Style Selector="TextBlock.kind.overwrite">
+            <Setter Property="Foreground" Value="#E53935" />
+        </Style>
+        <Style Selector="TextBlock.kind.rename">
+            <Setter Property="Foreground" Value="#FFA000" />
+        </Style>
+        <Style Selector="TextBlock.kind.write">
+            <Setter Property="Foreground" Value="#2E7D32" />
+        </Style>
+        <Style Selector="TextBlock.kind.skip">
+            <Setter Property="Foreground" Value="#9E9E9E" />
+        </Style>
+        <Style Selector="TextBlock.kind.unknown">
+            <Setter Property="Foreground" Value="#8E24AA" />
+        </Style>
+    </UserControl.Styles>
+
+    <DockPanel>
+        <!-- controls row -->
+        <StackPanel DockPanel.Dock="Top" Spacing="6">
+            <Grid ColumnDefinitions="Auto,*,Auto,Auto,Auto" Margin="0,4,0,0">
+                <TextBlock Grid.Column="0" Text="Scope (optional)" VerticalAlignment="Center" Margin="0,0,8,0" />
+                <TextBox Grid.Column="1" Text="{Binding ScopePath}"
+                         PlaceholderText="Limit the simulation to a folder under a Source — empty scans everything" />
+                <Button Grid.Column="2" Content="Browse…" Margin="6,0,0,0" Command="{Binding BrowseScopeCommand}" />
+                <Button Grid.Column="3" Content="Run dry run" Margin="6,0,0,0" Classes="accent"
+                        Command="{Binding RunCommand}" />
+                <Button Grid.Column="4" Content="Cancel" Margin="6,0,0,0"
+                        Command="{Binding RunCancelCommand}"
+                        IsVisible="{Binding RunCommand.IsRunning}" />
+            </Grid>
+            <ProgressBar IsIndeterminate="True" IsVisible="{Binding RunCommand.IsRunning}" />
+            <TextBlock Text="{Binding ErrorMessage}" Foreground="#E53935" TextWrapping="Wrap"
+                       IsVisible="{Binding ErrorMessage, Converter={x:Static ObjectConverters.IsNotNull}}" />
+        </StackPanel>
+
+        <ScrollViewer Margin="0,8,0,0">
+            <StackPanel Spacing="8" IsVisible="{Binding HasReport}">
+
+                <!-- blast-radius banner -->
+                <Border Background="{DynamicResource SystemControlBackgroundListLowBrush}" CornerRadius="6" Padding="10">
+                    <StackPanel Spacing="6">
+                        <StackPanel Orientation="Horizontal" Spacing="8">
+                            <TextBlock FontWeight="Bold" Text="Blast radius" VerticalAlignment="Center" />
+                            <TextBlock Text="{Binding GeneratedAtText}" Opacity="0.6" FontSize="11" VerticalAlignment="Center" />
+                        </StackPanel>
+                        <WrapPanel>
+                            <Border Classes="chip" Margin="0,0,6,0">
+                                <TextBlock><Run Text="{Binding TotalFiles}" /><Run Text=" files scanned" /></TextBlock>
+                            </Border>
+                            <Border Classes="chip" Margin="0,0,6,0">
+                                <TextBlock><Run Text="{Binding ProcessCount}" /><Run Text=" would process" /></TextBlock>
+                            </Border>
+                            <Border Classes="chip" Margin="0,0,6,0">
+                                <TextBlock><Run Text="{Binding FilterSkipCount}" /><Run Text=" filtered out" /></TextBlock>
+                            </Border>
+                            <Border Classes="chip" Margin="0,0,6,0">
+                                <TextBlock><Run Text="{Binding UnchangedSkipCount}" /><Run Text=" unchanged" /></TextBlock>
+                            </Border>
+                            <Border Classes="chip chipDanger" Margin="0,0,6,0" IsVisible="{Binding !!OverwriteCount}">
+                                <TextBlock><Run Text="{Binding OverwriteCount}" /><Run Text=" OVERWRITES" /></TextBlock>
+                            </Border>
+                            <Border Classes="chip chipAmber" Margin="0,0,6,0" IsVisible="{Binding !!RenameCount}">
+                                <TextBlock><Run Text="{Binding RenameCount}" /><Run Text=" renames" /></TextBlock>
+                            </Border>
+                            <Border Classes="chip chipDanger" Margin="0,0,6,0" IsVisible="{Binding !!DisposalCount}">
+                                <TextBlock><Run Text="{Binding DisposalCount}" /><Run Text=" source disposals" /></TextBlock>
+                            </Border>
+                            <Border Classes="chip chipSafe" Margin="0,0,6,0" IsVisible="{Binding !HasDestructiveActions}">
+                                <TextBlock Text="no destructive actions" />
+                            </Border>
+                        </WrapPanel>
+                        <ToggleButton Content="Destructive only" IsChecked="{Binding DestructiveOnly}" FontSize="12" />
+                    </StackPanel>
+                </Border>
+
+                <!-- would process -->
+                <Expander IsExpanded="True">
+                    <Expander.Header>
+                        <TextBlock><Run Text="Will process (" /><Run Text="{Binding ProcessCount}" /><Run Text=")" /></TextBlock>
+                    </Expander.Header>
+                    <ItemsControl ItemsSource="{Binding ProcessFiles}">
+                        <ItemsControl.ItemTemplate>
+                            <DataTemplate x:DataType="vm:DryRunFileRow">
+                                <Border BorderThickness="0,0,0,1" BorderBrush="{DynamicResource SystemControlBackgroundListLowBrush}"
+                                        Padding="4,6">
+                                    <StackPanel Spacing="3">
+                                        <StackPanel Orientation="Horizontal" Spacing="8">
+                                            <TextBlock Text="{Binding SourcePath}" FontFamily="Consolas,monospace"
+                                                       TextTrimming="CharacterEllipsis" MaxWidth="620" />
+                                            <TextBlock Classes="kind overwrite" Text="{Binding SourceDisposition}"
+                                                       IsVisible="{Binding IsSourceDisposalDestructive}" />
+                                        </StackPanel>
+                                        <ItemsControl ItemsSource="{Binding Targets}" Margin="18,0,0,0">
+                                            <ItemsControl.ItemTemplate>
+                                                <DataTemplate x:DataType="vm:DryRunTargetRow">
+                                                    <StackPanel Orientation="Horizontal" Spacing="8">
+                                                        <TextBlock Classes="kind" Text="{Binding KindText}" MinWidth="110"
+                                                                   Classes.overwrite="{Binding IsOverwrite}"
+                                                                   Classes.rename="{Binding IsRename}"
+                                                                   Classes.write="{Binding IsWrite}"
+                                                                   Classes.skip="{Binding IsSkip}"
+                                                                   Classes.unknown="{Binding IsUnknown}" />
+                                                        <TextBlock Text="{Binding Path}" FontFamily="Consolas,monospace" FontSize="12"
+                                                                   TextTrimming="CharacterEllipsis" MaxWidth="520" Opacity="0.85" />
+                                                        <TextBlock Text="{Binding Detail}" FontSize="11" Opacity="0.55"
+                                                                   VerticalAlignment="Center" TextTrimming="CharacterEllipsis" MaxWidth="320" />
+                                                    </StackPanel>
+                                                </DataTemplate>
+                                            </ItemsControl.ItemTemplate>
+                                        </ItemsControl>
+                                    </StackPanel>
+                                </Border>
+                            </DataTemplate>
+                        </ItemsControl.ItemTemplate>
+                    </ItemsControl>
+                </Expander>
+
+                <!-- filtered out -->
+                <Expander IsExpanded="False">
+                    <Expander.Header>
+                        <TextBlock><Run Text="Skipped by filters (" /><Run Text="{Binding FilterSkipCount}" /><Run Text=")" /></TextBlock>
+                    </Expander.Header>
+                    <ItemsControl ItemsSource="{Binding FilterSkips}">
+                        <ItemsControl.ItemTemplate>
+                            <DataTemplate x:DataType="vm:DryRunFileRow">
+                                <StackPanel Orientation="Horizontal" Spacing="8" Margin="4,3">
+                                    <TextBlock Text="{Binding SourcePath}" FontFamily="Consolas,monospace" FontSize="12"
+                                               TextTrimming="CharacterEllipsis" MaxWidth="560" />
+                                    <TextBlock Text="{Binding DecidingFilter}" FontSize="11" Opacity="0.6"
+                                               VerticalAlignment="Center" TextTrimming="CharacterEllipsis" MaxWidth="380" />
+                                </StackPanel>
+                            </DataTemplate>
+                        </ItemsControl.ItemTemplate>
+                    </ItemsControl>
+                </Expander>
+
+                <!-- unchanged -->
+                <Expander IsExpanded="False">
+                    <Expander.Header>
+                        <TextBlock><Run Text="Unchanged at all targets (" /><Run Text="{Binding UnchangedSkipCount}" /><Run Text=")" /></TextBlock>
+                    </Expander.Header>
+                    <ItemsControl ItemsSource="{Binding UnchangedSkips}">
+                        <ItemsControl.ItemTemplate>
+                            <DataTemplate x:DataType="vm:DryRunFileRow">
+                                <TextBlock Text="{Binding SourcePath}" FontFamily="Consolas,monospace" FontSize="12"
+                                           TextTrimming="CharacterEllipsis" Margin="4,3" />
+                            </DataTemplate>
+                        </ItemsControl.ItemTemplate>
+                    </ItemsControl>
+                </Expander>
+
+            </StackPanel>
+        </ScrollViewer>
+    </DockPanel>
+
+</UserControl>

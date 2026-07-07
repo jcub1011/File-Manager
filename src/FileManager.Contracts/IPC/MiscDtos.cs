@@ -1,5 +1,4 @@
-﻿using Microsoft.Extensions.Logging;
-using System;
+﻿using System;
 
 namespace FileManager.Contracts.IPC;
 
@@ -11,7 +10,11 @@ public sealed record ProfileSummary(
 
 public sealed record ProfileMatchDto(Guid ProfileId, string ProfileName, string MatchedSourceRoot);
 
-public sealed record ValidationIssue(LogLevel Severity, string Code, string Message);
+/// <summary>Warning: informational, never blocks. BlockingWarning: blocks a save unless the
+/// request sets AcknowledgeWarnings (spec §6.1's "blocking warning"). Error: always blocks.</summary>
+public enum ValidationSeverity { Warning, BlockingWarning, Error }
+
+public sealed record ValidationIssue(ValidationSeverity Severity, string Code, string Message);
 
 public sealed record JobSummaryDto(
     Guid JobId, Guid ProfileId, string SourcePath, string Outcome,

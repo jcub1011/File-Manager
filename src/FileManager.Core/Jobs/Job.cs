@@ -32,13 +32,62 @@ public readonly record struct JobId(Guid Value)
 /// Equality/hash: OrdinalIgnoreCase on Windows. Comparison defines the global lock order (I-LOCK-ORDER).</summary>
 public readonly record struct NormalizedPath : IComparable<NormalizedPath>
 {
+    // Filesystem case-sensitivity is a per-OS fact, not an OS code path — this is the one
+    // sanctioned OperatingSystem probe in Core (§1 rule 2 note).
+    private static readonly StringComparison Comparison =
+        OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+
+    private NormalizedPath(string value) => Value = value;
+
     public string Value { get; }
 
-    public static Result<NormalizedPath, JobError> Create(string path) => throw new NotImplementedException();
-    
-    public int CompareTo(NormalizedPath other) => throw new NotImplementedException();
+    public static Result<NormalizedPath, JobError> Create(string path)
+    {
+        // JobErrorCode has no dedicated malformed-path member (§5.4 is spec-frozen);
+        // SourceUnreadable is the generic "this path is unusable" bucket — callers key off
+        // the message, and the validator re-wraps failures as PROFILE_PATH_INVALID.
+        if (string.IsNullOrWhiteSpace(path))
+            return new JobError { Code = JobErrorCode.SourceUnreadable, Message = "path is empty", Path = path };
+        if (!System.IO.Path.IsPathFullyQualified(path))
+            return new JobError { Code = JobErrorCode.SourceUnreadable, Message = $"path is not absolute: \"{path}\"", Path = path };
+        try
+        {
+            string full = System.IO.Path.GetFullPath(path);
+            return new NormalizedPath(System.IO.Path.TrimEndingDirectorySeparator(full));
+        }
+        catch (Exception ex) when (ex is ArgumentException or System.IO.PathTooLongException or NotSupportedException)
+        {
+            return new JobError { Code = JobErrorCode.SourceUnreadable, Message = $"malformed path \"{path}\": {ex.Message}", Path = path };
+        }
+    }
 
-    public bool IsUnder(NormalizedPath ancestor) => throw new NotImplementedException();                  // containment checks for validation
+    public bool Equals(NormalizedPath other) => string.Equals(Value, other.Value, Comparison);
+
+    public override int GetHashCode() =>
+        Value is null ? 0 : string.GetHashCode(Value, Comparison);
+
+    public int CompareTo(NormalizedPath other) =>
+        string.Compare(Value, other.Value, Comparison);
+
+    /// <summary>Strict containment: true when this path is inside <paramref name="ancestor"/>
+    /// (never for equal paths). Boundary-safe: "C:\ab" is not under "C:\a".</summary>
+    public bool IsUnder(NormalizedPath ancestor)
+    {
+        if (Value is null || ancestor.Value is null)
+            return false;
+        if (Value.Length <= ancestor.Value.Length)
+            return false;
+        if (!Value.StartsWith(ancestor.Value, Comparison))
+            return false;
+        // Ancestor may itself end in a separator only when it is a volume root ("C:\").
+        char boundary = Value[ancestor.Value.Length];
+        return ancestor.Value[^1] == System.IO.Path.DirectorySeparatorChar
+            || ancestor.Value[^1] == System.IO.Path.AltDirectorySeparatorChar
+            || boundary == System.IO.Path.DirectorySeparatorChar
+            || boundary == System.IO.Path.AltDirectorySeparatorChar;
+    }
+
+    public override string ToString() => Value ?? string.Empty;
 }
 
 public enum TriggerKind { Watcher, Schedule, CatchUp, ManualShell, Cli }

@@ -6,7 +6,8 @@ using System.Text.Json.Serialization;
 namespace FileManager.Contracts;
 
 [JsonSourceGenerationOptions(WriteIndented = false,
-    DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull)]
+    DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
+    UseStringEnumConverter = true)]
 [JsonSerializable(typeof(Profile))]
 [JsonSerializable(typeof(IpcRequest))]
 [JsonSerializable(typeof(IpcResponse))]

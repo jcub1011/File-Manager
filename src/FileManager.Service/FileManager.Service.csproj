@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <PublishAot>true</PublishAot>
+    <!-- Timezone validation (PROFILE_TIMEZONE_INVALID) needs ICU. -->
+    <InvariantGlobalization>false</InvariantGlobalization>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.Hosting" Version="10.0.9" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\FileManager.Contracts\FileManager.Contracts.csproj" />
+    <ProjectReference Include="..\FileManager.Core\FileManager.Core.csproj" />
+    <ProjectReference Include="..\FileManager.Platform.Windows\FileManager.Platform.Windows.csproj" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,42 @@
+using FileManager.Contracts.IPC;
+
+namespace FileManager.Core.IPC;
+
+/// <summary>Maps a request instance to its wire discriminator — the dispatch-table key. An
+/// exhaustive compile-time switch (no reflection, AOT-safe); a unit test pins this table to the
+/// [JsonDerivedType] attributes on IpcRequest so the two can never drift apart.</summary>
+public static class IpcRequestTypes
+{
+    public const string GetStatus = "get-status";
+    public const string ListProfiles = "list-profiles";
+    public const string GetProfile = "get-profile";
+    public const string SaveProfile = "save-profile";
+    public const string DeleteProfile = "delete-profile";
+    public const string ValidateProfile = "validate-profile";
+    public const string GetMatching = "get-matching";
+    public const string RunProfile = "run-profile";
+    public const string SetPaused = "set-paused";
+    public const string DryRun = "dry-run";
+    public const string GetRecentJobs = "get-recent-jobs";
+    public const string GetJobLog = "get-job-log";
+    public const string Subscribe = "subscribe";
+
+    public static string DiscriminatorOf(IpcRequest request) => request switch
+    {
+        GetStatusRequest => GetStatus,
+        ListProfilesRequest => ListProfiles,
+        GetProfileRequest => GetProfile,
+        SaveProfileRequest => SaveProfile,
+        DeleteProfileRequest => DeleteProfile,
+        ValidateProfileRequest => ValidateProfile,
+        GetMatchingProfilesRequest => GetMatching,
+        RunProfileRequest => RunProfile,
+        SetPausedRequest => SetPaused,
+        DryRunRequest => DryRun,
+        GetRecentJobsRequest => GetRecentJobs,
+        GetJobLogRequest => GetJobLog,
+        SubscribeEventsRequest => Subscribe,
+        _ => throw new System.ArgumentOutOfRangeException(nameof(request),
+            $"unmapped request type {request.GetType().Name} — add it here and to IpcRequest's [JsonDerivedType] table"),
+    };
+}
