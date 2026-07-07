@@ -153,6 +153,11 @@ public sealed class IpcServer(
                         .ConfigureAwait(false);
                     if (writeResult.IsCanceled)
                         return;                     // shutdown
+                    if (writeResult.TryGetError(out string? writeError))
+                    {
+                        logger.LogDebug("IPC connection ended: {Reason}", writeError);
+                        return;
+                    }
                 }
             }
             catch (OperationCanceledException)
@@ -174,12 +179,16 @@ public sealed class IpcServer(
 
     private async Task<(string RequestType, IpcResponse Response)> DispatchAsync(byte[] payload, CancellationToken ct)
     {
-        IpcRequest? request = IpcSerializer.DeserializeRequest(payload);
-        if (request is null)
+        Result<IpcRequest, string> parsed = IpcSerializer.DeserializeRequest(payload);
+        if (parsed.TryGetError(out string? parseError))
+        {
+            logger.LogWarning("IPC request frame rejected: {Reason}", parseError);
             return ("<malformed>", new ErrorResponse { Code = "IPC_MALFORMED", Message = "the request frame could not be parsed" });
+        }
+        parsed.TryGetValue(out IpcRequest? request);
 
-        string discriminator = IpcRequestTypes.DiscriminatorOf(request);
-        if (request.ProtocolVersion != 1)
+        string discriminator = IpcRequestTypes.DiscriminatorOf(request!);
+        if (request!.ProtocolVersion != 1)
             return (discriminator, new ErrorResponse
             {
                 Code = "IPC_VERSION_MISMATCH",

@@ -1,3 +1,4 @@
+using FileManager.Contracts.IPC;
 using FileManager.Contracts.Primitives;
 using FileManager.Core.Platform;
 using Microsoft.Extensions.Logging;
@@ -57,23 +58,8 @@ public sealed class WindowsIpcEndpointProvider(ILogger<WindowsIpcEndpointProvide
         }
     }
 
-    /// <summary>Deliberately duplicates Contracts' IpcEndpoint.Resolve derivation byte-for-byte,
-    /// including the FILEMANAGER_PIPE_NAME override (§4.11 [flagged] — Contracts cannot see
-    /// Core). The end-to-end pipe test pins the two together.</summary>
-    internal static string ResolvePipeName()
-    {
-        string? overridden = Environment.GetEnvironmentVariable("FILEMANAGER_PIPE_NAME");
-        if (!string.IsNullOrWhiteSpace(overridden))
-            return overridden;
-
-        char[] chars = Environment.UserName.ToLowerInvariant().ToCharArray();
-        for (int i = 0; i < chars.Length; i++)
-        {
-            char c = chars[i];
-            bool legal = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '_';
-            if (!legal)
-                chars[i] = '-';
-        }
-        return "filemanager-" + new string(chars);
-    }
+    /// <summary>Both ends of the pipe use Contracts' IpcEndpoint.Resolve derivation (including
+    /// the FILEMANAGER_PIPE_NAME override) — one source of truth, so client and server can never
+    /// derive different names (§4.11).</summary>
+    internal static string ResolvePipeName() => IpcEndpoint.Resolve();
 }

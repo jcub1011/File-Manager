@@ -161,9 +161,18 @@ public sealed partial class DryRunViewModel : ViewModelBase
             f.Targets.Select(static t => new DryRunTargetRow(t.TargetPath, t.Kind, t.Detail)).ToList()))
             .ToList();
 
-        _processAll = rows.Where(static r => r.Disposition == DryRunFileDisposition.WouldProcess).ToList();
-        _filterSkipsAll = rows.Where(static r => r.Disposition == DryRunFileDisposition.WouldSkipFilter).ToList();
-        _unchangedSkipsAll = rows.Where(static r => r.Disposition == DryRunFileDisposition.WouldSkipUnchanged).ToList();
+        _processAll = [];
+        _filterSkipsAll = [];
+        _unchangedSkipsAll = [];
+        foreach (DryRunFileRow row in rows)
+        {
+            switch (row.Disposition)
+            {
+                case DryRunFileDisposition.WouldProcess: _processAll.Add(row); break;
+                case DryRunFileDisposition.WouldSkipFilter: _filterSkipsAll.Add(row); break;
+                case DryRunFileDisposition.WouldSkipUnchanged: _unchangedSkipsAll.Add(row); break;
+            }
+        }
 
         TotalFiles = rows.Count;
         ProcessCount = _processAll.Count;

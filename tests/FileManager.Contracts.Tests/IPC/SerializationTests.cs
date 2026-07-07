@@ -39,8 +39,7 @@ public sealed class SerializationTests
         using JsonDocument document = JsonDocument.Parse(wire);
         Assert.Equal(discriminator, document.RootElement.GetProperty("type").GetString());
 
-        IpcRequest? roundTripped = IpcSerializer.DeserializeRequest(wire);
-        Assert.NotNull(roundTripped);
+        Assert.True(IpcSerializer.DeserializeRequest(wire).TryGetValue(out IpcRequest? roundTripped));
         Assert.Equal(request.GetType(), roundTripped.GetType());
     }
 
@@ -67,8 +66,7 @@ public sealed class SerializationTests
         using JsonDocument document = JsonDocument.Parse(wire);
         Assert.Equal(discriminator, document.RootElement.GetProperty("type").GetString());
 
-        IpcResponse? roundTripped = IpcSerializer.DeserializeResponse(wire);
-        Assert.NotNull(roundTripped);
+        Assert.True(IpcSerializer.DeserializeResponse(wire).TryGetValue(out IpcResponse? roundTripped));
         Assert.Equal(response.GetType(), roundTripped.GetType());
     }
 
@@ -89,8 +87,7 @@ public sealed class SerializationTests
         using JsonDocument document = JsonDocument.Parse(wire);
         Assert.Equal(discriminator, document.RootElement.GetProperty("type").GetString());
 
-        EngineEvent? roundTripped = IpcSerializer.DeserializeEvent(wire);
-        Assert.NotNull(roundTripped);
+        Assert.True(IpcSerializer.DeserializeEvent(wire).TryGetValue(out EngineEvent? roundTripped));
         Assert.Equal(evt.GetType(), roundTripped.GetType());
     }
 
@@ -120,24 +117,26 @@ public sealed class SerializationTests
         using JsonDocument document = JsonDocument.Parse(wire);
         Assert.True(document.RootElement.GetProperty("Report").GetProperty("Truncated").GetBoolean());
 
-        DryRunResponse? roundTripped = IpcSerializer.DeserializeResponse(wire) as DryRunResponse;
-        Assert.NotNull(roundTripped);
+        Assert.True(IpcSerializer.DeserializeResponse(wire).TryGetValue(out IpcResponse? reparsed));
+        DryRunResponse roundTripped = Assert.IsType<DryRunResponse>(reparsed);
         Assert.True(roundTripped.Report.Truncated);
 
         // Old-server → new-client compatibility: a report serialized before the flag existed
         // (no "Truncated" property) deserializes to the constructor default, false.
         string legacy = """{"type":"dry-run-report","Report":{"ProfileId":""" + $"\"{SomeId}\"" +
             ""","GeneratedAt":"1970-01-01T00:00:00+00:00","Files":[]}}""";
-        DryRunResponse legacyParsed = Assert.IsType<DryRunResponse>(
-            IpcSerializer.DeserializeResponse(Encoding.UTF8.GetBytes(legacy)));
+        Assert.True(IpcSerializer.DeserializeResponse(Encoding.UTF8.GetBytes(legacy)).TryGetValue(out IpcResponse? legacyResponse));
+        DryRunResponse legacyParsed = Assert.IsType<DryRunResponse>(legacyResponse);
         Assert.False(legacyParsed.Report.Truncated);
     }
 
     [Fact]
-    public void Malformed_and_unknown_discriminator_payloads_deserialize_to_null()
+    public void Malformed_and_unknown_discriminator_payloads_deserialize_to_failures()
     {
-        Assert.Null(IpcSerializer.DeserializeRequest("not json"u8.ToArray()));
-        Assert.Null(IpcSerializer.DeserializeRequest("""{"type":"no-such-request"}"""u8.ToArray()));
+        Assert.True(IpcSerializer.DeserializeRequest("not json"u8.ToArray()).TryGetError(out string? malformed));
+        Assert.Contains("malformed request", malformed);
+        Assert.True(IpcSerializer.DeserializeRequest("""{"type":"no-such-request"}"""u8.ToArray()).TryGetError(out string? unknown));
+        Assert.Contains("malformed request", unknown);
     }
 
     internal static Profile SampleProfile() => new()

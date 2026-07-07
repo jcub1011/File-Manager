@@ -90,14 +90,41 @@ public sealed class IpcFrameCodecTests
         Assert.Contains("stream misbehaved", error);
     }
 
+    [Fact]
+    public async Task Write_to_a_dead_stream_is_a_failure_not_a_throw()
+    {
+        MemoryStream stream = new();
+        await stream.DisposeAsync();
+
+        var written = await IpcFrameCodec.WriteFrameAsync(stream, new byte[] { 1, 2, 3 });
+
+        Assert.True(written.TryGetError(out string? error));
+        Assert.Contains("write failed", error);
+    }
+
+    [Fact]
+    public async Task Unexpected_write_exception_is_a_traceable_failure_not_a_throw()
+    {
+        using ThrowingStream stream = new(new NotSupportedException("stream misbehaved"));
+
+        var written = await IpcFrameCodec.WriteFrameAsync(stream, new byte[] { 1, 2, 3 });
+
+        Assert.True(written.TryGetError(out string? error));
+        Assert.Contains(nameof(NotSupportedException), error);
+        Assert.Contains("stream misbehaved", error);
+    }
+
     private sealed class ThrowingStream(Exception exception) : Stream
     {
         public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken ct = default) =>
             throw exception;
 
+        public override ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken ct = default) =>
+            throw exception;
+
         public override bool CanRead => true;
         public override bool CanSeek => false;
-        public override bool CanWrite => false;
+        public override bool CanWrite => true;
         public override long Length => throw new NotSupportedException();
         public override long Position { get => 0; set => throw new NotSupportedException(); }
         public override void Flush() { }

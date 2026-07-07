@@ -83,6 +83,8 @@ public sealed class IpcClient : IAsyncDisposable
             Result writeResult = await IpcFrameCodec.WriteFrameAsync(_pipe, payload, ct).ConfigureAwait(false);
             if (writeResult.IsCanceled)
                 return Result<TResponse, IpcError>.Canceled();
+            if (writeResult.TryGetError(out string? writeError))
+                return new IpcError("IPC_TRANSPORT", writeError);
 
             Result<byte[], string> frame = await IpcFrameCodec.ReadFrameAsync(_pipe, ct).ConfigureAwait(false);
             if (frame.IsCanceled)
@@ -91,14 +93,16 @@ public sealed class IpcClient : IAsyncDisposable
                 return new IpcError("IPC_TRANSPORT", transportError);
             frame.TryGetValue(out byte[]? bytes);
 
-            IpcResponse? response = IpcSerializer.DeserializeResponse(bytes!);
-            return response switch
+            Result<IpcResponse, string> parsed = IpcSerializer.DeserializeResponse(bytes!);
+            if (parsed.TryGetError(out string? parseError))
+                return new IpcError("IPC_MALFORMED", $"the service sent a response that could not be parsed: {parseError}");
+            parsed.TryGetValue(out IpcResponse? response);
+            return response! switch
             {
-                null => new IpcError("IPC_MALFORMED", "the service sent a response that could not be parsed"),
                 ErrorResponse error => new IpcError(error.Code, error.Message),
                 TResponse typed => typed,
-                _ => new IpcError("IPC_UNEXPECTED_RESPONSE",
-                    $"expected {typeof(TResponse).Name}, got {response.GetType().Name}"),
+                IpcResponse other => new IpcError("IPC_UNEXPECTED_RESPONSE",
+                    $"expected {typeof(TResponse).Name}, got {other.GetType().Name}"),
             };
         }
         catch (OperationCanceledException)
@@ -123,7 +127,9 @@ public sealed class IpcClient : IAsyncDisposable
 
     /// <summary>Sends SubscribeEventsRequest; after the acknowledgment the connection is a
     /// one-way EngineEvent stream until disconnect (§3.2). Throws InvalidOperationException if
-    /// the server refuses the subscription. Ends (without error) when the connection closes.</summary>
+    /// the server refuses the subscription. Ends without error only on cancellation or a clean
+    /// close at a frame boundary; a transport fault or unreadable event throws IOException so
+    /// the failure reaches the consumer's logging boundary instead of ending the stream silently.</summary>
     public async IAsyncEnumerable<EngineEvent> SubscribeAsync([EnumeratorCancellation] CancellationToken ct = default)
     {
         Result<OkResponse, IpcError> ack = await RequestAsync<OkResponse>(new SubscribeEventsRequest(), ct).ConfigureAwait(false);
@@ -135,11 +141,21 @@ public sealed class IpcClient : IAsyncDisposable
         while (!ct.IsCancellationRequested)
         {
             Result<byte[], string> frame = await IpcFrameCodec.ReadFrameAsync(_pipe, ct).ConfigureAwait(false);
-            if (!frame.TryGetValue(out byte[]? bytes))
-                yield break;                       // connection closed — stream over
-            EngineEvent? evt = IpcSerializer.DeserializeEvent(bytes);
-            if (evt is not null)
-                yield return evt;
+            if (frame.IsCanceled)
+                yield break;                       // shutdown
+            if (frame.TryGetError(out string? readError))
+            {
+                if (readError == IpcFrameCodec.ConnectionClosedMessage)
+                    yield break;                   // clean close at a frame boundary — stream over
+                throw new System.IO.IOException($"event stream failed: {readError}");
+            }
+            frame.TryGetValue(out byte[]? bytes);
+
+            Result<EngineEvent, string> parsed = IpcSerializer.DeserializeEvent(bytes!);
+            if (parsed.TryGetError(out string? parseError))
+                throw new System.IO.IOException($"event stream sent an unreadable event: {parseError}");
+            parsed.TryGetValue(out EngineEvent? evt);
+            yield return evt!;
         }
     }
 
