@@ -10,6 +10,7 @@ using FileManager.Core.Watching;
 using Microsoft.Extensions.Logging;
 using FileManager.Contracts;
 using System;
+using System.Buffers;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -80,6 +81,11 @@ public sealed class DryRunEngine(
         long reportBytes = 0;
         List<DryRunFileResult> files = [];
 
+        // Reused across the whole scan so measuring doesn't allocate a byte[] per file; the
+        // default writer options (unindented, default encoder) match FileManagerJsonContext.
+        ArrayBufferWriter<byte> measureBuffer = new();
+        using Utf8JsonWriter measureWriter = new(measureBuffer);
+
         foreach (var scanned in scanner.Scan(profile, TriggerKind.Cli, scopePath))
         {
             if (ct.IsCancellationRequested)
@@ -117,8 +123,10 @@ public sealed class DryRunEngine(
                 // Measured exactly (a standalone record serializes byte-identically to the same
                 // record as a Files[] element) — path-length heuristics undercount JSON escaping
                 // (`\` doubles, non-ASCII becomes 6-byte \uXXXX).
-                int resultBytes = JsonSerializer.SerializeToUtf8Bytes(
-                    result, FileManagerJsonContext.Default.DryRunFileResult).Length;
+                measureBuffer.ResetWrittenCount();
+                measureWriter.Reset(measureBuffer);
+                JsonSerializer.Serialize(measureWriter, result, FileManagerJsonContext.Default.DryRunFileResult);
+                int resultBytes = measureBuffer.WrittenCount;
                 if (reportBytes + resultBytes > ReportByteBudget)
                 {
                     truncated = true;

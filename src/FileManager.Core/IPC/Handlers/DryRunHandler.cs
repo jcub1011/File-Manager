@@ -3,6 +3,7 @@ using FileManager.Contracts.IPC;
 using FileManager.Core.DryRun;
 using FileManager.Core.Profiles;
 using Microsoft.Extensions.Logging;
+using System;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
@@ -23,6 +24,23 @@ public sealed class DryRunHandler(ILogger<DryRunHandler> logger, IDryRunEngine e
         }
 
         var simulated = await engine.SimulateAsync(typed.ProfileId, typed.ScopePath, ct).ConfigureAwait(false);
+
+        // A large dry run leaves tens of MB of committed-but-free heap behind; the default GC
+        // decommits it lazily, so the service's working set stays inflated while idle. Aggressive
+        // mode compacts and returns the memory to the OS. Fire-and-forget so the reply isn't
+        // delayed behind a full blocking collection.
+        _ = Task.Run(() =>
+        {
+            try
+            {
+                GC.Collect(GC.MaxGeneration, GCCollectionMode.Aggressive, blocking: true, compacting: true);
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "Post-dry-run aggressive GC failed");
+            }
+        }, CancellationToken.None);
+
         if (simulated.IsCanceled)
             // Server-side cancellation only happens on shutdown; the connection is tearing down,
             // so this response is best-effort.
