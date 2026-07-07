@@ -12,10 +12,12 @@ namespace FileManager.UI.ViewModels;
 public sealed partial class MainWindowViewModel : ViewModelBase
 {
     private readonly IIpcGateway _gateway;
+    private readonly ILogFolderService _logFolder;
 
-    public MainWindowViewModel(IIpcGateway gateway, IFolderPicker folderPicker)
+    public MainWindowViewModel(IIpcGateway gateway, IFolderPicker folderPicker, ILogFolderService logFolder)
     {
         _gateway = gateway;
+        _logFolder = logFolder;
         List = new ProfileListViewModel(gateway);
         Editor = new ProfileEditorViewModel(gateway, folderPicker);
         DryRun = new DryRunViewModel(gateway, folderPicker);
@@ -49,6 +51,9 @@ public sealed partial class MainWindowViewModel : ViewModelBase
         Editor.LoadNew();
         DryRun.SetProfile(null, "");
     }
+
+    [RelayCommand]
+    public void OpenLogFolder() => _logFolder.OpenLogFolder();
 
     private async Task LoadSelectionSafeAsync(ProfileListItem? item)
     {

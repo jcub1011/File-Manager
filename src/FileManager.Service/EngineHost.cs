@@ -38,6 +38,7 @@ internal sealed class EngineHost(
 
         // 2. On-disk layout (§9).
         Directory.CreateDirectory(paths.ProfilesDirectory);
+        Directory.CreateDirectory(paths.LogsDirectory);
 
         // 3. Load profiles into the catalog.
         Result reload = catalog.Reload();

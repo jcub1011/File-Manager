@@ -27,7 +27,8 @@ namespace FileManager.UI
                 _gateway = new IpcGateway();
                 MainWindow window = new();
                 StorageProviderFolderPicker folderPicker = new(window);
-                MainWindowViewModel viewModel = new(_gateway, folderPicker);
+                LogFolderService logFolder = new();
+                MainWindowViewModel viewModel = new(_gateway, folderPicker, logFolder);
                 window.DataContext = viewModel;
                 desktop.MainWindow = window;
 
@@ -39,6 +40,7 @@ namespace FileManager.UI
                     }
                     catch (Exception ex)
                     {
+                        Serilog.Log.Error(ex, "Startup failed");
                         viewModel.List.ErrorMessage = $"Startup failed: {ex.Message}";
                     }
                 };

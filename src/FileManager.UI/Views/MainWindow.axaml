@@ -16,6 +16,7 @@
                 <StackPanel DockPanel.Dock="Top" Orientation="Horizontal" Spacing="6" Margin="0,0,0,8">
                     <Button Content="New profile" Command="{Binding NewProfileCommand}" />
                     <Button Content="Refresh" Command="{Binding List.RefreshCommand}" />
+                    <Button Content="Open log folder" Command="{Binding OpenLogFolderCommand}" />
                 </StackPanel>
                 <v:ProfileListView DataContext="{Binding List}" />
             </DockPanel>

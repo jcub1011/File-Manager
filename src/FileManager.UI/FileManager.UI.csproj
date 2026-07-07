@@ -18,10 +18,7 @@
     <!-- Build-order + copy-output only, NOT an assembly reference (§1 rule 3: the UI references
          Contracts only). ServiceLauncher resolves FileManager.Service.exe beside the UI exe —
          the publish layout — so the dev build must lay the files out the same way. -->
-    <ProjectReference Include="..\FileManager.Service\FileManager.Service.csproj"
-                      ReferenceOutputAssembly="false"
-                      OutputItemType="ServiceHostAssembly"
-                      Private="false" />
+    <ProjectReference Include="..\FileManager.Service\FileManager.Service.csproj" ReferenceOutputAssembly="false" OutputItemType="ServiceHostAssembly" Private="false" />
   </ItemGroup>
 
   <!-- Copies the Service host's entire output (exe, dlls, runtimeconfig) into the UI's output
@@ -30,9 +27,7 @@
     <ItemGroup>
       <ServiceHostFiles Include="%(ServiceHostAssembly.RootDir)%(ServiceHostAssembly.Directory)**\*" />
     </ItemGroup>
-    <Copy SourceFiles="@(ServiceHostFiles)"
-          DestinationFiles="@(ServiceHostFiles->'$(OutDir)%(RecursiveDir)%(Filename)%(Extension)')"
-          SkipUnchangedFiles="true" />
+    <Copy SourceFiles="@(ServiceHostFiles)" DestinationFiles="@(ServiceHostFiles->'$(OutDir)%(RecursiveDir)%(Filename)%(Extension)')" SkipUnchangedFiles="true" />
   </Target>
 
   <ItemGroup>
@@ -45,5 +40,7 @@
       <PrivateAssets Condition="'$(Configuration)' != 'Debug'">All</PrivateAssets>
     </PackageReference>
     <PackageReference Include="CommunityToolkit.Mvvm" Version="8.4.2" />
+    <PackageReference Include="Serilog" Version="4.3.1" />
+    <PackageReference Include="Serilog.Sinks.File" Version="7.0.0" />
   </ItemGroup>
 </Project>

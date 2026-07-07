@@ -11,8 +11,11 @@ using FileManager.Core.Watching;
 using FileManager.Platform.Windows;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
+using Serilog;
 using System;
 using System.Collections.Generic;
+using System.IO;
 
 namespace FileManager.Service;
 
@@ -25,9 +28,23 @@ internal static class Program
     {
         HostApplicationBuilder builder = Host.CreateApplicationBuilder(args);
 
+        // File logging (spec §9). Configured in code — no reflection-based appsettings binding
+        // (§1 AOT constraints). Rolling daily, 14-day retention: logs\service-YYYYMMDD.log.
+        EnginePaths paths = EnginePaths.Default();
+        Directory.CreateDirectory(paths.LogsDirectory);
+        Log.Logger = new LoggerConfiguration()
+            .MinimumLevel.Information()
+            .WriteTo.File(
+                Path.Combine(paths.LogsDirectory, "service-.log"),
+                rollingInterval: RollingInterval.Day,
+                retainedFileCountLimit: 14)
+            .CreateLogger();
+
         IServiceCollection services = builder.Services;
+        builder.Logging.ClearProviders();
+        services.AddSerilog();
         services.AddSingleton(TimeProvider.System);
-        services.AddSingleton(EnginePaths.Default());
+        services.AddSingleton(paths);
         services.AddSingleton<IFileSystemService, FileSystemService>();
         services.AddSingleton<IFilterCompiler, FilterCompiler>();
         services.AddSingleton<IProfileValidator, ProfileValidator>();
@@ -68,6 +85,13 @@ internal static class Program
 
         services.AddHostedService<EngineHost>();
 
-        builder.Build().Run();
+        try
+        {
+            builder.Build().Run();
+        }
+        finally
+        {
+            Log.CloseAndFlush();
+        }
     }
 }

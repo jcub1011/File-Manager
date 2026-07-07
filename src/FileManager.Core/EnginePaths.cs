@@ -11,6 +11,9 @@ public sealed record EnginePaths
 
     public string ProfilesDirectory => Path.Combine(Root, "profiles");
 
+    /// <summary>Rotating logs live here (spec §9): service-YYYYMMDD.log, 14-day retention.</summary>
+    public string LogsDirectory => Path.Combine(Root, "logs");
+
     public static EnginePaths Default() => new()
     {
         Root = Path.Combine(
