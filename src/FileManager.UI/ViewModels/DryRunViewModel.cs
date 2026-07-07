@@ -3,6 +3,7 @@ using CommunityToolkit.Mvvm.Input;
 using FileManager.Contracts.DryRun;
 using FileManager.Contracts.IPC;
 using FileManager.UI.Services;
+using Serilog;
 using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
@@ -116,6 +117,7 @@ public sealed partial class DryRunViewModel : ViewModelBase
         }
         catch (OperationCanceledException)
         {
+            Log.Debug("Dry run for profile {ProfileId} cancelled by the user", profileId);
             ErrorMessage = "Dry run cancelled.";
         }
     }

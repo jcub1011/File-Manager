@@ -1,4 +1,5 @@
 using FileManager.Platform.Windows;
+using Microsoft.Extensions.Logging.Abstractions;
 using System.IO.Pipes;
 using System.Runtime.Versioning;
 
@@ -14,7 +15,7 @@ public sealed class WindowsIpcEndpointProviderTests
         Environment.SetEnvironmentVariable("FILEMANAGER_PIPE_NAME", pipeName);
         try
         {
-            WindowsIpcEndpointProvider provider = new();
+            WindowsIpcEndpointProvider provider = new(NullLogger<WindowsIpcEndpointProvider>.Instance);
             using CancellationTokenSource cts = new(TimeSpan.FromSeconds(10));
 
             Task<FileManager.Contracts.Primitives.Result<Stream, string>> accept = provider.AcceptAsync(cts.Token);

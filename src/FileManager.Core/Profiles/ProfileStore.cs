@@ -50,6 +50,7 @@ public sealed class ProfileStore(ILogger<ProfileStore> logger, EnginePaths paths
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
+            logger.LogError(ex, "Could not enumerate profiles in {Directory}", paths.ProfilesDirectory);
             return $"could not enumerate profiles: {ex.Message}";
         }
     }
@@ -69,6 +70,7 @@ public sealed class ProfileStore(ILogger<ProfileStore> logger, EnginePaths paths
         }
         catch (Exception ex) when (ex is JsonException or IOException or UnauthorizedAccessException)
         {
+            logger.LogError(ex, "Could not load profile {ProfileId}", profileId);
             return $"could not load profile {profileId}: {ex.Message}";
         }
     }
@@ -112,6 +114,7 @@ public sealed class ProfileStore(ILogger<ProfileStore> logger, EnginePaths paths
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
+            logger.LogError(ex, "Could not save profile {ProfileId} ({Name})", profile.Id, profile.Name);
             return $"could not save profile {profile.Id}: {ex.Message}";
         }
     }
@@ -126,6 +129,7 @@ public sealed class ProfileStore(ILogger<ProfileStore> logger, EnginePaths paths
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
+            logger.LogError(ex, "Could not delete profile {ProfileId}", profileId);
             return $"could not delete profile {profileId}: {ex.Message}";
         }
     }

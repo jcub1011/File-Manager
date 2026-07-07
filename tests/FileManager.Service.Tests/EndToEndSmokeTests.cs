@@ -50,15 +50,15 @@ public sealed class EndToEndSmokeTests : IAsyncLifetime
         [
             new GetStatusHandler(catalog),
             new ListProfilesHandler(catalog),
-            new GetProfileHandler(catalog),
+            new GetProfileHandler(NullLogger<GetProfileHandler>.Instance, catalog),
             new SaveProfileHandler(NullLogger<SaveProfileHandler>.Instance, store, catalog),
             new DeleteProfileHandler(NullLogger<DeleteProfileHandler>.Instance, store, catalog),
             new ValidateProfileHandler(validator, catalog),
-            new DryRunHandler(dryRun, catalog),
+            new DryRunHandler(NullLogger<DryRunHandler>.Instance, dryRun, catalog),
         ];
         _server = new IpcServer(
             NullLogger<IpcServer>.Instance,
-            new WindowsIpcEndpointProvider(),
+            new WindowsIpcEndpointProvider(NullLogger<WindowsIpcEndpointProvider>.Instance),
             handlers.ToDictionary(h => h.RequestType));
 
         Assert.True(_server.Start().IsSuccess);

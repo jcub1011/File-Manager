@@ -40,6 +40,16 @@ internal static class Program
                 retainedFileCountLimit: 14)
             .CreateLogger();
 
+        // Last-resort safety net: capture crashes that escape the host so they reach the log
+        // before the process dies (mirrors the UI's handlers in FileManager.UI/Program.cs).
+        AppDomain.CurrentDomain.UnhandledException += (_, e) =>
+            Log.Fatal(e.ExceptionObject as Exception, "Unhandled exception in service host (terminating: {IsTerminating})", e.IsTerminating);
+        System.Threading.Tasks.TaskScheduler.UnobservedTaskException += (_, e) =>
+        {
+            Log.Error(e.Exception, "Unobserved task exception in service host");
+            e.SetObserved();
+        };
+
         IServiceCollection services = builder.Services;
         builder.Logging.ClearProviders();
         services.AddSerilog();

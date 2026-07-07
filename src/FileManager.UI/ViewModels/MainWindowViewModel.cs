@@ -2,6 +2,7 @@ using CommunityToolkit.Mvvm.Input;
 using FileManager.Contracts.IPC;
 using FileManager.Contracts.Profiles;
 using FileManager.UI.Services;
+using Serilog;
 using System;
 using System.Threading.Tasks;
 
@@ -79,6 +80,7 @@ public sealed partial class MainWindowViewModel : ViewModelBase
         }
         catch (Exception ex)
         {
+            Log.Error(ex, "Failed to load profile selection {ProfileId}", item?.ProfileId);
             List.ErrorMessage = $"Could not open the profile: {ex.Message}";
         }
     }
@@ -92,6 +94,7 @@ public sealed partial class MainWindowViewModel : ViewModelBase
         }
         catch (Exception ex)
         {
+            Log.Error(ex, "Profile {ProfileId} saved, but the list failed to refresh", profileId);
             List.ErrorMessage = $"Saved, but the list failed to refresh: {ex.Message}";
         }
     }

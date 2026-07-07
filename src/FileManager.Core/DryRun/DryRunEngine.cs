@@ -37,9 +37,16 @@ public sealed class DryRunEngine(
     public async Task<Result<DryRunReport, string>> SimulateAsync(
         Guid profileId, string? scopePath, CancellationToken ct = default)
     {
+        DateTimeOffset startedAt = time.GetUtcNow();
+        logger.LogInformation("Dry-run started for profile {ProfileId} (scope {Scope})",
+            profileId, scopePath ?? "<all sources>");
+
         Profile? profile = catalog.All.FirstOrDefault(p => p.Id == profileId);
         if (profile is null)
+        {
+            logger.LogDebug("Dry-run requested for profile {ProfileId} which was not found", profileId);
             return $"profile {profileId} not found";
+        }
 
         // One compiled set per source, keyed by the source root the scanner stamps on payloads.
         Dictionary<string, CompiledFilterSet> filtersBySourceRoot = new(StringComparer.OrdinalIgnoreCase);
@@ -47,7 +54,12 @@ public sealed class DryRunEngine(
         {
             var compiled = filterCompiler.Compile(profile.Filters, source.Filters);
             if (compiled.TryGetError(out string? compileError))
+            {
+                logger.LogError(
+                    "Dry-run for profile {ProfileId} failed: filter compilation error (was this profile saved through validation?): {Error}",
+                    profileId, compileError);
                 return $"filter compilation failed (was this profile saved through validation?): {compileError}";
+            }
             compiled.TryGetValue(out CompiledFilterSet? set);
             if (NormalizedPath.Create(source.Path).TryGetValue(out NormalizedPath root))
                 filtersBySourceRoot[root.Value] = set!;
@@ -64,7 +76,11 @@ public sealed class DryRunEngine(
             if (scanned.TryGetError(out EnumerationFault fault))
             {
                 if (fault.Severity == EnumerationSeverity.Fatal)
+                {
+                    logger.LogError("Dry-run for profile {ProfileId} failed: scan error: {Message}",
+                        profileId, fault.Message);
                     return $"scan failed: {fault.Message}";
+                }
                 // Warnings are logged, not reported — the frozen DryRunReport has no warnings
                 // field; adding one later is an additive Contracts change.
                 logger.LogWarning("Dry-run enumeration warning: {Message}", fault.Message);
@@ -90,7 +106,12 @@ public sealed class DryRunEngine(
                 profileId, MaxReportedFiles);
 
         files.Sort(static (a, b) => string.Compare(a.SourcePath, b.SourcePath, StringComparison.OrdinalIgnoreCase));
-        return new DryRunReport(profileId, time.GetUtcNow(), files);
+        DateTimeOffset completedAt = time.GetUtcNow();
+        logger.LogInformation(
+            "Dry-run completed for profile {ProfileId}: {FileCount} files in {ElapsedMs}ms{Truncated}",
+            profileId, files.Count, (completedAt - startedAt).TotalMilliseconds,
+            truncated ? " (report truncated)" : "");
+        return new DryRunReport(profileId, completedAt, files);
     }
 
     private async Task<DryRunFileResult?> EvaluateFileAsync(

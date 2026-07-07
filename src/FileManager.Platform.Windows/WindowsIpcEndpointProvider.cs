@@ -1,5 +1,6 @@
 using FileManager.Contracts.Primitives;
 using FileManager.Core.Platform;
+using Microsoft.Extensions.Logging;
 using System;
 using System.IO;
 using System.IO.Pipes;
@@ -14,7 +15,7 @@ namespace FileManager.Platform.Windows;
 /// it replaces a hand-rolled PipeSecurity ACL, is AOT-clean, and satisfies §3's "the pipe ACL
 /// restricts to the current user".</summary>
 [SupportedOSPlatform("windows")]
-public sealed class WindowsIpcEndpointProvider : IIpcEndpointProvider
+public sealed class WindowsIpcEndpointProvider(ILogger<WindowsIpcEndpointProvider> logger) : IIpcEndpointProvider
 {
     /// <summary>Explicit pipe buffers: the parameterless overload creates 0-byte buffers, and a
     /// zero-buffer named pipe makes every WriteFile block until the peer posts a read
@@ -43,6 +44,7 @@ public sealed class WindowsIpcEndpointProvider : IIpcEndpointProvider
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
+            logger.LogError(ex, "Could not listen on the service pipe {PipeName}", ResolvePipeName());
             await pipe.DisposeAsync().ConfigureAwait(false);
             return $"could not listen on the service pipe: {ex.Message}";
         }

@@ -2,6 +2,7 @@ using FileManager.Contracts.DryRun;
 using FileManager.Contracts.IPC;
 using FileManager.Contracts.Primitives;
 using FileManager.Contracts.Profiles;
+using Serilog;
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -58,7 +59,10 @@ public sealed class IpcGateway : IIpcGateway, IAsyncDisposable
         // Own connection: cancel = dispose, leaving the shared channel clean.
         var connected = await ServiceLauncher.ConnectOrStartAsync(ct).ConfigureAwait(false);
         if (connected.TryGetError(out string? connectError))
+        {
+            Log.Warning("Dry-run could not connect to the service: {Error}", connectError);
             return new IpcError("SERVICE_UNAVAILABLE", connectError);
+        }
         connected.TryGetValue(out IpcClient? client);
 
         await using (client)
@@ -66,7 +70,11 @@ public sealed class IpcGateway : IIpcGateway, IAsyncDisposable
             var response = await client!.RequestAsync<DryRunResponse>(
                 new DryRunRequest { ProfileId = profileId, ScopePath = scopePath }, ct).ConfigureAwait(false);
             if (response.TryGetError(out IpcError? error))
+            {
+                Log.Warning("Dry-run IPC request for profile {ProfileId} failed: {Code} {Message}",
+                    profileId, error.Code, error.Message);
                 return error;
+            }
             response.TryGetValue(out DryRunResponse? report);
             return report!.Report;
         }
@@ -86,12 +94,22 @@ public sealed class IpcGateway : IIpcGateway, IAsyncDisposable
     {
         var clientResult = await EnsureConnectedAsync(ct).ConfigureAwait(false);
         if (clientResult.TryGetError(out IpcError? connectError))
+        {
+            if (request is not GetStatusRequest)
+                Log.Warning("IPC request {RequestType} could not connect: {Code} {Message}",
+                    request.GetType().Name, connectError.Code, connectError.Message);
             return connectError;
+        }
         clientResult.TryGetValue(out IpcClient? client);
 
         var response = await client!.RequestAsync<TResponse>(request, ct).ConfigureAwait(false);
         if (response.TryGetError(out IpcError? error))
         {
+            // The status poll fires every couple of seconds; logging each failed poll here would
+            // flood the log during an outage. StatusBarViewModel logs that once, on transition.
+            if (request is not GetStatusRequest)
+                Log.Warning("IPC request {RequestType} failed: {Code} {Message}",
+                    request.GetType().Name, error.Code, error.Message);
             if (error.Code == "IPC_TRANSPORT")
                 await DropClientAsync(client).ConfigureAwait(false);
             return error;
