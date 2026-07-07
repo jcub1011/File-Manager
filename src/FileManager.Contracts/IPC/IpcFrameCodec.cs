@@ -18,17 +18,26 @@ public static class IpcFrameCodec
     private const int HeaderBytes = 4;
 
     /// <summary>Writes one frame. An oversized payload is a programmer error and throws;
-    /// transport failures surface as the stream's own exceptions (callers own the connection).</summary>
-    public static async Task WriteFrameAsync(Stream stream, ReadOnlyMemory<byte> payload, CancellationToken ct = default)
+    /// transport failures surface as the stream's own exceptions (callers own the connection).
+    /// Cancellation is returned as <see cref="ResultStatus.Canceled"/>, never thrown.</summary>
+    public static async Task<Result> WriteFrameAsync(Stream stream, ReadOnlyMemory<byte> payload, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(stream);
         ArgumentOutOfRangeException.ThrowIfGreaterThan(payload.Length, MaxPayloadBytes, nameof(payload));
 
         byte[] header = new byte[HeaderBytes];
         BinaryPrimitives.WriteInt32LittleEndian(header, payload.Length);
-        await stream.WriteAsync(header, ct).ConfigureAwait(false);
-        await stream.WriteAsync(payload, ct).ConfigureAwait(false);
-        await stream.FlushAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await stream.WriteAsync(header, ct).ConfigureAwait(false);
+            await stream.WriteAsync(payload, ct).ConfigureAwait(false);
+            await stream.FlushAsync(ct).ConfigureAwait(false);
+            return Result.Success();
+        }
+        catch (OperationCanceledException)
+        {
+            return Result.Canceled();
+        }
     }
 
     /// <summary>Reads one frame. Expected transport failures are values, never exceptions:
@@ -62,7 +71,7 @@ public static class IpcFrameCodec
         }
         catch (OperationCanceledException)
         {
-            throw;
+            return Result<byte[], string>.Canceled();
         }
         catch (Exception ex) when (ex is IOException or ObjectDisposedException)
         {

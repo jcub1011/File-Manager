@@ -25,6 +25,8 @@ public static class ServiceLauncher
         Result<IpcClient, string> first = await IpcClient.ConnectAsync(ct).ConfigureAwait(false);
         if (first.IsSuccess)
             return first;
+        if (first.IsCanceled)
+            return Result<IpcClient, string>.Canceled();
 
         string exePath = ResolveServiceExePath();
         if (!File.Exists(exePath))
@@ -51,10 +53,19 @@ public static class ServiceLauncher
         string lastError = "unknown";
         for (int attempt = 0; attempt < RetryCount; attempt++)
         {
-            await Task.Delay(RetryDelay, ct).ConfigureAwait(false);
+            try
+            {
+                await Task.Delay(RetryDelay, ct).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                return Result<IpcClient, string>.Canceled();
+            }
             Result<IpcClient, string> retry = await IpcClient.ConnectAsync(ct).ConfigureAwait(false);
             if (retry.IsSuccess)
                 return retry;
+            if (retry.IsCanceled)
+                return Result<IpcClient, string>.Canceled();
             retry.TryGetError(out lastError!);
         }
         return $"service was started but did not accept a connection within the retry budget: {lastError}";

@@ -107,6 +107,12 @@ public sealed partial class DryRunViewModel : ViewModelBase
         {
             var run = await _gateway.DryRunAsync(
                 profileId, string.IsNullOrWhiteSpace(ScopePath) ? null : ScopePath.Trim(), ct);
+            if (run.IsCanceled)
+            {
+                Log.Debug("Dry run for profile {ProfileId} cancelled by the user", profileId);
+                ErrorMessage = "Dry run cancelled.";
+                return;
+            }
             if (run.TryGetError(out IpcError? error))
             {
                 ErrorMessage = $"Dry run failed: {error.Message}";
@@ -117,6 +123,7 @@ public sealed partial class DryRunViewModel : ViewModelBase
         }
         catch (OperationCanceledException)
         {
+            // Defensive backstop — the gateway returns Canceled rather than throwing.
             Log.Debug("Dry run for profile {ProfileId} cancelled by the user", profileId);
             ErrorMessage = "Dry run cancelled.";
         }

@@ -47,4 +47,22 @@ public sealed class FileHasherTests
         Assert.True(hashed.TryGetError(out JobError? error));
         Assert.Equal(JobErrorCode.SourceUnreadable, error.Code);
     }
+
+    [Fact]
+    public async Task Cancellation_yields_a_Canceled_result_not_an_exception()
+    {
+        string path = Path.GetTempFileName();
+        try
+        {
+            using CancellationTokenSource cts = new();
+            cts.Cancel();
+            var hashed = await Hasher.HashFileAsync(path, cts.Token);
+            Assert.True(hashed.IsCanceled);
+            Assert.False(hashed.TryGetError(out _));
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
 }

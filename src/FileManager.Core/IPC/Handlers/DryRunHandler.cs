@@ -23,6 +23,10 @@ public sealed class DryRunHandler(ILogger<DryRunHandler> logger, IDryRunEngine e
         }
 
         var simulated = await engine.SimulateAsync(typed.ProfileId, typed.ScopePath, ct).ConfigureAwait(false);
+        if (simulated.IsCanceled)
+            // Server-side cancellation only happens on shutdown; the connection is tearing down,
+            // so this response is best-effort.
+            return new ErrorResponse { Code = "CANCELED", Message = "the dry run was canceled" };
         if (simulated.TryGetError(out string? error))
             return new ErrorResponse { Code = "DRY_RUN_FAILED", Message = error };
         simulated.TryGetValue(out DryRunReport? report);

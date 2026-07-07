@@ -65,22 +65,23 @@ public sealed class IpcServer(
     {
         while (!ct.IsCancellationRequested)
         {
-            Result<Stream, string> accepted;
-            try
-            {
-                accepted = await endpoint.AcceptAsync(ct).ConfigureAwait(false);
-            }
-            catch (OperationCanceledException)
-            {
+            Result<Stream, string> accepted = await endpoint.AcceptAsync(ct).ConfigureAwait(false);
+            if (accepted.IsCanceled)
                 return;
-            }
 
             if (accepted.TryGetError(out string? acceptError))
             {
                 if (ct.IsCancellationRequested)
                     return;
                 logger.LogWarning("IPC accept failed: {Error}; retrying", acceptError);
-                await Task.Delay(TimeSpan.FromMilliseconds(250), ct).ConfigureAwait(false);
+                try
+                {
+                    await Task.Delay(TimeSpan.FromMilliseconds(250), ct).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    return;         // shutdown during the retry backoff
+                }
                 continue;
             }
 
@@ -104,6 +105,8 @@ public sealed class IpcServer(
                 while (!ct.IsCancellationRequested)
                 {
                     Result<byte[], string> frame = await IpcFrameCodec.ReadFrameAsync(stream, ct).ConfigureAwait(false);
+                    if (frame.IsCanceled)
+                        return;                     // shutdown
                     if (frame.TryGetError(out string? readError))
                     {
                         logger.LogDebug("IPC connection ended: {Reason}", readError);
@@ -112,8 +115,10 @@ public sealed class IpcServer(
                     frame.TryGetValue(out byte[]? payload);
 
                     IpcResponse response = await DispatchAsync(payload!, ct).ConfigureAwait(false);
-                    await IpcFrameCodec.WriteFrameAsync(stream, IpcSerializer.SerializeResponse(response), ct)
+                    Result writeResult = await IpcFrameCodec.WriteFrameAsync(stream, IpcSerializer.SerializeResponse(response), ct)
                         .ConfigureAwait(false);
+                    if (writeResult.IsCanceled)
+                        return;                     // shutdown
                 }
             }
             catch (OperationCanceledException)

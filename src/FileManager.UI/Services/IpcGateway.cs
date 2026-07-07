@@ -58,6 +58,8 @@ public sealed class IpcGateway : IIpcGateway, IAsyncDisposable
     {
         // Own connection: cancel = dispose, leaving the shared channel clean.
         var connected = await ServiceLauncher.ConnectOrStartAsync(ct).ConfigureAwait(false);
+        if (connected.IsCanceled)
+            return Result<DryRunReport, IpcError>.Canceled();
         if (connected.TryGetError(out string? connectError))
         {
             Log.Warning("Dry-run could not connect to the service: {Error}", connectError);
@@ -69,6 +71,8 @@ public sealed class IpcGateway : IIpcGateway, IAsyncDisposable
         {
             var response = await client!.RequestAsync<DryRunResponse>(
                 new DryRunRequest { ProfileId = profileId, ScopePath = scopePath }, ct).ConfigureAwait(false);
+            if (response.IsCanceled)
+                return Result<DryRunReport, IpcError>.Canceled();
             if (response.TryGetError(out IpcError? error))
             {
                 Log.Warning("Dry-run IPC request for profile {ProfileId} failed: {Code} {Message}",
@@ -93,6 +97,8 @@ public sealed class IpcGateway : IIpcGateway, IAsyncDisposable
         where TResponse : IpcResponse
     {
         var clientResult = await EnsureConnectedAsync(ct).ConfigureAwait(false);
+        if (clientResult.IsCanceled)
+            return Result<TValue, IpcError>.Canceled();
         if (clientResult.TryGetError(out IpcError? connectError))
         {
             if (request is not GetStatusRequest)
@@ -103,6 +109,8 @@ public sealed class IpcGateway : IIpcGateway, IAsyncDisposable
         clientResult.TryGetValue(out IpcClient? client);
 
         var response = await client!.RequestAsync<TResponse>(request, ct).ConfigureAwait(false);
+        if (response.IsCanceled)
+            return Result<TValue, IpcError>.Canceled();
         if (response.TryGetError(out IpcError? error))
         {
             // The status poll fires every couple of seconds; logging each failed poll here would
@@ -120,12 +128,22 @@ public sealed class IpcGateway : IIpcGateway, IAsyncDisposable
 
     private async Task<Result<IpcClient, IpcError>> EnsureConnectedAsync(CancellationToken ct)
     {
-        await _connectGate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await _connectGate.WaitAsync(ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            // Cancelled before the gate was acquired — nothing to release.
+            return Result<IpcClient, IpcError>.Canceled();
+        }
         try
         {
             if (_client is not null)
                 return _client;
             var connected = await ServiceLauncher.ConnectOrStartAsync(ct).ConfigureAwait(false);
+            if (connected.IsCanceled)
+                return Result<IpcClient, IpcError>.Canceled();
             if (connected.TryGetError(out string? error))
                 return new IpcError("SERVICE_UNAVAILABLE", error);
             connected.TryGetValue(out IpcClient? client);

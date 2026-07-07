@@ -40,7 +40,7 @@ public sealed class WindowsIpcEndpointProvider(ILogger<WindowsIpcEndpointProvide
         catch (OperationCanceledException)
         {
             await pipe.DisposeAsync().ConfigureAwait(false);
-            throw;
+            return Result<Stream, string>.Canceled();
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {

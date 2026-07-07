@@ -47,7 +47,7 @@ public sealed class IpcClient : IAsyncDisposable
         catch (OperationCanceledException)
         {
             await pipe.DisposeAsync().ConfigureAwait(false);
-            throw;
+            return Result<IpcClient, string>.Canceled();
         }
     }
 
@@ -60,13 +60,26 @@ public sealed class IpcClient : IAsyncDisposable
     {
         ArgumentNullException.ThrowIfNull(request);
 
-        await _requestGate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await _requestGate.WaitAsync(ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            // Cancelled before the gate was acquired — nothing to release.
+            return Result<TResponse, IpcError>.Canceled();
+        }
+
         try
         {
             byte[] payload = IpcSerializer.SerializeRequest(request);
-            await IpcFrameCodec.WriteFrameAsync(_pipe, payload, ct).ConfigureAwait(false);
+            Result writeResult = await IpcFrameCodec.WriteFrameAsync(_pipe, payload, ct).ConfigureAwait(false);
+            if (writeResult.IsCanceled)
+                return Result<TResponse, IpcError>.Canceled();
 
             Result<byte[], string> frame = await IpcFrameCodec.ReadFrameAsync(_pipe, ct).ConfigureAwait(false);
+            if (frame.IsCanceled)
+                return Result<TResponse, IpcError>.Canceled();
             if (frame.TryGetError(out string? transportError))
                 return new IpcError("IPC_TRANSPORT", transportError);
             frame.TryGetValue(out byte[]? bytes);
@@ -80,6 +93,10 @@ public sealed class IpcClient : IAsyncDisposable
                 _ => new IpcError("IPC_UNEXPECTED_RESPONSE",
                     $"expected {typeof(TResponse).Name}, got {response.GetType().Name}"),
             };
+        }
+        catch (OperationCanceledException)
+        {
+            return Result<TResponse, IpcError>.Canceled();
         }
         catch (Exception ex) when (ex is System.IO.IOException or ObjectDisposedException)
         {
@@ -97,6 +114,8 @@ public sealed class IpcClient : IAsyncDisposable
     public async IAsyncEnumerable<EngineEvent> SubscribeAsync([EnumeratorCancellation] CancellationToken ct = default)
     {
         Result<OkResponse, IpcError> ack = await RequestAsync<OkResponse>(new SubscribeEventsRequest(), ct).ConfigureAwait(false);
+        if (ack.IsCanceled)
+            yield break;
         if (ack.TryGetError(out IpcError? error))
             throw new InvalidOperationException($"event subscription refused: {error.Code} — {error.Message}");
 

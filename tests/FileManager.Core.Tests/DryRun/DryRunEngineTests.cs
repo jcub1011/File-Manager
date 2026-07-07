@@ -202,6 +202,22 @@ public sealed class DryRunEngineTests : IDisposable
     }
 
     [Fact]
+    public async Task Cancellation_yields_a_Canceled_result_not_an_exception()
+    {
+        SourceFile("a.txt");
+        SourceFile("b.txt");
+        Profile profile = ProfileUnderTest();
+        using CancellationTokenSource cts = new();
+        cts.Cancel();
+
+        var simulated = await NewEngine(profile).SimulateAsync(profile.Id, null, cts.Token);
+
+        Assert.True(simulated.IsCanceled);
+        Assert.False(simulated.TryGetValue(out _));
+        Assert.False(simulated.TryGetError(out _));
+    }
+
+    [Fact]
     public async Task Dry_run_performs_zero_filesystem_mutation()
     {
         // The I-DRYRUN-RO proof: a scenario touching every code path — hashing an existing

@@ -71,7 +71,8 @@ public sealed class DryRunEngine(
 
         foreach (var scanned in scanner.Scan(profile, TriggerKind.Cli, scopePath))
         {
-            ct.ThrowIfCancellationRequested();
+            if (ct.IsCancellationRequested)
+                return Result<DryRunReport, string>.Canceled();
 
             if (scanned.TryGetError(out EnumerationFault fault))
             {
@@ -96,6 +97,10 @@ public sealed class DryRunEngine(
             scanned.TryGetValue(out Payload? payload);
             DryRunFileResult? result = await EvaluateFileAsync(profile, payload!, filtersBySourceRoot, hasTransformers, ct)
                 .ConfigureAwait(false);
+            // A hash or target loop cut short by cancellation returns a partial/placeholder result;
+            // the token check turns that into Canceled rather than a misleading partial report.
+            if (ct.IsCancellationRequested)
+                return Result<DryRunReport, string>.Canceled();
             if (result is not null)
                 files.Add(result);
         }
@@ -158,7 +163,8 @@ public sealed class DryRunEngine(
 
         foreach (TargetConfig target in profile.Targets)
         {
-            ct.ThrowIfCancellationRequested();
+            if (ct.IsCancellationRequested)
+                break;      // SimulateAsync's post-call token check turns this into Canceled
             string prospective = flatten
                 ? Path.Combine(target.Path, fileName)
                 : Path.Combine(target.Path, relativePath);
@@ -219,6 +225,14 @@ public sealed class DryRunEngine(
                     if (cachedSourceHash is null)
                     {
                         var sourceHash = await hasher.HashFileAsync(sourcePath, ct).ConfigureAwait(false);
+                        if (sourceHash.IsCanceled)
+                            // Placeholder — discarded by SimulateAsync's post-call cancellation check.
+                            return (new DryRunTargetAction
+                            {
+                                TargetPath = prospectivePath,
+                                Kind = DryRunTargetKind.Unknown,
+                                Detail = "canceled",
+                            }, cachedSourceHash);
                         if (sourceHash.TryGetError(out JobError? hashError))
                             return (new DryRunTargetAction
                             {
@@ -230,6 +244,14 @@ public sealed class DryRunEngine(
                     }
 
                     var targetHash = await hasher.HashFileAsync(prospectivePath, ct).ConfigureAwait(false);
+                    if (targetHash.IsCanceled)
+                        // Placeholder — discarded by SimulateAsync's post-call cancellation check.
+                        return (new DryRunTargetAction
+                        {
+                            TargetPath = prospectivePath,
+                            Kind = DryRunTargetKind.Unknown,
+                            Detail = "canceled",
+                        }, cachedSourceHash);
                     if (targetHash.TryGetError(out JobError? targetHashError))
                         return (new DryRunTargetAction
                         {

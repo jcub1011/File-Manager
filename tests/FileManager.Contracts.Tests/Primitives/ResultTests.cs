@@ -138,4 +138,71 @@ public class ResultTests
         Assert.True(result.TryGetError(out var error));
         Assert.Equal("boom", error);
     }
+
+    [Fact]
+    public void Canceled_IsNeitherSuccessNorFailure()
+    {
+        var result = Result<int, string>.Canceled();
+
+        Assert.Equal(ResultStatus.Canceled, result.Status);
+        Assert.True(result.IsCanceled);
+        Assert.False(result.IsSuccess);
+        Assert.False(result.IsFailure);
+        Assert.False(result.TryGetValue(out _));
+        Assert.False(result.TryGetError(out _));
+    }
+
+    [Fact]
+    public void NonGeneric_Canceled_IsNeitherSuccessNorFailure()
+    {
+        var result = Result.Canceled();
+
+        Assert.Equal(ResultStatus.Canceled, result.Status);
+        Assert.True(result.IsCanceled);
+        Assert.False(result.IsSuccess);
+        Assert.False(result.IsFailure);
+        Assert.False(result.TryGetError(out _));
+    }
+
+    [Fact]
+    public void Status_ReflectsSuccessAndFailure()
+    {
+        Assert.Equal(ResultStatus.Success, Result<int, string>.Success(1).Status);
+        Assert.Equal(ResultStatus.Failure, Result<int, string>.Failure("x").Status);
+        Assert.Equal(ResultStatus.Success, Result.Success().Status);
+        Assert.Equal(ResultStatus.Failure, Result.Failure("x").Status);
+    }
+
+    [Fact]
+    public void Switch_ThreeWay_RoutesCanceled()
+    {
+        bool canceledCalled = false;
+        Result<int, string>.Canceled().Switch(
+            _ => Assert.Fail("success branch"),
+            _ => Assert.Fail("error branch"),
+            () => canceledCalled = true);
+        Assert.True(canceledCalled);
+    }
+
+    [Fact]
+    public void Switch_TwoWay_ThrowsOnCanceled()
+    {
+        var result = Result<int, string>.Canceled();
+        Assert.Throws<InvalidOperationException>(() => result.Switch(_ => { }, _ => { }));
+    }
+
+    [Fact]
+    public void Match_ThreeWay_RoutesCanceled()
+    {
+        string outcome = Result<int, string>.Canceled().Match(
+            v => $"ok:{v}", e => $"err:{e}", () => "canceled");
+        Assert.Equal("canceled", outcome);
+    }
+
+    [Fact]
+    public void Match_TwoWay_ThrowsOnCanceled()
+    {
+        var result = Result<int, string>.Canceled();
+        Assert.Throws<InvalidOperationException>(() => result.Match(v => $"ok:{v}", e => $"err:{e}"));
+    }
 }

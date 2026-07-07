@@ -60,7 +60,17 @@ internal sealed class FakeIpcGateway : IIpcGateway
     {
         DryRunCalls.Add((profileId, scopePath));
         if (DryRunGate is not null)
-            await DryRunGate.Task.WaitAsync(ct);
+        {
+            try
+            {
+                await DryRunGate.Task.WaitAsync(ct);
+            }
+            catch (OperationCanceledException)
+            {
+                // Mirror the real gateway: cancellation is a Canceled result, never a throw.
+                return Result<DryRunReport, IpcError>.Canceled();
+            }
+        }
         return DryRunResult;
     }
 }

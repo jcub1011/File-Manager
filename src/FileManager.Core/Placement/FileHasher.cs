@@ -27,6 +27,10 @@ public sealed class FileHasher(ILogger<FileHasher> logger) : IFileHasher
             byte[] hash = await SHA256.HashDataAsync(stream, ct).ConfigureAwait(false);
             return Convert.ToHexString(hash);
         }
+        catch (OperationCanceledException)
+        {
+            return Result<string, JobError>.Canceled();
+        }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
             logger.LogDebug(ex, "Could not hash {Path}", path);

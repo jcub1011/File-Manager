@@ -26,6 +26,8 @@ public sealed partial class StatusBarViewModel(IIpcGateway gateway) : ViewModelB
     public async Task PollOnceAsync(CancellationToken ct = default)
     {
         var status = await gateway.GetStatusAsync(ct);
+        if (status.IsCanceled)
+            return;                 // shutting down — leave the last status as-is
         if (status.TryGetError(out IpcError? error))
         {
             // Log only on the reachable→unreachable edge — the poll fires every couple of
