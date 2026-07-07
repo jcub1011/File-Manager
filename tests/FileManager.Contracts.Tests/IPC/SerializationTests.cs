@@ -111,6 +111,29 @@ public sealed class SerializationTests
     }
 
     [Fact]
+    public void DryRunReport_truncated_flag_round_trips_and_is_false_when_absent()
+    {
+        byte[] wire = IpcSerializer.SerializeResponse(new DryRunResponse
+        {
+            Report = new DryRunReport(SomeId, DateTimeOffset.UnixEpoch, [], Truncated: true),
+        });
+        using JsonDocument document = JsonDocument.Parse(wire);
+        Assert.True(document.RootElement.GetProperty("Report").GetProperty("Truncated").GetBoolean());
+
+        DryRunResponse? roundTripped = IpcSerializer.DeserializeResponse(wire) as DryRunResponse;
+        Assert.NotNull(roundTripped);
+        Assert.True(roundTripped.Report.Truncated);
+
+        // Old-server → new-client compatibility: a report serialized before the flag existed
+        // (no "Truncated" property) deserializes to the constructor default, false.
+        string legacy = """{"type":"dry-run-report","Report":{"ProfileId":""" + $"\"{SomeId}\"" +
+            ""","GeneratedAt":"1970-01-01T00:00:00+00:00","Files":[]}}""";
+        DryRunResponse legacyParsed = Assert.IsType<DryRunResponse>(
+            IpcSerializer.DeserializeResponse(Encoding.UTF8.GetBytes(legacy)));
+        Assert.False(legacyParsed.Report.Truncated);
+    }
+
+    [Fact]
     public void Malformed_and_unknown_discriminator_payloads_deserialize_to_null()
     {
         Assert.Null(IpcSerializer.DeserializeRequest("not json"u8.ToArray()));

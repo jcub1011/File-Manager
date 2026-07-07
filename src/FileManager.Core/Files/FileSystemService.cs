@@ -59,6 +59,13 @@ public sealed class FileSystemService(ILogger<FileSystemService> logger) : IFile
                     fault = new EnumerationFault(ex.Message, EnumerationSeverity.Fatal);
                     current = null!;
                 }
+                catch (Exception ex)
+                {
+                    // Last resort: unexpected exceptions become logged faults, not faulted callers.
+                    logger.LogError(ex, "Enumeration failed unexpectedly.");
+                    fault = new EnumerationFault($"{ex.GetType().Name}: {ex.Message}", EnumerationSeverity.Fatal);
+                    current = null!;
+                }
 
                 if (fault is { } f)
                 {
@@ -77,6 +84,12 @@ public sealed class FileSystemService(ILogger<FileSystemService> logger) : IFile
                 {
                     logger.LogWarning(ex, "Unable to read entry.");
                     mapped = new EnumerationFault(ex.Message, EnumerationSeverity.Warning);
+                }
+                catch (Exception ex)
+                {
+                    // Last resort: unexpected exceptions become logged faults, not faulted callers.
+                    logger.LogError(ex, "Reading an entry failed unexpectedly.");
+                    mapped = new EnumerationFault($"{ex.GetType().Name}: {ex.Message}", EnumerationSeverity.Warning);
                 }
 
                 yield return mapped.Value;
@@ -125,6 +138,12 @@ public sealed class FileSystemService(ILogger<FileSystemService> logger) : IFile
             {
                 logger.LogWarning(ex, "Unable to read drive.");
                 mapped = new EnumerationFault(ex.Message, EnumerationSeverity.Warning);
+            }
+            catch (Exception ex)
+            {
+                // Last resort: unexpected exceptions become logged faults, not faulted callers.
+                logger.LogError(ex, "Reading a drive failed unexpectedly.");
+                mapped = new EnumerationFault($"{ex.GetType().Name}: {ex.Message}", EnumerationSeverity.Warning);
             }
 
             if (mapped is { } m)

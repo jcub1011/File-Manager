@@ -77,4 +77,33 @@ public sealed class IpcFrameCodecTests
         Assert.True(read.TryGetError(out string? error));
         Assert.Contains("mid-frame", error);
     }
+
+    [Fact]
+    public async Task Unexpected_read_exception_is_a_traceable_failure_not_a_throw()
+    {
+        using ThrowingStream stream = new(new NotSupportedException("stream misbehaved"));
+
+        var read = await IpcFrameCodec.ReadFrameAsync(stream);
+
+        Assert.True(read.TryGetError(out string? error));
+        Assert.Contains(nameof(NotSupportedException), error);
+        Assert.Contains("stream misbehaved", error);
+    }
+
+    private sealed class ThrowingStream(Exception exception) : Stream
+    {
+        public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken ct = default) =>
+            throw exception;
+
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => throw new NotSupportedException();
+        public override long Position { get => 0; set => throw new NotSupportedException(); }
+        public override void Flush() { }
+        public override int Read(byte[] buffer, int offset, int count) => throw exception;
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    }
 }

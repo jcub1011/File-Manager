@@ -41,5 +41,16 @@ public sealed class FileHasher(ILogger<FileHasher> logger) : IFileHasher
                 Path = path,
             };
         }
+        catch (Exception ex)
+        {
+            // Last resort: unexpected exceptions become logged failures, not faulted callers.
+            logger.LogError(ex, "Hashing {Path} failed unexpectedly", path);
+            return new JobError
+            {
+                Code = JobErrorCode.SourceUnreadable,
+                Message = $"could not hash \"{path}\": {ex.GetType().Name}: {ex.Message}",
+                Path = path,
+            };
+        }
     }
 }

@@ -283,41 +283,51 @@ public sealed partial class ProfileEditorViewModel : ViewModelBase
 
     private async Task SaveCoreAsync(bool acknowledgeWarnings)
     {
-        StatusMessage = null;
-        if (!TryParseLocalFields(out string? parseError))
+        try
         {
-            LocalError = parseError;
-            return;
-        }
-        LocalError = null;
+            StatusMessage = null;
+            if (!TryParseLocalFields(out string? parseError))
+            {
+                LocalError = parseError;
+                return;
+            }
+            LocalError = null;
 
-        Profile draft = BuildProfile();
-        var outcome = await _gateway.SaveProfileAsync(draft, acknowledgeWarnings);
-        if (outcome.TryGetError(out IpcError? error))
-        {
-            LocalError = $"Save failed: {error.Message}";
-            return;
-        }
-        outcome.TryGetValue(out SaveOutcome? result);
+            Profile draft = BuildProfile();
+            var outcome = await _gateway.SaveProfileAsync(draft, acknowledgeWarnings);
+            if (outcome.TryGetError(out IpcError? error))
+            {
+                LocalError = $"Save failed: {error.Message}";
+                return;
+            }
+            outcome.TryGetValue(out SaveOutcome? result);
 
-        Issues.Clear();
-        foreach (ValidationIssue issue in result!.Issues)
-            Issues.Add(new ValidationIssueItem(issue.Severity, issue.Code, issue.Message));
+            Issues.Clear();
+            foreach (ValidationIssue issue in result!.Issues)
+                Issues.Add(new ValidationIssueItem(issue.Severity, issue.Code, issue.Message));
 
-        if (result.Saved)
-        {
-            _original = draft;
-            IsNew = false;
-            IsDirty = false;
-            ShowUnsavedWarning = false;
-            CanAcknowledgeAndSave = false;
-            StatusMessage = Issues.Count > 0 ? "Saved (with warnings)." : "Saved.";
-            Saved?.Invoke(draft.Id);
+            if (result.Saved)
+            {
+                _original = draft;
+                IsNew = false;
+                IsDirty = false;
+                ShowUnsavedWarning = false;
+                CanAcknowledgeAndSave = false;
+                StatusMessage = Issues.Count > 0 ? "Saved (with warnings)." : "Saved.";
+                Saved?.Invoke(draft.Id);
+            }
+            else
+            {
+                CanAcknowledgeAndSave =
+                    Issues.Any(i => i.IsBlockingWarning) && Issues.All(i => !i.IsError);
+            }
         }
-        else
+        catch (Exception ex)
         {
-            CanAcknowledgeAndSave =
-                Issues.Any(i => i.IsBlockingWarning) && Issues.All(i => !i.IsError);
+            // Last resort: an unexpected exception becomes a logged error banner instead of an
+            // unobserved command fault.
+            Serilog.Log.Error(ex, "Profile save failed unexpectedly");
+            LocalError = $"Save failed unexpectedly: {ex.Message}";
         }
     }
 

@@ -30,5 +30,11 @@ internal static class FileMetadataReader
         {
             return $"could not stat {path}: {ex.Message}";
         }
+        catch (Exception ex)
+        {
+            // Last resort: an unexpected exception becomes a traceable failure value (callers
+            // log every failure).
+            return $"could not stat {path}: {ex.GetType().Name}: {ex.Message}";
+        }
     }
 }

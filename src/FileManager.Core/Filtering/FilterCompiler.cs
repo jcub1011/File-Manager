@@ -119,5 +119,12 @@ public sealed class FilterCompiler(ILogger<FilterCompiler> logger, TimeProvider 
             error = $"pattern \"{display}\" uses an unsupported construct: {ex.Message}";
             return false;
         }
+        catch (Exception ex)
+        {
+            // Last resort: an unexpected exception becomes a traceable failure value (callers
+            // log every failure).
+            error = $"pattern \"{display}\" failed to compile unexpectedly: {ex.GetType().Name}: {ex.Message}";
+            return false;
+        }
     }
 }

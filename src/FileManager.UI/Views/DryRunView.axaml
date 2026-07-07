@@ -74,6 +74,11 @@
         <ScrollViewer Margin="0,8,0,0">
             <StackPanel Spacing="8" IsVisible="{Binding HasReport}">
 
+                <!-- truncation notice -->
+                <Border Classes="chipAmber" CornerRadius="6" Padding="10" IsVisible="{Binding WasTruncated}">
+                    <TextBlock Text="{Binding TruncationNotice}" FontWeight="SemiBold" TextWrapping="Wrap" />
+                </Border>
+
                 <!-- blast-radius banner -->
                 <Border Background="{DynamicResource SystemControlBackgroundListLowBrush}" CornerRadius="6" Padding="10">
                     <StackPanel Spacing="6">

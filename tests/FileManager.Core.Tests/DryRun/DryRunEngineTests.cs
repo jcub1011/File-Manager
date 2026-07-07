@@ -1,4 +1,5 @@
 using FileManager.Contracts.DryRun;
+using FileManager.Contracts.IPC;
 using FileManager.Contracts.Primitives;
 using FileManager.Contracts.Profiles;
 using FileManager.Core.DryRun;
@@ -37,7 +38,10 @@ public sealed class DryRunEngineTests : IDisposable
         public Result Reload() => Result.Success();
     }
 
-    private static DryRunEngine NewEngine(params Profile[] profiles)
+    private static DryRunEngine NewEngine(params Profile[] profiles) =>
+        NewEngine(DryRunEngine.MaxReportBytes, profiles);
+
+    private static DryRunEngine NewEngine(int reportByteBudget, params Profile[] profiles)
     {
         FileSystemService fileSystem = new(NullLogger<FileSystemService>.Instance);
         return new DryRunEngine(
@@ -47,7 +51,8 @@ public sealed class DryRunEngineTests : IDisposable
             new FilterCompiler(NullLogger<FilterCompiler>.Instance, TimeProvider.System),
             new FileHasher(NullLogger<FileHasher>.Instance),
             new ConflictResolver(NullLogger<ConflictResolver>.Instance),
-            TimeProvider.System);
+            TimeProvider.System)
+        { ReportByteBudget = reportByteBudget };
     }
 
     private Profile ProfileUnderTest(
@@ -100,6 +105,30 @@ public sealed class DryRunEngineTests : IDisposable
         DryRunTargetAction action = Assert.Single(file.Targets);
         Assert.Equal(DryRunTargetKind.WouldWrite, action.Kind);
         Assert.Equal(Path.Combine(_target, "new.txt"), action.TargetPath);
+        Assert.False(report.Truncated);
+    }
+
+    [Fact]
+    public async Task Report_truncates_at_the_byte_budget_and_the_serialized_response_fits()
+    {
+        const int budget = 2048;
+        for (int i = 0; i < 20; i++)
+            // Backslash-heavy nesting and a non-ASCII name: JSON escaping (`\` doubles,
+            // non-ASCII becomes 6-byte \uXXXX) must count against the budget.
+            SourceFile(Path.Combine("nested", "further", $"a-quite-long-file-name résumé ✓ {i:D4}.txt"), $"content {i}");
+        Profile profile = ProfileUnderTest();
+
+        var simulated = await NewEngine(budget, profile).SimulateAsync(profile.Id, null);
+        Assert.True(simulated.TryGetValue(out DryRunReport? report));
+
+        Assert.True(report!.Truncated);
+        Assert.InRange(report.Files.Count, 1, 19);
+
+        // The measurement is a true upper bound: the full wire response is the measured file
+        // results plus commas and a bounded envelope.
+        int wireBytes = IpcSerializer.SerializeResponse(new DryRunResponse { Report = report }).Length;
+        Assert.True(wireBytes <= budget + 512,
+            $"serialized response was {wireBytes} bytes for a {budget}-byte report budget");
     }
 
     [Fact]

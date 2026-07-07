@@ -8,10 +8,12 @@ using FileManager.Core.Placement;
 using FileManager.Core.Profiles;
 using FileManager.Core.Watching;
 using Microsoft.Extensions.Logging;
+using FileManager.Contracts;
 using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -30,9 +32,17 @@ public sealed class DryRunEngine(
     IConflictResolver conflictResolver,
     TimeProvider time) : IDryRunEngine
 {
-    /// <summary>Report size guard: a serialized report must fit an IPC frame (16 MiB cap, §3.1).
-    /// A paged/streamed report is a future additive Contracts change.</summary>
+    /// <summary>Report size guards: a serialized report must fit an IPC frame (16 MiB cap, §3.1).
+    /// The byte budget is the guarantee — each result is measured as serialized and the report
+    /// truncates when the running total would exceed it (16 MiB minus the response envelope and
+    /// headroom for future additive fields). The file-count cap is a secondary bound on UI
+    /// row-building work. A paged/streamed report is a future additive Contracts change.</summary>
+    internal const int MaxReportBytes = 12 * 1024 * 1024;
     internal const int MaxReportedFiles = 50_000;
+
+    /// <summary>Test seam: production uses <see cref="MaxReportBytes"/>; tests shrink it so
+    /// truncation is reachable without tens of thousands of real files.</summary>
+    internal int ReportByteBudget { get; init; } = MaxReportBytes;
 
     public async Task<Result<DryRunReport, string>> SimulateAsync(
         Guid profileId, string? scopePath, CancellationToken ct = default)
@@ -67,6 +77,7 @@ public sealed class DryRunEngine(
 
         bool hasTransformers = profile.Transformers is { Count: > 0 };
         bool truncated = false;
+        long reportBytes = 0;
         List<DryRunFileResult> files = [];
 
         foreach (var scanned in scanner.Scan(profile, TriggerKind.Cli, scopePath))
@@ -102,13 +113,27 @@ public sealed class DryRunEngine(
             if (ct.IsCancellationRequested)
                 return Result<DryRunReport, string>.Canceled();
             if (result is not null)
+            {
+                // Measured exactly (a standalone record serializes byte-identically to the same
+                // record as a Files[] element) — path-length heuristics undercount JSON escaping
+                // (`\` doubles, non-ASCII becomes 6-byte \uXXXX).
+                int resultBytes = JsonSerializer.SerializeToUtf8Bytes(
+                    result, FileManagerJsonContext.Default.DryRunFileResult).Length;
+                if (reportBytes + resultBytes > ReportByteBudget)
+                {
+                    truncated = true;
+                    break;
+                }
+                reportBytes += resultBytes;
                 files.Add(result);
+            }
         }
 
         if (truncated)
             logger.LogWarning(
-                "Dry-run report for profile {ProfileId} truncated at {Cap} files — the scan found more",
-                profileId, MaxReportedFiles);
+                "Dry-run report for profile {ProfileId} truncated at {FileCount} files / {Bytes:N0} bytes " +
+                "(caps: {ByteCap:N0} bytes, {FileCap} files) — the scan found more",
+                profileId, files.Count, reportBytes, ReportByteBudget, MaxReportedFiles);
 
         files.Sort(static (a, b) => string.Compare(a.SourcePath, b.SourcePath, StringComparison.OrdinalIgnoreCase));
         DateTimeOffset completedAt = time.GetUtcNow();
@@ -116,7 +141,7 @@ public sealed class DryRunEngine(
             "Dry-run completed for profile {ProfileId}: {FileCount} files in {ElapsedMs}ms{Truncated}",
             profileId, files.Count, (completedAt - startedAt).TotalMilliseconds,
             truncated ? " (report truncated)" : "");
-        return new DryRunReport(profileId, completedAt, files);
+        return new DryRunReport(profileId, completedAt, files, truncated);
     }
 
     private async Task<DryRunFileResult?> EvaluateFileAsync(

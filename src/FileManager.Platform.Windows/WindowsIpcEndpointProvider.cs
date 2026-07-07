@@ -48,6 +48,13 @@ public sealed class WindowsIpcEndpointProvider(ILogger<WindowsIpcEndpointProvide
             await pipe.DisposeAsync().ConfigureAwait(false);
             return $"could not listen on the service pipe: {ex.Message}";
         }
+        catch (Exception ex)
+        {
+            // Last resort: unexpected exceptions become logged failures, not faulted callers.
+            logger.LogError(ex, "Listening on the service pipe {PipeName} failed unexpectedly", ResolvePipeName());
+            await pipe.DisposeAsync().ConfigureAwait(false);
+            return $"could not listen on the service pipe: {ex.GetType().Name}: {ex.Message}";
+        }
     }
 
     /// <summary>Deliberately duplicates Contracts' IpcEndpoint.Resolve derivation byte-for-byte,

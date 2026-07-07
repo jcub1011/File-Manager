@@ -77,5 +77,11 @@ public static class IpcFrameCodec
         {
             return $"read failed: {ex.Message}";
         }
+        catch (Exception ex)
+        {
+            // Last resort: an unexpected exception becomes a traceable failure value (callers
+            // log every failure) instead of faulting the connection task.
+            return $"read failed unexpectedly: {ex.GetType().Name}: {ex.Message}";
+        }
     }
 }

@@ -59,22 +59,32 @@ public sealed partial class ProfileListViewModel(IIpcGateway gateway) : ViewMode
     [RelayCommand]
     public async Task RefreshAsync()
     {
-        var listed = await gateway.ListProfilesAsync();
-        if (listed.TryGetError(out IpcError? error))
+        try
         {
-            ErrorMessage = $"Could not load profiles: {error.Message}";
-            return;
-        }
-        listed.TryGetValue(out IReadOnlyList<ProfileSummary>? summaries);
-        ErrorMessage = null;
+            var listed = await gateway.ListProfilesAsync();
+            if (listed.TryGetError(out IpcError? error))
+            {
+                ErrorMessage = $"Could not load profiles: {error.Message}";
+                return;
+            }
+            listed.TryGetValue(out IReadOnlyList<ProfileSummary>? summaries);
+            ErrorMessage = null;
 
-        Guid? selectedId = SelectedProfile?.ProfileId;
-        _revertingSelection = true;   // a refresh is not a user navigation
-        Profiles.Clear();
-        foreach (ProfileSummary summary in summaries!.OrderBy(s => s.Name, StringComparer.OrdinalIgnoreCase))
-            Profiles.Add(new ProfileListItem(summary.ProfileId, summary.Name, summary.Active, summary.TriggerSummary));
-        SelectedProfile = Profiles.FirstOrDefault(p => p.ProfileId == selectedId);
-        _revertingSelection = false;
+            Guid? selectedId = SelectedProfile?.ProfileId;
+            _revertingSelection = true;   // a refresh is not a user navigation
+            Profiles.Clear();
+            foreach (ProfileSummary summary in summaries!.OrderBy(s => s.Name, StringComparer.OrdinalIgnoreCase))
+                Profiles.Add(new ProfileListItem(summary.ProfileId, summary.Name, summary.Active, summary.TriggerSummary));
+            SelectedProfile = Profiles.FirstOrDefault(p => p.ProfileId == selectedId);
+            _revertingSelection = false;
+        }
+        catch (Exception ex)
+        {
+            // Last resort: an unexpected exception becomes a logged error banner instead of an
+            // unobserved command fault.
+            Serilog.Log.Error(ex, "Profile list refresh failed unexpectedly");
+            ErrorMessage = $"Could not load profiles: {ex.Message}";
+        }
     }
 
     /// <summary>Refresh and select a profile by id (after a save), without re-firing navigation.</summary>
@@ -97,15 +107,25 @@ public sealed partial class ProfileListViewModel(IIpcGateway gateway) : ViewMode
     {
         if (PendingDelete is not { } doomed)
             return;
-        var deleted = await gateway.DeleteProfileAsync(doomed.ProfileId);
-        PendingDelete = null;
-        if (deleted.TryGetError(out IpcError? error))
+        try
         {
-            ErrorMessage = $"Could not delete \"{doomed.Name}\": {error.Message}";
-            return;
+            var deleted = await gateway.DeleteProfileAsync(doomed.ProfileId);
+            PendingDelete = null;
+            if (deleted.TryGetError(out IpcError? error))
+            {
+                ErrorMessage = $"Could not delete \"{doomed.Name}\": {error.Message}";
+                return;
+            }
+            if (SelectedProfile?.ProfileId == doomed.ProfileId)
+                SelectedProfile = null;   // fires SelectionCommitted(null) → editor clears
+            await RefreshAsync();
         }
-        if (SelectedProfile?.ProfileId == doomed.ProfileId)
-            SelectedProfile = null;   // fires SelectionCommitted(null) → editor clears
-        await RefreshAsync();
+        catch (Exception ex)
+        {
+            // Last resort: an unexpected exception becomes a logged error banner instead of an
+            // unobserved command fault.
+            Serilog.Log.Error(ex, "Profile delete failed unexpectedly");
+            ErrorMessage = $"Could not delete \"{doomed.Name}\": {ex.Message}";
+        }
     }
 }

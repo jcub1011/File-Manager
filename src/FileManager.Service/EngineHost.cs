@@ -24,6 +24,25 @@ internal sealed class EngineHost(
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        try
+        {
+            await RunAsync(stoppingToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            // normal shutdown
+        }
+        catch (Exception ex)
+        {
+            // Last resort: a startup or run crash must land in the service log, not depend on
+            // host default unhandled-exception behavior.
+            logger.LogCritical(ex, "Engine host failed unexpectedly; stopping the service");
+            lifetime.StopApplication();
+        }
+    }
+
+    private async Task RunAsync(CancellationToken stoppingToken)
+    {
         // 1. Single-instance guard: a second service process (e.g. two UIs racing
         //    ServiceLauncher) exits immediately and harmlessly.
         _singleInstanceMutex = new Mutex(

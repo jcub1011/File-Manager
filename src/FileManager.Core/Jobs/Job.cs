@@ -59,6 +59,12 @@ public readonly record struct NormalizedPath : IComparable<NormalizedPath>
         {
             return new JobError { Code = JobErrorCode.SourceUnreadable, Message = $"malformed path \"{path}\": {ex.Message}", Path = path };
         }
+        catch (Exception ex)
+        {
+            // Last resort: an unexpected exception becomes a traceable failure value (callers
+            // log every failure).
+            return new JobError { Code = JobErrorCode.SourceUnreadable, Message = $"malformed path \"{path}\": {ex.GetType().Name}: {ex.Message}", Path = path };
+        }
     }
 
     public bool Equals(NormalizedPath other) => string.Equals(Value, other.Value, Comparison);

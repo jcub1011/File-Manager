@@ -114,6 +114,50 @@ public sealed class DryRunViewModelTests
     }
 
     [Fact]
+    public async Task Truncated_report_surfaces_a_notice_and_a_full_report_clears_it()
+    {
+        var (viewModel, gateway) = NewViewModel();
+        gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value) with { Truncated = true };
+
+        await viewModel.RunAsync(CancellationToken.None);
+
+        Assert.True(viewModel.WasTruncated);
+        Assert.Contains("4", viewModel.TruncationNotice);
+        Assert.Contains("truncated", viewModel.TruncationNotice, StringComparison.OrdinalIgnoreCase);
+
+        gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value);
+        await viewModel.RunAsync(CancellationToken.None);
+
+        Assert.False(viewModel.WasTruncated);
+        Assert.Equal("", viewModel.TruncationNotice);
+    }
+
+    [Fact]
+    public async Task Transport_errors_point_at_the_service_log()
+    {
+        var (viewModel, gateway) = NewViewModel();
+        gateway.DryRunResult = new IpcError("IPC_TRANSPORT", "connection closed");
+
+        await viewModel.RunAsync(CancellationToken.None);
+
+        Assert.False(viewModel.HasReport);
+        Assert.Contains("connection closed", viewModel.ErrorMessage);
+        Assert.Contains(@"FileManager\logs", viewModel.ErrorMessage);
+    }
+
+    [Fact]
+    public async Task Unexpected_gateway_exception_surfaces_as_a_banner_not_a_fault()
+    {
+        var (viewModel, gateway) = NewViewModel();
+        gateway.DryRunException = new InvalidOperationException("wire format drifted");
+
+        await viewModel.RunAsync(CancellationToken.None);
+
+        Assert.False(viewModel.HasReport);
+        Assert.Contains("wire format drifted", viewModel.ErrorMessage);
+    }
+
+    [Fact]
     public async Task Scope_path_is_forwarded_trimmed_or_null()
     {
         var (viewModel, gateway) = NewViewModel();

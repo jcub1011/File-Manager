@@ -49,6 +49,12 @@ public static class ServiceLauncher
         {
             return $"failed to start \"{exePath}\": {ex.Message}";
         }
+        catch (Exception ex)
+        {
+            // Last resort: an unexpected exception becomes a traceable failure value (callers
+            // log every failure).
+            return $"failed to start \"{exePath}\": {ex.GetType().Name}: {ex.Message}";
+        }
 
         string lastError = "unknown";
         for (int attempt = 0; attempt < RetryCount; attempt++)

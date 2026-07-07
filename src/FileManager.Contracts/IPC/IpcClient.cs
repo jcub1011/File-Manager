@@ -49,6 +49,13 @@ public sealed class IpcClient : IAsyncDisposable
             await pipe.DisposeAsync().ConfigureAwait(false);
             return Result<IpcClient, string>.Canceled();
         }
+        catch (Exception ex)
+        {
+            // Last resort: an unexpected exception becomes a traceable failure value (callers
+            // log every failure).
+            await pipe.DisposeAsync().ConfigureAwait(false);
+            return $"could not connect to the service pipe: {ex.GetType().Name}: {ex.Message}";
+        }
     }
 
     /// <summary>Sends one request and awaits its single response. An ErrorResponse — and any
@@ -101,6 +108,12 @@ public sealed class IpcClient : IAsyncDisposable
         catch (Exception ex) when (ex is System.IO.IOException or ObjectDisposedException)
         {
             return new IpcError("IPC_TRANSPORT", ex.Message);
+        }
+        catch (Exception ex)
+        {
+            // Last resort: an unexpected exception becomes a traceable failure value (callers
+            // log every failure).
+            return new IpcError("IPC_INTERNAL", $"{ex.GetType().Name}: {ex.Message}");
         }
         finally
         {

@@ -33,6 +33,9 @@ internal sealed class FakeIpcGateway : IIpcGateway
     /// <summary>When set, DryRunAsync awaits this before returning (cancellation tests).</summary>
     public TaskCompletionSource? DryRunGate { get; set; }
 
+    /// <summary>When set, DryRunAsync throws it (unexpected-exception tests).</summary>
+    public Exception? DryRunException { get; set; }
+
     public Task<Result<EngineStatusSnapshot, IpcError>> GetStatusAsync(CancellationToken ct = default) =>
         Task.FromResult(StatusResult);
 
@@ -59,6 +62,8 @@ internal sealed class FakeIpcGateway : IIpcGateway
         Guid profileId, string? scopePath, CancellationToken ct = default)
     {
         DryRunCalls.Add((profileId, scopePath));
+        if (DryRunException is not null)
+            throw DryRunException;
         if (DryRunGate is not null)
         {
             try

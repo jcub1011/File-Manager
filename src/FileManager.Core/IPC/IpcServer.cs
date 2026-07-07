@@ -63,6 +63,24 @@ public sealed class IpcServer(
 
     private async Task AcceptLoopAsync(CancellationToken ct)
     {
+        try
+        {
+            await AcceptLoopCoreAsync(ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            // shutdown
+        }
+        catch (Exception ex)
+        {
+            // Last resort: this task is otherwise unobserved until StopAsync — without this
+            // the service silently stops accepting connections.
+            logger.LogCritical(ex, "IPC accept loop failed unexpectedly; the service can no longer accept connections");
+        }
+    }
+
+    private async Task AcceptLoopCoreAsync(CancellationToken ct)
+    {
         while (!ct.IsCancellationRequested)
         {
             Result<Stream, string> accepted = await endpoint.AcceptAsync(ct).ConfigureAwait(false);
@@ -114,8 +132,24 @@ public sealed class IpcServer(
                     }
                     frame.TryGetValue(out byte[]? payload);
 
-                    IpcResponse response = await DispatchAsync(payload!, ct).ConfigureAwait(false);
-                    Result writeResult = await IpcFrameCodec.WriteFrameAsync(stream, IpcSerializer.SerializeResponse(response), ct)
+                    (string requestType, IpcResponse response) = await DispatchAsync(payload!, ct).ConfigureAwait(false);
+                    byte[] responseBytes = IpcSerializer.SerializeResponse(response);
+                    if (responseBytes.Length > IpcFrameCodec.MaxPayloadBytes)
+                    {
+                        // WriteFrameAsync treats an oversized payload as a programmer error and
+                        // throws — swap in a small, readable error so the connection survives.
+                        logger.LogWarning(
+                            "IPC response to \"{RequestType}\" is {Size:N0} bytes, over the {Cap:N0}-byte frame cap; replying IPC_RESPONSE_TOO_LARGE",
+                            requestType, responseBytes.Length, IpcFrameCodec.MaxPayloadBytes);
+                        responseBytes = IpcSerializer.SerializeResponse(new ErrorResponse
+                        {
+                            Code = "IPC_RESPONSE_TOO_LARGE",
+                            Message = $"the response to \"{requestType}\" was {responseBytes.Length:N0} bytes, over the " +
+                                $"{IpcFrameCodec.MaxPayloadBytes:N0}-byte IPC frame limit — narrow the request " +
+                                "(for a dry run, set a scope folder) and retry",
+                        });
+                    }
+                    Result writeResult = await IpcFrameCodec.WriteFrameAsync(stream, responseBytes, ct)
                         .ConfigureAwait(false);
                     if (writeResult.IsCanceled)
                         return;                     // shutdown
@@ -129,33 +163,39 @@ public sealed class IpcServer(
             {
                 logger.LogDebug(ex, "IPC connection dropped");
             }
+            catch (Exception ex)
+            {
+                // Last resort: this task is otherwise unobserved — without this the connection
+                // dies with no trace and the client sees only "connection closed".
+                logger.LogError(ex, "IPC connection handler failed unexpectedly; closing this connection");
+            }
         }
     }
 
-    private async Task<IpcResponse> DispatchAsync(byte[] payload, CancellationToken ct)
+    private async Task<(string RequestType, IpcResponse Response)> DispatchAsync(byte[] payload, CancellationToken ct)
     {
         IpcRequest? request = IpcSerializer.DeserializeRequest(payload);
         if (request is null)
-            return new ErrorResponse { Code = "IPC_MALFORMED", Message = "the request frame could not be parsed" };
+            return ("<malformed>", new ErrorResponse { Code = "IPC_MALFORMED", Message = "the request frame could not be parsed" });
 
+        string discriminator = IpcRequestTypes.DiscriminatorOf(request);
         if (request.ProtocolVersion != 1)
-            return new ErrorResponse
+            return (discriminator, new ErrorResponse
             {
                 Code = "IPC_VERSION_MISMATCH",
                 Message = $"this service speaks protocol version 1, the client sent {request.ProtocolVersion}",
-            };
+            });
 
-        string discriminator = IpcRequestTypes.DiscriminatorOf(request);
         if (!handlers.TryGetValue(discriminator, out IIpcRequestHandler? handler))
-            return new ErrorResponse
+            return (discriminator, new ErrorResponse
             {
                 Code = "NOT_IMPLEMENTED",
                 Message = $"\"{discriminator}\" is not available in this build",
-            };
+            });
 
         try
         {
-            return await handler.HandleAsync(request, ct).ConfigureAwait(false);
+            return (discriminator, await handler.HandleAsync(request, ct).ConfigureAwait(false));
         }
         catch (OperationCanceledException)
         {
@@ -164,7 +204,7 @@ public sealed class IpcServer(
         catch (Exception ex)
         {
             logger.LogError(ex, "Handler for {RequestType} threw", discriminator);
-            return new ErrorResponse { Code = "INTERNAL_ERROR", Message = ex.Message };
+            return (discriminator, new ErrorResponse { Code = "INTERNAL_ERROR", Message = ex.Message });
         }
     }
 }

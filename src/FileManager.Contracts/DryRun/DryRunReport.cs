@@ -4,7 +4,10 @@ using System.Collections.Generic;
 namespace FileManager.Contracts.DryRun;
 
 public sealed record DryRunReport(
-    Guid ProfileId, DateTimeOffset GeneratedAt, IReadOnlyList<DryRunFileResult> Files);
+    Guid ProfileId, DateTimeOffset GeneratedAt, IReadOnlyList<DryRunFileResult> Files,
+    // Additive (old peers omit it and deserialize the default): true when the engine stopped
+    // reporting before the scan ran out — the report shows a prefix, not everything found.
+    bool Truncated = false);
 
 public enum DryRunFileDisposition { WouldProcess, WouldSkipFilter, WouldSkipUnchanged }
 

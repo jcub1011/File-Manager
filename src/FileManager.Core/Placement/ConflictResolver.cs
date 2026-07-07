@@ -68,6 +68,17 @@ public sealed class ConflictResolver(ILogger<ConflictResolver> logger) : IConfli
                 Path = desiredFinalPath,
             };
         }
+        catch (Exception ex)
+        {
+            // Last resort: unexpected exceptions become logged failures, not faulted callers.
+            logger.LogError(ex, "Conflict probe for {Path} failed unexpectedly", desiredFinalPath);
+            return new JobError
+            {
+                Code = JobErrorCode.ConflictUnresolvable,
+                Message = $"could not probe \"{desiredFinalPath}\": {ex.GetType().Name}: {ex.Message}",
+                Path = desiredFinalPath,
+            };
+        }
     }
 
     private Result<ConflictOutcome, JobError> ProbeRenameSuffix(string desiredFinalPath)

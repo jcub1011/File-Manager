@@ -45,6 +45,11 @@ public sealed class ProfileStore(ILogger<ProfileStore> logger, EnginePaths paths
                 {
                     logger.LogWarning(ex, "Profile file {File} could not be loaded; skipping", file);
                 }
+                catch (Exception ex)
+                {
+                    // Last resort: unexpected exceptions become logged skips, not faulted callers.
+                    logger.LogError(ex, "Profile file {File} failed to load unexpectedly; skipping", file);
+                }
             }
             return profiles;
         }
@@ -52,6 +57,11 @@ public sealed class ProfileStore(ILogger<ProfileStore> logger, EnginePaths paths
         {
             logger.LogError(ex, "Could not enumerate profiles in {Directory}", paths.ProfilesDirectory);
             return $"could not enumerate profiles: {ex.Message}";
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "Enumerating profiles in {Directory} failed unexpectedly", paths.ProfilesDirectory);
+            return $"could not enumerate profiles: {ex.GetType().Name}: {ex.Message}";
         }
     }
 
@@ -72,6 +82,12 @@ public sealed class ProfileStore(ILogger<ProfileStore> logger, EnginePaths paths
         {
             logger.LogError(ex, "Could not load profile {ProfileId}", profileId);
             return $"could not load profile {profileId}: {ex.Message}";
+        }
+        catch (Exception ex)
+        {
+            // Last resort: unexpected exceptions become logged failures, not faulted callers.
+            logger.LogError(ex, "Loading profile {ProfileId} failed unexpectedly", profileId);
+            return $"could not load profile {profileId}: {ex.GetType().Name}: {ex.Message}";
         }
     }
 
@@ -117,6 +133,12 @@ public sealed class ProfileStore(ILogger<ProfileStore> logger, EnginePaths paths
             logger.LogError(ex, "Could not save profile {ProfileId} ({Name})", profile.Id, profile.Name);
             return $"could not save profile {profile.Id}: {ex.Message}";
         }
+        catch (Exception ex)
+        {
+            // Last resort: unexpected exceptions become logged failures, not faulted callers.
+            logger.LogError(ex, "Saving profile {ProfileId} ({Name}) failed unexpectedly", profile.Id, profile.Name);
+            return $"could not save profile {profile.Id}: {ex.GetType().Name}: {ex.Message}";
+        }
     }
 
     public Result Delete(Guid profileId)
@@ -131,6 +153,12 @@ public sealed class ProfileStore(ILogger<ProfileStore> logger, EnginePaths paths
         {
             logger.LogError(ex, "Could not delete profile {ProfileId}", profileId);
             return $"could not delete profile {profileId}: {ex.Message}";
+        }
+        catch (Exception ex)
+        {
+            // Last resort: unexpected exceptions become logged failures, not faulted callers.
+            logger.LogError(ex, "Deleting profile {ProfileId} failed unexpectedly", profileId);
+            return $"could not delete profile {profileId}: {ex.GetType().Name}: {ex.Message}";
         }
     }
 

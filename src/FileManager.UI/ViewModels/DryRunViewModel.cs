@@ -70,6 +70,8 @@ public sealed partial class DryRunViewModel : ViewModelBase
     [ObservableProperty] public partial string? ErrorMessage { get; set; }
     [ObservableProperty] public partial bool DestructiveOnly { get; set; }
     [ObservableProperty] public partial string GeneratedAtText { get; set; } = "";
+    [ObservableProperty] public partial bool WasTruncated { get; set; }
+    [ObservableProperty] public partial string TruncationNotice { get; set; } = "";
 
     // Blast-radius banner numbers (spec §8: deletions and overwrites are the report's whole point).
     [ObservableProperty] public partial int TotalFiles { get; set; }
@@ -115,7 +117,10 @@ public sealed partial class DryRunViewModel : ViewModelBase
             }
             if (run.TryGetError(out IpcError? error))
             {
-                ErrorMessage = $"Dry run failed: {error.Message}";
+                // A transport drop carries no context of its own — point at the service log.
+                ErrorMessage = error.Code == "IPC_TRANSPORT"
+                    ? $"Dry run failed: {error.Message}. The connection to the background service was lost unexpectedly — see the service log in %LOCALAPPDATA%\\FileManager\\logs."
+                    : $"Dry run failed: {error.Message}";
                 return;
             }
             run.TryGetValue(out DryRunReport? report);
@@ -126,6 +131,13 @@ public sealed partial class DryRunViewModel : ViewModelBase
             // Defensive backstop — the gateway returns Canceled rather than throwing.
             Log.Debug("Dry run for profile {ProfileId} cancelled by the user", profileId);
             ErrorMessage = "Dry run cancelled.";
+        }
+        catch (Exception ex)
+        {
+            // Last resort: an unexpected exception becomes a logged error banner instead of an
+            // unobserved command fault.
+            Log.Error(ex, "Dry run for profile {ProfileId} failed unexpectedly", profileId);
+            ErrorMessage = $"Dry run failed unexpectedly: {ex.Message}";
         }
     }
 
@@ -162,6 +174,10 @@ public sealed partial class DryRunViewModel : ViewModelBase
         DisposalCount = rows.Count(static r => r.IsSourceDisposalDestructive);
         HasDestructiveActions = OverwriteCount > 0 || DisposalCount > 0;
         GeneratedAtText = $"Generated {report.GeneratedAt.ToLocalTime():yyyy-MM-dd HH:mm:ss}";
+        WasTruncated = report.Truncated;
+        TruncationNotice = report.Truncated
+            ? $"Report truncated: showing the first {report.Files.Count:N0} files — the scan found more. Set a scope folder to narrow the simulation."
+            : "";
 
         HasReport = true;
         RebuildVisibleRows();
@@ -195,5 +211,7 @@ public sealed partial class DryRunViewModel : ViewModelBase
         OverwriteCount = RenameCount = DisposalCount = 0;
         HasDestructiveActions = false;
         GeneratedAtText = "";
+        WasTruncated = false;
+        TruncationNotice = "";
     }
 }

@@ -20,6 +20,7 @@ namespace FileManager.Service.Tests;
 /// WindowsIpcEndpointProvider, driven by the real Contracts IpcClient — save, list, get,
 /// dry-run over a real temp tree, delete, NOT_IMPLEMENTED, and version rejection.</summary>
 [SupportedOSPlatform("windows")]
+[Collection(PipeCollection.Name)]
 public sealed class EndToEndSmokeTests : IAsyncLifetime
 {
     private readonly string _root = Path.Combine(Path.GetTempPath(), "fm-e2e-" + Guid.NewGuid().ToString("N"));

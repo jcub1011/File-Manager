@@ -49,6 +49,17 @@ public sealed class FileHasherTests
     }
 
     [Fact]
+    public async Task Unexpected_exception_is_a_traceable_failure_not_a_throw()
+    {
+        // A null path throws ArgumentNullException — not one of the expected I/O exception
+        // types — which the last-resort catch must convert to a failure carrying the type name.
+        var hashed = await Hasher.HashFileAsync(null!);
+        Assert.True(hashed.TryGetError(out JobError? error));
+        Assert.Equal(JobErrorCode.SourceUnreadable, error.Code);
+        Assert.Contains(nameof(ArgumentNullException), error.Message);
+    }
+
+    [Fact]
     public async Task Cancellation_yields_a_Canceled_result_not_an_exception()
     {
         string path = Path.GetTempFileName();

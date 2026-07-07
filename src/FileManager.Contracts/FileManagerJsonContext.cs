@@ -13,4 +13,6 @@ namespace FileManager.Contracts;
 [JsonSerializable(typeof(IpcResponse))]
 [JsonSerializable(typeof(EngineEvent))]
 [JsonSerializable(typeof(DryRunReport))]
+// Also serialized standalone: DryRunEngine measures each result against its report byte budget.
+[JsonSerializable(typeof(DryRunFileResult))]
 public sealed partial class FileManagerJsonContext : JsonSerializerContext;
