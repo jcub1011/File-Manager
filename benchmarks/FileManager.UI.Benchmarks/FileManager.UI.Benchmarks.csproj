@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+    <!-- BenchmarkDotNet emits and loads a runner assembly at run time; it is not
+         trim/AOT-friendly, so this host is deliberately not PublishAot (unlike the UI app). -->
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="BenchmarkDotNet" Version="0.15.8" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Pulls Avalonia transitively, but the benchmark never initializes an AppBuilder:
+         DryRunViewModel's PropertyChanged / ObservableCollection work with no UI thread. -->
+    <ProjectReference Include="..\..\src\FileManager.UI\FileManager.UI.csproj" />
+  </ItemGroup>
+
+</Project>

@@ -23,5 +23,6 @@
   <Folder Name="/benchmarks/">
     <Project Path="benchmarks/FileManager.Contracts.Benchmarks/FileManager.Contracts.Benchmarks.csproj" />
     <Project Path="benchmarks/FileManager.Core.Benchmarks/FileManager.Core.Benchmarks.csproj" />
+    <Project Path="benchmarks/FileManager.UI.Benchmarks/FileManager.UI.Benchmarks.csproj" />
   </Folder>
 </Solution>

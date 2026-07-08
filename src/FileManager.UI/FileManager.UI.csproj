@@ -14,6 +14,10 @@
   </ItemGroup>
 
   <ItemGroup>
+    <InternalsVisibleTo Include="FileManager.UI.Benchmarks" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="..\FileManager.Contracts\FileManager.Contracts.csproj" />
     <!-- Build-order + copy-output only, NOT an assembly reference (§1 rule 3: the UI references
          Contracts only). ServiceLauncher resolves FileManager.Service.exe beside the UI exe —
