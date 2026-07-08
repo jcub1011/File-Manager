@@ -49,13 +49,15 @@ public sealed class DryRunEngine(
         Guid profileId, string? scopePath, CancellationToken ct = default)
     {
         DateTimeOffset startedAt = time.GetUtcNow();
-        logger.LogInformation("Dry-run started for profile {ProfileId} (scope {Scope})",
+        if (logger.IsEnabled(LogLevel.Information))
+            logger.LogInformation("Dry-run started for profile {ProfileId} (scope {Scope})",
             profileId, scopePath ?? "<all sources>");
 
         Profile? profile = catalog.All.FirstOrDefault(p => p.Id == profileId);
         if (profile is null)
         {
-            logger.LogDebug("Dry-run requested for profile {ProfileId} which was not found", profileId);
+            if (logger.IsEnabled(LogLevel.Debug))
+                logger.LogDebug("Dry-run requested for profile {ProfileId} which was not found", profileId);
             return $"profile {profileId} not found";
         }
 
@@ -71,6 +73,7 @@ public sealed class DryRunEngine(
                     profileId, compileError);
                 return $"filter compilation failed (was this profile saved through validation?): {compileError}";
             }
+
             compiled.TryGetValue(out CompiledFilterSet? set);
             if (NormalizedPath.Create(source.Path).TryGetValue(out NormalizedPath root))
                 filtersBySourceRoot[root.Value] = set!;

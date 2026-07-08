@@ -20,4 +20,8 @@
     <Project Path="tests/FileManager.Service.Tests/FileManager.Service.Tests.csproj" />
     <Project Path="tests/FileManager.UI.Tests/FileManager.UI.Tests.csproj" />
   </Folder>
+  <Folder Name="/benchmarks/">
+    <Project Path="benchmarks/FileManager.Contracts.Benchmarks/FileManager.Contracts.Benchmarks.csproj" />
+    <Project Path="benchmarks/FileManager.Core.Benchmarks/FileManager.Core.Benchmarks.csproj" />
+  </Folder>
 </Solution>

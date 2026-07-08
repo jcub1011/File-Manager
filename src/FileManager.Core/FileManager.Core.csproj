@@ -23,6 +23,7 @@
 
   <ItemGroup>
     <InternalsVisibleTo Include="FileManager.Core.Tests" />
+    <InternalsVisibleTo Include="FileManager.Core.Benchmarks" />
   </ItemGroup>
 
   <ItemGroup>

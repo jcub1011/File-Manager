@@ -29,11 +29,14 @@ public sealed class CompiledFilterSet
 
     public FilterDecision Evaluate(in FilterInput input)
     {
-        foreach (IFilter rule in _rules)
+        for (int i = 0; i < _rules.Count; i++)
         {
+            var rule = _rules[i];
             if (rule.Excludes(in input, out string reason))
-                return new FilterDecision(false, reason.Length > 0 ? reason : rule.Description);
+                return new FilterDecision(false,
+                    string.IsNullOrWhiteSpace(reason) ? rule.Description : reason);
         }
+
         return new FilterDecision(true, null);
     }
 }
