@@ -2,6 +2,7 @@ using FileManager.Contracts.Primitives;
 using FileManager.Core.Jobs;
 using Microsoft.Extensions.Logging;
 using System;
+using System.Buffers;
 using System.IO;
 using System.Security.Cryptography;
 using System.Threading;
@@ -18,14 +19,24 @@ public sealed class FileHasher(ILogger<FileHasher> logger) : IFileHasher
 
     public async Task<Result<string, JobError>> HashFileAsync(string path, CancellationToken ct = default)
     {
+        // Rent one reusable buffer rather than letting FileStream allocate a fresh 1 MiB internal
+        // buffer per call — that buffer lands on the LOH and forces Gen2 GCs even for tiny files.
+        // FileStream does no internal buffering (bufferSize 1); we read into the rented buffer and
+        // feed an IncrementalHash, keeping the "never whole-file in memory" guarantee.
+        byte[] buffer = ArrayPool<byte>.Shared.Rent(BufferSize);
         try
         {
             await using FileStream stream = new(
                 path, FileMode.Open, FileAccess.Read,
                 FileShare.ReadWrite | FileShare.Delete,
-                BufferSize, FileOptions.Asynchronous | FileOptions.SequentialScan);
-            byte[] hash = await SHA256.HashDataAsync(stream, ct).ConfigureAwait(false);
-            return Convert.ToHexString(hash);
+                bufferSize: 1, FileOptions.Asynchronous | FileOptions.SequentialScan);
+            using IncrementalHash hasher = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+
+            int read;
+            while ((read = await stream.ReadAsync(buffer.AsMemory(0, BufferSize), ct).ConfigureAwait(false)) > 0)
+                hasher.AppendData(buffer, 0, read);
+
+            return Convert.ToHexString(hasher.GetHashAndReset());
         }
         catch (OperationCanceledException)
         {
@@ -51,6 +62,10 @@ public sealed class FileHasher(ILogger<FileHasher> logger) : IFileHasher
                 Message = $"could not hash \"{path}\": {ex.GetType().Name}: {ex.Message}",
                 Path = path,
             };
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buffer);
         }
     }
 }
