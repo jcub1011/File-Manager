@@ -98,8 +98,13 @@ public readonly record struct NormalizedPath : IComparable<NormalizedPath>
 
 public enum TriggerKind { Watcher, Schedule, CatchUp, ManualShell, Cli }
 
+/// <summary><paramref name="Metadata"/> is the stat snapshot captured for free during enumeration
+/// (see <see cref="FileManager.Core.Files.FileSystemEntry"/>); consumers that have it can skip a
+/// redundant source stat. Null when the payload was produced without an enumeration snapshot (e.g. a
+/// single-file scope), in which case consumers stat on demand.</summary>
 public sealed record Payload(
-    Guid ProfileId, string SourcePath, string SourceRoot, TriggerKind Trigger, DateTimeOffset EnqueuedAt);
+    Guid ProfileId, string SourcePath, string SourceRoot, TriggerKind Trigger, DateTimeOffset EnqueuedAt,
+    FileMetadata? Metadata = null);
 
 /// <summary>Immutable snapshot at journal-open; recovery compares the filesystem against it.</summary>
 public sealed record SourceSnapshot

@@ -76,9 +76,13 @@ public sealed class FileSystemService(ILogger<FileSystemService> logger) : IFile
                 Result<FileSystemEntry, EnumerationFault>? mapped = null;
                 try
                 {
+                    // All of Length/CreationTimeUtc/Attributes are served from the enumeration's
+                    // cached snapshot (no per-entry Refresh/stat), so carrying them lets the scanner
+                    // build a full FileMetadata without a second stat of every file.
                     mapped = current is DirectoryInfo
                         ? new FileSystemEntry(current.Name, current.FullName, true, 0, current.LastWriteTime)
-                        : new FileSystemEntry(current.Name, current.FullName, false, ((FileInfo)current).Length, current.LastWriteTime);
+                        : new FileSystemEntry(current.Name, current.FullName, false, ((FileInfo)current).Length,
+                            current.LastWriteTime, current.CreationTimeUtc, current.Attributes);
                 }
                 catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
                 {

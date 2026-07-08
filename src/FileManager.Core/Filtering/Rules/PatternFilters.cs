@@ -15,7 +15,7 @@ internal sealed class IncludePatternFilter(IReadOnlyList<CompiledPattern> patter
 
     public bool Excludes(in FilterInput input, out string reason)
     {
-        string relative = input.RelativePath.Replace('\\', '/');
+        string relative = input.NormalizedRelativePath ?? input.RelativePath.Replace('\\', '/');
         foreach (CompiledPattern pattern in patterns)
         {
             if (pattern.Regex.IsMatch(relative))
@@ -44,7 +44,7 @@ internal sealed class ExcludePatternFilter(IReadOnlyList<CompiledPattern> patter
 
     public bool Excludes(in FilterInput input, out string reason)
     {
-        string relative = input.RelativePath.Replace('\\', '/');
+        string relative = input.NormalizedRelativePath ?? input.RelativePath.Replace('\\', '/');
         foreach (CompiledPattern pattern in patterns)
         {
             if (pattern.Regex.IsMatch(relative))

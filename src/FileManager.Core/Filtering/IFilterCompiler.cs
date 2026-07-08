@@ -21,11 +21,24 @@ public sealed class CompiledFilterSet
     {
         _rules = rules;
         MaxDepth = maxDepth;
+        foreach (IFilter rule in rules)
+        {
+            if (rule is Rules.IncludePatternFilter or Rules.ExcludePatternFilter)
+            {
+                HasPatternRules = true;
+                break;
+            }
+        }
     }
 
     /// <summary>The merged MaxDepth, exposed so the scanner can prune directories instead of
     /// enumerating whole subtrees only to filter every file out.</summary>
     public int? MaxDepth { get; }
+
+    /// <summary>True when the set has glob/regex rules that match against the '/'-normalized
+    /// relative path. Lets the caller skip normalizing that path when nothing would consult it
+    /// (the common case: only the always-present attribute filter).</summary>
+    public bool HasPatternRules { get; }
 
     public FilterDecision Evaluate(in FilterInput input)
     {

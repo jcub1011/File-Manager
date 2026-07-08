@@ -41,6 +41,11 @@ public sealed class DryRunEngine(
     internal const int MaxReportBytes = 12 * 1024 * 1024;
     internal const int MaxReportedFiles = 50_000;
 
+    /// <summary>Per-file evaluation (stat + existence probe + up to two SHA-256 hashes) is
+    /// independent and I/O-bound, so candidates are evaluated concurrently. Capped so a huge scan
+    /// cannot swamp the machine; the collaborators are all read-only, so this is race-free.</summary>
+    private static readonly int MaxEvaluationConcurrency = Math.Min(Environment.ProcessorCount, 8);
+
     /// <summary>Test seam: production uses <see cref="MaxReportBytes"/>; tests shrink it so
     /// truncation is reachable without tens of thousands of real files.</summary>
     internal int ReportByteBudget { get; init; } = MaxReportBytes;
@@ -81,14 +86,11 @@ public sealed class DryRunEngine(
 
         bool hasTransformers = profile.Transformers is { Count: > 0 };
         bool truncated = false;
-        long reportBytes = 0;
-        List<DryRunFileResult> files = [];
 
-        // Reused across the whole scan so measuring doesn't allocate a byte[] per file; the
-        // default writer options (unindented, default encoder) match FileManagerJsonContext.
-        ArrayBufferWriter<byte> measureBuffer = new();
-        using Utf8JsonWriter measureWriter = new(measureBuffer);
-
+        // Phase 1: drain the scan into a bounded candidate list. Fault handling matches the old
+        // inline loop — a fatal fault aborts the whole run; warnings are logged and skipped. The
+        // file cap bounds both the buffered payloads and the parallel evaluation work below.
+        List<Payload> candidates = [];
         foreach (var scanned in scanner.Scan(profile, TriggerKind.Cli, scopePath))
         {
             if (ct.IsCancellationRequested)
@@ -108,45 +110,54 @@ public sealed class DryRunEngine(
                 continue;
             }
 
-            if (files.Count >= MaxReportedFiles)
+            if (candidates.Count >= MaxReportedFiles)
             {
                 truncated = true;
                 break;
             }
 
             scanned.TryGetValue(out Payload? payload);
-            DryRunFileResult? result = await EvaluateFileAsync(profile, payload!, filtersBySourceRoot, hasTransformers, ct)
-                .ConfigureAwait(false);
-            // A hash or target loop cut short by cancellation returns a partial/placeholder result;
-            // the token check turns that into Canceled rather than a misleading partial report.
-            if (ct.IsCancellationRequested)
-                return Result<DryRunReport, string>.Canceled();
-            if (result is not null)
-            {
-                // Measured exactly (a standalone record serializes byte-identically to the same
-                // record as a Files[] element) — path-length heuristics undercount JSON escaping
-                // (`\` doubles, non-ASCII becomes 6-byte \uXXXX).
-                measureBuffer.ResetWrittenCount();
-                measureWriter.Reset(measureBuffer);
-                JsonSerializer.Serialize(measureWriter, result, FileManagerJsonContext.Default.DryRunFileResult);
-                int resultBytes = measureBuffer.WrittenCount;
-                if (reportBytes + resultBytes > ReportByteBudget)
-                {
-                    truncated = true;
-                    break;
-                }
-                reportBytes += resultBytes;
-                files.Add(result);
-            }
+            candidates.Add(payload!);
         }
+
+        // Phase 2: evaluate candidates concurrently. Every collaborator is read-only (I-DRYRUN-RO)
+        // and stateless, so this is race-free; results land positionally so ordering is
+        // deterministic regardless of completion order.
+        DryRunFileResult?[] evaluated = new DryRunFileResult?[candidates.Count];
+        try
+        {
+            await Parallel.ForEachAsync(
+                Enumerable.Range(0, candidates.Count),
+                new ParallelOptions { MaxDegreeOfParallelism = MaxEvaluationConcurrency, CancellationToken = ct },
+                async (i, token) =>
+                {
+                    evaluated[i] = await EvaluateFileAsync(profile, candidates[i], filtersBySourceRoot, hasTransformers, token)
+                        .ConfigureAwait(false);
+                }).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            // A hash or target loop cut short by cancellation returns a partial/placeholder result;
+            // cancellation turns the whole run into Canceled rather than a misleading partial report.
+            return Result<DryRunReport, string>.Canceled();
+        }
+
+        // Phase 3: order by source path, then truncate to the report byte budget in that order.
+        List<DryRunFileResult> ordered = new(candidates.Count);
+        foreach (DryRunFileResult? result in evaluated)
+            if (result is not null)
+                ordered.Add(result);
+        ordered.Sort(static (a, b) => string.Compare(a.SourcePath, b.SourcePath, StringComparison.OrdinalIgnoreCase));
+
+        (List<DryRunFileResult> files, bool budgetTruncated, long reportBytes) = ApplyByteBudget(ordered);
+        truncated |= budgetTruncated;
 
         if (truncated)
             logger.LogWarning(
-                "Dry-run report for profile {ProfileId} truncated at {FileCount} files / {Bytes:N0} bytes " +
+                "Dry-run report for profile {ProfileId} truncated at {FileCount} files / ~{Bytes:N0} bytes " +
                 "(caps: {ByteCap:N0} bytes, {FileCap} files) — the scan found more",
                 profileId, files.Count, reportBytes, ReportByteBudget, MaxReportedFiles);
 
-        files.Sort(static (a, b) => string.Compare(a.SourcePath, b.SourcePath, StringComparison.OrdinalIgnoreCase));
         DateTimeOffset completedAt = time.GetUtcNow();
         logger.LogInformation(
             "Dry-run completed for profile {ProfileId}: {FileCount} files in {ElapsedMs}ms{Truncated}",
@@ -155,6 +166,102 @@ public sealed class DryRunEngine(
         return new DryRunReport(profileId, completedAt, files, truncated);
     }
 
+    /// <summary>Truncates the ordered results to the serialized byte budget. Serialization is not
+    /// free, so it is skipped entirely while a conservative upper-bound estimate proves the report
+    /// still fits — the common case. Only once the upper bound could cross the budget does it fall
+    /// back to exact measurement (re-establishing the running total from the already-kept results),
+    /// preserving precise truncation near the cap. Returns the kept results, whether truncation
+    /// occurred, and the running byte total (exact once measuring, otherwise the upper-bound).</summary>
+    private (List<DryRunFileResult> Files, bool Truncated, long ReportBytes) ApplyByteBudget(
+        List<DryRunFileResult> ordered)
+    {
+        List<DryRunFileResult> kept = new(ordered.Count);
+        long total = 0;
+        bool exactMode = false;
+        bool truncated = false;
+
+        ArrayBufferWriter<byte>? measureBuffer = null;
+        Utf8JsonWriter? measureWriter = null;
+        try
+        {
+            foreach (DryRunFileResult result in ordered)
+            {
+                if (!exactMode)
+                {
+                    long upperBound = UpperBoundBytes(result);
+                    if (total + upperBound <= ReportByteBudget)
+                    {
+                        // Actual serialized size <= upper bound <= budget, so this is provably safe
+                        // to keep without serializing anything.
+                        total += upperBound;
+                        kept.Add(result);
+                        continue;
+                    }
+
+                    // The upper bound could exceed the budget — switch to exact measurement and
+                    // re-establish the running total as the exact size of what's already kept.
+                    exactMode = true;
+                    measureBuffer = new ArrayBufferWriter<byte>();
+                    measureWriter = new Utf8JsonWriter(measureBuffer);
+                    total = 0;
+                    foreach (DryRunFileResult keptResult in kept)
+                        total += ExactBytes(keptResult, measureBuffer, measureWriter);
+                }
+
+                int resultBytes = ExactBytes(result, measureBuffer!, measureWriter!);
+                if (total + resultBytes > ReportByteBudget)
+                {
+                    truncated = true;
+                    break;
+                }
+                total += resultBytes;
+                kept.Add(result);
+            }
+        }
+        finally
+        {
+            measureWriter?.Dispose();
+        }
+
+        return (kept, truncated, total);
+    }
+
+    // Measured exactly (a standalone record serializes byte-identically to the same record as a
+    // Files[] element) using the reused writer so measuring doesn't allocate a byte[] per result.
+    private static int ExactBytes(DryRunFileResult result, ArrayBufferWriter<byte> buffer, Utf8JsonWriter writer)
+    {
+        buffer.ResetWrittenCount();
+        writer.Reset(buffer);
+        JsonSerializer.Serialize(writer, result, FileManagerJsonContext.Default.DryRunFileResult);
+        return buffer.WrittenCount;
+    }
+
+    // Fixed structural overhead (braces, property names, enum text, quotes) — generous so it is a
+    // true upper bound alongside the 6-bytes-per-char string bound.
+    private const int ResultStructuralBytes = 320;
+    private const int TargetStructuralBytes = 128;
+
+    private static long UpperBoundBytes(DryRunFileResult result)
+    {
+        long bytes = ResultStructuralBytes;
+        bytes += StringUpperBound(result.SourcePath);
+        bytes += StringUpperBound(result.DecidingFilter);
+        bytes += StringUpperBound(result.SourceDisposition);
+        foreach (string command in result.ExpandedCommands)
+            bytes += StringUpperBound(command);
+        foreach (DryRunTargetAction target in result.Targets)
+        {
+            bytes += TargetStructuralBytes;
+            bytes += StringUpperBound(target.TargetPath);
+            bytes += StringUpperBound(target.Detail);
+        }
+        return bytes;
+    }
+
+    // JSON's absolute worst case is 6 UTF-8 bytes per UTF-16 code unit (\uXXXX, incl. surrogates),
+    // plus the surrounding quotes — a true upper bound regardless of escaping or non-ASCII content.
+    private static long StringUpperBound(string? value) => value is null ? 0 : (long)value.Length * 6 + 2;
+
     private async Task<DryRunFileResult?> EvaluateFileAsync(
         Profile profile,
         Payload payload,
@@ -162,22 +269,32 @@ public sealed class DryRunEngine(
         bool hasTransformers,
         CancellationToken ct)
     {
-        var metadataResult = FileMetadataReader.Read(payload.SourcePath);
-        if (metadataResult.TryGetError(out string? statError))
+        // The scanner captures the stat snapshot for free during enumeration; only fall back to a
+        // dedicated stat when it didn't (e.g. a single-file scope payload).
+        FileMetadata? metadata = payload.Metadata;
+        if (metadata is null)
         {
-            // The file vanished or turned unreadable between enumeration and stat — a race,
-            // not a reportable plan item.
-            logger.LogWarning("Dry-run skipping {Path}: {Error}", payload.SourcePath, statError);
-            return null;
+            var metadataResult = FileMetadataReader.Read(payload.SourcePath);
+            if (metadataResult.TryGetError(out string? statError))
+            {
+                // The file vanished or turned unreadable between enumeration and stat — a race,
+                // not a reportable plan item.
+                logger.LogWarning("Dry-run skipping {Path}: {Error}", payload.SourcePath, statError);
+                return null;
+            }
+            metadataResult.TryGetValue(out metadata);
         }
-        metadataResult.TryGetValue(out FileMetadata? metadata);
 
         string relativePath = Path.GetRelativePath(payload.SourceRoot, payload.SourcePath);
-        int depth = relativePath.Count(static c => c == Path.DirectorySeparatorChar || c == Path.AltDirectorySeparatorChar);
+        int depth = SeparatorCount(relativePath);
 
         if (filtersBySourceRoot.TryGetValue(payload.SourceRoot, out CompiledFilterSet? filters))
         {
-            FilterInput input = new(payload.SourcePath, relativePath, depth, metadata!);
+            // Normalize once here rather than per pattern rule inside the filter set — but only when
+            // a pattern rule would actually consult it (the attribute filter, always present, does
+            // not), so the common no-glob profile allocates no normalized string.
+            string? normalized = filters.HasPatternRules ? NormalizeSeparators(relativePath) : null;
+            FilterInput input = new(payload.SourcePath, relativePath, depth, metadata!, normalized);
             FilterDecision decision = filters.Evaluate(in input);
             if (!decision.Matched)
             {
@@ -192,17 +309,19 @@ public sealed class DryRunEngine(
 
         // M:1 topologies force Flatten (spec §3.1.2); otherwise the profile's TargetLayout rules.
         bool flatten = profile.TargetLayout == TargetLayout.Flatten || profile.Sources.Count > 1;
-        string fileName = Path.GetFileName(payload.SourcePath);
+        // Only the flatten branch uses the bare file name; PreserveStructure never allocates it.
+        string? fileName = flatten ? Path.GetFileName(payload.SourcePath) : null;
 
-        List<DryRunTargetAction> targetActions = [];
-        string? cachedSourceHash = null;
+        List<DryRunTargetAction> targetActions = new(profile.Targets.Count);
+        byte[]? cachedSourceHash = null;
+        bool allUnchanged = true;
 
         foreach (TargetConfig target in profile.Targets)
         {
             if (ct.IsCancellationRequested)
-                break;      // SimulateAsync's post-call token check turns this into Canceled
+                break;      // SimulateAsync's cancellation catch turns this into Canceled
             string prospective = flatten
-                ? Path.Combine(target.Path, fileName)
+                ? Path.Combine(target.Path, fileName!)
                 : Path.Combine(target.Path, relativePath);
 
             if (hasTransformers)
@@ -216,6 +335,7 @@ public sealed class DryRunEngine(
                     Kind = DryRunTargetKind.Unknown,
                     Detail = "requires transform",
                 });
+                allUnchanged = false;
                 continue;
             }
 
@@ -223,10 +343,11 @@ public sealed class DryRunEngine(
                 profile.Policies, payload.SourcePath, metadata!, prospective, cachedSourceHash, ct)
                 .ConfigureAwait(false);
             targetActions.Add(action);
+            if (action.Kind != DryRunTargetKind.WouldSkipUnchanged)
+                allUnchanged = false;
         }
 
-        bool allUnchanged = targetActions.Count > 0
-            && targetActions.All(static t => t.Kind == DryRunTargetKind.WouldSkipUnchanged);
+        allUnchanged = allUnchanged && targetActions.Count > 0;
 
         return new DryRunFileResult
         {
@@ -239,14 +360,28 @@ public sealed class DryRunEngine(
         };
     }
 
+    private static int SeparatorCount(string value)
+    {
+        int count = 0;
+        foreach (char c in value)
+        {
+            if (c == Path.DirectorySeparatorChar || c == Path.AltDirectorySeparatorChar)
+                count++;
+        }
+        return count;
+    }
+
+    private static string NormalizeSeparators(string relativePath) =>
+        Path.DirectorySeparatorChar == '/' ? relativePath : relativePath.Replace('\\', '/');
+
     /// <summary>Per-target simulation, in the executor's order: unchanged-check FIRST
     /// (spec §3.4.1, before conflict resolution), then the read-only conflict probe.</summary>
-    private async Task<(DryRunTargetAction Action, string? SourceHash)> EvaluateTargetAsync(
+    private async Task<(DryRunTargetAction Action, byte[]? SourceHash)> EvaluateTargetAsync(
         PolicySettings policies,
         string sourcePath,
         FileMetadata metadata,
         string prospectivePath,
-        string? cachedSourceHash,
+        byte[]? cachedSourceHash,
         CancellationToken ct)
     {
         bool finalExists = File.Exists(prospectivePath);
@@ -260,9 +395,9 @@ public sealed class DryRunEngine(
                 {
                     if (cachedSourceHash is null)
                     {
-                        var sourceHash = await hasher.HashFileAsync(sourcePath, ct).ConfigureAwait(false);
+                        var sourceHash = await hasher.HashFileToBytesAsync(sourcePath, ct).ConfigureAwait(false);
                         if (sourceHash.IsCanceled)
-                            // Placeholder — discarded by SimulateAsync's post-call cancellation check.
+                            // Placeholder — discarded by SimulateAsync's cancellation catch.
                             return (new DryRunTargetAction
                             {
                                 TargetPath = prospectivePath,
@@ -279,9 +414,9 @@ public sealed class DryRunEngine(
                         sourceHash.TryGetValue(out cachedSourceHash);
                     }
 
-                    var targetHash = await hasher.HashFileAsync(prospectivePath, ct).ConfigureAwait(false);
+                    var targetHash = await hasher.HashFileToBytesAsync(prospectivePath, ct).ConfigureAwait(false);
                     if (targetHash.IsCanceled)
-                        // Placeholder — discarded by SimulateAsync's post-call cancellation check.
+                        // Placeholder — discarded by SimulateAsync's cancellation catch.
                         return (new DryRunTargetAction
                         {
                             TargetPath = prospectivePath,
@@ -295,9 +430,10 @@ public sealed class DryRunEngine(
                             Kind = DryRunTargetKind.Unknown,
                             Detail = $"could not hash the existing target: {targetHashError.Message}",
                         }, cachedSourceHash);
-                    targetHash.TryGetValue(out string? existingHash);
+                    targetHash.TryGetValue(out byte[]? existingHash);
 
-                    if (string.Equals(cachedSourceHash, existingHash, StringComparison.OrdinalIgnoreCase))
+                    if (cachedSourceHash is not null && existingHash is not null
+                        && existingHash.AsSpan().SequenceEqual(cachedSourceHash))
                         return (new DryRunTargetAction
                         {
                             TargetPath = prospectivePath,

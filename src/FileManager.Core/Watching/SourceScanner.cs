@@ -6,7 +6,6 @@ using Microsoft.Extensions.Logging;
 using System;
 using System.Collections.Generic;
 using System.IO;
-using System.Linq;
 
 namespace FileManager.Core.Watching;
 
@@ -103,7 +102,7 @@ public sealed class SourceScanner(
                 entry.TryGetValue(out FileSystemEntry? item);
                 if (item!.IsDirectory)
                 {
-                    if (InfrastructureDirectories.Contains(item.FileName, StringComparer.OrdinalIgnoreCase))
+                    if (IsInfrastructureDirectoryName(item.FileName))
                     {
                         logger.LogDebug("Skipping infrastructure directory {Path}", item.FullPath);
                         continue;
@@ -117,11 +116,25 @@ public sealed class SourceScanner(
                 {
                     if (item.FileName.Contains(TempFileMarker, StringComparison.OrdinalIgnoreCase))
                         continue;
-                    yield return new Payload(profileId, item.FullPath, sourceRoot, trigger, time.GetUtcNow());
+                    yield return new Payload(profileId, item.FullPath, sourceRoot, trigger, time.GetUtcNow(),
+                        MetadataFrom(item));
                 }
             }
         }
     }
+
+    /// <summary>Builds the stat snapshot from the enumeration entry so callers avoid a second
+    /// stat. Mirrors <see cref="FileMetadataReader"/>'s attribute/timestamp derivation exactly
+    /// (UTC timestamps; Hidden/System/ReparsePoint from the attribute flags).</summary>
+    private static FileMetadata MetadataFrom(FileSystemEntry item) => new()
+    {
+        Length = item.Size,
+        LastWritten = item.Modified.ToUniversalTime(),
+        Created = item.Created,
+        IsHidden = (item.Attributes & FileAttributes.Hidden) != 0,
+        IsSystem = (item.Attributes & FileAttributes.System) != 0,
+        IsSymlink = (item.Attributes & FileAttributes.ReparsePoint) != 0,
+    };
 
     private static int RelativeDepth(string root, string path)
     {
@@ -141,7 +154,19 @@ public sealed class SourceScanner(
             return true;
         foreach (string segment in path.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar))
         {
-            if (InfrastructureDirectories.Contains(segment, StringComparer.OrdinalIgnoreCase))
+            if (IsInfrastructureDirectoryName(segment))
+                return true;
+        }
+        return false;
+    }
+
+    // Manual scan over the fixed two-element set — avoids the per-entry enumerator that
+    // Enumerable.Contains(comparer) allocates on the scanner's hot path.
+    private static bool IsInfrastructureDirectoryName(string name)
+    {
+        foreach (string infra in InfrastructureDirectories)
+        {
+            if (string.Equals(name, infra, StringComparison.OrdinalIgnoreCase))
                 return true;
         }
         return false;
