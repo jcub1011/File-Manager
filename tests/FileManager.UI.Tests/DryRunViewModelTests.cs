@@ -11,7 +11,8 @@ public sealed class DryRunViewModelTests
     private static (DryRunViewModel ViewModel, FakeIpcGateway Gateway) NewViewModel()
     {
         FakeIpcGateway gateway = new();
-        DryRunViewModel viewModel = new(gateway, new FakeFolderPicker());
+        // Zero debounce keeps search-driven rebuilds synchronous so tests can assert immediately.
+        DryRunViewModel viewModel = new(gateway, new FakeFolderPicker(), searchDebounce: TimeSpan.Zero);
         viewModel.SetProfile(Guid.NewGuid(), "P");
         return (viewModel, gateway);
     }

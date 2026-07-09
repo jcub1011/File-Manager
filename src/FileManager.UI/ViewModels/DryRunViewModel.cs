@@ -173,16 +173,20 @@ public sealed partial class DryRunViewModel : ViewModelBase
 {
     private readonly IIpcGateway _gateway;
     private readonly IFolderPicker _folderPicker;
+    private readonly TimeSpan _searchDebounce;
+    private CancellationTokenSource? _searchCts;
+    private bool _applyingReport;
     private List<DryRunFileRow> _processAll = [];
     private List<DryRunFileRow> _processMatches = [];
     private IReadOnlyList<DryRunTreeNode> _treeRoots = [];
     private List<DryRunFileRow> _filterSkipsAll = [];
     private List<DryRunFileRow> _unchangedSkipsAll = [];
 
-    public DryRunViewModel(IIpcGateway gateway, IFolderPicker folderPicker)
+    public DryRunViewModel(IIpcGateway gateway, IFolderPicker folderPicker, TimeSpan? searchDebounce = null)
     {
         _gateway = gateway;
         _folderPicker = folderPicker;
+        _searchDebounce = searchDebounce ?? TimeSpan.FromMilliseconds(200);
     }
 
     [ObservableProperty] public partial Guid? ProfileId { get; set; }
@@ -281,12 +285,49 @@ public sealed partial class DryRunViewModel : ViewModelBase
             ScopePath = picked;
     }
 
-    partial void OnDestructiveOnlyChanged(bool value) => RebuildVisibleRows();
-    partial void OnSearchTextChanged(string value) => RebuildVisibleRows();
+    partial void OnDestructiveOnlyChanged(bool value)
+    {
+        if (_applyingReport) return;   // ApplyReport does exactly one rebuild at the end
+        RebuildVisibleRows();
+    }
+
+    partial void OnSearchTextChanged(string value)
+    {
+        _searchCts?.Cancel();
+        _searchCts?.Dispose();
+        _searchCts = new CancellationTokenSource();
+        _ = DebouncedRebuildAsync(_searchCts.Token);
+    }
+
     partial void OnShowTreeChanged(bool value)
     {
         if (value)
             RebuildTree();
+        else
+        {
+            // Release the flattened node list once the tree is hidden — it can hold a lot of nodes.
+            _treeRoots = [];
+            TreeRows = [];
+        }
+    }
+
+    // A short pause after the last keystroke coalesces typing into one rebuild, so a 50k-row report's
+    // list re-filter and tree rebuild don't run per character. Resumes on the UI thread (no
+    // ConfigureAwait) per the §8 UI-thread-only mutation rule.
+    private async Task DebouncedRebuildAsync(CancellationToken ct)
+    {
+        try
+        {
+            if (_searchDebounce > TimeSpan.Zero)
+                await Task.Delay(_searchDebounce, ct);
+            RebuildVisibleRows();
+        }
+        catch (OperationCanceledException) { /* superseded by a newer keystroke */ }
+        catch (Exception ex)
+        {
+            // Last resort: a rebuild fault becomes a logged error rather than an unobserved task fault.
+            Log.Error(ex, "Failed to rebuild dry-run rows after a search change");
+        }
     }
 
     internal void ApplyReport(DryRunReport report)
@@ -323,7 +364,10 @@ public sealed partial class DryRunViewModel : ViewModelBase
         // Auto-focus the review-worthy set: a run nobody can scroll through 50k rows of is only
         // reviewable if it opens on the overwrites/disposals (spec §8). Benign runs still show
         // everything. Full counts stay in the banner, and the toggle reveals the rest cheaply.
+        // Suppress the change-handler's rebuild here; ApplyReport does exactly one at the end (below).
+        _applyingReport = true;
         DestructiveOnly = HasDestructiveActions;
+        _applyingReport = false;
         GeneratedAtText = $"Generated {report.GeneratedAt.ToLocalTime():yyyy-MM-dd HH:mm:ss}";
         WasTruncated = report.Truncated;
         TruncationNotice = report.Truncated

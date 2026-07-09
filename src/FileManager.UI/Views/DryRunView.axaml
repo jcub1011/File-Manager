@@ -223,8 +223,8 @@
                         </ListBox.ItemTemplate>
                     </ListBox>
 
-                    <!-- filtered out -->
-                    <Expander Grid.Row="2" IsExpanded="False">
+                    <!-- filtered out (hidden while destructive-only focuses the risky subset; the toggle reveals it) -->
+                    <Expander Grid.Row="2" IsExpanded="False" IsVisible="{Binding !DestructiveOnly}">
                         <Expander.Header>
                             <TextBlock><Run Text="Skipped by filters (" /><Run Text="{Binding FilterSkipCount}" /><Run Text=")" /></TextBlock>
                         </Expander.Header>
@@ -243,8 +243,8 @@
                         </ListBox>
                     </Expander>
 
-                    <!-- unchanged -->
-                    <Expander Grid.Row="3" IsExpanded="False">
+                    <!-- unchanged (hidden while destructive-only focuses the risky subset; the toggle reveals it) -->
+                    <Expander Grid.Row="3" IsExpanded="False" IsVisible="{Binding !DestructiveOnly}">
                         <Expander.Header>
                             <TextBlock><Run Text="Unchanged at all targets (" /><Run Text="{Binding UnchangedSkipCount}" /><Run Text=")" /></TextBlock>
                         </Expander.Header>
