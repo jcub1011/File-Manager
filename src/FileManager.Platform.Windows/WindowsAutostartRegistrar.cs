@@ -18,6 +18,10 @@ public sealed class WindowsAutostartRegistrar(ILogger<WindowsAutostartRegistrar>
 
     public Result RegisterAutostart()
     {
+        // Assumes a self-contained / single-file deployment where ProcessPath IS the service exe.
+        // If the service were ever launched via `dotnet FileManager.Service.dll`, ProcessPath would
+        // be the dotnet host — the Run entry would then start the host with no dll argument. Revisit
+        // this if the deployment model changes to framework-dependent.
         string? exePath = Environment.ProcessPath;
         if (string.IsNullOrWhiteSpace(exePath))
             return "could not determine the service executable path for autostart registration";

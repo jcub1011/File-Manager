@@ -26,8 +26,11 @@ public sealed class DryRunStreamHandler(
     /// <see cref="DryRunCompleteResponse.Truncated"/>. This is the user-visible half of the safety
     /// bound; the engine independently caps its candidate buffer at the same
     /// <see cref="DryRunEngine.MaxStreamedFiles"/> so memory and evaluation are bounded even before
-    /// the first chunk (see <see cref="DryRunEngine.MaxScannedCandidates"/>). Test seam: shrunk so
-    /// truncation is reachable without half a million files.</summary>
+    /// the first chunk (see <see cref="DryRunEngine.MaxScannedCandidates"/>). Against the real engine
+    /// this emitted cap is a redundant backstop — the engine's candidate cap fires first (filtering
+    /// only ever reduces the count), so this rarely trips. It is kept for defense in depth against a
+    /// future engine that streams differently, and is independently testable via the seam below.
+    /// Test seam: shrunk so truncation is reachable without half a million files.</summary>
     internal int MaxStreamedFiles { get; init; } = DryRunEngine.MaxStreamedFiles;
 
     public string RequestType => IpcRequestTypes.DryRunStream;
