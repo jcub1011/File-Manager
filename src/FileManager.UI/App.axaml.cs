@@ -35,6 +35,8 @@ namespace FileManager.UI
                     settings.RequestClose = dialog.Close;
                     await dialog.ShowDialog(window);
                 };
+                viewModel.ConfirmClose = async message =>
+                    await new ConfirmWindow(message).ShowDialog<bool>(window);
                 window.DataContext = viewModel;
                 desktop.MainWindow = window;
 

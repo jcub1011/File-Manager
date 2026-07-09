@@ -67,6 +67,7 @@ internal static class Program
         services.AddSingleton<IConflictResolver, ConflictResolver>();
         services.AddSingleton<IDryRunEngine, DryRunEngine>();
         services.AddSingleton<IIpcEndpointProvider, WindowsIpcEndpointProvider>();
+        services.AddSingleton<IAutostartRegistrar, WindowsAutostartRegistrar>();
 
         // Explicit dispatch table — no reflection-based handler discovery (§1 AOT constraints).
         services.AddSingleton<GetStatusHandler>();
@@ -79,6 +80,7 @@ internal static class Program
         services.AddSingleton<DryRunStreamHandler>();
         services.AddSingleton<GetSettingsHandler>();
         services.AddSingleton<UpdateSettingsHandler>();
+        services.AddSingleton<ShutdownHandler>();
         services.AddSingleton<IReadOnlyDictionary<string, IIpcRequestHandler>>(provider =>
         {
             IIpcRequestHandler[] handlers =
@@ -93,6 +95,7 @@ internal static class Program
                 provider.GetRequiredService<DryRunStreamHandler>(),
                 provider.GetRequiredService<GetSettingsHandler>(),
                 provider.GetRequiredService<UpdateSettingsHandler>(),
+                provider.GetRequiredService<ShutdownHandler>(),
             ];
             Dictionary<string, IIpcRequestHandler> table = new(StringComparer.Ordinal);
             foreach (IIpcRequestHandler handler in handlers)

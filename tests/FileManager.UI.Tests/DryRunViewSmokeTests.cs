@@ -1,5 +1,4 @@
 using Avalonia.Controls;
-using Avalonia.Headless;
 using FileManager.Contracts.DryRun;
 using FileManager.UI.Tests.Fakes;
 using FileManager.UI.ViewModels;
@@ -10,7 +9,8 @@ namespace FileManager.UI.Tests;
 /// <summary>Loads the real DryRunView control against a populated view model and forces a layout pass,
 /// so runtime-only XAML failures (the $parent[ListBox] command binding, the Thickness Indent binding,
 /// style selectors, the virtualizing ListBox panels) surface as a failing test rather than in the app.</summary>
-public sealed class DryRunViewSmokeTests
+[Collection(HeadlessCollection.Name)]
+public sealed class DryRunViewSmokeTests(HeadlessSessionFixture headless)
 {
     private static DryRunViewModel PopulatedViewModel()
     {
@@ -49,8 +49,7 @@ public sealed class DryRunViewSmokeTests
     [Fact]
     public async Task List_view_loads_and_lays_out()
     {
-        using HeadlessUnitTestSession session = HeadlessUnitTestSession.StartNew(typeof(TestAppBuilder));
-        await session.Dispatch(async () =>
+        await headless.Session.Dispatch(async () =>
         {
             DryRunViewModel vm = PopulatedViewModel();
             await vm.RunAsync(CancellationToken.None);
@@ -66,8 +65,7 @@ public sealed class DryRunViewSmokeTests
     [Fact]
     public async Task Tree_view_loads_and_toggling_a_node_relayouts()
     {
-        using HeadlessUnitTestSession session = HeadlessUnitTestSession.StartNew(typeof(TestAppBuilder));
-        await session.Dispatch(() =>
+        await headless.Session.Dispatch(() =>
         {
             DryRunViewModel vm = PopulatedViewModel();
             vm.RunAsync(CancellationToken.None).GetAwaiter().GetResult();

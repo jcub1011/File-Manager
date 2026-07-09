@@ -55,4 +55,17 @@ public sealed class SettingsServiceTests : IDisposable
         service.Update(new GlobalSettings { DryRunConcurrencyMode = ConcurrencyMode.Manual, DryRunManualWorkers = 0 });
         Assert.Equal(1, service.Current.DryRunManualWorkers);
     }
+
+    [Fact]
+    public void Default_startup_mode_is_start_and_stop_with_program()
+    {
+        Assert.Equal(ServiceStartupMode.StartAndStopWithProgram, NewService().Current.ServiceStartupMode);
+    }
+
+    [Fact]
+    public void Update_persists_and_reloads_the_startup_mode()
+    {
+        NewService().Update(new GlobalSettings { ServiceStartupMode = ServiceStartupMode.RunOnStartup });
+        Assert.Equal(ServiceStartupMode.RunOnStartup, NewService().Current.ServiceStartupMode);
+    }
 }

@@ -48,6 +48,7 @@ public sealed class IpcRequestTypesTests
             nameof(SubscribeEventsRequest) => new SubscribeEventsRequest(),
             nameof(GetSettingsRequest) => new GetSettingsRequest(),
             nameof(UpdateSettingsRequest) => new UpdateSettingsRequest { Settings = GlobalSettings.Default },
+            nameof(ShutdownRequest) => new ShutdownRequest(),
             _ => throw new InvalidOperationException(
                 $"{type.Name} is in IpcRequest's [JsonDerivedType] table but this test cannot construct it — add a case"),
         };

@@ -1,7 +1,9 @@
 using FileManager.Contracts.IPC;
 using FileManager.Contracts.Primitives;
 using FileManager.Core.IPC;
+using FileManager.Core.Platform;
 using FileManager.Core.Profiles;
+using FileManager.Core.Settings;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using System;
@@ -18,7 +20,9 @@ internal sealed class EngineHost(
     IHostApplicationLifetime lifetime,
     Core.EnginePaths paths,
     IProfileCatalog catalog,
-    IIpcServer ipcServer) : BackgroundService
+    IIpcServer ipcServer,
+    ISettingsProvider settings,
+    IAutostartRegistrar autostart) : BackgroundService
 {
     private Mutex? _singleInstanceMutex;
 
@@ -77,7 +81,9 @@ internal sealed class EngineHost(
             return;
         }
 
-        // 6. [slot] IShellIntegration.RegisterContextMenu() + IAutostartRegistrar (idempotent).
+        // 6. Reconcile OS autostart with the configured startup mode (idempotent).
+        AutostartApplier.Apply(settings.Current.ServiceStartupMode, autostart, logger);
+        //    [slot] IShellIntegration.RegisterContextMenu().
         //    [slot] Start triggers: watcher, scheduler missed-run evaluation, trigger-queue consumer.
         //    [slot] Spawn the tray client when a desktop session exists.
 

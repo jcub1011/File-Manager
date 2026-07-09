@@ -23,6 +23,7 @@ public static class IpcRequestTypes
     public const string Subscribe = "subscribe";
     public const string GetSettings = "get-settings";
     public const string UpdateSettings = "update-settings";
+    public const string Shutdown = "shutdown";
 
     public static string DiscriminatorOf(IpcRequest request) => request switch
     {
@@ -42,6 +43,7 @@ public static class IpcRequestTypes
         SubscribeEventsRequest => Subscribe,
         GetSettingsRequest => GetSettings,
         UpdateSettingsRequest => UpdateSettings,
+        ShutdownRequest => Shutdown,
         _ => throw new System.ArgumentOutOfRangeException(nameof(request),
             $"unmapped request type {request.GetType().Name} — add it here and to IpcRequest's [JsonDerivedType] table"),
     };

@@ -33,6 +33,7 @@ public sealed class SerializationTests
         { new SubscribeEventsRequest(), "subscribe" },
         { new GetSettingsRequest(), "get-settings" },
         { new UpdateSettingsRequest { Settings = GlobalSettings.Default }, "update-settings" },
+        { new ShutdownRequest(), "shutdown" },
     };
 
     [Theory]
@@ -143,17 +144,25 @@ public sealed class SerializationTests
     {
         byte[] wire = IpcSerializer.SerializeResponse(new SettingsResponse
         {
-            Settings = new GlobalSettings { DryRunConcurrencyMode = ConcurrencyMode.Manual, DryRunManualWorkers = 6 },
+            Settings = new GlobalSettings
+            {
+                ServiceStartupMode = ServiceStartupMode.RunOnStartup,
+                DryRunConcurrencyMode = ConcurrencyMode.Manual,
+                DryRunManualWorkers = 6,
+            },
         });
         Assert.True(IpcSerializer.DeserializeResponse(wire).TryGetValue(out IpcResponse? reparsed));
         SettingsResponse roundTripped = Assert.IsType<SettingsResponse>(reparsed);
+        Assert.Equal(ServiceStartupMode.RunOnStartup, roundTripped.Settings.ServiceStartupMode);
         Assert.Equal(ConcurrencyMode.Manual, roundTripped.Settings.DryRunConcurrencyMode);
         Assert.Equal(6, roundTripped.Settings.DryRunManualWorkers);
 
-        // Enum serializes as a string, consistent with the rest of the wire format.
+        // Enums serialize as strings, consistent with the rest of the wire format.
         using JsonDocument document = JsonDocument.Parse(wire);
         Assert.Equal("Manual",
             document.RootElement.GetProperty("Settings").GetProperty("DryRunConcurrencyMode").GetString());
+        Assert.Equal("RunOnStartup",
+            document.RootElement.GetProperty("Settings").GetProperty("ServiceStartupMode").GetString());
     }
 
     [Fact]

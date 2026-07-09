@@ -131,7 +131,11 @@ public sealed class IpcClient : IAsyncDisposable
     /// <see cref="DryRunCompleteResponse"/> terminator. Because the report arrives as many small
     /// frames it is not bounded by the single-frame size cap. An ErrorResponse (e.g. PROFILE_NOT_FOUND,
     /// DRY_RUN_FAILED) and every transport fault surface as an <see cref="IpcError"/>; cancellation is
-    /// a Canceled result, never a throw. Holds the request gate for the whole stream (§3.2).</summary>
+    /// a Canceled result, never a throw. Holds the request gate for the whole stream (§3.2).
+    /// A Canceled result abandons the stream mid-flight: the service keeps writing the remaining
+    /// chunk and completion frames, so those bytes are still queued on the pipe. This connection must
+    /// therefore be discarded after a cancellation (as callers do — one connection per dry run);
+    /// reusing it for another request would read the stale frames and desync the protocol.</summary>
     public async Task<Result<DryRunReport, IpcError>> DryRunStreamAsync(
         DryRunStreamRequest request, CancellationToken ct = default)
     {

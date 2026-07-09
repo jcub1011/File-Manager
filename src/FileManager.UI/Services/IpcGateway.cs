@@ -62,6 +62,10 @@ public sealed class IpcGateway : IIpcGateway, IAsyncDisposable
         RequestAsync<SettingsResponse, GlobalSettings>(
             new UpdateSettingsRequest { Settings = settings }, static r => r.Settings, ct);
 
+    public Task<Result<bool, IpcError>> ShutdownServiceAsync(CancellationToken ct = default) =>
+        RequestAsync<OkResponse, bool>(
+            new ShutdownRequest(), static _ => true, ct);
+
     public async Task<Result<DryRunReport, IpcError>> DryRunAsync(
         Guid profileId, string? scopePath, CancellationToken ct = default)
     {

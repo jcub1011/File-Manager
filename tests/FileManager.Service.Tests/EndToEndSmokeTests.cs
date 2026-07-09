@@ -6,9 +6,11 @@ using FileManager.Core;
 using FileManager.Core.DryRun;
 using FileManager.Core.Files;
 using FileManager.Core.Filtering;
+using FileManager.Contracts.Primitives;
 using FileManager.Core.IPC;
 using FileManager.Core.IPC.Handlers;
 using FileManager.Core.Placement;
+using FileManager.Core.Platform;
 using FileManager.Core.Profiles;
 using FileManager.Core.Settings;
 using FileManager.Core.Watching;
@@ -60,7 +62,7 @@ public sealed class EndToEndSmokeTests : IAsyncLifetime
             new ValidateProfileHandler(validator, catalog),
             new DryRunHandler(NullLogger<DryRunHandler>.Instance, dryRun, catalog),
             new GetSettingsHandler(settings),
-            new UpdateSettingsHandler(NullLogger<UpdateSettingsHandler>.Instance, settings),
+            new UpdateSettingsHandler(NullLogger<UpdateSettingsHandler>.Instance, settings, new NoopAutostartRegistrar()),
         ];
         _server = new IpcServer(
             NullLogger<IpcServer>.Instance,
@@ -199,4 +201,11 @@ public sealed class EndToEndSmokeTests : IAsyncLifetime
         Filters = null,
         Logging = new LoggingSettings { Verbosity = LogVerbosity.FailuresAndSkips, NotifyOnFailure = true },
     };
+}
+
+/// <summary>No-op autostart so the e2e test never mutates the real HKCU Run key.</summary>
+internal sealed class NoopAutostartRegistrar : IAutostartRegistrar
+{
+    public Result RegisterAutostart() => Result.Success();
+    public Result UnregisterAutostart() => Result.Success();
 }

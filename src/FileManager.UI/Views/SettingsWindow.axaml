@@ -20,7 +20,17 @@
     </Window.Styles>
 
     <StackPanel Margin="16" Spacing="4">
-        <TextBlock Classes="sectionHeader" Text="Dry-run performance" />
+        <TextBlock Classes="sectionHeader" Text="Service startup" />
+        <TextBlock TextWrapping="Wrap" Opacity="0.8" Margin="0,0,0,8"
+                   Text="When the background service runs. RunOnStartup launches it at Windows login. StartOnProgramOpen starts it when this app opens and leaves it running. StartAndStopWithProgram starts it on open and stops it when the app closes (warning first if jobs are running)." />
+
+        <Grid ColumnDefinitions="140,*" RowDefinitions="Auto" Margin="0,0,0,4">
+            <TextBlock Grid.Row="0" Grid.Column="0" Classes="fieldLabel" Text="Startup mode" />
+            <ComboBox Grid.Row="0" Grid.Column="1" ItemsSource="{Binding ServiceStartupModeOptions}"
+                      SelectedItem="{Binding StartupMode}" Margin="0,2" MinWidth="220" />
+        </Grid>
+
+        <TextBlock Classes="sectionHeader" Text="Dry-run performance" Margin="0,12,0,6" />
         <TextBlock TextWrapping="Wrap" Opacity="0.8" Margin="0,0,0,8"
                    Text="How many files a dry run evaluates in parallel. Automatic reserves one core for the system (capped at 8). Individual profiles can override this." />
 

@@ -52,6 +52,14 @@ public sealed class DryRunEngine(
     /// leaves generous headroom under the cap. On a local pipe the extra frames cost nothing.</summary>
     internal const int ChunkByteThreshold = 1 * 1024 * 1024;
 
+    /// <summary>Streaming lifts the frame-cap ceiling, but not the good sense of an upper limit. The
+    /// candidate buffer (<see cref="SimulateStreamAsync"/> phase 1) has to be fully materialized to
+    /// sort by source path, so a pathological scan of millions of files would otherwise buffer — and
+    /// then hash — all of them before the first chunk. This bound caps the buffered candidates
+    /// (and therefore the evaluation work), the same way <see cref="MaxReportedFiles"/> bounds the
+    /// batched path; it is set far above the old ~50k cap. Hitting it marks the report truncated.</summary>
+    internal const int MaxStreamedFiles = 500_000;
+
     /// <summary>Candidates are evaluated in batches so the byte budget can halt evaluation early
     /// (see phase 2). Sized well above the resolved worker count so every worker stays busy, while
     /// capping the evaluation wasted past the truncation point to at most one batch.</summary>
@@ -64,6 +72,10 @@ public sealed class DryRunEngine(
     /// <summary>Test seam: production uses <see cref="ChunkByteThreshold"/>; tests shrink it so a
     /// stream splits into several chunks without generating a megabyte of files.</summary>
     internal int ChunkByteBudget { get; init; } = ChunkByteThreshold;
+
+    /// <summary>Test seam: production uses <see cref="MaxStreamedFiles"/>; tests shrink it so the
+    /// candidate cap is reachable without generating half a million files.</summary>
+    internal int MaxScannedCandidates { get; init; } = MaxStreamedFiles;
 
     public async Task<Result<DryRunReport, string>> SimulateAsync(
         Guid profileId, string? scopePath, CancellationToken ct = default)
@@ -222,10 +234,14 @@ public sealed class DryRunEngine(
 
         bool hasTransformers = profile.Transformers is { Count: > 0 };
 
-        // Phase 1: drain the scan into a candidate list. No file cap — streaming has no ceiling. A
-        // fatal fault ends the stream with a failure; warnings are logged and skipped (matching
-        // SimulateAsync). Cancellation throws, which the consumer treats as a cancelled run.
+        // Phase 1: drain the scan into a candidate list. The buffer must be fully materialized to
+        // sort by source path (phase 2), so it is bounded by MaxScannedCandidates — a memory/CPU
+        // backstop, far above the batched path's ceiling, that stops a pathological scan from
+        // buffering and hashing millions of files. A fatal fault ends the stream with a failure;
+        // warnings are logged and skipped (matching SimulateAsync). Cancellation throws, which the
+        // consumer treats as a cancelled run.
         List<Payload> candidates = [];
+        bool scanTruncated = false;
         foreach (var scanned in scanner.Scan(profile, TriggerKind.Cli, scopePath))
         {
             ct.ThrowIfCancellationRequested();
@@ -241,6 +257,17 @@ public sealed class DryRunEngine(
                 logger.LogWarning("Dry-run enumeration warning: {Message}", fault.Message);
                 continue;
             }
+
+            if (candidates.Count >= MaxScannedCandidates)
+            {
+                logger.LogWarning(
+                    "Dry-run (stream) for profile {ProfileId} hit the {Cap:N0}-candidate safety bound; " +
+                    "report truncated — the scan found more",
+                    profileId, MaxScannedCandidates);
+                scanTruncated = true;
+                break;
+            }
+
             scanned.TryGetValue(out Payload? payload);
             candidates.Add(payload!);
         }
@@ -288,9 +315,11 @@ public sealed class DryRunEngine(
             yield return Result<IReadOnlyList<DryRunFileResult>, string>.Success(chunk);
 
         DateTimeOffset completedAt = time.GetUtcNow();
-        logger.LogInformation(
-            "Dry-run (stream) completed for profile {ProfileId}: {FileCount} files in {ElapsedMs}ms",
-            profileId, totalKept, (completedAt - startedAt).TotalMilliseconds);
+        if (logger.IsEnabled(LogLevel.Information))
+            logger.LogInformation(
+                "Dry-run (stream) completed for profile {ProfileId}: {FileCount} files in {ElapsedMs}ms{Truncated}",
+                profileId, totalKept, (completedAt - startedAt).TotalMilliseconds,
+                scanTruncated ? " (candidate cap reached)" : "");
     }
 
     /// <summary>Compiles one filter set per source, keyed by the source root the scanner stamps on

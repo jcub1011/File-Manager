@@ -18,7 +18,8 @@ public sealed class IpcServerStreamingTests : IAsyncLifetime
     private IpcServer? _server;
 
     /// <summary>Streams three 4-file chunks then a completion. ScopePath is a test control channel:
-    /// "error-midway" yields an ErrorResponse after the second chunk; "throw" faults immediately.</summary>
+    /// "error-midway" yields an ErrorResponse after the second chunk; "throw" faults immediately;
+    /// "throw-midway" faults after the second chunk has already been sent.</summary>
     private sealed class ChunkedDryRunHandler : IIpcStreamingRequestHandler
     {
         public string RequestType => IpcRequestTypes.DryRunStream;
@@ -52,6 +53,8 @@ public sealed class IpcServerStreamingTests : IAsyncLifetime
                     yield return new ErrorResponse { Code = "DRY_RUN_FAILED", Message = "midway failure" };
                     yield break;
                 }
+                if (typed.ScopePath == "throw-midway" && b == 1)
+                    throw new InvalidOperationException("boom-midway");
                 await Task.Yield();
             }
 
@@ -133,6 +136,24 @@ public sealed class IpcServerStreamingTests : IAsyncLifetime
         await using (client)
         {
             var result = await client!.DryRunStreamAsync(new DryRunStreamRequest { ProfileId = Guid.NewGuid(), ScopePath = "throw" });
+            Assert.True(result.TryGetError(out IpcError? error));
+            Assert.Equal("INTERNAL_ERROR", error!.Code);
+
+            var followUp = await client.RequestAsync<StatusResponse>(new GetStatusRequest());
+            Assert.True(followUp.TryGetValue(out _));
+        }
+    }
+
+    [Fact]
+    public async Task Handler_fault_after_a_chunk_discards_partial_data_as_an_error_and_the_connection_survives()
+    {
+        var connected = await IpcClient.ConnectAsync();
+        Assert.True(connected.TryGetValue(out IpcClient? client));
+        await using (client)
+        {
+            // Chunks were already sent before the fault; the client must surface the terminal error
+            // rather than a partial "success", and the connection must still serve the next request.
+            var result = await client!.DryRunStreamAsync(new DryRunStreamRequest { ProfileId = Guid.NewGuid(), ScopePath = "throw-midway" });
             Assert.True(result.TryGetError(out IpcError? error));
             Assert.Equal("INTERNAL_ERROR", error!.Code);
 

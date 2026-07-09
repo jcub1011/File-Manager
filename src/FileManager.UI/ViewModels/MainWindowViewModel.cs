@@ -1,6 +1,7 @@
 using CommunityToolkit.Mvvm.Input;
 using FileManager.Contracts.IPC;
 using FileManager.Contracts.Profiles;
+using FileManager.Contracts.Settings;
 using FileManager.UI.Services;
 using Serilog;
 using System;
@@ -55,6 +56,55 @@ public sealed partial class MainWindowViewModel : ViewModelBase
 
     [RelayCommand]
     public void OpenLogFolder() => _logFolder.OpenLogFolder();
+
+    /// <summary>Set by the composition root to show a modal Yes/No confirmation and return the
+    /// choice. Kept as a callback so the shell VM stays window-agnostic (mirrors the settings seam).</summary>
+    public Func<string, Task<bool>>? ConfirmClose { get; set; }
+
+    /// <summary>Decides whether the window may close, and performs any mode-dependent teardown.
+    /// Returns true to allow the close. In StartAndStopWithProgram mode this warns about active jobs
+    /// and then stops the service; other modes leave the service running.</summary>
+    public async Task<bool> RequestCloseAsync()
+    {
+        try
+        {
+            var settingsResult = await _gateway.GetSettingsAsync();
+            // If settings can't be read (e.g. service unreachable), fall back to the default mode so a
+            // transient outage never traps the user in the window.
+            ServiceStartupMode mode = settingsResult.TryGetValue(out GlobalSettings? settings)
+                ? settings.ServiceStartupMode
+                : GlobalSettings.Default.ServiceStartupMode;
+
+            if (mode != ServiceStartupMode.StartAndStopWithProgram)
+                return true;        // leave the service running
+
+            // Warn if the service reports work in flight. NOTE: JobsInFlight is currently hard-coded
+            // to 0 by the service (real job execution is a future slice), so this guard is dormant
+            // today and activates automatically once the service reports a live count.
+            var statusResult = await _gateway.GetStatusAsync();
+            if (statusResult.TryGetValue(out EngineStatusSnapshot? snapshot)
+                && snapshot.JobsInFlight > 0
+                && ConfirmClose is not null)
+            {
+                bool proceed = await ConfirmClose(
+                    $"{snapshot.JobsInFlight} job(s) are still running. Closing now will stop the service and interrupt them. Close anyway?");
+                if (!proceed)
+                    return false;
+            }
+
+            // Best-effort graceful stop; log on failure but still allow the close.
+            var shutdown = await _gateway.ShutdownServiceAsync();
+            if (shutdown.TryGetError(out IpcError? error))
+                Log.Warning("Requesting service shutdown on close failed: {Code} {Message}", error.Code, error.Message);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            // Last resort: never trap the user in the window because close orchestration threw.
+            Log.Error(ex, "Close orchestration failed; allowing the window to close");
+            return true;
+        }
+    }
 
     /// <summary>Set by the composition root to show the modal settings dialog for a prepared VM.
     /// Kept as a callback so the shell VM stays window-agnostic (mirrors the folder-picker seam).</summary>

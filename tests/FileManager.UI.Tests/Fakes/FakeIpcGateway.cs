@@ -34,6 +34,8 @@ internal sealed class FakeIpcGateway : IIpcGateway
 
     public Result<GlobalSettings, IpcError> GetSettingsResult { get; set; } = GlobalSettings.Default;
     public Result<GlobalSettings, IpcError> SaveSettingsResult { get; set; } = GlobalSettings.Default;
+    public Result<bool, IpcError> ShutdownResult { get; set; } = true;
+    public int ShutdownCalls { get; private set; }
 
     /// <summary>When set, DryRunAsync awaits this before returning (cancellation tests).</summary>
     public TaskCompletionSource? DryRunGate { get; set; }
@@ -91,6 +93,12 @@ internal sealed class FakeIpcGateway : IIpcGateway
     {
         SaveSettingsCalls.Add(settings);
         return Task.FromResult(SaveSettingsResult);
+    }
+
+    public Task<Result<bool, IpcError>> ShutdownServiceAsync(CancellationToken ct = default)
+    {
+        ShutdownCalls++;
+        return Task.FromResult(ShutdownResult);
     }
 }
 

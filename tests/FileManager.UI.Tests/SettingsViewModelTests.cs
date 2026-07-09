@@ -64,4 +64,23 @@ public sealed class SettingsViewModelTests
 
         Assert.True(closed);
     }
+
+    [Fact]
+    public async Task Load_and_save_round_trip_the_startup_mode()
+    {
+        FakeIpcGateway gateway = new()
+        {
+            GetSettingsResult = new GlobalSettings { ServiceStartupMode = ServiceStartupMode.RunOnStartup },
+        };
+        SettingsViewModel vm = new(gateway);
+
+        await vm.LoadAsync();
+        Assert.Equal(ServiceStartupMode.RunOnStartup, vm.StartupMode);
+
+        vm.StartupMode = ServiceStartupMode.StartOnProgramOpen;
+        await vm.SaveCommand.ExecuteAsync(null);
+
+        GlobalSettings sent = Assert.Single(gateway.SaveSettingsCalls);
+        Assert.Equal(ServiceStartupMode.StartOnProgramOpen, sent.ServiceStartupMode);
+    }
 }

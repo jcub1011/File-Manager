@@ -1,5 +1,6 @@
 using FileManager.Contracts.IPC;
 using FileManager.Contracts.Settings;
+using FileManager.Core.Platform;
 using FileManager.Core.Settings;
 using Microsoft.Extensions.Logging;
 using System.Threading;
@@ -7,7 +8,8 @@ using System.Threading.Tasks;
 
 namespace FileManager.Core.IPC.Handlers;
 
-public sealed class UpdateSettingsHandler(ILogger<UpdateSettingsHandler> logger, ISettingsProvider settings)
+public sealed class UpdateSettingsHandler(
+    ILogger<UpdateSettingsHandler> logger, ISettingsProvider settings, IAutostartRegistrar autostart)
     : IIpcRequestHandler
 {
     public string RequestType => IpcRequestTypes.UpdateSettings;
@@ -23,6 +25,11 @@ public sealed class UpdateSettingsHandler(ILogger<UpdateSettingsHandler> logger,
             return Task.FromResult(failure);
         }
         result.TryGetValue(out GlobalSettings? saved);
+
+        // Reconcile OS autostart with the (possibly changed) startup mode so the change takes effect
+        // immediately, not just on the next service start.
+        AutostartApplier.Apply(saved!.ServiceStartupMode, autostart, logger);
+
         IpcResponse response = new SettingsResponse { Settings = saved! };
         return Task.FromResult(response);
     }

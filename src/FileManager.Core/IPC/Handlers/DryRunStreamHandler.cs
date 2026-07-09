@@ -22,11 +22,13 @@ public sealed class DryRunStreamHandler(
     ILogger<DryRunStreamHandler> logger, IDryRunEngine engine, IProfileCatalog catalog, TimeProvider time)
     : IIpcStreamingRequestHandler
 {
-    /// <summary>Safety bound on a single streamed report. Streaming removes the frame-cap ceiling,
-    /// but not the good sense of an upper limit — a pathological scan is truncated here (surfaced via
-    /// <see cref="DryRunCompleteResponse.Truncated"/>) rather than streaming unboundedly. Far above
-    /// the old ~50k cap.</summary>
-    internal const int MaxStreamedFiles = 500_000;
+    /// <summary>Bound on the files a single streamed report forwards to the client, surfaced via
+    /// <see cref="DryRunCompleteResponse.Truncated"/>. This is the user-visible half of the safety
+    /// bound; the engine independently caps its candidate buffer at the same
+    /// <see cref="DryRunEngine.MaxStreamedFiles"/> so memory and evaluation are bounded even before
+    /// the first chunk (see <see cref="DryRunEngine.MaxScannedCandidates"/>). Test seam: shrunk so
+    /// truncation is reachable without half a million files.</summary>
+    internal int MaxStreamedFiles { get; init; } = DryRunEngine.MaxStreamedFiles;
 
     public string RequestType => IpcRequestTypes.DryRunStream;
 
@@ -49,7 +51,7 @@ public sealed class DryRunStreamHandler(
         int emitted = 0;
         bool truncated = false;
         await foreach (Result<IReadOnlyList<DryRunFileResult>, string> chunk in
-            engine.SimulateStreamAsync(typed.ProfileId, typed.ScopePath, ct).WithCancellation(ct).ConfigureAwait(false))
+            engine.SimulateStreamAsync(typed.ProfileId, typed.ScopePath, ct).ConfigureAwait(false))
         {
             if (chunk.TryGetError(out string? error))
             {

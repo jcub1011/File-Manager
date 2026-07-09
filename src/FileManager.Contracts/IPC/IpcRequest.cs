@@ -22,6 +22,7 @@ namespace FileManager.Contracts.IPC;
 [JsonDerivedType(typeof(SubscribeEventsRequest), "subscribe")]
 [JsonDerivedType(typeof(GetSettingsRequest), "get-settings")]
 [JsonDerivedType(typeof(UpdateSettingsRequest), "update-settings")]
+[JsonDerivedType(typeof(ShutdownRequest), "shutdown")]
 public abstract record IpcRequest
 {
     public int ProtocolVersion { get; init; } = 1;
@@ -63,3 +64,5 @@ public sealed record GetJobLogRequest : IpcRequest { public required Guid JobId 
 public sealed record SubscribeEventsRequest : IpcRequest;
 public sealed record GetSettingsRequest : IpcRequest;
 public sealed record UpdateSettingsRequest : IpcRequest { public required GlobalSettings Settings { get; init; } }
+/// <summary>Asks the service to shut itself down gracefully (StartAndStopWithProgram mode on UI close).</summary>
+public sealed record ShutdownRequest : IpcRequest;

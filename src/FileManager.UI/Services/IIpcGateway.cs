@@ -26,4 +26,6 @@ public interface IIpcGateway
     Task<Result<DryRunReport, IpcError>> DryRunAsync(Guid profileId, string? scopePath, CancellationToken ct = default);
     Task<Result<GlobalSettings, IpcError>> GetSettingsAsync(CancellationToken ct = default);
     Task<Result<GlobalSettings, IpcError>> SaveSettingsAsync(GlobalSettings settings, CancellationToken ct = default);
+    /// <summary>Asks the service to shut itself down (StartAndStopWithProgram mode on UI close).</summary>
+    Task<Result<bool, IpcError>> ShutdownServiceAsync(CancellationToken ct = default);
 }

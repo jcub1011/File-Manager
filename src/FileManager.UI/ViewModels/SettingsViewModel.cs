@@ -23,6 +23,10 @@ public sealed partial class SettingsViewModel : ViewModelBase
     public IReadOnlyList<ConcurrencyMode> ConcurrencyModeOptions { get; } =
         [ConcurrencyMode.Automatic, ConcurrencyMode.Manual];
 
+    public IReadOnlyList<ServiceStartupMode> ServiceStartupModeOptions { get; } =
+        [ServiceStartupMode.RunOnStartup, ServiceStartupMode.StartOnProgramOpen, ServiceStartupMode.StartAndStopWithProgram];
+
+    [ObservableProperty] public partial ServiceStartupMode StartupMode { get; set; } = ServiceStartupMode.StartAndStopWithProgram;
     [ObservableProperty] public partial ConcurrencyMode Mode { get; set; } = ConcurrencyMode.Automatic;
     [ObservableProperty] public partial int ManualWorkers { get; set; } = 1;
     [ObservableProperty] public partial string? StatusMessage { get; set; }
@@ -51,7 +55,8 @@ public sealed partial class SettingsViewModel : ViewModelBase
                 return;
             }
             result.TryGetValue(out GlobalSettings? settings);
-            Mode = settings!.DryRunConcurrencyMode == ConcurrencyMode.Manual
+            StartupMode = settings!.ServiceStartupMode;
+            Mode = settings.DryRunConcurrencyMode == ConcurrencyMode.Manual
                 ? ConcurrencyMode.Manual
                 : ConcurrencyMode.Automatic;
             ManualWorkers = Math.Max(1, settings.DryRunManualWorkers ?? 1);
@@ -78,6 +83,7 @@ public sealed partial class SettingsViewModel : ViewModelBase
         {
             GlobalSettings settings = new()
             {
+                ServiceStartupMode = StartupMode,
                 DryRunConcurrencyMode = Mode,
                 DryRunManualWorkers = Mode == ConcurrencyMode.Manual ? Math.Max(1, ManualWorkers) : null,
             };

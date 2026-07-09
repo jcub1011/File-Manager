@@ -94,7 +94,11 @@ public sealed class DryRunEngineTests : IDisposable
     private static DryRunEngine NewEngine(int reportByteBudget, GlobalSettings global, params Profile[] profiles) =>
         NewEngine(reportByteBudget, DryRunEngine.ChunkByteThreshold, global, profiles);
 
-    private static DryRunEngine NewEngine(int reportByteBudget, int chunkByteBudget, GlobalSettings global, params Profile[] profiles)
+    private static DryRunEngine NewEngine(int reportByteBudget, int chunkByteBudget, GlobalSettings global, params Profile[] profiles) =>
+        NewEngine(reportByteBudget, chunkByteBudget, DryRunEngine.MaxStreamedFiles, global, profiles);
+
+    private static DryRunEngine NewEngine(
+        int reportByteBudget, int chunkByteBudget, int maxScannedCandidates, GlobalSettings global, params Profile[] profiles)
     {
         FileSystemService fileSystem = new(NullLogger<FileSystemService>.Instance);
         return new DryRunEngine(
@@ -106,7 +110,7 @@ public sealed class DryRunEngineTests : IDisposable
             new ConflictResolver(NullLogger<ConflictResolver>.Instance),
             new FakeSettings(global),
             TimeProvider.System)
-        { ReportByteBudget = reportByteBudget, ChunkByteBudget = chunkByteBudget };
+        { ReportByteBudget = reportByteBudget, ChunkByteBudget = chunkByteBudget, MaxScannedCandidates = maxScannedCandidates };
     }
 
     private static async Task<List<DryRunFileResult>> CollectStream(
@@ -381,6 +385,24 @@ public sealed class DryRunEngineTests : IDisposable
     }
 
     // ----- streaming (SimulateStreamAsync) -----
+
+    [Fact]
+    public async Task Stream_caps_the_candidate_buffer_at_the_scan_safety_bound()
+    {
+        // The candidate buffer must be bounded so a pathological scan can't buffer (and hash) an
+        // unbounded number of files before the first chunk. A tiny cap truncates the scan to a
+        // bounded subset rather than materializing all 20.
+        for (int i = 0; i < 20; i++)
+            SourceFile($"{i:D3}.txt", $"content {i}");
+        Profile profile = ProfileUnderTest();
+
+        DryRunEngine engine = NewEngine(
+            DryRunEngine.MaxReportBytes, DryRunEngine.ChunkByteThreshold, maxScannedCandidates: 5,
+            GlobalSettings.Default, profile);
+        List<DryRunFileResult> streamed = await CollectStream(engine, profile.Id);
+
+        Assert.Equal(5, streamed.Count);
+    }
 
     [Fact]
     public async Task Stream_yields_the_same_results_in_the_same_order_as_the_batched_report()
