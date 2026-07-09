@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using FileManager.Contracts;
 
 namespace FileManager.Contracts.DryRun;
 
@@ -9,7 +10,15 @@ public sealed record DryRunReport(
     // reporting before the scan ran out — the report shows a prefix, not everything found.
     bool Truncated = false);
 
-public enum DryRunFileDisposition { WouldProcess, WouldSkipFilter, WouldSkipUnchanged }
+public enum DryRunFileDisposition
+{
+    [Tooltip("Would Process")]
+    WouldProcess,
+    [Tooltip("Would Skip (Filtered)")]
+    WouldSkipFilter,
+    [Tooltip("Would Skip (Unchanged)")]
+    WouldSkipUnchanged,
+}
 
 public sealed record DryRunFileResult
 {
@@ -23,7 +32,21 @@ public sealed record DryRunFileResult
     public string? SourceDisposition { get; init; }
 }
 
-public enum DryRunTargetKind { WouldWrite, WouldOverwrite, WouldRenameTo, WouldSkipConflict, WouldSkipUnchanged, Unknown }
+public enum DryRunTargetKind
+{
+    [Tooltip("Write")]
+    WouldWrite,
+    [Tooltip("Overwrite")]
+    WouldOverwrite,
+    [Tooltip("Rename")]
+    WouldRenameTo,
+    [Tooltip("Skip (Conflict)")]
+    WouldSkipConflict,
+    [Tooltip("Skip (Unchanged)")]
+    WouldSkipUnchanged,
+    [Tooltip("Unknown")]
+    Unknown,
+}
 
 public sealed record DryRunTargetAction
 {

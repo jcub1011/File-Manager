@@ -2,6 +2,8 @@
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
              xmlns:vm="using:FileManager.UI.ViewModels"
              xmlns:ed="using:FileManager.UI.ViewModels.Editor"
+             xmlns:conv="using:FileManager.UI.Converters"
+             xmlns:prof="using:FileManager.Contracts.Profiles"
              x:Class="FileManager.UI.Views.ProfileEditorView"
              x:DataType="vm:ProfileEditorViewModel">
 
@@ -75,10 +77,22 @@
                     <CheckBox Grid.Row="1" Grid.Column="1" IsChecked="{Binding Active}" Margin="0,2" />
                     <TextBlock Grid.Row="2" Grid.Column="0" Classes="fieldLabel" Text="Sync mode" />
                     <ComboBox Grid.Row="2" Grid.Column="1" ItemsSource="{Binding SyncModeOptions}"
-                              SelectedItem="{Binding SyncMode}" Margin="0,2" MinWidth="220" />
+                              SelectedItem="{Binding SyncMode}" Margin="0,2" MinWidth="220">
+                        <ComboBox.ItemTemplate>
+                            <DataTemplate x:DataType="prof:SyncMode">
+                                <TextBlock Text="{Binding Converter={x:Static conv:EnumTitleConverters.SyncMode}}" />
+                            </DataTemplate>
+                        </ComboBox.ItemTemplate>
+                    </ComboBox>
                     <TextBlock Grid.Row="3" Grid.Column="0" Classes="fieldLabel" Text="Target layout" />
                     <ComboBox Grid.Row="3" Grid.Column="1" ItemsSource="{Binding TargetLayoutOptions}"
-                              SelectedItem="{Binding TargetLayout}" Margin="0,2" MinWidth="220" />
+                              SelectedItem="{Binding TargetLayout}" Margin="0,2" MinWidth="220">
+                        <ComboBox.ItemTemplate>
+                            <DataTemplate x:DataType="prof:TargetLayout">
+                                <TextBlock Text="{Binding Converter={x:Static conv:EnumTitleConverters.TargetLayout}}" />
+                            </DataTemplate>
+                        </ComboBox.ItemTemplate>
+                    </ComboBox>
                 </Grid>
 
                 <!-- sources -->
@@ -126,16 +140,40 @@
                 <Grid ColumnDefinitions="140,*" RowDefinitions="Auto,Auto,Auto,Auto,Auto,Auto" Margin="0,0,0,4">
                     <TextBlock Grid.Row="0" Grid.Column="0" Classes="fieldLabel" Text="On conflict" />
                     <ComboBox Grid.Row="0" Grid.Column="1" ItemsSource="{Binding ConflictResolutionOptions}"
-                              SelectedItem="{Binding ConflictResolution}" Margin="0,2" MinWidth="220" />
+                              SelectedItem="{Binding ConflictResolution}" Margin="0,2" MinWidth="220">
+                        <ComboBox.ItemTemplate>
+                            <DataTemplate x:DataType="prof:ConflictResolution">
+                                <TextBlock Text="{Binding Converter={x:Static conv:EnumTitleConverters.ConflictResolution}}" />
+                            </DataTemplate>
+                        </ComboBox.ItemTemplate>
+                    </ComboBox>
                     <TextBlock Grid.Row="1" Grid.Column="0" Classes="fieldLabel" Text="Overwrite handling" />
                     <ComboBox Grid.Row="1" Grid.Column="1" ItemsSource="{Binding OverwriteHandlingOptions}"
-                              SelectedItem="{Binding OverwriteHandling}" Margin="0,2" MinWidth="220" />
+                              SelectedItem="{Binding OverwriteHandling}" Margin="0,2" MinWidth="220">
+                        <ComboBox.ItemTemplate>
+                            <DataTemplate x:DataType="prof:OverwriteHandling">
+                                <TextBlock Text="{Binding Converter={x:Static conv:EnumTitleConverters.OverwriteHandling}}" />
+                            </DataTemplate>
+                        </ComboBox.ItemTemplate>
+                    </ComboBox>
                     <TextBlock Grid.Row="2" Grid.Column="0" Classes="fieldLabel" Text="Verification" />
                     <ComboBox Grid.Row="2" Grid.Column="1" ItemsSource="{Binding VerificationOptions}"
-                              SelectedItem="{Binding VerificationMethod}" Margin="0,2" MinWidth="220" />
+                              SelectedItem="{Binding VerificationMethod}" Margin="0,2" MinWidth="220">
+                        <ComboBox.ItemTemplate>
+                            <DataTemplate x:DataType="prof:VerificationMethod">
+                                <TextBlock Text="{Binding Converter={x:Static conv:EnumTitleConverters.VerificationMethod}}" />
+                            </DataTemplate>
+                        </ComboBox.ItemTemplate>
+                    </ComboBox>
                     <TextBlock Grid.Row="3" Grid.Column="0" Classes="fieldLabel" Text="On success" />
                     <ComboBox Grid.Row="3" Grid.Column="1" ItemsSource="{Binding OnSuccessOptions}"
-                              SelectedItem="{Binding OnSuccess}" Margin="0,2" MinWidth="220" />
+                              SelectedItem="{Binding OnSuccess}" Margin="0,2" MinWidth="220">
+                        <ComboBox.ItemTemplate>
+                            <DataTemplate x:DataType="prof:OnSuccessAction">
+                                <TextBlock Text="{Binding Converter={x:Static conv:EnumTitleConverters.OnSuccessAction}}" />
+                            </DataTemplate>
+                        </ComboBox.ItemTemplate>
+                    </ComboBox>
                     <TextBlock Grid.Row="4" Grid.Column="0" Classes="fieldLabel" Text="Archive folder"
                                IsVisible="{Binding ShowArchiveFolder}" />
                     <TextBox Grid.Row="4" Grid.Column="1" Text="{Binding ArchiveFolder}" Margin="0,2"
@@ -143,7 +181,13 @@
                              IsVisible="{Binding ShowArchiveFolder}" />
                     <TextBlock Grid.Row="5" Grid.Column="0" Classes="fieldLabel" Text="Metadata loss" />
                     <ComboBox Grid.Row="5" Grid.Column="1" ItemsSource="{Binding MetadataOptions}"
-                              SelectedItem="{Binding MetadataOnConflict}" Margin="0,2" MinWidth="220" />
+                              SelectedItem="{Binding MetadataOnConflict}" Margin="0,2" MinWidth="220">
+                        <ComboBox.ItemTemplate>
+                            <DataTemplate x:DataType="prof:MetadataOnConflict">
+                                <TextBlock Text="{Binding Converter={x:Static conv:EnumTitleConverters.MetadataOnConflict}}" />
+                            </DataTemplate>
+                        </ComboBox.ItemTemplate>
+                    </ComboBox>
                 </Grid>
 
                 <!-- filters -->
@@ -168,7 +212,13 @@
                 <Grid ColumnDefinitions="140,*" RowDefinitions="Auto,Auto" Margin="0,0,0,8">
                     <TextBlock Grid.Row="0" Grid.Column="0" Classes="fieldLabel" Text="Verbosity" />
                     <ComboBox Grid.Row="0" Grid.Column="1" ItemsSource="{Binding VerbosityOptions}"
-                              SelectedItem="{Binding Verbosity}" Margin="0,2" MinWidth="220" />
+                              SelectedItem="{Binding Verbosity}" Margin="0,2" MinWidth="220">
+                        <ComboBox.ItemTemplate>
+                            <DataTemplate x:DataType="prof:LogVerbosity">
+                                <TextBlock Text="{Binding Converter={x:Static conv:EnumTitleConverters.LogVerbosity}}" />
+                            </DataTemplate>
+                        </ComboBox.ItemTemplate>
+                    </ComboBox>
                     <TextBlock Grid.Row="1" Grid.Column="0" Classes="fieldLabel" Text="Notify on failure" />
                     <CheckBox Grid.Row="1" Grid.Column="1" IsChecked="{Binding NotifyOnFailure}" Margin="0,2" />
                 </Grid>
@@ -179,7 +229,13 @@
                     <TextBlock Grid.Row="0" Grid.Column="0" Classes="fieldLabel" Text="Dry-run workers" />
                     <ComboBox Grid.Row="0" Grid.Column="1" ItemsSource="{Binding ConcurrencyModeOptions}"
                               SelectedItem="{Binding ConcurrencyMode}" Margin="0,2" MinWidth="220"
-                              ToolTip.Tip="Inherit uses the global Settings value; Manual overrides it for this profile." />
+                              ToolTip.Tip="Inherit uses the global Settings value; Manual overrides it for this profile.">
+                        <ComboBox.ItemTemplate>
+                            <DataTemplate x:DataType="prof:ConcurrencyMode">
+                                <TextBlock Text="{Binding Converter={x:Static conv:EnumTitleConverters.ConcurrencyMode}}" />
+                            </DataTemplate>
+                        </ComboBox.ItemTemplate>
+                    </ComboBox>
                     <TextBlock Grid.Row="1" Grid.Column="0" Classes="fieldLabel" Text="Worker count"
                                IsVisible="{Binding ShowConcurrencyWorkers}" />
                     <NumericUpDown Grid.Row="1" Grid.Column="1" Value="{Binding ConcurrencyWorkers}" Minimum="1"

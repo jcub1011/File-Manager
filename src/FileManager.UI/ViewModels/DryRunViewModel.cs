@@ -3,6 +3,7 @@ using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using FileManager.Contracts.DryRun;
 using FileManager.Contracts.IPC;
+using FileManager.UI.Extensions;
 using FileManager.UI.Services;
 using Serilog;
 using System;
@@ -15,15 +16,7 @@ namespace FileManager.UI.ViewModels;
 
 public sealed record DryRunTargetRow(string Path, DryRunTargetKind Kind, string? Detail)
 {
-    public string KindText => Kind switch
-    {
-        DryRunTargetKind.WouldWrite => "write",
-        DryRunTargetKind.WouldOverwrite => "OVERWRITE",
-        DryRunTargetKind.WouldRenameTo => "rename",
-        DryRunTargetKind.WouldSkipConflict => "skip (conflict)",
-        DryRunTargetKind.WouldSkipUnchanged => "skip (unchanged)",
-        _ => "unknown",
-    };
+    public string KindText => Kind.GetTitle();
 
     public bool IsOverwrite => Kind == DryRunTargetKind.WouldOverwrite;
     public bool IsRename => Kind == DryRunTargetKind.WouldRenameTo;

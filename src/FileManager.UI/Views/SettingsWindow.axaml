@@ -1,6 +1,9 @@
 <Window xmlns="https://github.com/avaloniaui"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:vm="using:FileManager.UI.ViewModels"
+        xmlns:conv="using:FileManager.UI.Converters"
+        xmlns:settings="using:FileManager.Contracts.Settings"
+        xmlns:prof="using:FileManager.Contracts.Profiles"
         x:Class="FileManager.UI.Views.SettingsWindow"
         x:DataType="vm:SettingsViewModel"
         Width="520" SizeToContent="Height"
@@ -27,7 +30,13 @@
         <Grid ColumnDefinitions="140,*" RowDefinitions="Auto" Margin="0,0,0,4">
             <TextBlock Grid.Row="0" Grid.Column="0" Classes="fieldLabel" Text="Startup mode" />
             <ComboBox Grid.Row="0" Grid.Column="1" ItemsSource="{Binding ServiceStartupModeOptions}"
-                      SelectedItem="{Binding StartupMode}" Margin="0,2" MinWidth="220" />
+                      SelectedItem="{Binding StartupMode}" Margin="0,2" MinWidth="220">
+                <ComboBox.ItemTemplate>
+                    <DataTemplate x:DataType="settings:ServiceStartupMode">
+                        <TextBlock Text="{Binding Converter={x:Static conv:EnumTitleConverters.ServiceStartupMode}}" />
+                    </DataTemplate>
+                </ComboBox.ItemTemplate>
+            </ComboBox>
         </Grid>
 
         <TextBlock Classes="sectionHeader" Text="Dry-run performance" Margin="0,12,0,6" />
@@ -37,7 +46,13 @@
         <Grid ColumnDefinitions="140,*" RowDefinitions="Auto,Auto" Margin="0,0,0,4">
             <TextBlock Grid.Row="0" Grid.Column="0" Classes="fieldLabel" Text="Concurrency" />
             <ComboBox Grid.Row="0" Grid.Column="1" ItemsSource="{Binding ConcurrencyModeOptions}"
-                      SelectedItem="{Binding Mode}" Margin="0,2" MinWidth="220" />
+                      SelectedItem="{Binding Mode}" Margin="0,2" MinWidth="220">
+                <ComboBox.ItemTemplate>
+                    <DataTemplate x:DataType="prof:ConcurrencyMode">
+                        <TextBlock Text="{Binding Converter={x:Static conv:EnumTitleConverters.ConcurrencyMode}}" />
+                    </DataTemplate>
+                </ComboBox.ItemTemplate>
+            </ComboBox>
             <TextBlock Grid.Row="1" Grid.Column="0" Classes="fieldLabel" Text="Worker count"
                        IsVisible="{Binding ShowManualWorkers}" />
             <NumericUpDown Grid.Row="1" Grid.Column="1" Value="{Binding ManualWorkers}" Minimum="1"

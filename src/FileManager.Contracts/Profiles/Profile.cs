@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Text.Json.Serialization;
+using FileManager.Contracts;
 
 namespace FileManager.Contracts.Profiles;
 
@@ -144,42 +145,119 @@ public sealed record LoggingSettings
 
 public enum SyncMode
 {
+    [Tooltip("Additive Archive")]
     AdditiveArchive,
+    [Tooltip("Mirror")]
     Mirror,               /// [reserved — fails v1 validation]
 }
 
-public enum TargetLayout { PreserveStructure, Flatten }
+public enum TargetLayout
+{
+    [Tooltip("Preserve Structure")]
+    PreserveStructure,
+    [Tooltip("Flatten")]
+    Flatten,
+}
 
-public enum ConflictResolution { Overwrite, OverwriteIfNewer, RenameSuffix, Skip }
+public enum ConflictResolution
+{
+    [Tooltip("Overwrite")]
+    Overwrite,
+    [Tooltip("Overwrite If Newer")]
+    OverwriteIfNewer,
+    [Tooltip("Rename (Add Suffix)")]
+    RenameSuffix,
+    [Tooltip("Skip")]
+    Skip,
+}
 
-public enum OverwriteHandling { DirectOverwrite, StageOverwrites }
+public enum OverwriteHandling
+{
+    [Tooltip("Direct Overwrite")]
+    DirectOverwrite,
+    [Tooltip("Stage Overwrites")]
+    StageOverwrites,
+}
 
 public enum VerificationMethod
 {
     [JsonStringEnumMemberName("SHA256")]
+    [Tooltip("SHA-256")]
     Sha256,
+    [Tooltip("None")]
     None,
+    [Tooltip("Size & Timestamp")]
     SizeTimestamp,        /// [reserved — fails v1 validation]
 }
 
-public enum OnSuccessAction { KeepSource, MoveToTrash, MoveToArchive, PermanentDelete }
+public enum OnSuccessAction
+{
+    [Tooltip("Keep Source")]
+    KeepSource,
+    [Tooltip("Move to Trash")]
+    MoveToTrash,
+    [Tooltip("Move to Archive")]
+    MoveToArchive,
+    [Tooltip("Permanently Delete")]
+    PermanentDelete,
+}
 
-public enum OnFailureAction { AbortRestoreAndClean }   // single value; extension point (spec §5.1)
+public enum OnFailureAction
+{
+    [Tooltip("Abort, Restore, & Clean")]
+    AbortRestoreAndClean,   // single value; extension point (spec §5.1)
+}
 
-public enum MetadataOnConflict { WarnAndContinue, FailJob }
+public enum MetadataOnConflict
+{
+    [Tooltip("Warn and Continue")]
+    WarnAndContinue,
+    [Tooltip("Fail Job")]
+    FailJob,
+}
 
 public enum ArgumentMode
 {
+    [Tooltip("Literal")]
     Literal,
+    [Tooltip("Shell")]
     Shell,                /// [reserved — fails v1 validation]
 }
 
-public enum OutputMode { NewFile, InPlace }
+public enum OutputMode
+{
+    [Tooltip("New File")]
+    NewFile,
+    [Tooltip("In Place")]
+    InPlace,
+}
 
-public enum MissedRunPolicy { CatchUpOnce, Skip }
+public enum MissedRunPolicy
+{
+    [Tooltip("Catch Up Once")]
+    CatchUpOnce,
+    [Tooltip("Skip")]
+    Skip,
+}
 
-public enum LogVerbosity { FailuresOnly, FailuresAndSkips, All }
+public enum LogVerbosity
+{
+    [Tooltip("Failures Only")]
+    FailuresOnly,
+    [Tooltip("Failures and Skips")]
+    FailuresAndSkips,
+    [Tooltip("All")]
+    All,
+}
 
 /// <summary>How the dry-run evaluation worker count is chosen. The global setting uses only
 /// Automatic/Manual; per-profile overrides additionally allow Inherit (defer to the global setting).</summary>
-public enum ConcurrencyMode { Inherit, Automatic, Manual }
+public enum ConcurrencyMode
+{
+    [Tooltip("Inherit")]
+    Inherit,
+    [Tooltip("Automatic")]
+    Automatic,
+    [Tooltip("Manual")]
+    Manual,
+}
