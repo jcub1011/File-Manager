@@ -28,7 +28,7 @@ public class DryRunViewModelBenchmarks
     [GlobalSetup]
     public void Setup()
     {
-        _viewModel = new DryRunViewModel(gateway: null!, folderPicker: null!)
+        _viewModel = new DryRunViewModel(gateway: null!)
         {
             DestructiveOnly = DestructiveOnly,
         };

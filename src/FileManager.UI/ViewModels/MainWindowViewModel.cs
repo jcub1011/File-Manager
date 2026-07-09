@@ -22,7 +22,7 @@ public sealed partial class MainWindowViewModel : ViewModelBase
         _logFolder = logFolder;
         List = new ProfileListViewModel(gateway);
         Editor = new ProfileEditorViewModel(gateway, folderPicker);
-        DryRun = new DryRunViewModel(gateway, folderPicker);
+        DryRun = new DryRunViewModel(gateway);
         StatusBar = new StatusBarViewModel(gateway);
 
         List.CanNavigate = () => !Editor.IsDirty;

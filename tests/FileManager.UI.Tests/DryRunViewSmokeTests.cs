@@ -15,7 +15,7 @@ public sealed class DryRunViewSmokeTests(HeadlessSessionFixture headless)
     private static DryRunViewModel PopulatedViewModel()
     {
         FakeIpcGateway gateway = new();
-        DryRunViewModel vm = new(gateway, new FakeFolderPicker());
+        DryRunViewModel vm = new(gateway);
         vm.SetProfile(Guid.NewGuid(), "P");
 
         var files = new List<DryRunFileResult>();
@@ -68,7 +68,7 @@ public sealed class DryRunViewSmokeTests(HeadlessSessionFixture headless)
         await headless.Session.Dispatch(async () =>
         {
             FakeIpcGateway gateway = new();
-            DryRunViewModel vm = new(gateway, new FakeFolderPicker());
+            DryRunViewModel vm = new(gateway);
             vm.SetProfile(Guid.NewGuid(), "P");
 
             // Two sources so the facet is shown and its CheckBox DataTemplate realizes on layout.

@@ -189,11 +189,8 @@ public sealed partial class DryRunViewModel : ViewModelBase
     private List<DryRunFileRow> _filterSkipsAll = [];
     private List<DryRunFileRow> _unchangedSkipsAll = [];
 
-    // folderPicker is accepted for parity with the other viewmodels' construction; the dry-run view
-    // no longer owns a folder picker (scope was removed in favour of the in-report source facet).
-    public DryRunViewModel(IIpcGateway gateway, IFolderPicker folderPicker, TimeSpan? searchDebounce = null)
+    public DryRunViewModel(IIpcGateway gateway, TimeSpan? searchDebounce = null)
     {
-        _ = folderPicker;
         _gateway = gateway;
         _searchDebounce = searchDebounce ?? TimeSpan.FromMilliseconds(200);
     }
