@@ -173,6 +173,20 @@
                     <CheckBox Grid.Row="1" Grid.Column="1" IsChecked="{Binding NotifyOnFailure}" Margin="0,2" />
                 </Grid>
 
+                <!-- concurrency -->
+                <TextBlock Classes="sectionHeader" Text="Concurrency" />
+                <Grid ColumnDefinitions="140,*" RowDefinitions="Auto,Auto" Margin="0,0,0,8">
+                    <TextBlock Grid.Row="0" Grid.Column="0" Classes="fieldLabel" Text="Dry-run workers" />
+                    <ComboBox Grid.Row="0" Grid.Column="1" ItemsSource="{Binding ConcurrencyModeOptions}"
+                              SelectedItem="{Binding ConcurrencyMode}" Margin="0,2" MinWidth="220"
+                              ToolTip.Tip="Inherit uses the global Settings value; Manual overrides it for this profile." />
+                    <TextBlock Grid.Row="1" Grid.Column="0" Classes="fieldLabel" Text="Worker count"
+                               IsVisible="{Binding ShowConcurrencyWorkers}" />
+                    <NumericUpDown Grid.Row="1" Grid.Column="1" Value="{Binding ConcurrencyWorkers}" Minimum="1"
+                                   Width="220" HorizontalAlignment="Left" Margin="0,2" FormatString="0"
+                                   IsVisible="{Binding ShowConcurrencyWorkers}" />
+                </Grid>
+
             </StackPanel>
         </ScrollViewer>
     </DockPanel>

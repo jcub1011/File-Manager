@@ -27,6 +27,35 @@ public sealed record Profile
     public required PolicySettings Policies { get; init; }
     public FilterSet? Filters { get; init; }
     public required LoggingSettings Logging { get; init; }
+
+    private readonly ConcurrencyOverride? _concurrency;
+
+    /// <summary>Per-profile override for dry-run evaluation concurrency. Never null: a profile
+    /// whose JSON predates this field deserializes with no value (the source generator does not run
+    /// property initializers for absent members), which the getter reads back as
+    /// <see cref="ConcurrencyOverride.Default"/> (<see cref="ConcurrencyMode.Inherit"/> — defer to
+    /// the global setting).</summary>
+    public ConcurrencyOverride Concurrency
+    {
+        get => _concurrency ?? ConcurrencyOverride.Default;
+        init => _concurrency = value;
+    }
+}
+
+/// <summary>Per-profile override for the dry-run evaluation worker count.
+/// <see cref="ConcurrencyMode.Inherit"/> defers to the global setting;
+/// <see cref="ConcurrencyMode.Automatic"/> lets the engine choose; <see cref="ConcurrencyMode.Manual"/>
+/// uses <see cref="ManualWorkers"/>.</summary>
+public sealed record ConcurrencyOverride
+{
+    /// <summary>The shared default (Inherit) used for profiles that never set a concurrency override.</summary>
+    public static ConcurrencyOverride Default { get; } = new();
+
+    public ConcurrencyMode Mode { get; init; } = ConcurrencyMode.Inherit;
+
+    /// <summary>Worker count when <see cref="Mode"/> is Manual; clamped to >= 1 by the engine.
+    /// Null / ignored for Inherit and Automatic.</summary>
+    public int? ManualWorkers { get; init; }
 }
 
 public sealed record TriggerSettings
@@ -147,3 +176,7 @@ public enum OutputMode { NewFile, InPlace }
 public enum MissedRunPolicy { CatchUpOnce, Skip }
 
 public enum LogVerbosity { FailuresOnly, FailuresAndSkips, All }
+
+/// <summary>How the dry-run evaluation worker count is chosen. The global setting uses only
+/// Automatic/Manual; per-profile overrides additionally allow Inherit (defer to the global setting).</summary>
+public enum ConcurrencyMode { Inherit, Automatic, Manual }

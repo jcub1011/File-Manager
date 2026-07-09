@@ -1,6 +1,7 @@
 using FileManager.Contracts.DryRun;
 using FileManager.Contracts.IPC;
 using FileManager.Contracts.Profiles;
+using FileManager.Contracts.Settings;
 using FileManager.Core;
 using FileManager.Core.DryRun;
 using FileManager.Core.Files;
@@ -9,6 +10,7 @@ using FileManager.Core.IPC;
 using FileManager.Core.IPC.Handlers;
 using FileManager.Core.Placement;
 using FileManager.Core.Profiles;
+using FileManager.Core.Settings;
 using FileManager.Core.Watching;
 using FileManager.Platform.Windows;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -45,7 +47,8 @@ public sealed class EndToEndSmokeTests : IAsyncLifetime
         SourceScanner scanner = new(NullLogger<SourceScanner>.Instance, fileSystem, TimeProvider.System);
         FileHasher hasher = new(NullLogger<FileHasher>.Instance);
         ConflictResolver resolver = new(NullLogger<ConflictResolver>.Instance);
-        DryRunEngine dryRun = new(NullLogger<DryRunEngine>.Instance, catalog, scanner, filterCompiler, hasher, resolver, TimeProvider.System);
+        SettingsService settings = new(NullLogger<SettingsService>.Instance, paths);
+        DryRunEngine dryRun = new(NullLogger<DryRunEngine>.Instance, catalog, scanner, filterCompiler, hasher, resolver, settings, TimeProvider.System);
 
         IIpcRequestHandler[] handlers =
         [
@@ -56,6 +59,8 @@ public sealed class EndToEndSmokeTests : IAsyncLifetime
             new DeleteProfileHandler(NullLogger<DeleteProfileHandler>.Instance, store, catalog),
             new ValidateProfileHandler(validator, catalog),
             new DryRunHandler(NullLogger<DryRunHandler>.Instance, dryRun, catalog),
+            new GetSettingsHandler(settings),
+            new UpdateSettingsHandler(NullLogger<UpdateSettingsHandler>.Instance, settings),
         ];
         _server = new IpcServer(
             NullLogger<IpcServer>.Instance,
@@ -137,6 +142,36 @@ public sealed class EndToEndSmokeTests : IAsyncLifetime
             var gone = await client.RequestAsync<ProfileResponse>(new GetProfileRequest { ProfileId = profile.Id });
             Assert.True(gone.TryGetError(out IpcError? notFound));
             Assert.Equal("PROFILE_NOT_FOUND", notFound!.Code);
+        }
+    }
+
+    [Fact]
+    public async Task Global_settings_round_trip_and_persist_over_the_pipe()
+    {
+        var connected = await IpcClient.ConnectAsync();
+        Assert.True(connected.TryGetValue(out IpcClient? client));
+        await using (client)
+        {
+            // default before any save
+            var initial = await client!.RequestAsync<SettingsResponse>(new GetSettingsRequest());
+            Assert.True(initial.TryGetValue(out SettingsResponse? initialResponse));
+            Assert.Equal(ConcurrencyMode.Automatic, initialResponse!.Settings.DryRunConcurrencyMode);
+
+            // update → echoed back and written to disk
+            var updated = await client.RequestAsync<SettingsResponse>(new UpdateSettingsRequest
+            {
+                Settings = new GlobalSettings { DryRunConcurrencyMode = ConcurrencyMode.Manual, DryRunManualWorkers = 3 },
+            });
+            Assert.True(updated.TryGetValue(out SettingsResponse? updatedResponse));
+            Assert.Equal(ConcurrencyMode.Manual, updatedResponse!.Settings.DryRunConcurrencyMode);
+            Assert.Equal(3, updatedResponse.Settings.DryRunManualWorkers);
+            Assert.True(File.Exists(Path.Combine(_root, "engine", "settings.json")));
+
+            // a subsequent read reflects the persisted value
+            var reread = await client.RequestAsync<SettingsResponse>(new GetSettingsRequest());
+            Assert.True(reread.TryGetValue(out SettingsResponse? rereadResponse));
+            Assert.Equal(ConcurrencyMode.Manual, rereadResponse!.Settings.DryRunConcurrencyMode);
+            Assert.Equal(3, rereadResponse.Settings.DryRunManualWorkers);
         }
     }
 

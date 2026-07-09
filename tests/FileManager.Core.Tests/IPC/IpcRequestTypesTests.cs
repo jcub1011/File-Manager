@@ -1,4 +1,5 @@
 using FileManager.Contracts.IPC;
+using FileManager.Contracts.Settings;
 using FileManager.Core.IPC;
 using System.Reflection;
 using System.Text.Json.Serialization;
@@ -44,6 +45,8 @@ public sealed class IpcRequestTypesTests
             nameof(GetRecentJobsRequest) => new GetRecentJobsRequest(),
             nameof(GetJobLogRequest) => new GetJobLogRequest { JobId = id },
             nameof(SubscribeEventsRequest) => new SubscribeEventsRequest(),
+            nameof(GetSettingsRequest) => new GetSettingsRequest(),
+            nameof(UpdateSettingsRequest) => new UpdateSettingsRequest { Settings = GlobalSettings.Default },
             _ => throw new InvalidOperationException(
                 $"{type.Name} is in IpcRequest's [JsonDerivedType] table but this test cannot construct it — add a case"),
         };

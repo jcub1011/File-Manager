@@ -20,6 +20,8 @@ public static class IpcRequestTypes
     public const string GetRecentJobs = "get-recent-jobs";
     public const string GetJobLog = "get-job-log";
     public const string Subscribe = "subscribe";
+    public const string GetSettings = "get-settings";
+    public const string UpdateSettings = "update-settings";
 
     public static string DiscriminatorOf(IpcRequest request) => request switch
     {
@@ -36,6 +38,8 @@ public static class IpcRequestTypes
         GetRecentJobsRequest => GetRecentJobs,
         GetJobLogRequest => GetJobLog,
         SubscribeEventsRequest => Subscribe,
+        GetSettingsRequest => GetSettings,
+        UpdateSettingsRequest => UpdateSettings,
         _ => throw new System.ArgumentOutOfRangeException(nameof(request),
             $"unmapped request type {request.GetType().Name} — add it here and to IpcRequest's [JsonDerivedType] table"),
     };

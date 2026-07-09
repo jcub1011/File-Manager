@@ -1,8 +1,10 @@
 using FileManager.Contracts.DryRun;
 using FileManager.Contracts.IPC;
 using FileManager.Contracts.Profiles;
+using FileManager.Contracts.Settings;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 
 namespace FileManager.Contracts.Tests.IPC;
 
@@ -28,6 +30,8 @@ public sealed class SerializationTests
         { new GetRecentJobsRequest(), "get-recent-jobs" },
         { new GetJobLogRequest { JobId = SomeId }, "get-job-log" },
         { new SubscribeEventsRequest(), "subscribe" },
+        { new GetSettingsRequest(), "get-settings" },
+        { new UpdateSettingsRequest { Settings = GlobalSettings.Default }, "update-settings" },
     };
 
     [Theory]
@@ -55,6 +59,7 @@ public sealed class SerializationTests
         { new DryRunResponse { Report = new DryRunReport(SomeId, DateTimeOffset.UnixEpoch, []) }, "dry-run-report" },
         { new RecentJobsResponse { Jobs = [] }, "recent-jobs" },
         { new JobLogResponse { Lines = ["a"] }, "job-log" },
+        { new SettingsResponse { Settings = GlobalSettings.Default }, "settings" },
     };
 
     [Theory]
@@ -128,6 +133,40 @@ public sealed class SerializationTests
         Assert.True(IpcSerializer.DeserializeResponse(Encoding.UTF8.GetBytes(legacy)).TryGetValue(out IpcResponse? legacyResponse));
         DryRunResponse legacyParsed = Assert.IsType<DryRunResponse>(legacyResponse);
         Assert.False(legacyParsed.Report.Truncated);
+    }
+
+    [Fact]
+    public void GlobalSettings_round_trips_its_fields_over_the_wire()
+    {
+        byte[] wire = IpcSerializer.SerializeResponse(new SettingsResponse
+        {
+            Settings = new GlobalSettings { DryRunConcurrencyMode = ConcurrencyMode.Manual, DryRunManualWorkers = 6 },
+        });
+        Assert.True(IpcSerializer.DeserializeResponse(wire).TryGetValue(out IpcResponse? reparsed));
+        SettingsResponse roundTripped = Assert.IsType<SettingsResponse>(reparsed);
+        Assert.Equal(ConcurrencyMode.Manual, roundTripped.Settings.DryRunConcurrencyMode);
+        Assert.Equal(6, roundTripped.Settings.DryRunManualWorkers);
+
+        // Enum serializes as a string, consistent with the rest of the wire format.
+        using JsonDocument document = JsonDocument.Parse(wire);
+        Assert.Equal("Manual",
+            document.RootElement.GetProperty("Settings").GetProperty("DryRunConcurrencyMode").GetString());
+    }
+
+    [Fact]
+    public void Profile_without_a_concurrency_field_deserializes_to_the_default()
+    {
+        // Mimic a profile file written before the Concurrency field existed: serialize, then strip
+        // the property so it is absent (not null) from the JSON.
+        string json = Encoding.UTF8.GetString(JsonSerializer.SerializeToUtf8Bytes(
+            SampleProfile(), FileManagerJsonContext.Default.Profile));
+        JsonObject obj = JsonNode.Parse(json)!.AsObject();
+        Assert.True(obj.Remove("Concurrency"));
+
+        Profile? parsed = JsonSerializer.Deserialize(obj.ToJsonString(), FileManagerJsonContext.Default.Profile);
+        Assert.NotNull(parsed);
+        Assert.NotNull(parsed!.Concurrency);                                 // must not be null (the bug)
+        Assert.Equal(ConcurrencyMode.Inherit, parsed.Concurrency.Mode);
     }
 
     [Fact]

@@ -17,6 +17,7 @@
                     <Button Content="New profile" Command="{Binding NewProfileCommand}" />
                     <Button Content="Refresh" Command="{Binding List.RefreshCommand}" />
                     <Button Content="Open log folder" Command="{Binding OpenLogFolderCommand}" />
+                    <Button Content="Settings" Command="{Binding OpenSettingsCommand}" />
                 </StackPanel>
                 <v:ProfileListView DataContext="{Binding List}" />
             </DockPanel>

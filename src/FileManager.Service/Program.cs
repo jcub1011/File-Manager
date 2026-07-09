@@ -7,6 +7,7 @@ using FileManager.Core.IPC.Handlers;
 using FileManager.Core.Placement;
 using FileManager.Core.Platform;
 using FileManager.Core.Profiles;
+using FileManager.Core.Settings;
 using FileManager.Core.Watching;
 using FileManager.Platform.Windows;
 using Microsoft.Extensions.DependencyInjection;
@@ -60,6 +61,7 @@ internal static class Program
         services.AddSingleton<IProfileValidator, ProfileValidator>();
         services.AddSingleton<IProfileStore, ProfileStore>();
         services.AddSingleton<IProfileCatalog, ProfileCatalog>();
+        services.AddSingleton<ISettingsProvider, SettingsService>();
         services.AddSingleton<ISourceScanner, SourceScanner>();
         services.AddSingleton<IFileHasher, FileHasher>();
         services.AddSingleton<IConflictResolver, ConflictResolver>();
@@ -74,6 +76,8 @@ internal static class Program
         services.AddSingleton<DeleteProfileHandler>();
         services.AddSingleton<ValidateProfileHandler>();
         services.AddSingleton<DryRunHandler>();
+        services.AddSingleton<GetSettingsHandler>();
+        services.AddSingleton<UpdateSettingsHandler>();
         services.AddSingleton<IReadOnlyDictionary<string, IIpcRequestHandler>>(provider =>
         {
             IIpcRequestHandler[] handlers =
@@ -85,6 +89,8 @@ internal static class Program
                 provider.GetRequiredService<DeleteProfileHandler>(),
                 provider.GetRequiredService<ValidateProfileHandler>(),
                 provider.GetRequiredService<DryRunHandler>(),
+                provider.GetRequiredService<GetSettingsHandler>(),
+                provider.GetRequiredService<UpdateSettingsHandler>(),
             ];
             Dictionary<string, IIpcRequestHandler> table = new(StringComparer.Ordinal);
             foreach (IIpcRequestHandler handler in handlers)

@@ -5,8 +5,10 @@ using FileManager.Contracts.Profiles;
 using FileManager.Core.DryRun;
 using FileManager.Core.Files;
 using FileManager.Core.Filtering;
+using FileManager.Contracts.Settings;
 using FileManager.Core.Placement;
 using FileManager.Core.Profiles;
+using FileManager.Core.Settings;
 using FileManager.Core.Tests.TestSupport;
 using FileManager.Core.Watching;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -38,10 +40,58 @@ public sealed class DryRunEngineTests : IDisposable
         public Result Reload() => Result.Success();
     }
 
-    private static DryRunEngine NewEngine(params Profile[] profiles) =>
-        NewEngine(DryRunEngine.MaxReportBytes, profiles);
+    // ----- concurrency resolution -----
 
-    private static DryRunEngine NewEngine(int reportByteBudget, params Profile[] profiles)
+    private static readonly int ExpectedAutoWorkers = Math.Max(1, Math.Min(8, Environment.ProcessorCount - 1));
+
+    private Profile ProfileWithConcurrency(ConcurrencyMode mode, int? manualWorkers = null) =>
+        ProfileUnderTest() with { Concurrency = new ConcurrencyOverride { Mode = mode, ManualWorkers = manualWorkers } };
+
+    [Fact]
+    public void ResolveWorkers_profile_manual_overrides_the_global_setting()
+    {
+        DryRunEngine engine = NewEngine(DryRunEngine.MaxReportBytes,
+            GlobalSettings.Default with { DryRunConcurrencyMode = ConcurrencyMode.Manual, DryRunManualWorkers = 3 });
+        Assert.Equal(5, engine.ResolveWorkers(ProfileWithConcurrency(ConcurrencyMode.Manual, 5)));
+    }
+
+    [Fact]
+    public void ResolveWorkers_profile_automatic_uses_the_auto_formula()
+    {
+        DryRunEngine engine = NewEngine(DryRunEngine.MaxReportBytes,
+            GlobalSettings.Default with { DryRunConcurrencyMode = ConcurrencyMode.Manual, DryRunManualWorkers = 3 });
+        Assert.Equal(ExpectedAutoWorkers, engine.ResolveWorkers(ProfileWithConcurrency(ConcurrencyMode.Automatic)));
+    }
+
+    [Fact]
+    public void ResolveWorkers_inherit_uses_the_global_manual_value()
+    {
+        DryRunEngine engine = NewEngine(DryRunEngine.MaxReportBytes,
+            GlobalSettings.Default with { DryRunConcurrencyMode = ConcurrencyMode.Manual, DryRunManualWorkers = 4 });
+        Assert.Equal(4, engine.ResolveWorkers(ProfileWithConcurrency(ConcurrencyMode.Inherit)));
+    }
+
+    [Fact]
+    public void ResolveWorkers_inherit_uses_the_auto_formula_when_global_is_automatic()
+    {
+        DryRunEngine engine = NewEngine(DryRunEngine.MaxReportBytes, GlobalSettings.Default);   // global = Automatic
+        Assert.Equal(ExpectedAutoWorkers, engine.ResolveWorkers(ProfileWithConcurrency(ConcurrencyMode.Inherit)));
+    }
+
+    [Fact]
+    public void ResolveWorkers_clamps_a_manual_value_below_one()
+    {
+        DryRunEngine engine = NewEngine(DryRunEngine.MaxReportBytes, GlobalSettings.Default);
+        Assert.Equal(1, engine.ResolveWorkers(ProfileWithConcurrency(ConcurrencyMode.Manual, 0)));
+    }
+
+    private static DryRunEngine NewEngine(params Profile[] profiles) =>
+        NewEngine(DryRunEngine.MaxReportBytes, GlobalSettings.Default, profiles);
+
+    private static DryRunEngine NewEngine(int reportByteBudget, params Profile[] profiles) =>
+        NewEngine(reportByteBudget, GlobalSettings.Default, profiles);
+
+    private static DryRunEngine NewEngine(int reportByteBudget, GlobalSettings global, params Profile[] profiles)
     {
         FileSystemService fileSystem = new(NullLogger<FileSystemService>.Instance);
         return new DryRunEngine(
@@ -51,8 +101,16 @@ public sealed class DryRunEngineTests : IDisposable
             new FilterCompiler(NullLogger<FilterCompiler>.Instance, TimeProvider.System),
             new FileHasher(NullLogger<FileHasher>.Instance),
             new ConflictResolver(NullLogger<ConflictResolver>.Instance),
+            new FakeSettings(global),
             TimeProvider.System)
         { ReportByteBudget = reportByteBudget };
+    }
+
+    private sealed class FakeSettings(GlobalSettings current) : ISettingsProvider
+    {
+        public GlobalSettings Current { get; } = current;
+        public Result<GlobalSettings, string> Update(GlobalSettings settings) =>
+            Result<GlobalSettings, string>.Success(settings);
     }
 
     private Profile ProfileUnderTest(

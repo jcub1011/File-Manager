@@ -1,5 +1,6 @@
 ﻿using FileManager.Contracts.DryRun;
 using FileManager.Contracts.Profiles;
+using FileManager.Contracts.Settings;
 using System.Collections.Generic;
 using System.Text.Json.Serialization;
 
@@ -16,6 +17,7 @@ namespace FileManager.Contracts.IPC;
 [JsonDerivedType(typeof(DryRunResponse), "dry-run-report")]
 [JsonDerivedType(typeof(RecentJobsResponse), "recent-jobs")]
 [JsonDerivedType(typeof(JobLogResponse), "job-log")]
+[JsonDerivedType(typeof(SettingsResponse), "settings")]
 public abstract record IpcResponse;
 
 public sealed record OkResponse : IpcResponse;
@@ -32,3 +34,4 @@ public sealed record MatchingProfilesResponse : IpcResponse { public required IR
 public sealed record DryRunResponse : IpcResponse { public required DryRunReport Report { get; init; } }
 public sealed record RecentJobsResponse : IpcResponse { public required IReadOnlyList<JobSummaryDto> Jobs { get; init; } }
 public sealed record JobLogResponse : IpcResponse { public required IReadOnlyList<string> Lines { get; init; } }
+public sealed record SettingsResponse : IpcResponse { public required GlobalSettings Settings { get; init; } }

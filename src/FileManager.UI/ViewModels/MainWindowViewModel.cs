@@ -56,6 +56,20 @@ public sealed partial class MainWindowViewModel : ViewModelBase
     [RelayCommand]
     public void OpenLogFolder() => _logFolder.OpenLogFolder();
 
+    /// <summary>Set by the composition root to show the modal settings dialog for a prepared VM.
+    /// Kept as a callback so the shell VM stays window-agnostic (mirrors the folder-picker seam).</summary>
+    public Func<SettingsViewModel, Task>? ShowSettingsDialog { get; set; }
+
+    [RelayCommand]
+    public async Task OpenSettings()
+    {
+        if (ShowSettingsDialog is null)
+            return;
+        SettingsViewModel settings = new(_gateway);
+        await settings.LoadAsync();
+        await ShowSettingsDialog(settings);
+    }
+
     private async Task LoadSelectionSafeAsync(ProfileListItem? item)
     {
         try

@@ -2,6 +2,7 @@ using FileManager.Contracts.DryRun;
 using FileManager.Contracts.IPC;
 using FileManager.Contracts.Primitives;
 using FileManager.Contracts.Profiles;
+using FileManager.Contracts.Settings;
 using Serilog;
 using System;
 using System.Collections.Generic;
@@ -52,6 +53,14 @@ public sealed class IpcGateway : IIpcGateway, IAsyncDisposable
     public Task<Result<bool, IpcError>> DeleteProfileAsync(Guid profileId, CancellationToken ct = default) =>
         RequestAsync<OkResponse, bool>(
             new DeleteProfileRequest { ProfileId = profileId }, static _ => true, ct);
+
+    public Task<Result<GlobalSettings, IpcError>> GetSettingsAsync(CancellationToken ct = default) =>
+        RequestAsync<SettingsResponse, GlobalSettings>(
+            new GetSettingsRequest(), static r => r.Settings, ct);
+
+    public Task<Result<GlobalSettings, IpcError>> SaveSettingsAsync(GlobalSettings settings, CancellationToken ct = default) =>
+        RequestAsync<SettingsResponse, GlobalSettings>(
+            new UpdateSettingsRequest { Settings = settings }, static r => r.Settings, ct);
 
     public async Task<Result<DryRunReport, IpcError>> DryRunAsync(
         Guid profileId, string? scopePath, CancellationToken ct = default)

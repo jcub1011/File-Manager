@@ -14,6 +14,9 @@ public sealed record EnginePaths
     /// <summary>Rotating logs live here (spec §9): service-YYYYMMDD.log, 14-day retention.</summary>
     public string LogsDirectory => Path.Combine(Root, "logs");
 
+    /// <summary>Machine-level settings (§9): a single settings.json at the root.</summary>
+    public string SettingsFilePath => Path.Combine(Root, "settings.json");
+
     public static EnginePaths Default() => new()
     {
         Root = Path.Combine(

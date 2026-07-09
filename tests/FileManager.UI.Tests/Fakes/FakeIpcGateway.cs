@@ -2,6 +2,7 @@ using FileManager.Contracts.DryRun;
 using FileManager.Contracts.IPC;
 using FileManager.Contracts.Primitives;
 using FileManager.Contracts.Profiles;
+using FileManager.Contracts.Settings;
 using FileManager.UI.Services;
 
 namespace FileManager.UI.Tests.Fakes;
@@ -12,6 +13,7 @@ internal sealed class FakeIpcGateway : IIpcGateway
     public List<(Profile Profile, bool Acknowledge)> SaveCalls { get; } = [];
     public List<Guid> DeleteCalls { get; } = [];
     public List<(Guid ProfileId, string? Scope)> DryRunCalls { get; } = [];
+    public List<GlobalSettings> SaveSettingsCalls { get; } = [];
 
     public Result<EngineStatusSnapshot, IpcError> StatusResult { get; set; } =
         new EngineStatusSnapshot(false, 0, 0, 0, null);
@@ -29,6 +31,9 @@ internal sealed class FakeIpcGateway : IIpcGateway
 
     public Result<DryRunReport, IpcError> DryRunResult { get; set; } =
         new DryRunReport(Guid.Empty, DateTimeOffset.UnixEpoch, []);
+
+    public Result<GlobalSettings, IpcError> GetSettingsResult { get; set; } = GlobalSettings.Default;
+    public Result<GlobalSettings, IpcError> SaveSettingsResult { get; set; } = GlobalSettings.Default;
 
     /// <summary>When set, DryRunAsync awaits this before returning (cancellation tests).</summary>
     public TaskCompletionSource? DryRunGate { get; set; }
@@ -77,6 +82,15 @@ internal sealed class FakeIpcGateway : IIpcGateway
             }
         }
         return DryRunResult;
+    }
+
+    public Task<Result<GlobalSettings, IpcError>> GetSettingsAsync(CancellationToken ct = default) =>
+        Task.FromResult(GetSettingsResult);
+
+    public Task<Result<GlobalSettings, IpcError>> SaveSettingsAsync(GlobalSettings settings, CancellationToken ct = default)
+    {
+        SaveSettingsCalls.Add(settings);
+        return Task.FromResult(SaveSettingsResult);
     }
 }
 

@@ -1,4 +1,5 @@
 ﻿using FileManager.Contracts.Profiles;
+using FileManager.Contracts.Settings;
 using System;
 using System.Text.Json.Serialization;
 
@@ -18,6 +19,8 @@ namespace FileManager.Contracts.IPC;
 [JsonDerivedType(typeof(GetRecentJobsRequest), "get-recent-jobs")]
 [JsonDerivedType(typeof(GetJobLogRequest), "get-job-log")]
 [JsonDerivedType(typeof(SubscribeEventsRequest), "subscribe")]
+[JsonDerivedType(typeof(GetSettingsRequest), "get-settings")]
+[JsonDerivedType(typeof(UpdateSettingsRequest), "update-settings")]
 public abstract record IpcRequest
 {
     public int ProtocolVersion { get; init; } = 1;
@@ -49,3 +52,5 @@ public sealed record DryRunRequest : IpcRequest
 public sealed record GetRecentJobsRequest : IpcRequest { public int Count { get; init; } = 50; }
 public sealed record GetJobLogRequest : IpcRequest { public required Guid JobId { get; init; } }
 public sealed record SubscribeEventsRequest : IpcRequest;
+public sealed record GetSettingsRequest : IpcRequest;
+public sealed record UpdateSettingsRequest : IpcRequest { public required GlobalSettings Settings { get; init; } }

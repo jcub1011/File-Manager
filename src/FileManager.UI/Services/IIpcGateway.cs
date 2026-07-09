@@ -2,6 +2,7 @@ using FileManager.Contracts.DryRun;
 using FileManager.Contracts.IPC;
 using FileManager.Contracts.Primitives;
 using FileManager.Contracts.Profiles;
+using FileManager.Contracts.Settings;
 using System;
 using System.Collections.Generic;
 using System.Threading;
@@ -23,4 +24,6 @@ public interface IIpcGateway
     Task<Result<SaveOutcome, IpcError>> SaveProfileAsync(Profile profile, bool acknowledgeWarnings, CancellationToken ct = default);
     Task<Result<bool, IpcError>> DeleteProfileAsync(Guid profileId, CancellationToken ct = default);
     Task<Result<DryRunReport, IpcError>> DryRunAsync(Guid profileId, string? scopePath, CancellationToken ct = default);
+    Task<Result<GlobalSettings, IpcError>> GetSettingsAsync(CancellationToken ct = default);
+    Task<Result<GlobalSettings, IpcError>> SaveSettingsAsync(GlobalSettings settings, CancellationToken ct = default);
 }

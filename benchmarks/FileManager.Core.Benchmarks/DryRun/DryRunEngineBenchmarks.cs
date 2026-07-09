@@ -1,11 +1,13 @@
 using BenchmarkDotNet.Attributes;
 using FileManager.Contracts.Primitives;
 using FileManager.Contracts.Profiles;
+using FileManager.Contracts.Settings;
 using FileManager.Core.DryRun;
 using FileManager.Core.Files;
 using FileManager.Core.Filtering;
 using FileManager.Core.Placement;
 using FileManager.Core.Profiles;
+using FileManager.Core.Settings;
 using FileManager.Core.Watching;
 using Microsoft.Extensions.Logging.Abstractions;
 
@@ -80,7 +82,17 @@ public class DryRunEngineBenchmarks
             new FilterCompiler(NullLogger<FilterCompiler>.Instance, TimeProvider.System),
             new FileHasher(NullLogger<FileHasher>.Instance),
             new ConflictResolver(NullLogger<ConflictResolver>.Instance),
+            new FixedSettings(),
             TimeProvider.System);
+    }
+
+    /// <summary>Automatic concurrency (the default) so the benchmark measures the engine's own
+    /// worker-count choice, not a configured override.</summary>
+    private sealed class FixedSettings : ISettingsProvider
+    {
+        public GlobalSettings Current => GlobalSettings.Default;
+        public Result<GlobalSettings, string> Update(GlobalSettings settings) =>
+            Result<GlobalSettings, string>.Success(settings);
     }
 
     [GlobalCleanup]

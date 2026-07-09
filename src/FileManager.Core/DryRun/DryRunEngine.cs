@@ -6,9 +6,11 @@ using FileManager.Core.Filtering;
 using FileManager.Core.Jobs;
 using FileManager.Core.Placement;
 using FileManager.Core.Profiles;
+using FileManager.Core.Settings;
 using FileManager.Core.Watching;
 using Microsoft.Extensions.Logging;
 using FileManager.Contracts;
+using FileManager.Contracts.Settings;
 using System;
 using System.Buffers;
 using System.Collections.Generic;
@@ -31,6 +33,7 @@ public sealed class DryRunEngine(
     IFilterCompiler filterCompiler,
     IFileHasher hasher,
     IConflictResolver conflictResolver,
+    ISettingsProvider settings,
     TimeProvider time) : IDryRunEngine
 {
     /// <summary>Report size guards: a serialized report must fit an IPC frame (16 MiB cap, §3.1).
@@ -41,14 +44,9 @@ public sealed class DryRunEngine(
     internal const int MaxReportBytes = 12 * 1024 * 1024;
     internal const int MaxReportedFiles = 50_000;
 
-    /// <summary>Per-file evaluation (stat + existence probe + up to two SHA-256 hashes) is
-    /// independent and I/O-bound, so candidates are evaluated concurrently. Capped so a huge scan
-    /// cannot swamp the machine; the collaborators are all read-only, so this is race-free.</summary>
-    private static readonly int MaxEvaluationConcurrency = Math.Min(Environment.ProcessorCount, 8);
-
     /// <summary>Candidates are evaluated in batches so the byte budget can halt evaluation early
-    /// (see phase 2). Sized well above <see cref="MaxEvaluationConcurrency"/> so every worker stays
-    /// busy, while capping the evaluation wasted past the truncation point to at most one batch.</summary>
+    /// (see phase 2). Sized well above the resolved worker count so every worker stays busy, while
+    /// capping the evaluation wasted past the truncation point to at most one batch.</summary>
     private const int EvaluationBatchSize = 512;
 
     /// <summary>Test seam: production uses <see cref="MaxReportBytes"/>; tests shrink it so
@@ -137,6 +135,7 @@ public sealed class DryRunEngine(
         candidates.Sort(static (a, b) =>
             string.Compare(a.SourcePath, b.SourcePath, StringComparison.OrdinalIgnoreCase));
 
+        int maxConcurrency = ResolveWorkers(profile);
         using ByteBudget budget = new(ReportByteBudget);
         try
         {
@@ -146,7 +145,7 @@ public sealed class DryRunEngine(
                 DryRunFileResult?[] batch = new DryRunFileResult?[count];
                 await Parallel.ForEachAsync(
                     Enumerable.Range(0, count),
-                    new ParallelOptions { MaxDegreeOfParallelism = MaxEvaluationConcurrency, CancellationToken = ct },
+                    new ParallelOptions { MaxDegreeOfParallelism = maxConcurrency, CancellationToken = ct },
                     async (j, token) =>
                     {
                         batch[j] = await EvaluateFileAsync(
@@ -187,6 +186,33 @@ public sealed class DryRunEngine(
             truncated ? " (report truncated)" : "");
         return new DryRunReport(profileId, completedAt, files, truncated);
     }
+
+    /// <summary>Resolves the evaluation worker count for this run. The profile's own mode wins;
+    /// <see cref="ConcurrencyMode.Inherit"/> defers to the global setting. Every path is clamped to
+    /// at least 1 so <see cref="ParallelOptions.MaxDegreeOfParallelism"/> is always valid.</summary>
+    internal int ResolveWorkers(Profile profile)
+    {
+        ConcurrencyOverride c = profile.Concurrency;
+        return c.Mode switch
+        {
+            ConcurrencyMode.Manual => Math.Max(1, c.ManualWorkers ?? AutoWorkers()),
+            ConcurrencyMode.Automatic => AutoWorkers(),
+            _ => ResolveGlobalWorkers(),   // Inherit
+        };
+    }
+
+    private int ResolveGlobalWorkers()
+    {
+        GlobalSettings global = settings.Current;
+        return global.DryRunConcurrencyMode == ConcurrencyMode.Manual
+            ? Math.Max(1, global.DryRunManualWorkers ?? AutoWorkers())
+            : AutoWorkers();
+    }
+
+    // Reserve one core for the system and keep an 8-worker ceiling — per-file evaluation is
+    // I/O-bound (stat + existence probe + up to two SHA-256 hashes), so beyond ~8 concurrent
+    // hashers the disk, not the CPU, is the bottleneck. Floor of 1 covers single-core machines.
+    private static int AutoWorkers() => Math.Max(1, Math.Min(8, Environment.ProcessorCount - 1));
 
     /// <summary>Streaming truncation to the serialized byte budget, fed results in final
     /// (source-path) order as they are evaluated. Serialization is not free, so it is skipped
