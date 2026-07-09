@@ -46,6 +46,11 @@ public sealed class DryRunEngine(
     /// cannot swamp the machine; the collaborators are all read-only, so this is race-free.</summary>
     private static readonly int MaxEvaluationConcurrency = Math.Min(Environment.ProcessorCount, 8);
 
+    /// <summary>Candidates are evaluated in batches so the byte budget can halt evaluation early
+    /// (see phase 2). Sized well above <see cref="MaxEvaluationConcurrency"/> so every worker stays
+    /// busy, while capping the evaluation wasted past the truncation point to at most one batch.</summary>
+    private const int EvaluationBatchSize = 512;
+
     /// <summary>Test seam: production uses <see cref="MaxReportBytes"/>; tests shrink it so
     /// truncation is reachable without tens of thousands of real files.</summary>
     internal int ReportByteBudget { get; init; } = MaxReportBytes;
@@ -120,20 +125,43 @@ public sealed class DryRunEngine(
             candidates.Add(payload!);
         }
 
-        // Phase 2: evaluate candidates concurrently. Every collaborator is read-only (I-DRYRUN-RO)
-        // and stateless, so this is race-free; results land positionally so ordering is
-        // deterministic regardless of completion order.
-        DryRunFileResult?[] evaluated = new DryRunFileResult?[candidates.Count];
+        // Phase 2: fix the output order up front by sorting candidates by source path, then evaluate
+        // them in that order. Truncation keeps a path-ordered *prefix* (SourcePath == payload path,
+        // and filtered candidates evaluate to null and never count), so once the byte budget fills,
+        // every remaining candidate sorts after the last kept file and would be truncated anyway —
+        // evaluating it (including hashing its contents) would be wasted I/O, so we stop. Evaluating
+        // in bounded batches keeps the concurrency of an all-at-once pass while capping the work
+        // wasted past the truncation point to at most one batch. Every collaborator is read-only
+        // (I-DRYRUN-RO) and stateless, so the parallel evaluation is race-free; positional writes
+        // into the batch array make the kept order deterministic regardless of completion order.
+        candidates.Sort(static (a, b) =>
+            string.Compare(a.SourcePath, b.SourcePath, StringComparison.OrdinalIgnoreCase));
+
+        using ByteBudget budget = new(ReportByteBudget);
         try
         {
-            await Parallel.ForEachAsync(
-                Enumerable.Range(0, candidates.Count),
-                new ParallelOptions { MaxDegreeOfParallelism = MaxEvaluationConcurrency, CancellationToken = ct },
-                async (i, token) =>
+            for (int start = 0; start < candidates.Count && !budget.Truncated; start += EvaluationBatchSize)
+            {
+                int count = Math.Min(EvaluationBatchSize, candidates.Count - start);
+                DryRunFileResult?[] batch = new DryRunFileResult?[count];
+                await Parallel.ForEachAsync(
+                    Enumerable.Range(0, count),
+                    new ParallelOptions { MaxDegreeOfParallelism = MaxEvaluationConcurrency, CancellationToken = ct },
+                    async (j, token) =>
+                    {
+                        batch[j] = await EvaluateFileAsync(
+                            profile, candidates[start + j], filtersBySourceRoot, hasTransformers, token)
+                            .ConfigureAwait(false);
+                    }).ConfigureAwait(false);
+
+                foreach (DryRunFileResult? result in batch)
                 {
-                    evaluated[i] = await EvaluateFileAsync(profile, candidates[i], filtersBySourceRoot, hasTransformers, token)
-                        .ConfigureAwait(false);
-                }).ConfigureAwait(false);
+                    if (result is null)
+                        continue;
+                    if (!budget.TryAdd(result))
+                        break;      // budget full — Truncated is set, so the outer loop also stops
+                }
+            }
         }
         catch (OperationCanceledException)
         {
@@ -142,15 +170,9 @@ public sealed class DryRunEngine(
             return Result<DryRunReport, string>.Canceled();
         }
 
-        // Phase 3: order by source path, then truncate to the report byte budget in that order.
-        List<DryRunFileResult> ordered = new(candidates.Count);
-        foreach (DryRunFileResult? result in evaluated)
-            if (result is not null)
-                ordered.Add(result);
-        ordered.Sort(static (a, b) => string.Compare(a.SourcePath, b.SourcePath, StringComparison.OrdinalIgnoreCase));
-
-        (List<DryRunFileResult> files, bool budgetTruncated, long reportBytes) = ApplyByteBudget(ordered);
-        truncated |= budgetTruncated;
+        List<DryRunFileResult> files = budget.Kept;
+        truncated |= budget.Truncated;
+        long reportBytes = budget.ReportBytes;
 
         if (truncated)
             logger.LogWarning(
@@ -166,64 +188,69 @@ public sealed class DryRunEngine(
         return new DryRunReport(profileId, completedAt, files, truncated);
     }
 
-    /// <summary>Truncates the ordered results to the serialized byte budget. Serialization is not
-    /// free, so it is skipped entirely while a conservative upper-bound estimate proves the report
-    /// still fits — the common case. Only once the upper bound could cross the budget does it fall
-    /// back to exact measurement (re-establishing the running total from the already-kept results),
-    /// preserving precise truncation near the cap. Returns the kept results, whether truncation
-    /// occurred, and the running byte total (exact once measuring, otherwise the upper-bound).</summary>
-    private (List<DryRunFileResult> Files, bool Truncated, long ReportBytes) ApplyByteBudget(
-        List<DryRunFileResult> ordered)
+    /// <summary>Streaming truncation to the serialized byte budget, fed results in final
+    /// (source-path) order as they are evaluated. Serialization is not free, so it is skipped
+    /// entirely while a conservative upper-bound estimate proves the report still fits — the common
+    /// case. Only once the upper bound could cross the budget does it fall back to exact measurement
+    /// (re-establishing the running total from the already-kept results), preserving precise
+    /// truncation near the cap. <see cref="TryAdd"/> returns false the moment the budget is crossed
+    /// so the caller can stop evaluating further candidates instead of hashing files that cannot
+    /// fit.</summary>
+    private sealed class ByteBudget(long budget) : IDisposable
     {
-        List<DryRunFileResult> kept = new(ordered.Count);
-        long total = 0;
-        bool exactMode = false;
-        bool truncated = false;
+        private readonly List<DryRunFileResult> _kept = [];
+        private long _total;
+        private bool _exactMode;
+        private ArrayBufferWriter<byte>? _measureBuffer;
+        private Utf8JsonWriter? _measureWriter;
 
-        ArrayBufferWriter<byte>? measureBuffer = null;
-        Utf8JsonWriter? measureWriter = null;
-        try
+        /// <summary>The kept results, in the order they were added.</summary>
+        public List<DryRunFileResult> Kept => _kept;
+
+        /// <summary>True once a result was rejected because keeping it would cross the budget.</summary>
+        public bool Truncated { get; private set; }
+
+        /// <summary>Exact once measuring, otherwise the running upper-bound estimate.</summary>
+        public long ReportBytes => _total;
+
+        /// <summary>Keeps <paramref name="result"/> if it fits; otherwise sets
+        /// <see cref="Truncated"/> and returns false without keeping it.</summary>
+        public bool TryAdd(DryRunFileResult result)
         {
-            foreach (DryRunFileResult result in ordered)
+            if (!_exactMode)
             {
-                if (!exactMode)
+                long upperBound = UpperBoundBytes(result);
+                if (_total + upperBound <= budget)
                 {
-                    long upperBound = UpperBoundBytes(result);
-                    if (total + upperBound <= ReportByteBudget)
-                    {
-                        // Actual serialized size <= upper bound <= budget, so this is provably safe
-                        // to keep without serializing anything.
-                        total += upperBound;
-                        kept.Add(result);
-                        continue;
-                    }
-
-                    // The upper bound could exceed the budget — switch to exact measurement and
-                    // re-establish the running total as the exact size of what's already kept.
-                    exactMode = true;
-                    measureBuffer = new ArrayBufferWriter<byte>();
-                    measureWriter = new Utf8JsonWriter(measureBuffer);
-                    total = 0;
-                    foreach (DryRunFileResult keptResult in kept)
-                        total += ExactBytes(keptResult, measureBuffer, measureWriter);
+                    // Actual serialized size <= upper bound <= budget, so this is provably safe to
+                    // keep without serializing anything.
+                    _total += upperBound;
+                    _kept.Add(result);
+                    return true;
                 }
 
-                int resultBytes = ExactBytes(result, measureBuffer!, measureWriter!);
-                if (total + resultBytes > ReportByteBudget)
-                {
-                    truncated = true;
-                    break;
-                }
-                total += resultBytes;
-                kept.Add(result);
+                // The upper bound could exceed the budget — switch to exact measurement and
+                // re-establish the running total as the exact size of what's already kept.
+                _exactMode = true;
+                _measureBuffer = new ArrayBufferWriter<byte>();
+                _measureWriter = new Utf8JsonWriter(_measureBuffer);
+                _total = 0;
+                foreach (DryRunFileResult keptResult in _kept)
+                    _total += ExactBytes(keptResult, _measureBuffer, _measureWriter);
             }
-        }
-        finally
-        {
-            measureWriter?.Dispose();
+
+            int resultBytes = ExactBytes(result, _measureBuffer!, _measureWriter!);
+            if (_total + resultBytes > budget)
+            {
+                Truncated = true;
+                return false;
+            }
+            _total += resultBytes;
+            _kept.Add(result);
+            return true;
         }
 
-        return (kept, truncated, total);
+        public void Dispose() => _measureWriter?.Dispose();
     }
 
     // Measured exactly (a standalone record serializes byte-identically to the same record as a

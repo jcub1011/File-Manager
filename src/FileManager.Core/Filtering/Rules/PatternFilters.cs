@@ -7,9 +7,14 @@ namespace FileManager.Core.Filtering.Rules;
 /// (e.g. "glob *.wav" or "regex ^draft-").</summary>
 internal readonly record struct CompiledPattern(Regex Regex, string Display);
 
+/// <summary>Marker for rules that match against the '/'-normalized relative path, so the compiled
+/// set can detect them (to pre-normalize once) without enumerating concrete rule types — a new
+/// pattern rule just implements this and is picked up automatically.</summary>
+internal interface IPatternFilter;
+
 /// <summary>Union of include globs + include regexes; excludes when the set is non-empty and
 /// nothing matches (spec §4 Phase 2). Matches against the '/'-normalized relative path.</summary>
-internal sealed class IncludePatternFilter(IReadOnlyList<CompiledPattern> patterns) : IFilter
+internal sealed class IncludePatternFilter(IReadOnlyList<CompiledPattern> patterns) : IFilter, IPatternFilter
 {
     public string Description { get; } = "Include patterns " + DescribePatterns(patterns);
 
@@ -38,7 +43,7 @@ internal sealed class IncludePatternFilter(IReadOnlyList<CompiledPattern> patter
 }
 
 /// <summary>Excludes on any match; the reason names the winning pattern.</summary>
-internal sealed class ExcludePatternFilter(IReadOnlyList<CompiledPattern> patterns) : IFilter
+internal sealed class ExcludePatternFilter(IReadOnlyList<CompiledPattern> patterns) : IFilter, IPatternFilter
 {
     public string Description { get; } = "Exclude patterns " + IncludePatternFilter.DescribePatterns(patterns);
 

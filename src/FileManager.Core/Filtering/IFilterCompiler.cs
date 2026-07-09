@@ -23,7 +23,7 @@ public sealed class CompiledFilterSet
         MaxDepth = maxDepth;
         foreach (IFilter rule in rules)
         {
-            if (rule is Rules.IncludePatternFilter or Rules.ExcludePatternFilter)
+            if (rule is Rules.IPatternFilter)
             {
                 HasPatternRules = true;
                 break;

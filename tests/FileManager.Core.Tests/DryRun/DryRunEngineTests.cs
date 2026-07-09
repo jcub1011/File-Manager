@@ -132,6 +132,43 @@ public sealed class DryRunEngineTests : IDisposable
     }
 
     [Fact]
+    public async Task Report_files_are_ordered_by_source_path_regardless_of_evaluation_order()
+    {
+        // Creation order is deliberately not sorted order; the parallel, batched evaluation may
+        // complete files in any order, but the report must be a stable ascending-by-source-path list.
+        string[] names = ["m.txt", "a.txt", "z.txt", "c.txt", "b.txt", "y.txt", "d.txt", "n.txt"];
+        foreach (string name in names)
+            SourceFile(name, $"content of {name}");
+
+        DryRunReport report = await Simulate(ProfileUnderTest());
+
+        List<string> paths = report.Files.Select(f => f.SourcePath).ToList();
+        Assert.Equal(names.Length, paths.Count);
+        Assert.Equal(paths.OrderBy(p => p, StringComparer.OrdinalIgnoreCase).ToList(), paths);
+    }
+
+    [Fact]
+    public async Task Truncation_keeps_the_lexicographically_first_files()
+    {
+        // Zero-padded names so lexical order equals numeric order; a budget small enough to force
+        // truncation must keep exactly the lexicographically-first prefix (the early-halt property).
+        for (int i = 0; i < 40; i++)
+            SourceFile($"{i:D3}.txt", $"content {i}");
+        Profile profile = ProfileUnderTest();
+
+        var simulated = await NewEngine(1500, profile).SimulateAsync(profile.Id, null);
+        Assert.True(simulated.TryGetValue(out DryRunReport? report));
+
+        Assert.True(report!.Truncated);
+        Assert.InRange(report.Files.Count, 1, 39);
+
+        List<string> kept = report.Files.Select(f => Path.GetFileName(f.SourcePath)).ToList();
+        List<string> expectedPrefix = Enumerable.Range(0, 40).Select(i => $"{i:D3}.txt")
+            .OrderBy(n => n, StringComparer.OrdinalIgnoreCase).Take(kept.Count).ToList();
+        Assert.Equal(expectedPrefix, kept);
+    }
+
+    [Fact]
     public async Task Filtered_file_reports_the_deciding_filter()
     {
         SourceFile("song.wav");
