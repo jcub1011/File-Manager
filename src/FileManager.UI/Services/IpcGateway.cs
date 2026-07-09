@@ -67,7 +67,7 @@ public sealed class IpcGateway : IIpcGateway, IAsyncDisposable
             new ShutdownRequest(), static _ => true, ct);
 
     public async Task<Result<DryRunReport, IpcError>> DryRunAsync(
-        Guid profileId, string? scopePath, CancellationToken ct = default)
+        Guid profileId, CancellationToken ct = default)
     {
         // Own connection: cancel = dispose, leaving the shared channel clean.
         var connected = await ServiceLauncher.ConnectOrStartAsync(ct).ConfigureAwait(false);
@@ -83,9 +83,11 @@ public sealed class IpcGateway : IIpcGateway, IAsyncDisposable
         await using (client)
         {
             // Streamed: the report arrives as many small frames and is reassembled here, so it is
-            // not bounded by the single-frame size cap (no ~50k-file truncation).
+            // not bounded by the single-frame size cap (no ~50k-file truncation). The GUI always
+            // simulates every source (ScopePath stays null) and focuses the result in the view;
+            // scoped enumeration remains a service/CLI capability.
             var response = await client!.DryRunStreamAsync(
-                new DryRunStreamRequest { ProfileId = profileId, ScopePath = scopePath }, ct).ConfigureAwait(false);
+                new DryRunStreamRequest { ProfileId = profileId, ScopePath = null }, ct).ConfigureAwait(false);
             if (response.IsCanceled)
                 return Result<DryRunReport, IpcError>.Canceled();
             if (response.TryGetError(out IpcError? error))

@@ -140,6 +140,36 @@ public sealed class SerializationTests
     }
 
     [Fact]
+    public void DryRunFileResult_source_root_round_trips_and_is_null_when_absent()
+    {
+        byte[] wire = IpcSerializer.SerializeResponse(new DryRunResponse
+        {
+            Report = new DryRunReport(SomeId, DateTimeOffset.UnixEpoch,
+            [
+                new DryRunFileResult
+                {
+                    SourcePath = @"C:\a\one.txt",
+                    SourceRoot = @"C:\a",
+                    Disposition = DryRunFileDisposition.WouldProcess,
+                },
+            ]),
+        });
+
+        Assert.True(IpcSerializer.DeserializeResponse(wire).TryGetValue(out IpcResponse? reparsed));
+        DryRunResponse roundTripped = Assert.IsType<DryRunResponse>(reparsed);
+        Assert.Equal(@"C:\a", roundTripped.Report.Files[0].SourceRoot);
+
+        // Old-server → new-client compatibility: a result serialized before SourceRoot existed
+        // (no "SourceRoot" property) deserializes to null.
+        string legacy = """{"type":"dry-run-report","Report":{"ProfileId":""" + $"\"{SomeId}\"" +
+            ""","GeneratedAt":"1970-01-01T00:00:00+00:00","Files":[""" +
+            """{"SourcePath":"C:\\a\\one.txt","Disposition":"WouldProcess"}]}}""";
+        Assert.True(IpcSerializer.DeserializeResponse(Encoding.UTF8.GetBytes(legacy)).TryGetValue(out IpcResponse? legacyResponse));
+        DryRunResponse legacyParsed = Assert.IsType<DryRunResponse>(legacyResponse);
+        Assert.Null(legacyParsed.Report.Files[0].SourceRoot);
+    }
+
+    [Fact]
     public void GlobalSettings_round_trips_its_fields_over_the_wire()
     {
         byte[] wire = IpcSerializer.SerializeResponse(new SettingsResponse

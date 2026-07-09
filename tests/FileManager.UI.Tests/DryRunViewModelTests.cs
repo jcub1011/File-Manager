@@ -297,17 +297,104 @@ public sealed class DryRunViewModelTests
         Assert.Contains("wire format drifted", viewModel.ErrorMessage);
     }
 
+    // Two sources (C:\a with one process + one filter-skip, C:\b with two process), benign so nothing
+    // auto-focuses and every row is visible for the facet assertions.
+    private static DryRunReport MultiSourceReport(Guid profileId) => new(profileId, DateTimeOffset.UnixEpoch,
+    [
+        new DryRunFileResult
+        {
+            SourcePath = @"C:\a\one.txt", SourceRoot = @"C:\a",
+            Disposition = DryRunFileDisposition.WouldProcess, SourceDisposition = "KeepSource",
+            Targets = [new DryRunTargetAction { TargetPath = @"C:\t\one.txt", Kind = DryRunTargetKind.WouldWrite }],
+        },
+        new DryRunFileResult
+        {
+            SourcePath = @"C:\a\junk.tmp", SourceRoot = @"C:\a",
+            Disposition = DryRunFileDisposition.WouldSkipFilter, DecidingFilter = "exclude *.tmp",
+        },
+        new DryRunFileResult
+        {
+            SourcePath = @"C:\b\three.txt", SourceRoot = @"C:\b",
+            Disposition = DryRunFileDisposition.WouldProcess, SourceDisposition = "KeepSource",
+            Targets = [new DryRunTargetAction { TargetPath = @"C:\t\three.txt", Kind = DryRunTargetKind.WouldWrite }],
+        },
+        new DryRunFileResult
+        {
+            SourcePath = @"C:\b\four.txt", SourceRoot = @"C:\b",
+            Disposition = DryRunFileDisposition.WouldProcess, SourceDisposition = "KeepSource",
+            Targets = [new DryRunTargetAction { TargetPath = @"C:\t\four.txt", Kind = DryRunTargetKind.WouldWrite }],
+        },
+    ]);
+
     [Fact]
-    public async Task Scope_path_is_forwarded_trimmed_or_null()
+    public async Task Source_facet_lists_each_distinct_source_with_its_process_count()
     {
         var (viewModel, gateway) = NewViewModel();
-        viewModel.ScopePath = "   ";
-        await viewModel.RunAsync(CancellationToken.None);
-        viewModel.ScopePath = @" C:\s\sub ";
+        gateway.DryRunResult = MultiSourceReport(viewModel.ProfileId!.Value);
+
         await viewModel.RunAsync(CancellationToken.None);
 
-        Assert.Null(gateway.DryRunCalls[0].Scope);
-        Assert.Equal(@"C:\s\sub", gateway.DryRunCalls[1].Scope);
+        Assert.True(viewModel.ShowSourceFacet);
+        Assert.Equal(2, viewModel.SourceFacets.Count);
+        Assert.All(viewModel.SourceFacets, f => Assert.True(f.IsSelected));
+        Assert.Equal(1, viewModel.SourceFacets.Single(f => f.Root == @"C:\a").Count);
+        Assert.Equal(2, viewModel.SourceFacets.Single(f => f.Root == @"C:\b").Count);
+    }
+
+    [Fact]
+    public async Task Toggling_a_source_off_filters_the_lists_but_leaves_the_banner_intact()
+    {
+        var (viewModel, gateway) = NewViewModel();
+        gateway.DryRunResult = MultiSourceReport(viewModel.ProfileId!.Value);
+        await viewModel.RunAsync(CancellationToken.None);
+
+        // Baseline: benign report shows everything from both sources.
+        Assert.False(viewModel.DestructiveOnly);
+        Assert.Equal(3, viewModel.ProcessFiles.Count);
+        Assert.Single(viewModel.FilterSkips);
+
+        viewModel.SourceFacets.Single(f => f.Root == @"C:\a").IsSelected = false;
+
+        // Only C:\b's rows remain visible; C:\a's process row and filter-skip drop out.
+        Assert.Equal(2, viewModel.ProcessFiles.Count);
+        Assert.All(viewModel.ProcessFiles, r => Assert.Equal(@"C:\b", r.SourceRoot));
+        Assert.Empty(viewModel.FilterSkips);
+
+        // The blast-radius banner always reflects the complete run — a view filter never changes it.
+        Assert.Equal(4, viewModel.TotalFiles);
+        Assert.Equal(3, viewModel.ProcessCount);
+        Assert.Equal(1, viewModel.FilterSkipCount);
+    }
+
+    [Fact]
+    public async Task Single_source_report_shows_no_facet()
+    {
+        var (viewModel, gateway) = NewViewModel();
+        gateway.DryRunResult = new DryRunReport(viewModel.ProfileId!.Value, DateTimeOffset.UnixEpoch,
+        [
+            new DryRunFileResult
+            {
+                SourcePath = @"C:\only\a.txt", SourceRoot = @"C:\only",
+                Disposition = DryRunFileDisposition.WouldProcess, SourceDisposition = "KeepSource",
+                Targets = [new DryRunTargetAction { TargetPath = @"C:\t\a.txt", Kind = DryRunTargetKind.WouldWrite }],
+            },
+        ]);
+
+        await viewModel.RunAsync(CancellationToken.None);
+
+        Assert.False(viewModel.ShowSourceFacet);
+        Assert.Empty(viewModel.SourceFacets);
+    }
+
+    [Fact]
+    public async Task Dry_run_forwards_the_profile_id()
+    {
+        var (viewModel, gateway) = NewViewModel();
+        gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value);
+
+        await viewModel.RunAsync(CancellationToken.None);
+
+        Assert.Equal(viewModel.ProfileId!.Value, Assert.Single(gateway.DryRunCalls));
     }
 
     [Fact]

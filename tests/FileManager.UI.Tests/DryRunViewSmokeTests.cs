@@ -63,6 +63,40 @@ public sealed class DryRunViewSmokeTests(HeadlessSessionFixture headless)
     }
 
     [Fact]
+    public async Task Source_facet_renders_and_toggling_a_source_relayouts()
+    {
+        await headless.Session.Dispatch(async () =>
+        {
+            FakeIpcGateway gateway = new();
+            DryRunViewModel vm = new(gateway, new FakeFolderPicker());
+            vm.SetProfile(Guid.NewGuid(), "P");
+
+            // Two sources so the facet is shown and its CheckBox DataTemplate realizes on layout.
+            var files = new List<DryRunFileResult>();
+            for (int i = 0; i < 40; i++)
+                files.Add(new DryRunFileResult
+                {
+                    SourcePath = $@"C:\src-{i % 2}\file-{i}.dat",
+                    SourceRoot = $@"C:\src-{i % 2}",
+                    Disposition = DryRunFileDisposition.WouldProcess,
+                    SourceDisposition = "KeepSource",
+                    Targets = [new DryRunTargetAction { TargetPath = $@"D:\dst\file-{i}.dat", Kind = DryRunTargetKind.WouldWrite }],
+                });
+            gateway.DryRunResult = new DryRunReport(vm.ProfileId!.Value, DateTimeOffset.UnixEpoch, files);
+            await vm.RunAsync(CancellationToken.None);
+
+            Window window = ShowView(vm);
+
+            Assert.True(vm.ShowSourceFacet);
+            Assert.Equal(2, vm.SourceFacets.Count);
+
+            int before = vm.ProcessFiles.Count;
+            vm.SourceFacets[0].IsSelected = false;   // drives the facet checkbox → RebuildVisibleRows path
+            Assert.True(vm.ProcessFiles.Count < before);
+        }, CancellationToken.None);
+    }
+
+    [Fact]
     public async Task Tree_view_loads_and_toggling_a_node_relayouts()
     {
         await headless.Session.Dispatch(() =>

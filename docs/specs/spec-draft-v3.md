@@ -711,6 +711,13 @@ token-expanded), every Target path that would be written, and every **deletion a
 would occur (including source disposition). Its purpose is to let a user see the complete blast
 radius before any real, possibly destructive, execution.
 
+The GUI dry-run always simulates **every** Source of the profile — it never narrows the scan, so the
+report is always the complete blast radius. For a multi-source profile the report view offers a
+**per-source focus facet** (checkboxes) plus the path filter, "destructive only" toggle, and tree
+view; these narrow only what is *displayed* and never change the blast-radius totals. Scoped
+enumeration (a single subtree) remains a service/CLI capability — used by the shell "run this folder"
+verb — but is not exposed in the GUI dry-run.
+
 ---
 
 ## 9. Security Model

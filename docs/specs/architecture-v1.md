@@ -1666,6 +1666,7 @@ public enum DryRunFileDisposition { WouldProcess, WouldSkipFilter, WouldSkipUnch
 public sealed record DryRunFileResult
 {
     public required string SourcePath { get; init; }
+    public string? SourceRoot { get; init; }                      // originating Source; GUI groups/filters by it
     public required DryRunFileDisposition Disposition { get; init; }
     public string? DecidingFilter { get; init; }                  // set for WouldSkipFilter
     /// <summary>Fully token-expanded argv per transformer step, joined for display. Empty if no transformers.</summary>

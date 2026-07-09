@@ -12,7 +12,7 @@ internal sealed class FakeIpcGateway : IIpcGateway
 {
     public List<(Profile Profile, bool Acknowledge)> SaveCalls { get; } = [];
     public List<Guid> DeleteCalls { get; } = [];
-    public List<(Guid ProfileId, string? Scope)> DryRunCalls { get; } = [];
+    public List<Guid> DryRunCalls { get; } = [];
     public List<GlobalSettings> SaveSettingsCalls { get; } = [];
 
     public Result<EngineStatusSnapshot, IpcError> StatusResult { get; set; } =
@@ -66,9 +66,9 @@ internal sealed class FakeIpcGateway : IIpcGateway
     }
 
     public async Task<Result<DryRunReport, IpcError>> DryRunAsync(
-        Guid profileId, string? scopePath, CancellationToken ct = default)
+        Guid profileId, CancellationToken ct = default)
     {
-        DryRunCalls.Add((profileId, scopePath));
+        DryRunCalls.Add(profileId);
         if (DryRunException is not null)
             throw DryRunException;
         if (DryRunGate is not null)

@@ -456,6 +456,7 @@ public sealed class DryRunEngine(
     {
         long bytes = ResultStructuralBytes;
         bytes += StringUpperBound(result.SourcePath);
+        bytes += StringUpperBound(result.SourceRoot);
         bytes += StringUpperBound(result.DecidingFilter);
         bytes += StringUpperBound(result.SourceDisposition);
         foreach (string command in result.ExpandedCommands)
@@ -512,6 +513,7 @@ public sealed class DryRunEngine(
                 return new DryRunFileResult
                 {
                     SourcePath = payload.SourcePath,
+                    SourceRoot = payload.SourceRoot,
                     Disposition = DryRunFileDisposition.WouldSkipFilter,
                     DecidingFilter = decision.DecidingRule,
                 };
@@ -563,6 +565,7 @@ public sealed class DryRunEngine(
         return new DryRunFileResult
         {
             SourcePath = payload.SourcePath,
+            SourceRoot = payload.SourceRoot,
             Disposition = allUnchanged ? DryRunFileDisposition.WouldSkipUnchanged : DryRunFileDisposition.WouldProcess,
             Targets = targetActions,
             // An all-unchanged job closes Skipped without committing (§3.4.1), so no disposition

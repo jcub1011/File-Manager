@@ -23,6 +23,9 @@ public enum DryRunFileDisposition
 public sealed record DryRunFileResult
 {
     public required string SourcePath { get; init; }
+    // Additive (old peers omit it and deserialize to null): the Source root this file was
+    // enumerated under, so the GUI can group/filter a multi-source report by source.
+    public string? SourceRoot { get; init; }
     public required DryRunFileDisposition Disposition { get; init; }
     public string? DecidingFilter { get; init; }                  // set for WouldSkipFilter
     /// <summary>Fully token-expanded argv per transformer step, joined for display. Empty if no transformers.</summary>

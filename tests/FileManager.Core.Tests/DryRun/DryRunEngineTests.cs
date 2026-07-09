@@ -179,10 +179,35 @@ public sealed class DryRunEngineTests : IDisposable
 
         DryRunFileResult file = Assert.Single(report.Files);
         Assert.Equal(DryRunFileDisposition.WouldProcess, file.Disposition);
+        Assert.EndsWith("source", file.SourceRoot!, StringComparison.OrdinalIgnoreCase);
         DryRunTargetAction action = Assert.Single(file.Targets);
         Assert.Equal(DryRunTargetKind.WouldWrite, action.Kind);
         Assert.Equal(Path.Combine(_target, "new.txt"), action.TargetPath);
         Assert.False(report.Truncated);
+    }
+
+    [Fact]
+    public async Task Each_result_is_stamped_with_its_originating_source_root()
+    {
+        // Two sources, one file each: every result must carry the root it was enumerated under so the
+        // GUI can group/filter a multi-source report by source.
+        string sourceB = Path.Combine(_root, "source-b");
+        Directory.CreateDirectory(sourceB);
+        File.WriteAllText(Path.Combine(_source, "a.txt"), "a");
+        File.WriteAllText(Path.Combine(sourceB, "b.txt"), "b");
+
+        Profile profile = ProfileUnderTest() with
+        {
+            Sources = [new SourceConfig { Path = _source }, new SourceConfig { Path = sourceB }],
+        };
+
+        DryRunReport report = await Simulate(profile);
+
+        DryRunFileResult a = Assert.Single(report.Files, f => f.SourcePath.EndsWith("a.txt"));
+        DryRunFileResult b = Assert.Single(report.Files, f => f.SourcePath.EndsWith("b.txt"));
+        Assert.EndsWith("source", a.SourceRoot!, StringComparison.OrdinalIgnoreCase);      // ...\source
+        Assert.EndsWith("source-b", b.SourceRoot!, StringComparison.OrdinalIgnoreCase);    // ...\source-b
+        Assert.NotEqual(a.SourceRoot, b.SourceRoot);
     }
 
     [Fact]

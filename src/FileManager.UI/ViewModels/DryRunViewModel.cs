@@ -8,6 +8,7 @@ using FileManager.UI.Services;
 using Serilog;
 using System;
 using System.Collections.Generic;
+using System.ComponentModel;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
@@ -27,6 +28,7 @@ public sealed record DryRunTargetRow(string Path, DryRunTargetKind Kind, string?
 
 public sealed record DryRunFileRow(
     string SourcePath,
+    string? SourceRoot,
     DryRunFileDisposition Disposition,
     string? DecidingFilter,
     string? SourceDisposition,
@@ -162,10 +164,22 @@ public sealed class DryRunTreeNode
     }
 }
 
+/// <summary>One checkable Source in the dry-run report's focus facet. Toggling <see cref="IsSelected"/>
+/// filters which sources' rows are shown in the detail lists/tree — it never re-scans and never changes
+/// the blast-radius banner, which always reflects the complete run.</summary>
+public sealed partial class SourceFacetRow : ViewModelBase
+{
+    public required string Root { get; init; }
+    /// <summary>Would-process rows originating from this source (banner orientation, not a filtered count).</summary>
+    public required int Count { get; init; }
+    public string Label => $"{Root}  ({Count:N0})";
+
+    [ObservableProperty] public partial bool IsSelected { get; set; } = true;
+}
+
 public sealed partial class DryRunViewModel : ViewModelBase
 {
     private readonly IIpcGateway _gateway;
-    private readonly IFolderPicker _folderPicker;
     private readonly TimeSpan _searchDebounce;
     private CancellationTokenSource? _searchCts;
     private bool _applyingReport;
@@ -175,16 +189,17 @@ public sealed partial class DryRunViewModel : ViewModelBase
     private List<DryRunFileRow> _filterSkipsAll = [];
     private List<DryRunFileRow> _unchangedSkipsAll = [];
 
+    // folderPicker is accepted for parity with the other viewmodels' construction; the dry-run view
+    // no longer owns a folder picker (scope was removed in favour of the in-report source facet).
     public DryRunViewModel(IIpcGateway gateway, IFolderPicker folderPicker, TimeSpan? searchDebounce = null)
     {
+        _ = folderPicker;
         _gateway = gateway;
-        _folderPicker = folderPicker;
         _searchDebounce = searchDebounce ?? TimeSpan.FromMilliseconds(200);
     }
 
     [ObservableProperty] public partial Guid? ProfileId { get; set; }
     [ObservableProperty] public partial string ProfileName { get; set; } = "";
-    [ObservableProperty] public partial string ScopePath { get; set; } = "";
     [ObservableProperty] public partial bool HasReport { get; set; }
     [ObservableProperty] public partial string? ErrorMessage { get; set; }
     [ObservableProperty] public partial bool DestructiveOnly { get; set; }
@@ -212,6 +227,11 @@ public sealed partial class DryRunViewModel : ViewModelBase
     [ObservableProperty] public partial IReadOnlyList<DryRunFileRow> FilterSkips { get; private set; } = [];
     [ObservableProperty] public partial IReadOnlyList<DryRunFileRow> UnchangedSkips { get; private set; } = [];
 
+    /// <summary>Per-source checkboxes for a multi-source report. Empty (and <see cref="ShowSourceFacet"/>
+    /// false) for single-source reports, or when a legacy service omitted the per-row source root.</summary>
+    [ObservableProperty] public partial IReadOnlyList<SourceFacetRow> SourceFacets { get; private set; } = [];
+    [ObservableProperty] public partial bool ShowSourceFacet { get; private set; }
+
     /// <summary>When true, the "Will process" set is shown as a navigable path tree instead of a flat
     /// list — 50k rows collapse to a handful of directory nodes with rolled-up counts to drill into.</summary>
     [ObservableProperty] public partial bool ShowTree { get; set; }
@@ -222,7 +242,6 @@ public sealed partial class DryRunViewModel : ViewModelBase
     {
         ProfileId = profileId;
         ProfileName = profileName;
-        ScopePath = "";
         ClearReport();
         OnPropertyChanged(nameof(CanRun));
     }
@@ -236,8 +255,7 @@ public sealed partial class DryRunViewModel : ViewModelBase
 
         try
         {
-            var run = await _gateway.DryRunAsync(
-                profileId, string.IsNullOrWhiteSpace(ScopePath) ? null : ScopePath.Trim(), ct);
+            var run = await _gateway.DryRunAsync(profileId, ct);
             if (run.IsCanceled)
             {
                 Log.Debug("Dry run for profile {ProfileId} cancelled by the user", profileId);
@@ -268,14 +286,6 @@ public sealed partial class DryRunViewModel : ViewModelBase
             Log.Error(ex, "Dry run for profile {ProfileId} failed unexpectedly", profileId);
             ErrorMessage = $"Dry run failed unexpectedly: {ex.Message}";
         }
-    }
-
-    [RelayCommand]
-    public async Task BrowseScopeAsync()
-    {
-        string? picked = await _folderPicker.PickFolderAsync("Limit the dry run to a folder (must be under a Source)");
-        if (picked is not null)
-            ScopePath = picked;
     }
 
     partial void OnDestructiveOnlyChanged(bool value)
@@ -327,6 +337,7 @@ public sealed partial class DryRunViewModel : ViewModelBase
     {
         List<DryRunFileRow> rows = report.Files.Select(static f => new DryRunFileRow(
             f.SourcePath,
+            f.SourceRoot,
             f.Disposition,
             f.DecidingFilter,
             f.SourceDisposition,
@@ -364,33 +375,102 @@ public sealed partial class DryRunViewModel : ViewModelBase
         GeneratedAtText = $"Generated {report.GeneratedAt.ToLocalTime():yyyy-MM-dd HH:mm:ss}";
         WasTruncated = report.Truncated;
         TruncationNotice = report.Truncated
-            ? $"Report truncated: showing the first {report.Files.Count:N0} files — the scan found more. Set a scope folder to narrow the simulation."
+            ? $"Report truncated: showing the first {report.Files.Count:N0} files — the scan found more. Use the filter to narrow the view."
             : "";
+
+        BuildSourceFacets(rows);
 
         HasReport = true;
         RebuildVisibleRows();
     }
 
+    /// <summary>Builds the per-source focus checkboxes from the report. Only shown for a multi-source
+    /// report (>1 distinct root); a single source needs no facet, and a legacy service that omits the
+    /// per-row root (any null) can't be grouped reliably, so the facet stays hidden there too.</summary>
+    private void BuildSourceFacets(IReadOnlyList<DryRunFileRow> rows)
+    {
+        List<SourceFacetRow> facets = [];
+        bool anyNullRoot = false;
+        List<string> roots = [];
+        HashSet<string> seen = new(StringComparer.OrdinalIgnoreCase);
+        foreach (DryRunFileRow row in rows)
+        {
+            if (row.SourceRoot is null) { anyNullRoot = true; break; }
+            if (seen.Add(row.SourceRoot))
+                roots.Add(row.SourceRoot);
+        }
+
+        if (!anyNullRoot && roots.Count > 1)
+        {
+            Dictionary<string, int> processByRoot = new(StringComparer.OrdinalIgnoreCase);
+            foreach (DryRunFileRow row in _processAll)
+                if (row.SourceRoot is not null)
+                    processByRoot[row.SourceRoot] = processByRoot.GetValueOrDefault(row.SourceRoot) + 1;
+
+            roots.Sort(StringComparer.OrdinalIgnoreCase);
+            foreach (string root in roots)
+            {
+                SourceFacetRow facet = new() { Root = root, Count = processByRoot.GetValueOrDefault(root) };
+                facet.PropertyChanged += OnSourceFacetChanged;
+                facets.Add(facet);
+            }
+        }
+
+        SourceFacets = facets;
+        ShowSourceFacet = facets.Count > 0;
+    }
+
+    private void OnSourceFacetChanged(object? sender, PropertyChangedEventArgs e)
+    {
+        // The initial build assigns all-selected under _applyingReport; ApplyReport does the one rebuild.
+        if (_applyingReport) return;
+        if (e.PropertyName == nameof(SourceFacetRow.IsSelected))
+            RebuildVisibleRows();
+    }
+
     private void RebuildVisibleRows()
     {
         string? term = string.IsNullOrWhiteSpace(SearchText) ? null : SearchText.Trim();
+        // Null when every source is selected (or the facet is hidden) — the common case skips the
+        // per-row source check entirely. The banner counts are never touched: they always reflect
+        // the complete run, so a source toggle only narrows the visible detail lists/tree.
+        HashSet<string>? sources = SelectedSourceFilter();
 
         IEnumerable<DryRunFileRow> process = DestructiveOnly
             ? _processAll.Where(static r => r.HasDestructiveAction)
             : _processAll;
+        if (sources is not null) process = process.Where(r => InSelectedSource(r, sources));
         // The list virtualizes, so bind every match — no truncation. The tree aggregates the same set.
         _processMatches = (term is null ? process : process.Where(r => Matches(r, term))).ToList();
         ProcessFiles = _processMatches;
 
-        FilterSkips = Filter(DestructiveOnly ? [] : _filterSkipsAll, term);
-        UnchangedSkips = Filter(DestructiveOnly ? [] : _unchangedSkipsAll, term);
+        FilterSkips = Filter(DestructiveOnly ? [] : _filterSkipsAll, term, sources);
+        UnchangedSkips = Filter(DestructiveOnly ? [] : _unchangedSkipsAll, term, sources);
 
         if (ShowTree)
             RebuildTree();
     }
 
-    private static IReadOnlyList<DryRunFileRow> Filter(IEnumerable<DryRunFileRow> rows, string? term) =>
-        (term is null ? rows : rows.Where(r => Matches(r, term))).ToList();
+    /// <summary>The set of selected source roots to keep, or null when the facet is hidden or every
+    /// source is selected (no filtering needed).</summary>
+    private HashSet<string>? SelectedSourceFilter()
+    {
+        if (!ShowSourceFacet || SourceFacets.Count == 0 || SourceFacets.All(f => f.IsSelected))
+            return null;
+        return SourceFacets.Where(f => f.IsSelected)
+            .Select(f => f.Root).ToHashSet(StringComparer.OrdinalIgnoreCase);
+    }
+
+    private static bool InSelectedSource(DryRunFileRow row, HashSet<string> sources) =>
+        row.SourceRoot is not null && sources.Contains(row.SourceRoot);
+
+    private static IReadOnlyList<DryRunFileRow> Filter(
+        IEnumerable<DryRunFileRow> rows, string? term, HashSet<string>? sources)
+    {
+        if (sources is not null) rows = rows.Where(r => InSelectedSource(r, sources));
+        if (term is not null) rows = rows.Where(r => Matches(r, term));
+        return rows.ToList();
+    }
 
     private void RebuildTree()
     {
@@ -430,6 +510,8 @@ public sealed partial class DryRunViewModel : ViewModelBase
         FilterSkips = [];
         UnchangedSkips = [];
         TreeRows = [];
+        SourceFacets = [];
+        ShowSourceFacet = false;
         HasReport = false;
         ErrorMessage = null;
         SearchText = "";
