@@ -32,11 +32,17 @@
             <Setter Property="VerticalAlignment" Value="Stretch" />
         </Style>
         <Style Selector="Button.caption:pointerover /template/ ContentPresenter">
-            <Setter Property="Background" Value="#33808080" />
+            <Setter Property="Background" Value="#19808080" />
         </Style>
-        <!-- Close gets the conventional red hover with a light glyph. -->
+        <Style Selector="Button.caption:pressed /template/ ContentPresenter">
+            <Setter Property="Background" Value="#0F808080" />
+        </Style>
+        <!-- Close gets the conventional Windows 11 red hover with a light glyph. -->
         <Style Selector="Button.caption.close:pointerover /template/ ContentPresenter">
-            <Setter Property="Background" Value="#E81123" />
+            <Setter Property="Background" Value="#C42B1C" />
+        </Style>
+        <Style Selector="Button.caption.close:pressed /template/ ContentPresenter">
+            <Setter Property="Background" Value="#B4271C" />
         </Style>
         <Style Selector="Button.caption.close:pointerover PathIcon">
             <Setter Property="Foreground" Value="White" />
@@ -68,16 +74,16 @@
 
                 <Button Classes="caption" chrome:WindowDecorationProperties.ElementRole="MinimizeButton"
                         Click="OnMinimize" ToolTip.Tip="Minimize">
-                    <PathIcon Data="{StaticResource IconMinimize}" Width="14" Height="14" />
+                    <PathIcon Data="{StaticResource IconMinimize}" Width="10" Height="10" />
                 </Button>
                 <Button x:Name="MaximizeButton" Classes="caption"
                         chrome:WindowDecorationProperties.ElementRole="MaximizeButton"
                         Click="OnMaximizeRestore" ToolTip.Tip="Maximize">
-                    <PathIcon x:Name="MaximizeIcon" Data="{StaticResource IconMaximize}" Width="14" Height="14" />
+                    <PathIcon x:Name="MaximizeIcon" Data="{StaticResource IconMaximize}" Width="10" Height="10" />
                 </Button>
                 <Button Classes="caption close" chrome:WindowDecorationProperties.ElementRole="CloseButton"
                         Click="OnClose" ToolTip.Tip="Close">
-                    <PathIcon Data="{StaticResource IconClose}" Width="14" Height="14" />
+                    <PathIcon Data="{StaticResource IconClose}" Width="10" Height="10" />
                 </Button>
             </StackPanel>
         </Grid>
