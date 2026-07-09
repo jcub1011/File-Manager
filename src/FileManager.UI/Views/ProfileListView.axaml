@@ -23,7 +23,7 @@
             </StackPanel>
         </Border>
 
-        <ListBox ItemsSource="{Binding Profiles}" SelectedItem="{Binding SelectedProfile}">
+        <ListBox ItemsSource="{Binding FilteredProfiles}" SelectedItem="{Binding SelectedProfile}">
             <ListBox.ItemTemplate>
                 <DataTemplate x:DataType="vm:ProfileListItem">
                     <Grid ColumnDefinitions="*,Auto">

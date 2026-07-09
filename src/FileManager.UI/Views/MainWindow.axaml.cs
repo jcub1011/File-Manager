@@ -1,4 +1,5 @@
 using Avalonia.Controls;
+using Avalonia.Input;
 using FileManager.UI.ViewModels;
 using System;
 
@@ -18,6 +19,24 @@ namespace FileManager.UI.Views
         public MainWindow()
         {
             InitializeComponent();
+
+            // The client area is extended under the OS title bar (ExtendClientAreaToDecorationsHint),
+            // so the custom title-bar grid must drive window move/maximize itself.
+            TitleBar.PointerPressed += OnTitleBarPointerPressed;
+            TitleBar.DoubleTapped += OnTitleBarDoubleTapped;
+        }
+
+        private void OnTitleBarPointerPressed(object? sender, PointerPressedEventArgs e)
+        {
+            if (e.GetCurrentPoint(this).Properties.IsLeftButtonPressed)
+                BeginMoveDrag(e);
+        }
+
+        private void OnTitleBarDoubleTapped(object? sender, TappedEventArgs e)
+        {
+            WindowState = WindowState == WindowState.Maximized
+                ? WindowState.Normal
+                : WindowState.Maximized;
         }
 
         // NOTE: this override must stay `async void` — Avalonia's OnClosing returns void and the

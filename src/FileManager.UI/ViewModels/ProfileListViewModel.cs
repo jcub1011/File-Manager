@@ -6,6 +6,7 @@ using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace FileManager.UI.ViewModels;
@@ -18,9 +19,20 @@ public sealed record ProfileListItem(Guid ProfileId, string Name, bool Active, s
 
 public sealed partial class ProfileListViewModel(IIpcGateway gateway) : ViewModelBase
 {
-    private bool _revertingSelection;
+    /// <summary>How long to wait after the last keystroke before applying the search filter.</summary>
+    private static readonly TimeSpan SearchDebounce = TimeSpan.FromMilliseconds(250);
 
+    private bool _revertingSelection;
+    private CancellationTokenSource? _searchDebounceCts;
+
+    /// <summary>The full, unfiltered set of profiles (source of truth). The list UI binds to
+    /// <see cref="FilteredProfiles"/>, which is derived from this via <see cref="SearchText"/>.</summary>
     public ObservableCollection<ProfileListItem> Profiles { get; } = [];
+
+    /// <summary>The subset of <see cref="Profiles"/> shown in the list: those whose name matches
+    /// <see cref="SearchText"/>, plus the currently selected profile (so filtering never drops the
+    /// active selection out from under the editor).</summary>
+    public ObservableCollection<ProfileListItem> FilteredProfiles { get; } = [];
 
     /// <summary>Asked before honoring a selection change; false (dirty editor) reverts it.</summary>
     public Func<bool>? CanNavigate { get; set; }
@@ -40,6 +52,9 @@ public sealed partial class ProfileListViewModel(IIpcGateway gateway) : ViewMode
     [ObservableProperty]
     public partial ProfileListItem? PendingDelete { get; set; }
 
+    [ObservableProperty]
+    public partial string? SearchText { get; set; }
+
     partial void OnSelectedProfileChanged(ProfileListItem? oldValue, ProfileListItem? newValue)
     {
         if (_revertingSelection)
@@ -54,6 +69,60 @@ public sealed partial class ProfileListViewModel(IIpcGateway gateway) : ViewMode
         }
         PendingDelete = null;
         SelectionCommitted?.Invoke(newValue);
+
+        // Refresh the filtered view so a previously force-included (selected-but-unmatched) row
+        // drops out now that the selection has moved on. Guarded so the transient clear/re-add
+        // does not re-enter this handler as a real navigation.
+        _revertingSelection = true;
+        RebuildFiltered(newValue?.ProfileId);
+        SelectedProfile = newValue;
+        _revertingSelection = false;
+    }
+
+    partial void OnSearchTextChanged(string? value)
+    {
+        // Debounce: coalesce rapid keystrokes into a single filter pass. Cancelling the previous
+        // token abandons the pending delay; the continuation resumes on the UI thread (Avalonia's
+        // SynchronizationContext) so touching the observable collections stays thread-safe.
+        _searchDebounceCts?.Cancel();
+        _searchDebounceCts = new CancellationTokenSource();
+        _ = ApplySearchAfterDelayAsync(_searchDebounceCts.Token);
+    }
+
+    private async Task ApplySearchAfterDelayAsync(CancellationToken token)
+    {
+        try
+        {
+            await Task.Delay(SearchDebounce, token);
+        }
+        catch (OperationCanceledException)
+        {
+            return;   // superseded by a newer keystroke
+        }
+
+        Guid? keepId = SelectedProfile?.ProfileId;
+        _revertingSelection = true;
+        RebuildFiltered(keepId);
+        // The clear/re-add above can null the list's selection; re-assert it (same instance, now
+        // present in FilteredProfiles) so the editor stays on the open profile while filtering.
+        SelectedProfile = keepId is Guid id ? Profiles.FirstOrDefault(p => p.ProfileId == id) : null;
+        _revertingSelection = false;
+    }
+
+    /// <summary>Repopulates <see cref="FilteredProfiles"/> from <see cref="Profiles"/>: keeps names
+    /// matching <see cref="SearchText"/> (case-insensitive substring; empty term = all), and always
+    /// keeps the profile identified by <paramref name="keepSelectedId"/> even if it doesn't match.</summary>
+    private void RebuildFiltered(Guid? keepSelectedId)
+    {
+        string? term = SearchText?.Trim();
+        FilteredProfiles.Clear();
+        foreach (ProfileListItem p in Profiles)
+        {
+            bool matches = string.IsNullOrEmpty(term)
+                || p.Name.Contains(term, StringComparison.OrdinalIgnoreCase);
+            if (matches || p.ProfileId == keepSelectedId)
+                FilteredProfiles.Add(p);
+        }
     }
 
     [RelayCommand]
@@ -75,6 +144,7 @@ public sealed partial class ProfileListViewModel(IIpcGateway gateway) : ViewMode
             Profiles.Clear();
             foreach (ProfileSummary summary in summaries!.OrderBy(s => s.Name, StringComparer.OrdinalIgnoreCase))
                 Profiles.Add(new ProfileListItem(summary.ProfileId, summary.Name, summary.Active, summary.TriggerSummary));
+            RebuildFiltered(selectedId);   // build the filtered view before re-selecting into it
             SelectedProfile = Profiles.FirstOrDefault(p => p.ProfileId == selectedId);
             _revertingSelection = false;
         }
@@ -92,6 +162,7 @@ public sealed partial class ProfileListViewModel(IIpcGateway gateway) : ViewMode
     {
         await RefreshAsync();
         _revertingSelection = true;
+        RebuildFiltered(profileId);   // ensure the target is present in the filtered view first
         SelectedProfile = Profiles.FirstOrDefault(p => p.ProfileId == profileId);
         _revertingSelection = false;
     }
