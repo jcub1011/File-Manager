@@ -34,11 +34,14 @@ public sealed record Profile
     /// whose JSON predates this field deserializes with no value (the source generator does not run
     /// property initializers for absent members), which the getter reads back as
     /// <see cref="ConcurrencyOverride.Default"/> (<see cref="ConcurrencyMode.Inherit"/> — defer to
-    /// the global setting).</summary>
+    /// the global setting). The setter collapses an explicit default back to the absent (null)
+    /// representation so that a profile that omits the field and one that sets it to the default
+    /// compare equal under the record's value-equality (which is over <c>_concurrency</c>, not the
+    /// getter).</summary>
     public ConcurrencyOverride Concurrency
     {
         get => _concurrency ?? ConcurrencyOverride.Default;
-        init => _concurrency = value;
+        init => _concurrency = value == ConcurrencyOverride.Default ? null : value;
     }
 }
 

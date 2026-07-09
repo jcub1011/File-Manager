@@ -105,9 +105,10 @@ public sealed class SettingsService : ISettingsProvider
     }
 
     // A Manual worker count below 1 is meaningless and would make MaxDegreeOfParallelism throw, so
-    // clamp it here — stored files and incoming IPC values both pass through Load/Update.
+    // clamp it here — stored files and incoming IPC values both pass through Load/Update. In
+    // Automatic mode the worker count is unused, so drop it to keep the persisted form canonical.
     private static GlobalSettings Normalize(GlobalSettings settings) =>
         settings.DryRunConcurrencyMode == ConcurrencyMode.Manual
             ? settings with { DryRunManualWorkers = Math.Max(1, settings.DryRunManualWorkers ?? 1) }
-            : settings;
+            : settings with { DryRunManualWorkers = null };
 }
