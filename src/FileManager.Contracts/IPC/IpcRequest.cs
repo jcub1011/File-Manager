@@ -16,6 +16,7 @@ namespace FileManager.Contracts.IPC;
 [JsonDerivedType(typeof(RunProfileRequest), "run-profile")]
 [JsonDerivedType(typeof(SetPausedRequest), "set-paused")]
 [JsonDerivedType(typeof(DryRunRequest), "dry-run")]
+[JsonDerivedType(typeof(DryRunStreamRequest), "dry-run-stream")]
 [JsonDerivedType(typeof(GetRecentJobsRequest), "get-recent-jobs")]
 [JsonDerivedType(typeof(GetJobLogRequest), "get-job-log")]
 [JsonDerivedType(typeof(SubscribeEventsRequest), "subscribe")]
@@ -45,6 +46,14 @@ public sealed record RunProfileRequest : IpcRequest
 }
 public sealed record SetPausedRequest : IpcRequest { public required bool Paused { get; init; } }
 public sealed record DryRunRequest : IpcRequest
+{
+    public required Guid ProfileId { get; init; }
+    public string? ScopePath { get; init; }
+}
+/// <summary>Same inputs as <see cref="DryRunRequest"/>, but the report streams back as a sequence
+/// of DryRunChunkResponse frames terminated by a DryRunCompleteResponse (see IpcResponse) — so a
+/// report is no longer bounded by the single-frame size cap.</summary>
+public sealed record DryRunStreamRequest : IpcRequest
 {
     public required Guid ProfileId { get; init; }
     public string? ScopePath { get; init; }

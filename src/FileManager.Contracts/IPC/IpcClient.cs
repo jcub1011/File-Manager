@@ -1,3 +1,4 @@
+using FileManager.Contracts.DryRun;
 using FileManager.Contracts.Primitives;
 using System;
 using System.Collections.Generic;
@@ -108,6 +109,85 @@ public sealed class IpcClient : IAsyncDisposable
         catch (OperationCanceledException)
         {
             return Result<TResponse, IpcError>.Canceled();
+        }
+        catch (Exception ex) when (ex is System.IO.IOException or ObjectDisposedException)
+        {
+            return new IpcError("IPC_TRANSPORT", ex.Message);
+        }
+        catch (Exception ex)
+        {
+            // Last resort: an unexpected exception becomes a traceable failure value (callers
+            // log every failure).
+            return new IpcError("IPC_INTERNAL", $"{ex.GetType().Name}: {ex.Message}");
+        }
+        finally
+        {
+            _requestGate.Release();
+        }
+    }
+
+    /// <summary>Sends a streaming dry-run request and reassembles the chunk frames
+    /// (<see cref="DryRunChunkResponse"/>) into one <see cref="DryRunReport"/>, stopping at the
+    /// <see cref="DryRunCompleteResponse"/> terminator. Because the report arrives as many small
+    /// frames it is not bounded by the single-frame size cap. An ErrorResponse (e.g. PROFILE_NOT_FOUND,
+    /// DRY_RUN_FAILED) and every transport fault surface as an <see cref="IpcError"/>; cancellation is
+    /// a Canceled result, never a throw. Holds the request gate for the whole stream (§3.2).</summary>
+    public async Task<Result<DryRunReport, IpcError>> DryRunStreamAsync(
+        DryRunStreamRequest request, CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+
+        try
+        {
+            await _requestGate.WaitAsync(ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            return Result<DryRunReport, IpcError>.Canceled();
+        }
+
+        try
+        {
+            byte[] payload = IpcSerializer.SerializeRequest(request);
+            Result writeResult = await IpcFrameCodec.WriteFrameAsync(_pipe, payload, ct).ConfigureAwait(false);
+            if (writeResult.IsCanceled)
+                return Result<DryRunReport, IpcError>.Canceled();
+            if (writeResult.TryGetError(out string? writeError))
+                return new IpcError("IPC_TRANSPORT", writeError);
+
+            List<DryRunFileResult> files = [];
+            while (true)
+            {
+                Result<byte[], string> frame = await IpcFrameCodec.ReadFrameAsync(_pipe, ct).ConfigureAwait(false);
+                if (frame.IsCanceled)
+                    return Result<DryRunReport, IpcError>.Canceled();
+                if (frame.TryGetError(out string? transportError))
+                    return new IpcError("IPC_TRANSPORT", transportError);
+                frame.TryGetValue(out byte[]? bytes);
+
+                Result<IpcResponse, string> parsed = IpcSerializer.DeserializeResponse(bytes!);
+                if (parsed.TryGetError(out string? parseError))
+                    return new IpcError("IPC_MALFORMED", $"the service sent a response that could not be parsed: {parseError}");
+                parsed.TryGetValue(out IpcResponse? response);
+
+                switch (response!)
+                {
+                    case DryRunChunkResponse chunk:
+                        files.AddRange(chunk.Files);
+                        break;
+                    case DryRunCompleteResponse complete:
+                        return new DryRunReport(request.ProfileId, complete.GeneratedAt, files, complete.Truncated);
+                    case ErrorResponse error:
+                        return new IpcError(error.Code, error.Message);
+                    default:
+                        return new IpcError("IPC_UNEXPECTED_RESPONSE",
+                            $"expected a dry-run chunk or completion, got {response!.GetType().Name}");
+                }
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            return Result<DryRunReport, IpcError>.Canceled();
         }
         catch (Exception ex) when (ex is System.IO.IOException or ObjectDisposedException)
         {

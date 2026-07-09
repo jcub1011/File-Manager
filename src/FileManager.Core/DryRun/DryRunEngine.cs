@@ -16,6 +16,7 @@ using System.Buffers;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Runtime.CompilerServices;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
@@ -44,6 +45,13 @@ public sealed class DryRunEngine(
     internal const int MaxReportBytes = 12 * 1024 * 1024;
     internal const int MaxReportedFiles = 50_000;
 
+    /// <summary>Streaming (<see cref="SimulateStreamAsync"/>) has no report ceiling — the report is
+    /// split across many frames, so a chunk only needs to sit comfortably under the 16 MiB frame
+    /// cap. A traditional ~1 MiB per chunk (bounded by the cheap <see cref="UpperBoundBytes"/>
+    /// estimate, so the true serialized size is always smaller) keeps per-message memory low and
+    /// leaves generous headroom under the cap. On a local pipe the extra frames cost nothing.</summary>
+    internal const int ChunkByteThreshold = 1 * 1024 * 1024;
+
     /// <summary>Candidates are evaluated in batches so the byte budget can halt evaluation early
     /// (see phase 2). Sized well above the resolved worker count so every worker stays busy, while
     /// capping the evaluation wasted past the truncation point to at most one batch.</summary>
@@ -52,6 +60,10 @@ public sealed class DryRunEngine(
     /// <summary>Test seam: production uses <see cref="MaxReportBytes"/>; tests shrink it so
     /// truncation is reachable without tens of thousands of real files.</summary>
     internal int ReportByteBudget { get; init; } = MaxReportBytes;
+
+    /// <summary>Test seam: production uses <see cref="ChunkByteThreshold"/>; tests shrink it so a
+    /// stream splits into several chunks without generating a megabyte of files.</summary>
+    internal int ChunkByteBudget { get; init; } = ChunkByteThreshold;
 
     public async Task<Result<DryRunReport, string>> SimulateAsync(
         Guid profileId, string? scopePath, CancellationToken ct = default)
@@ -70,22 +82,10 @@ public sealed class DryRunEngine(
         }
 
         // One compiled set per source, keyed by the source root the scanner stamps on payloads.
-        Dictionary<string, CompiledFilterSet> filtersBySourceRoot = new(StringComparer.OrdinalIgnoreCase);
-        foreach (SourceConfig source in profile.Sources)
-        {
-            var compiled = filterCompiler.Compile(profile.Filters, source.Filters);
-            if (compiled.TryGetError(out string? compileError))
-            {
-                logger.LogError(
-                    "Dry-run for profile {ProfileId} failed: filter compilation error (was this profile saved through validation?): {Error}",
-                    profileId, compileError);
-                return $"filter compilation failed (was this profile saved through validation?): {compileError}";
-            }
-
-            compiled.TryGetValue(out CompiledFilterSet? set);
-            if (NormalizedPath.Create(source.Path).TryGetValue(out NormalizedPath root))
-                filtersBySourceRoot[root.Value] = set!;
-        }
+        Result<Dictionary<string, CompiledFilterSet>, string> filtersResult = CompileFilters(profile);
+        if (filtersResult.TryGetError(out string? compileError))
+            return compileError;
+        filtersResult.TryGetValue(out Dictionary<string, CompiledFilterSet>? filtersBySourceRoot);
 
         bool hasTransformers = profile.Transformers is { Count: > 0 };
         bool truncated = false;
@@ -149,7 +149,7 @@ public sealed class DryRunEngine(
                     async (j, token) =>
                     {
                         batch[j] = await EvaluateFileAsync(
-                            profile, candidates[start + j], filtersBySourceRoot, hasTransformers, token)
+                            profile, candidates[start + j], filtersBySourceRoot!, hasTransformers, token)
                             .ConfigureAwait(false);
                     }).ConfigureAwait(false);
 
@@ -185,6 +185,135 @@ public sealed class DryRunEngine(
             profileId, files.Count, (completedAt - startedAt).TotalMilliseconds,
             truncated ? " (report truncated)" : "");
         return new DryRunReport(profileId, completedAt, files, truncated);
+    }
+
+    /// <summary>Streaming counterpart to <see cref="SimulateAsync"/> (spec §8): yields the report as
+    /// a sequence of source-path-ordered chunks instead of one bounded, truncatable report, so a
+    /// run larger than the single-frame budget reports every file. Reuses the same scan → sort →
+    /// batched read-only evaluation; only the accumulation differs — results are buffered and a
+    /// chunk is emitted once its cheap upper-bound size crosses <see cref="ChunkByteThreshold"/>.
+    /// A fatal setup/scan error is yielded as a single failure item and ends the stream; cancellation
+    /// surfaces as <see cref="OperationCanceledException"/> from the enumerator (the async-stream
+    /// convention), never a partial "success".</summary>
+    public async IAsyncEnumerable<Result<IReadOnlyList<DryRunFileResult>, string>> SimulateStreamAsync(
+        Guid profileId, string? scopePath, [EnumeratorCancellation] CancellationToken ct = default)
+    {
+        DateTimeOffset startedAt = time.GetUtcNow();
+        if (logger.IsEnabled(LogLevel.Information))
+            logger.LogInformation("Dry-run (stream) started for profile {ProfileId} (scope {Scope})",
+                profileId, scopePath ?? "<all sources>");
+
+        Profile? profile = catalog.All.FirstOrDefault(p => p.Id == profileId);
+        if (profile is null)
+        {
+            if (logger.IsEnabled(LogLevel.Debug))
+                logger.LogDebug("Dry-run requested for profile {ProfileId} which was not found", profileId);
+            yield return $"profile {profileId} not found";
+            yield break;
+        }
+
+        Result<Dictionary<string, CompiledFilterSet>, string> filtersResult = CompileFilters(profile);
+        if (filtersResult.TryGetError(out string? compileError))
+        {
+            yield return compileError;
+            yield break;
+        }
+        filtersResult.TryGetValue(out Dictionary<string, CompiledFilterSet>? filtersBySourceRoot);
+
+        bool hasTransformers = profile.Transformers is { Count: > 0 };
+
+        // Phase 1: drain the scan into a candidate list. No file cap — streaming has no ceiling. A
+        // fatal fault ends the stream with a failure; warnings are logged and skipped (matching
+        // SimulateAsync). Cancellation throws, which the consumer treats as a cancelled run.
+        List<Payload> candidates = [];
+        foreach (var scanned in scanner.Scan(profile, TriggerKind.Cli, scopePath))
+        {
+            ct.ThrowIfCancellationRequested();
+            if (scanned.TryGetError(out EnumerationFault fault))
+            {
+                if (fault.Severity == EnumerationSeverity.Fatal)
+                {
+                    logger.LogError("Dry-run (stream) for profile {ProfileId} failed: scan error: {Message}",
+                        profileId, fault.Message);
+                    yield return $"scan failed: {fault.Message}";
+                    yield break;
+                }
+                logger.LogWarning("Dry-run enumeration warning: {Message}", fault.Message);
+                continue;
+            }
+            scanned.TryGetValue(out Payload? payload);
+            candidates.Add(payload!);
+        }
+
+        // Phase 2: fix the output order (source path), evaluate in bounded batches, and flush a chunk
+        // whenever the buffer's upper-bound size crosses the threshold. Same read-only, race-free
+        // evaluation as SimulateAsync; positional writes keep the kept order deterministic.
+        candidates.Sort(static (a, b) =>
+            string.Compare(a.SourcePath, b.SourcePath, StringComparison.OrdinalIgnoreCase));
+
+        int maxConcurrency = ResolveWorkers(profile);
+        List<DryRunFileResult> chunk = [];
+        long chunkBytes = 0;
+        int totalKept = 0;
+        for (int start = 0; start < candidates.Count; start += EvaluationBatchSize)
+        {
+            int count = Math.Min(EvaluationBatchSize, candidates.Count - start);
+            DryRunFileResult?[] batch = new DryRunFileResult?[count];
+            await Parallel.ForEachAsync(
+                Enumerable.Range(0, count),
+                new ParallelOptions { MaxDegreeOfParallelism = maxConcurrency, CancellationToken = ct },
+                async (j, token) =>
+                {
+                    batch[j] = await EvaluateFileAsync(
+                        profile, candidates[start + j], filtersBySourceRoot!, hasTransformers, token)
+                        .ConfigureAwait(false);
+                }).ConfigureAwait(false);
+
+            foreach (DryRunFileResult? result in batch)
+            {
+                if (result is null)
+                    continue;
+                chunk.Add(result);
+                totalKept++;
+                chunkBytes += UpperBoundBytes(result);
+                if (chunkBytes >= ChunkByteBudget)
+                {
+                    yield return Result<IReadOnlyList<DryRunFileResult>, string>.Success(chunk);
+                    chunk = [];
+                    chunkBytes = 0;
+                }
+            }
+        }
+        if (chunk.Count > 0)
+            yield return Result<IReadOnlyList<DryRunFileResult>, string>.Success(chunk);
+
+        DateTimeOffset completedAt = time.GetUtcNow();
+        logger.LogInformation(
+            "Dry-run (stream) completed for profile {ProfileId}: {FileCount} files in {ElapsedMs}ms",
+            profileId, totalKept, (completedAt - startedAt).TotalMilliseconds);
+    }
+
+    /// <summary>Compiles one filter set per source, keyed by the source root the scanner stamps on
+    /// payloads. Shared by the batched and streamed simulations.</summary>
+    private Result<Dictionary<string, CompiledFilterSet>, string> CompileFilters(Profile profile)
+    {
+        Dictionary<string, CompiledFilterSet> filtersBySourceRoot = new(StringComparer.OrdinalIgnoreCase);
+        foreach (SourceConfig source in profile.Sources)
+        {
+            var compiled = filterCompiler.Compile(profile.Filters, source.Filters);
+            if (compiled.TryGetError(out string? compileError))
+            {
+                logger.LogError(
+                    "Dry-run for profile {ProfileId} failed: filter compilation error (was this profile saved through validation?): {Error}",
+                    profile.Id, compileError);
+                return $"filter compilation failed (was this profile saved through validation?): {compileError}";
+            }
+
+            compiled.TryGetValue(out CompiledFilterSet? set);
+            if (NormalizedPath.Create(source.Path).TryGetValue(out NormalizedPath root))
+                filtersBySourceRoot[root.Value] = set!;
+        }
+        return filtersBySourceRoot;
     }
 
     /// <summary>Resolves the evaluation worker count for this run. The profile's own mode wins;

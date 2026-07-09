@@ -42,6 +42,7 @@ public sealed class IpcRequestTypesTests
             nameof(RunProfileRequest) => new RunProfileRequest { ProfileId = id, Path = "x" },
             nameof(SetPausedRequest) => new SetPausedRequest { Paused = false },
             nameof(DryRunRequest) => new DryRunRequest { ProfileId = id },
+            nameof(DryRunStreamRequest) => new DryRunStreamRequest { ProfileId = id },
             nameof(GetRecentJobsRequest) => new GetRecentJobsRequest(),
             nameof(GetJobLogRequest) => new GetJobLogRequest { JobId = id },
             nameof(SubscribeEventsRequest) => new SubscribeEventsRequest(),

@@ -91,7 +91,10 @@ public sealed class DryRunEngineTests : IDisposable
     private static DryRunEngine NewEngine(int reportByteBudget, params Profile[] profiles) =>
         NewEngine(reportByteBudget, GlobalSettings.Default, profiles);
 
-    private static DryRunEngine NewEngine(int reportByteBudget, GlobalSettings global, params Profile[] profiles)
+    private static DryRunEngine NewEngine(int reportByteBudget, GlobalSettings global, params Profile[] profiles) =>
+        NewEngine(reportByteBudget, DryRunEngine.ChunkByteThreshold, global, profiles);
+
+    private static DryRunEngine NewEngine(int reportByteBudget, int chunkByteBudget, GlobalSettings global, params Profile[] profiles)
     {
         FileSystemService fileSystem = new(NullLogger<FileSystemService>.Instance);
         return new DryRunEngine(
@@ -103,7 +106,19 @@ public sealed class DryRunEngineTests : IDisposable
             new ConflictResolver(NullLogger<ConflictResolver>.Instance),
             new FakeSettings(global),
             TimeProvider.System)
-        { ReportByteBudget = reportByteBudget };
+        { ReportByteBudget = reportByteBudget, ChunkByteBudget = chunkByteBudget };
+    }
+
+    private static async Task<List<DryRunFileResult>> CollectStream(
+        DryRunEngine engine, Guid profileId, string? scope = null, CancellationToken ct = default)
+    {
+        List<DryRunFileResult> files = [];
+        await foreach (Result<IReadOnlyList<DryRunFileResult>, string> chunk in engine.SimulateStreamAsync(profileId, scope, ct))
+        {
+            Assert.True(chunk.TryGetValue(out IReadOnlyList<DryRunFileResult>? batch), "stream yielded a failure chunk");
+            files.AddRange(batch!);
+        }
+        return files;
     }
 
     private sealed class FakeSettings(GlobalSettings current) : ISettingsProvider
@@ -363,6 +378,96 @@ public sealed class DryRunEngineTests : IDisposable
             filters: new FilterSet { ExcludeGlob = ["*.tmp"] }));
 
         Assert.Equal(before, SnapshotTree());
+    }
+
+    // ----- streaming (SimulateStreamAsync) -----
+
+    [Fact]
+    public async Task Stream_yields_the_same_results_in_the_same_order_as_the_batched_report()
+    {
+        string[] names = ["m.txt", "a.txt", "z.txt", "c.txt", "b.txt", "y.txt", "d.txt", "n.txt"];
+        foreach (string name in names)
+            SourceFile(name, $"content of {name}");
+        Profile profile = ProfileUnderTest();
+
+        DryRunReport batched = await Simulate(profile);
+        List<DryRunFileResult> streamed = await CollectStream(NewEngine(profile), profile.Id);
+
+        Assert.Equal(
+            batched.Files.Select(f => (f.SourcePath, f.Disposition)).ToList(),
+            streamed.Select(f => (f.SourcePath, f.Disposition)).ToList());
+    }
+
+    [Fact]
+    public async Task Stream_has_no_truncation_ceiling_where_the_batched_report_truncates()
+    {
+        // A budget that truncates the single-frame report must NOT truncate the stream: streaming
+        // reports every file across many frames.
+        for (int i = 0; i < 40; i++)
+            SourceFile($"{i:D3}.txt", $"content {i}");
+        Profile profile = ProfileUnderTest();
+
+        var batched = await NewEngine(1500, profile).SimulateAsync(profile.Id, null);
+        Assert.True(batched.TryGetValue(out DryRunReport? truncatedReport));
+        Assert.True(truncatedReport!.Truncated);
+        Assert.InRange(truncatedReport.Files.Count, 1, 39);
+
+        // Same tiny budget as the *chunk* budget — still every file comes back.
+        List<DryRunFileResult> streamed = await CollectStream(NewEngine(1500, 1500, GlobalSettings.Default, profile), profile.Id);
+        Assert.Equal(40, streamed.Count);
+        Assert.Equal(
+            Enumerable.Range(0, 40).Select(i => $"{i:D3}.txt").OrderBy(n => n, StringComparer.OrdinalIgnoreCase).ToList(),
+            streamed.Select(f => Path.GetFileName(f.SourcePath)).ToList());
+    }
+
+    [Fact]
+    public async Task Stream_splits_into_multiple_chunks_at_the_chunk_budget()
+    {
+        for (int i = 0; i < 30; i++)
+            SourceFile($"{i:D3}.txt", $"content {i}");
+        Profile profile = ProfileUnderTest();
+
+        // A small chunk budget forces several chunks; each stays under the 16 MiB frame cap by design.
+        DryRunEngine engine = NewEngine(DryRunEngine.MaxReportBytes, 512, GlobalSettings.Default, profile);
+        List<IReadOnlyList<DryRunFileResult>> chunks = [];
+        await foreach (Result<IReadOnlyList<DryRunFileResult>, string> chunk in engine.SimulateStreamAsync(profile.Id, null))
+        {
+            Assert.True(chunk.TryGetValue(out IReadOnlyList<DryRunFileResult>? batch));
+            chunks.Add(batch!);
+        }
+
+        Assert.True(chunks.Count > 1, $"expected multiple chunks, got {chunks.Count}");
+        Assert.All(chunks, c => Assert.NotEmpty(c));
+        Assert.Equal(30, chunks.Sum(c => c.Count));
+    }
+
+    [Fact]
+    public async Task Stream_unknown_profile_yields_a_single_failure_item()
+    {
+        List<Result<IReadOnlyList<DryRunFileResult>, string>> items = [];
+        await foreach (var item in NewEngine(ProfileUnderTest()).SimulateStreamAsync(Guid.NewGuid(), null))
+            items.Add(item);
+
+        Result<IReadOnlyList<DryRunFileResult>, string> only = Assert.Single(items);
+        Assert.True(only.TryGetError(out string? error));
+        Assert.Contains("not found", error);
+    }
+
+    [Fact]
+    public async Task Stream_cancellation_throws_from_the_enumerator()
+    {
+        SourceFile("a.txt");
+        SourceFile("b.txt");
+        Profile profile = ProfileUnderTest();
+        using CancellationTokenSource cts = new();
+        cts.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(async () =>
+        {
+            await foreach (var _ in NewEngine(profile).SimulateStreamAsync(profile.Id, null, cts.Token))
+            {
+            }
+        });
     }
 
     private Dictionary<string, (long Length, DateTime Mtime)> SnapshotTree() =>

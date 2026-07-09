@@ -78,8 +78,10 @@ public sealed class IpcGateway : IIpcGateway, IAsyncDisposable
 
         await using (client)
         {
-            var response = await client!.RequestAsync<DryRunResponse>(
-                new DryRunRequest { ProfileId = profileId, ScopePath = scopePath }, ct).ConfigureAwait(false);
+            // Streamed: the report arrives as many small frames and is reassembled here, so it is
+            // not bounded by the single-frame size cap (no ~50k-file truncation).
+            var response = await client!.DryRunStreamAsync(
+                new DryRunStreamRequest { ProfileId = profileId, ScopePath = scopePath }, ct).ConfigureAwait(false);
             if (response.IsCanceled)
                 return Result<DryRunReport, IpcError>.Canceled();
             if (response.TryGetError(out IpcError? error))
@@ -88,8 +90,8 @@ public sealed class IpcGateway : IIpcGateway, IAsyncDisposable
                     profileId, error.Code, error.Message);
                 return error;
             }
-            response.TryGetValue(out DryRunResponse? report);
-            return report!.Report;
+            response.TryGetValue(out DryRunReport? report);
+            return report!;
         }
     }
 

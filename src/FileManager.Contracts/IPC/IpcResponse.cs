@@ -15,6 +15,8 @@ namespace FileManager.Contracts.IPC;
 [JsonDerivedType(typeof(ValidationResponse), "validation")]
 [JsonDerivedType(typeof(MatchingProfilesResponse), "matching")]
 [JsonDerivedType(typeof(DryRunResponse), "dry-run-report")]
+[JsonDerivedType(typeof(DryRunChunkResponse), "dry-run-chunk")]
+[JsonDerivedType(typeof(DryRunCompleteResponse), "dry-run-complete")]
 [JsonDerivedType(typeof(RecentJobsResponse), "recent-jobs")]
 [JsonDerivedType(typeof(JobLogResponse), "job-log")]
 [JsonDerivedType(typeof(SettingsResponse), "settings")]
@@ -32,6 +34,17 @@ public sealed record ProfileResponse : IpcResponse { public required Profile Pro
 public sealed record ValidationResponse : IpcResponse { public required IReadOnlyList<ValidationIssue> Issues { get; init; } }
 public sealed record MatchingProfilesResponse : IpcResponse { public required IReadOnlyList<ProfileMatchDto> Matches { get; init; } }
 public sealed record DryRunResponse : IpcResponse { public required DryRunReport Report { get; init; } }
+/// <summary>One batch of a streamed dry-run report (see DryRunStreamRequest). The service sends
+/// zero or more of these, in source-path order, each well under the frame cap, then a single
+/// <see cref="DryRunCompleteResponse"/> terminator.</summary>
+public sealed record DryRunChunkResponse : IpcResponse { public required IReadOnlyList<DryRunFileResult> Files { get; init; } }
+/// <summary>Terminates a streamed dry-run report. GeneratedAt is stamped when the report finishes;
+/// Truncated is true only if a service-side safety bound cut the report short.</summary>
+public sealed record DryRunCompleteResponse : IpcResponse
+{
+    public required System.DateTimeOffset GeneratedAt { get; init; }
+    public required bool Truncated { get; init; }
+}
 public sealed record RecentJobsResponse : IpcResponse { public required IReadOnlyList<JobSummaryDto> Jobs { get; init; } }
 public sealed record JobLogResponse : IpcResponse { public required IReadOnlyList<string> Lines { get; init; } }
 public sealed record SettingsResponse : IpcResponse { public required GlobalSettings Settings { get; init; } }

@@ -132,32 +132,27 @@ public sealed class IpcServer(
                     }
                     frame.TryGetValue(out byte[]? payload);
 
-                    (string requestType, IpcResponse response) = await DispatchAsync(payload!, ct).ConfigureAwait(false);
-                    byte[] responseBytes = IpcSerializer.SerializeResponse(response);
-                    if (responseBytes.Length > IpcFrameCodec.MaxPayloadBytes)
+                    Resolution resolution = Resolve(payload!);
+                    if (resolution.Error is not null)
                     {
-                        // WriteFrameAsync treats an oversized payload as a programmer error and
-                        // throws — swap in a small, readable error so the connection survives.
-                        logger.LogWarning(
-                            "IPC response to \"{RequestType}\" is {Size:N0} bytes, over the {Cap:N0}-byte frame cap; replying IPC_RESPONSE_TOO_LARGE",
-                            requestType, responseBytes.Length, IpcFrameCodec.MaxPayloadBytes);
-                        responseBytes = IpcSerializer.SerializeResponse(new ErrorResponse
-                        {
-                            Code = "IPC_RESPONSE_TOO_LARGE",
-                            Message = $"the response to \"{requestType}\" was {responseBytes.Length:N0} bytes, over the " +
-                                $"{IpcFrameCodec.MaxPayloadBytes:N0}-byte IPC frame limit — narrow the request " +
-                                "(for a dry run, set a scope folder) and retry",
-                        });
+                        // Parse / version / not-implemented failure: one frame, then keep serving.
+                        if (!await TryWriteResponseFrameAsync(stream, resolution.RequestType, resolution.Error, ct).ConfigureAwait(false))
+                            return;
+                        continue;
                     }
-                    Result writeResult = await IpcFrameCodec.WriteFrameAsync(stream, responseBytes, ct)
-                        .ConfigureAwait(false);
-                    if (writeResult.IsCanceled)
-                        return;                     // shutdown
-                    if (writeResult.TryGetError(out string? writeError))
+
+                    if (resolution.Handler is IIpcStreamingRequestHandler streaming)
                     {
-                        logger.LogDebug("IPC connection ended: {Reason}", writeError);
+                        // One request, many response frames (§ streamed dry-run). The connection
+                        // survives a normal or errored stream; only a transport fault ends it.
+                        if (!await ServeStreamAsync(stream, resolution.RequestType, streaming, resolution.Request!, ct).ConfigureAwait(false))
+                            return;
+                        continue;
+                    }
+
+                    IpcResponse response = await InvokeAsync(resolution.RequestType, resolution.Handler!, resolution.Request!, ct).ConfigureAwait(false);
+                    if (!await TryWriteResponseFrameAsync(stream, resolution.RequestType, response, ct).ConfigureAwait(false))
                         return;
-                    }
                 }
             }
             catch (OperationCanceledException)
@@ -177,34 +172,48 @@ public sealed class IpcServer(
         }
     }
 
-    private async Task<(string RequestType, IpcResponse Response)> DispatchAsync(byte[] payload, CancellationToken ct)
+    /// <summary>The outcome of parsing + routing one request frame: either an <see cref="Error"/>
+    /// response to send once, or a resolved <see cref="Handler"/> and <see cref="Request"/> to serve.</summary>
+    private readonly record struct Resolution(string RequestType, IpcRequest? Request, IIpcRequestHandler? Handler, IpcResponse? Error);
+
+    /// <summary>Parses the frame, checks the protocol version, and looks up the handler — the shared
+    /// front half of both the single-response and streaming paths.</summary>
+    private Resolution Resolve(byte[] payload)
     {
         Result<IpcRequest, string> parsed = IpcSerializer.DeserializeRequest(payload);
         if (parsed.TryGetError(out string? parseError))
         {
             logger.LogWarning("IPC request frame rejected: {Reason}", parseError);
-            return ("<malformed>", new ErrorResponse { Code = "IPC_MALFORMED", Message = "the request frame could not be parsed" });
+            return new Resolution("<malformed>", null, null,
+                new ErrorResponse { Code = "IPC_MALFORMED", Message = "the request frame could not be parsed" });
         }
         parsed.TryGetValue(out IpcRequest? request);
 
         string discriminator = IpcRequestTypes.DiscriminatorOf(request!);
         if (request!.ProtocolVersion != 1)
-            return (discriminator, new ErrorResponse
+            return new Resolution(discriminator, null, null, new ErrorResponse
             {
                 Code = "IPC_VERSION_MISMATCH",
                 Message = $"this service speaks protocol version 1, the client sent {request.ProtocolVersion}",
             });
 
         if (!handlers.TryGetValue(discriminator, out IIpcRequestHandler? handler))
-            return (discriminator, new ErrorResponse
+            return new Resolution(discriminator, null, null, new ErrorResponse
             {
                 Code = "NOT_IMPLEMENTED",
                 Message = $"\"{discriminator}\" is not available in this build",
             });
 
+        return new Resolution(discriminator, request, handler, null);
+    }
+
+    /// <summary>Invokes a single-response handler, turning a handler fault into an INTERNAL_ERROR
+    /// response (cancellation still propagates as shutdown).</summary>
+    private async Task<IpcResponse> InvokeAsync(string requestType, IIpcRequestHandler handler, IpcRequest request, CancellationToken ct)
+    {
         try
         {
-            return (discriminator, await handler.HandleAsync(request, ct).ConfigureAwait(false));
+            return await handler.HandleAsync(request, ct).ConfigureAwait(false);
         }
         catch (OperationCanceledException)
         {
@@ -212,8 +221,81 @@ public sealed class IpcServer(
         }
         catch (Exception ex)
         {
-            logger.LogError(ex, "Handler for {RequestType} threw", discriminator);
-            return (discriminator, new ErrorResponse { Code = "INTERNAL_ERROR", Message = ex.Message });
+            logger.LogError(ex, "Handler for {RequestType} threw", requestType);
+            return new ErrorResponse { Code = "INTERNAL_ERROR", Message = ex.Message };
         }
+    }
+
+    /// <summary>Serves a streaming handler: one response frame per yielded item, then the connection
+    /// survives to serve the next request. A handler fault becomes a trailing INTERNAL_ERROR frame;
+    /// cancellation (shutdown) propagates. Returns false only when the connection must close (a
+    /// transport write failed or was cancelled).</summary>
+    private async Task<bool> ServeStreamAsync(
+        Stream stream, string requestType, IIpcStreamingRequestHandler handler, IpcRequest request, CancellationToken ct)
+    {
+        IAsyncEnumerator<IpcResponse> enumerator = handler.HandleStreamAsync(request, ct).GetAsyncEnumerator(ct);
+        try
+        {
+            while (true)
+            {
+                IpcResponse response;
+                try
+                {
+                    if (!await enumerator.MoveNextAsync().ConfigureAwait(false))
+                        return true;                // stream complete — keep the connection
+                    response = enumerator.Current;
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;                          // shutdown — let ServeConnectionAsync end the connection
+                }
+                catch (Exception ex)
+                {
+                    logger.LogError(ex, "Streaming handler for {RequestType} threw", requestType);
+                    // Best-effort terminal error frame; the result is moot (we stop either way).
+                    await TryWriteResponseFrameAsync(stream, requestType,
+                        new ErrorResponse { Code = "INTERNAL_ERROR", Message = ex.Message }, ct).ConfigureAwait(false);
+                    return true;
+                }
+
+                if (!await TryWriteResponseFrameAsync(stream, requestType, response, ct).ConfigureAwait(false))
+                    return false;                   // transport write failed/cancelled — close
+            }
+        }
+        finally
+        {
+            await enumerator.DisposeAsync().ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>Serializes and writes one response frame, swapping an oversized payload for a
+    /// readable IPC_RESPONSE_TOO_LARGE error (WriteFrameAsync would otherwise throw). Returns false
+    /// when the connection should close (write failed or was cancelled).</summary>
+    private async Task<bool> TryWriteResponseFrameAsync(Stream stream, string requestType, IpcResponse response, CancellationToken ct)
+    {
+        byte[] responseBytes = IpcSerializer.SerializeResponse(response);
+        if (responseBytes.Length > IpcFrameCodec.MaxPayloadBytes)
+        {
+            logger.LogWarning(
+                "IPC response to \"{RequestType}\" is {Size:N0} bytes, over the {Cap:N0}-byte frame cap; replying IPC_RESPONSE_TOO_LARGE",
+                requestType, responseBytes.Length, IpcFrameCodec.MaxPayloadBytes);
+            responseBytes = IpcSerializer.SerializeResponse(new ErrorResponse
+            {
+                Code = "IPC_RESPONSE_TOO_LARGE",
+                Message = $"the response to \"{requestType}\" was {responseBytes.Length:N0} bytes, over the " +
+                    $"{IpcFrameCodec.MaxPayloadBytes:N0}-byte IPC frame limit — narrow the request " +
+                    "(for a dry run, set a scope folder) and retry",
+            });
+        }
+
+        Result writeResult = await IpcFrameCodec.WriteFrameAsync(stream, responseBytes, ct).ConfigureAwait(false);
+        if (writeResult.IsCanceled)
+            return false;                           // shutdown
+        if (writeResult.TryGetError(out string? writeError))
+        {
+            logger.LogDebug("IPC connection ended: {Reason}", writeError);
+            return false;
+        }
+        return true;
     }
 }

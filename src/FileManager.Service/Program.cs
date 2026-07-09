@@ -76,6 +76,7 @@ internal static class Program
         services.AddSingleton<DeleteProfileHandler>();
         services.AddSingleton<ValidateProfileHandler>();
         services.AddSingleton<DryRunHandler>();
+        services.AddSingleton<DryRunStreamHandler>();
         services.AddSingleton<GetSettingsHandler>();
         services.AddSingleton<UpdateSettingsHandler>();
         services.AddSingleton<IReadOnlyDictionary<string, IIpcRequestHandler>>(provider =>
@@ -89,6 +90,7 @@ internal static class Program
                 provider.GetRequiredService<DeleteProfileHandler>(),
                 provider.GetRequiredService<ValidateProfileHandler>(),
                 provider.GetRequiredService<DryRunHandler>(),
+                provider.GetRequiredService<DryRunStreamHandler>(),
                 provider.GetRequiredService<GetSettingsHandler>(),
                 provider.GetRequiredService<UpdateSettingsHandler>(),
             ];

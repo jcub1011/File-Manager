@@ -17,6 +17,7 @@ public static class IpcRequestTypes
     public const string RunProfile = "run-profile";
     public const string SetPaused = "set-paused";
     public const string DryRun = "dry-run";
+    public const string DryRunStream = "dry-run-stream";
     public const string GetRecentJobs = "get-recent-jobs";
     public const string GetJobLog = "get-job-log";
     public const string Subscribe = "subscribe";
@@ -35,6 +36,7 @@ public static class IpcRequestTypes
         RunProfileRequest => RunProfile,
         SetPausedRequest => SetPaused,
         DryRunRequest => DryRun,
+        DryRunStreamRequest => DryRunStream,
         GetRecentJobsRequest => GetRecentJobs,
         GetJobLogRequest => GetJobLog,
         SubscribeEventsRequest => Subscribe,
