@@ -98,6 +98,66 @@ public sealed class ProfileListViewModelTests
     }
 
     [Fact]
+    public async Task Search_filters_rows_by_name_case_insensitively()
+    {
+        var (list, _) = NewList();
+        list.SearchDebounce = TimeSpan.Zero;
+        await list.RefreshAsync();
+
+        list.SearchText = "bet";
+        await list.PendingSearch!;
+
+        Assert.Single(list.FilteredProfiles);
+        Assert.Equal("Beta", list.FilteredProfiles[0].Name);
+    }
+
+    [Fact]
+    public async Task Clearing_search_restores_all_rows()
+    {
+        var (list, _) = NewList();
+        list.SearchDebounce = TimeSpan.Zero;
+        await list.RefreshAsync();
+
+        list.SearchText = "bet";
+        await list.PendingSearch!;
+        list.SearchText = "";
+        await list.PendingSearch!;
+
+        Assert.Equal(2, list.FilteredProfiles.Count);
+    }
+
+    [Fact]
+    public async Task Selected_row_stays_visible_even_when_the_search_excludes_it()
+    {
+        var (list, _) = NewList();
+        list.SearchDebounce = TimeSpan.Zero;
+        await list.RefreshAsync();
+        list.SelectedProfile = list.Profiles.First(p => p.Name == "Alpha");
+
+        list.SearchText = "zzz";                       // matches nothing
+        await list.PendingSearch!;
+
+        Assert.Contains(list.FilteredProfiles, p => p.Name == "Alpha");   // force-included
+        Assert.DoesNotContain(list.FilteredProfiles, p => p.Name == "Beta");
+        Assert.Equal("Alpha", list.SelectedProfile?.Name);                // editor keeps its profile
+    }
+
+    [Fact]
+    public async Task Refresh_preserves_the_active_search_filter()
+    {
+        var (list, _) = NewList();
+        list.SearchDebounce = TimeSpan.Zero;
+        await list.RefreshAsync();
+        list.SearchText = "alpha";
+        await list.PendingSearch!;
+
+        await list.RefreshAsync();
+
+        Assert.Single(list.FilteredProfiles);
+        Assert.Equal("Alpha", list.FilteredProfiles[0].Name);
+    }
+
+    [Fact]
     public async Task RefreshAndSelect_reselects_without_firing_navigation()
     {
         var (list, _) = NewList();

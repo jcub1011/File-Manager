@@ -9,38 +9,75 @@
         Width="1200" Height="760"
         Title="File Manager"
         ExtendClientAreaToDecorationsHint="True"
-        ExtendClientAreaTitleBarHeightHint="-1">
+        WindowDecorations="None">
 
     <Window.Styles>
-        <!-- Avalonia 12 draws its own caption buttons when the client area is extended; hide the
-             full-screen button so it doesn't sit over our title-bar folder/gear buttons. -->
-        <Style Selector="chrome|WindowDrawnDecorations /template/ Button#PART_FullScreenButton">
-            <Setter Property="IsVisible" Value="False" />
-            <Setter Property="Width" Value="0" />
-        </Style>
-
-        <!-- Flat, transparent icon buttons used in the title bar and the profile toolbar. -->
+        <!-- Flat, transparent icon buttons used in the title bar and profile toolbar. -->
         <Style Selector="Button.iconButton">
             <Setter Property="Background" Value="Transparent" />
             <Setter Property="BorderThickness" Value="0" />
             <Setter Property="Padding" Value="8,4" />
             <Setter Property="VerticalAlignment" Value="Center" />
         </Style>
+
+        <!-- Caption buttons (minimize/maximize/close). WindowDecorations="None" means Avalonia draws
+             no system buttons, so we draw and size our own; standard 46x32 caption metrics. -->
+        <Style Selector="Button.caption">
+            <Setter Property="Background" Value="Transparent" />
+            <Setter Property="BorderThickness" Value="0" />
+            <Setter Property="CornerRadius" Value="0" />
+            <Setter Property="Width" Value="46" />
+            <Setter Property="Height" Value="32" />
+            <Setter Property="Padding" Value="0" />
+            <Setter Property="VerticalAlignment" Value="Stretch" />
+        </Style>
+        <Style Selector="Button.caption:pointerover /template/ ContentPresenter">
+            <Setter Property="Background" Value="#33808080" />
+        </Style>
+        <!-- Close gets the conventional red hover with a light glyph. -->
+        <Style Selector="Button.caption.close:pointerover /template/ ContentPresenter">
+            <Setter Property="Background" Value="#E81123" />
+        </Style>
+        <Style Selector="Button.caption.close:pointerover PathIcon">
+            <Setter Property="Foreground" Value="White" />
+        </Style>
     </Window.Styles>
 
     <DockPanel>
-        <!-- Custom title bar: extends into the OS caption area. The right StackPanel reserves space
-             so its icon buttons never sit under the system min/max/close buttons. -->
-        <Grid x:Name="TitleBar" DockPanel.Dock="Top" Height="32" Background="Transparent"
-              ColumnDefinitions="*,Auto">
+        <!-- Custom title bar (Avalonia 12 WindowDecorations="None" + ElementRole markers). Because no
+             system caption buttons are drawn, there is nothing to reserve space for — no hardcoded
+             margins, DPI- and platform-independent. ElementRole="TitleBar" makes the grid the drag +
+             double-click-maximize region. CRITICAL: every interactive child must carry its own role
+             (User for app buttons, {Min,Max,Close}Button for the caption buttons) or the drag region
+             swallows its clicks. The role only routes input — the Click handlers still do the work. -->
+        <Grid DockPanel.Dock="Top" Height="32" Background="Transparent"
+              ColumnDefinitions="Auto,*,Auto"
+              chrome:WindowDecorationProperties.ElementRole="TitleBar">
             <TextBlock Grid.Column="0" Text="File Manager" VerticalAlignment="Center"
                        Margin="12,0,0,0" FontSize="12" Opacity="0.8" />
-            <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="4" Margin="0,0,150,0">
-                <Button Classes="iconButton" Command="{Binding OpenLogFolderCommand}" ToolTip.Tip="Open log folder">
+
+            <StackPanel Grid.Column="2" Orientation="Horizontal">
+                <Button Classes="iconButton" chrome:WindowDecorationProperties.ElementRole="User"
+                        Command="{Binding OpenLogFolderCommand}" ToolTip.Tip="Open log folder">
                     <PathIcon Data="{StaticResource IconFolder}" Width="16" Height="16" />
                 </Button>
-                <Button Classes="iconButton" Command="{Binding OpenSettingsCommand}" ToolTip.Tip="Settings">
+                <Button Classes="iconButton" chrome:WindowDecorationProperties.ElementRole="User"
+                        Command="{Binding OpenSettingsCommand}" ToolTip.Tip="Settings" Margin="0,0,8,0">
                     <PathIcon Data="{StaticResource IconGear}" Width="16" Height="16" />
+                </Button>
+
+                <Button Classes="caption" chrome:WindowDecorationProperties.ElementRole="MinimizeButton"
+                        Click="OnMinimize" ToolTip.Tip="Minimize">
+                    <PathIcon Data="{StaticResource IconMinimize}" Width="14" Height="14" />
+                </Button>
+                <Button x:Name="MaximizeButton" Classes="caption"
+                        chrome:WindowDecorationProperties.ElementRole="MaximizeButton"
+                        Click="OnMaximizeRestore" ToolTip.Tip="Maximize">
+                    <PathIcon x:Name="MaximizeIcon" Data="{StaticResource IconMaximize}" Width="14" Height="14" />
+                </Button>
+                <Button Classes="caption close" chrome:WindowDecorationProperties.ElementRole="CloseButton"
+                        Click="OnClose" ToolTip.Tip="Close">
+                    <PathIcon Data="{StaticResource IconClose}" Width="14" Height="14" />
                 </Button>
             </StackPanel>
         </Grid>

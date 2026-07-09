@@ -19,11 +19,16 @@ public sealed record ProfileListItem(Guid ProfileId, string Name, bool Active, s
 
 public sealed partial class ProfileListViewModel(IIpcGateway gateway) : ViewModelBase
 {
-    /// <summary>How long to wait after the last keystroke before applying the search filter.</summary>
-    private static readonly TimeSpan SearchDebounce = TimeSpan.FromMilliseconds(250);
+    /// <summary>How long to wait after the last keystroke before applying the search filter.
+    /// Mutable as a test seam: tests set it to zero so they need not wait real time.</summary>
+    internal TimeSpan SearchDebounce { get; set; } = TimeSpan.FromMilliseconds(250);
 
     private bool _revertingSelection;
     private CancellationTokenSource? _searchDebounceCts;
+
+    /// <summary>Test seam: the in-flight (or last-completed) debounced filter pass, so tests can
+    /// await it deterministically instead of sleeping.</summary>
+    internal Task? PendingSearch { get; private set; }
 
     /// <summary>The full, unfiltered set of profiles (source of truth). The list UI binds to
     /// <see cref="FilteredProfiles"/>, which is derived from this via <see cref="SearchText"/>.</summary>
@@ -70,23 +75,30 @@ public sealed partial class ProfileListViewModel(IIpcGateway gateway) : ViewMode
         PendingDelete = null;
         SelectionCommitted?.Invoke(newValue);
 
-        // Refresh the filtered view so a previously force-included (selected-but-unmatched) row
-        // drops out now that the selection has moved on. Guarded so the transient clear/re-add
-        // does not re-enter this handler as a real navigation.
-        _revertingSelection = true;
-        RebuildFiltered(newValue?.ProfileId);
-        SelectedProfile = newValue;
-        _revertingSelection = false;
+        // A previously force-included (selected-but-unmatched) row must drop out now that the
+        // selection has moved on. Such a row only exists while a search term is active, so skip the
+        // rebuild otherwise: with no filter FilteredProfiles already equals Profiles, and clearing
+        // it on every click would reset the ListBox scroll/selection visuals for nothing. Guarded so
+        // the transient clear/re-add does not re-enter this handler as a real navigation.
+        if (!string.IsNullOrEmpty(SearchText?.Trim()))
+        {
+            _revertingSelection = true;
+            RebuildFiltered(newValue?.ProfileId);
+            SelectedProfile = newValue;
+            _revertingSelection = false;
+        }
     }
 
     partial void OnSearchTextChanged(string? value)
     {
         // Debounce: coalesce rapid keystrokes into a single filter pass. Cancelling the previous
         // token abandons the pending delay; the continuation resumes on the UI thread (Avalonia's
-        // SynchronizationContext) so touching the observable collections stays thread-safe.
+        // SynchronizationContext) so touching the observable collections stays thread-safe. Dispose
+        // the superseded source after cancelling it so we don't leak one CTS per keystroke.
         _searchDebounceCts?.Cancel();
+        _searchDebounceCts?.Dispose();
         _searchDebounceCts = new CancellationTokenSource();
-        _ = ApplySearchAfterDelayAsync(_searchDebounceCts.Token);
+        PendingSearch = ApplySearchAfterDelayAsync(_searchDebounceCts.Token);
     }
 
     private async Task ApplySearchAfterDelayAsync(CancellationToken token)
@@ -100,13 +112,23 @@ public sealed partial class ProfileListViewModel(IIpcGateway gateway) : ViewMode
             return;   // superseded by a newer keystroke
         }
 
-        Guid? keepId = SelectedProfile?.ProfileId;
-        _revertingSelection = true;
-        RebuildFiltered(keepId);
-        // The clear/re-add above can null the list's selection; re-assert it (same instance, now
-        // present in FilteredProfiles) so the editor stays on the open profile while filtering.
-        SelectedProfile = keepId is Guid id ? Profiles.FirstOrDefault(p => p.ProfileId == id) : null;
-        _revertingSelection = false;
+        // This runs fire-and-forget, so an escaping exception would be unobserved; match the rest of
+        // the view model and turn any failure into a logged error instead.
+        try
+        {
+            Guid? keepId = SelectedProfile?.ProfileId;
+            _revertingSelection = true;
+            RebuildFiltered(keepId);
+            // The clear/re-add above can null the list's selection; re-assert it (same instance, now
+            // present in FilteredProfiles) so the editor stays on the open profile while filtering.
+            SelectedProfile = keepId is Guid id ? Profiles.FirstOrDefault(p => p.ProfileId == id) : null;
+            _revertingSelection = false;
+        }
+        catch (Exception ex)
+        {
+            _revertingSelection = false;
+            Serilog.Log.Error(ex, "Applying the profile search filter failed");
+        }
     }
 
     /// <summary>Repopulates <see cref="FilteredProfiles"/> from <see cref="Profiles"/>: keeps names

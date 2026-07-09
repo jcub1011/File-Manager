@@ -15,6 +15,7 @@
 
   <ItemGroup>
     <InternalsVisibleTo Include="FileManager.UI.Benchmarks" />
+    <InternalsVisibleTo Include="FileManager.UI.Tests" />
   </ItemGroup>
 
   <ItemGroup>

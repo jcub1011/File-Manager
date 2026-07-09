@@ -1,5 +1,7 @@
+using Avalonia;
 using Avalonia.Controls;
-using Avalonia.Input;
+using Avalonia.Interactivity;
+using Avalonia.Media;
 using FileManager.UI.ViewModels;
 using System;
 
@@ -19,24 +21,39 @@ namespace FileManager.UI.Views
         public MainWindow()
         {
             InitializeComponent();
-
-            // The client area is extended under the OS title bar (ExtendClientAreaToDecorationsHint),
-            // so the custom title-bar grid must drive window move/maximize itself.
-            TitleBar.PointerPressed += OnTitleBarPointerPressed;
-            TitleBar.DoubleTapped += OnTitleBarDoubleTapped;
+            UpdateMaximizeGlyph();
         }
 
-        private void OnTitleBarPointerPressed(object? sender, PointerPressedEventArgs e)
+        // WindowDecorations="None" means we draw the caption buttons, so their actions are wired here
+        // rather than by the framework. Close() routes through the two-pass OnClosing teardown below.
+        private void OnMinimize(object? sender, RoutedEventArgs e) => WindowState = WindowState.Minimized;
+
+        private void OnMaximizeRestore(object? sender, RoutedEventArgs e) =>
+            WindowState = WindowState == WindowState.Maximized ? WindowState.Normal : WindowState.Maximized;
+
+        private void OnClose(object? sender, RoutedEventArgs e) => Close();
+
+        // Keep the maximize/restore glyph and tooltip in sync with the window state — it also changes
+        // when the user double-clicks the title bar (native ElementRole="TitleBar" behaviour).
+        protected override void OnPropertyChanged(AvaloniaPropertyChangedEventArgs change)
         {
-            if (e.GetCurrentPoint(this).Properties.IsLeftButtonPressed)
-                BeginMoveDrag(e);
+            base.OnPropertyChanged(change);
+            if (change.Property == WindowStateProperty)
+                UpdateMaximizeGlyph();
         }
 
-        private void OnTitleBarDoubleTapped(object? sender, TappedEventArgs e)
+        private void UpdateMaximizeGlyph()
         {
-            WindowState = WindowState == WindowState.Maximized
-                ? WindowState.Normal
-                : WindowState.Maximized;
+            // Called from the constructor before the named fields are assigned during early property
+            // changes; guard until the template has populated them.
+            if (MaximizeIcon is null || MaximizeButton is null)
+                return;
+
+            bool maximized = WindowState == WindowState.Maximized;
+            if (this.TryFindResource(maximized ? "IconRestore" : "IconMaximize", out object? geometry)
+                && geometry is Geometry g)
+                MaximizeIcon.Data = g;
+            ToolTip.SetTip(MaximizeButton, maximized ? "Restore" : "Maximize");
         }
 
         // NOTE: this override must stay `async void` — Avalonia's OnClosing returns void and the
