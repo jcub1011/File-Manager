@@ -2,7 +2,7 @@
 
 **Version:** 3 (supersedes `spec-draft-v2.md`)
 **Status:** Draft for implementation planning
-**Last updated:** 2026-07-02
+**Last updated:** 2026-07-09
 
 > This revision incorporates the viability/scope review of v2. It adds seven design areas v2 left
 > open (loop prevention, idempotency, multi-Profile overlap, disk preflight, a CLI, global
@@ -571,9 +571,52 @@ literal dollar is escaped `$$`. Token names are case-sensitive.
 
 #### Installation & autostart
 
-Windows: per-user install; the Core Service is registered as a logon startup task.
+Windows: per-user install; when `ServiceStartupMode` is `RunOnStartup` the Core Service is registered
+as a logon startup task (per-user HKCU Run key — no elevation).
 Linux **[Linux release]**: a `systemd --user` unit (`filemanager.service`) enabled for the user.
 The service runs without a tray if none is available.
+
+##### Startup mode & reconciliation
+
+`ServiceStartupMode` is a global setting (edited in the UI) with three values:
+
+* **`StartAndStopWithProgram`** — default (and the fail-safe zero value). The UI starts the service on
+  open and gracefully stops it on close. No autostart entry.
+* **`RunOnStartup`** — the service is registered under the per-user HKCU Run key
+  (`Software\Microsoft\Windows\CurrentVersion\Run`, value `FileManager.Service`) so it auto-starts at
+  Windows login; the UI just connects and leaves it running on close.
+* **`StartOnProgramOpen`** — the UI starts the service on open (if not already running) and leaves it
+  running after close. No autostart entry.
+
+Only `RunOnStartup` implies an autostart entry.
+
+**Effective Windows startup state.** A startup entry is *effectively registered* only when the HKCU Run
+value `FileManager.Service` **exists** *and* is **not disabled** under
+`...\CurrentVersion\Explorer\StartupApproved\Run`. Users turn a startup item off two ways — deleting the
+Run value, or toggling it off in Task Manager's *Startup* tab (or *Settings ▸ Apps ▸ Startup*), which
+leaves the value in place but records a disabled flag in `StartupApproved\Run`. **Both count as "not
+registered."**
+
+**Writing the registry (on explicit settings change only).** Changing the setting to `RunOnStartup`
+registers the Run entry; changing it to any other mode unregisters it. This is the *only* path that
+writes the autostart registry.
+
+**Reconciliation at UI startup (the setting follows the OS).** When the UI starts — and *only* then —
+it reconciles the persisted `ServiceStartupMode` against the effective Windows startup state and adjusts
+**the setting** to match what the user has done through Windows. It never re-asserts the registry from
+the setting:
+
+* If the mode is `RunOnStartup` but the entry is **not** effectively registered (deleted or disabled),
+  the mode reverts to `StartAndStopWithProgram`. The entry is **not** re-added — the user's removal
+  through Windows wins.
+* If the entry **is** effectively registered but the mode is not `RunOnStartup`, the mode is updated to
+  `RunOnStartup`.
+* Otherwise the setting is left unchanged.
+
+The reconciled setting is persisted. Because reconciliation runs at UI startup only — never at service
+startup — the app never overrides a startup choice the user made directly in Windows between launches.
+This deliberately supersedes any behavior where the service re-asserts the Run entry from the setting on
+every service start, which would fight the user's manual changes.
 
 ### 5.4 Concurrency & Locking
 

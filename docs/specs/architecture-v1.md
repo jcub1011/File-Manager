@@ -2,7 +2,7 @@
 
 **Version:** 1
 **Status:** Draft for review
-**Last updated:** 2026-07-02
+**Last updated:** 2026-07-09
 **Authoritative behavior spec:** [`spec-draft-v3.md`](spec-draft-v3.md)
 
 ---
@@ -198,7 +198,10 @@ installer dependency, no elevation (HKCU).
 3. **Run crash recovery to completion** (`ICrashRecovery.Recover`, §7.3). Nothing else touches
    the filesystem before this finishes.
 4. Start IPC server (§4.9); accept GUI/CLI/shell connections.
-5. Register shell integration + autostart idempotently (§4.11).
+5. Register shell integration idempotently (§4.11). Autostart is **not** reconciled here: the service
+   writes the Run entry only on an explicit settings change, and the persisted `ServiceStartupMode` is
+   reconciled against the OS startup state at **UI** startup (spec §5.3), so the app never overrides a
+   startup choice the user made through Windows.
 6. Start triggers: watcher (§4.2), scheduler (missed-run evaluation per spec §3.2.2), trigger
    queue consumer (§4.3). If the persisted pause state (§9) is paused, the queue gate stays shut.
 7. Spawn tray client if a desktop session exists.
@@ -1297,7 +1300,7 @@ interfaces.
 | `ITrashService` (§4.8) | `WindowsTrashService` — `IFileOperation`, `[GeneratedComInterface]` | FreeDesktop trash (spec §5.3) |
 | `IVolumeInfoProvider` (below) | `WindowsVolumeInfoProvider` — `DriveInfo` + UNC/`GetDriveType` | statvfs / mount table |
 | `IShellIntegration` (below) | `WindowsShellIntegration` — HKCU `shell` verbs for `Directory`, `Directory\Background`, `AllFilesystemObjects` (spec §5.3) | per-file-manager actions (spec §5.3) |
-| `IAutostartRegistrar` (below) | `WindowsAutostartRegistrar` — logon startup task (spec §5.3) | systemd user unit |
+| `IAutostartRegistrar` (below) | `WindowsAutostartRegistrar` — HKCU Run entry + effective-state query (present *and* not disabled in `StartupApproved\Run`), for the UI-startup reconciliation of `ServiceStartupMode` (spec §5.3) | systemd user unit + enabled-state query |
 | `IIpcEndpointProvider` (below) | `WindowsIpcEndpointProvider` — named pipe `\\.\pipe\filemanager-<user>` | `$XDG_RUNTIME_DIR/filemanager.sock` |
 | `IMetadataPreserver` (below) | `WindowsMetadataPreserver` — timestamps + ACL best-effort; detects lossy transitions pre-copy (spec §6.4) | mode bits |
 
@@ -1318,8 +1321,11 @@ public interface IShellIntegration
 
 public interface IAutostartRegistrar
 {
-    Result RegisterAutostart();        // idempotent
-    Result UnregisterAutostart();
+    Result RegisterAutostart();        // idempotent; written only on an explicit settings change
+    Result UnregisterAutostart();      // idempotent
+    /// <summary>Effective OS startup state: the Run entry exists AND is not disabled in
+    /// StartupApproved\Run. Drives the UI-startup reconciliation of ServiceStartupMode (spec §5.3).</summary>
+    Result<bool, string> IsEffectivelyRegistered();
 }
 
 public interface IIpcEndpointProvider
