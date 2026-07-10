@@ -4,6 +4,31 @@
              x:Class="FileManager.UI.Views.DryRunView"
              x:DataType="vm:DryRunViewModel">
 
+    <UserControl.Resources>
+        <!-- Shared tree row, used by all three categories' TreeViews. The built-in TreeView draws the
+             expand chevron + indentation; we only supply the node name and the rolled-up count chips.
+             ItemsSource="{Binding Children}" is what makes it hierarchical. -->
+        <TreeDataTemplate x:Key="DryRunNodeTemplate" x:DataType="vm:DryRunTreeNode"
+                          ItemsSource="{Binding Children}">
+            <StackPanel Orientation="Horizontal" Spacing="6" Height="24">
+                <TextBlock Text="{Binding Name}" FontFamily="Consolas,monospace" VerticalAlignment="Center"
+                           Classes.dir="{Binding IsDirectory}" TextTrimming="CharacterEllipsis" MaxWidth="480" />
+                <Border Classes="chip" IsVisible="{Binding IsDirectory}">
+                    <TextBlock Text="{Binding FileText}" FontSize="11" />
+                </Border>
+                <Border Classes="chip chipDanger" IsVisible="{Binding HasOverwrites}">
+                    <TextBlock Text="{Binding OverwriteText}" FontSize="11" />
+                </Border>
+                <Border Classes="chip chipAmber" IsVisible="{Binding HasRenames}">
+                    <TextBlock Text="{Binding RenameText}" FontSize="11" />
+                </Border>
+                <Border Classes="chip chipDanger" IsVisible="{Binding HasDisposals}">
+                    <TextBlock Text="{Binding DisposalText}" FontSize="11" />
+                </Border>
+            </StackPanel>
+        </TreeDataTemplate>
+    </UserControl.Resources>
+
     <UserControl.Styles>
         <Style Selector="Border.chip">
             <Setter Property="CornerRadius" Value="10" />
@@ -67,6 +92,30 @@
         <!-- directory node names in the tree view -->
         <Style Selector="TextBlock.dir">
             <Setter Property="FontWeight" Value="SemiBold" />
+        </Style>
+
+        <!-- Virtualized tree lists. A VirtualizingStackPanel on both the TreeView and each TreeViewItem
+             makes the built-in control recycle containers per level instead of realizing every node, so
+             a 50k-file forest stays bounded (matching the ListBox virtualization the flat views rely on). -->
+        <Style Selector="TreeView.rows">
+            <Setter Property="Background" Value="Transparent" />
+            <Setter Property="BorderThickness" Value="0" />
+            <Setter Property="Padding" Value="0" />
+            <Setter Property="ItemsPanel">
+                <ItemsPanelTemplate>
+                    <VirtualizingStackPanel />
+                </ItemsPanelTemplate>
+            </Setter>
+        </Style>
+        <!-- x:DataType lets the IsExpanded setter bind (two-way) against the node so the default-expanded
+             roots open on load and user expand/collapse round-trips into the model. -->
+        <Style Selector="TreeView.rows TreeViewItem" x:DataType="vm:DryRunTreeNode">
+            <Setter Property="IsExpanded" Value="{Binding IsExpanded, Mode=TwoWay}" />
+            <Setter Property="ItemsPanel">
+                <ItemsPanelTemplate>
+                    <VirtualizingStackPanel />
+                </ItemsPanelTemplate>
+            </Setter>
         </Style>
     </UserControl.Styles>
 
@@ -214,55 +263,40 @@
                         </ListBox.ItemTemplate>
                     </ListBox>
 
-                    <!-- tree view: the same "would process" set as a navigable directory tree. Rows are
-                         the flattened, expanded-only nodes, so the virtualizing ListBox still bounds memory. -->
-                    <ListBox Grid.Row="2" Classes="rows" ItemsSource="{Binding TreeRows}"
-                             IsVisible="{Binding ShowTree}"
-                             SelectionMode="Single" ScrollViewer.HorizontalScrollBarVisibility="Disabled">
-                        <ListBox.ItemTemplate>
-                            <DataTemplate x:DataType="vm:DryRunTreeNode">
-                                <StackPanel Orientation="Horizontal" Spacing="6" Margin="{Binding Indent}" Height="24">
-                                    <Button Content="{Binding Glyph}" CommandParameter="{Binding}"
-                                            Command="{Binding $parent[ListBox].((vm:DryRunViewModel)DataContext).ToggleNodeCommand}"
-                                            Background="Transparent" BorderThickness="0" Padding="0" Width="18"
-                                            FontSize="12" VerticalAlignment="Center" />
-                                    <TextBlock Text="{Binding Name}" FontFamily="Consolas,monospace" VerticalAlignment="Center"
-                                               Classes.dir="{Binding IsDirectory}" TextTrimming="CharacterEllipsis" MaxWidth="480" />
-                                    <Border Classes="chip" IsVisible="{Binding IsDirectory}">
-                                        <TextBlock Text="{Binding FileText}" FontSize="11" />
-                                    </Border>
-                                    <Border Classes="chip chipDanger" IsVisible="{Binding HasOverwrites}">
-                                        <TextBlock Text="{Binding OverwriteText}" FontSize="11" />
-                                    </Border>
-                                    <Border Classes="chip chipAmber" IsVisible="{Binding HasRenames}">
-                                        <TextBlock Text="{Binding RenameText}" FontSize="11" />
-                                    </Border>
-                                    <Border Classes="chip chipDanger" IsVisible="{Binding HasDisposals}">
-                                        <TextBlock Text="{Binding DisposalText}" FontSize="11" />
-                                    </Border>
-                                </StackPanel>
-                            </DataTemplate>
-                        </ListBox.ItemTemplate>
-                    </ListBox>
+                    <!-- tree view: the same "would process" set as a navigable directory tree, using the
+                         built-in TreeView. Only expanded nodes' children are realized, and the
+                         VirtualizingStackPanel recycles rows, so a large forest stays bounded. -->
+                    <TreeView Grid.Row="2" Classes="rows" ItemsSource="{Binding ProcessTree}"
+                              IsVisible="{Binding ShowTree}"
+                              ItemTemplate="{StaticResource DryRunNodeTemplate}" />
 
                     <!-- filtered out (hidden while destructive-only focuses the risky subset; the toggle reveals it) -->
                     <Expander Grid.Row="3" IsExpanded="False" IsVisible="{Binding !DestructiveOnly}">
                         <Expander.Header>
                             <TextBlock><Run Text="Skipped by filters (" /><Run Text="{Binding FilterSkipCount}" /><Run Text=")" /></TextBlock>
                         </Expander.Header>
-                        <ListBox Classes="rows" MaxHeight="260" ItemsSource="{Binding FilterSkips}"
-                                 SelectionMode="Single" ScrollViewer.HorizontalScrollBarVisibility="Disabled">
-                            <ListBox.ItemTemplate>
-                                <DataTemplate x:DataType="vm:DryRunFileRow">
-                                    <StackPanel Orientation="Horizontal" Spacing="8" Margin="4,3">
-                                        <TextBlock Text="{Binding SourcePath}" FontFamily="Consolas,monospace" FontSize="12"
-                                                   TextTrimming="CharacterEllipsis" MaxWidth="560" />
-                                        <TextBlock Text="{Binding DecidingFilter}" FontSize="11" Opacity="0.6"
-                                                   VerticalAlignment="Center" TextTrimming="CharacterEllipsis" MaxWidth="380" />
-                                    </StackPanel>
-                                </DataTemplate>
-                            </ListBox.ItemTemplate>
-                        </ListBox>
+                        <Grid RowDefinitions="Auto,Auto">
+                            <ToggleButton Grid.Row="0" HorizontalAlignment="Right" Content="Tree view"
+                                          IsChecked="{Binding ShowFilterTree}" FontSize="12" Margin="0,0,0,6"
+                                          ToolTip.Tip="Group the skipped files into a navigable directory tree" />
+                            <ListBox Grid.Row="1" Classes="rows" MaxHeight="260" ItemsSource="{Binding FilterSkips}"
+                                     IsVisible="{Binding !ShowFilterTree}"
+                                     SelectionMode="Single" ScrollViewer.HorizontalScrollBarVisibility="Disabled">
+                                <ListBox.ItemTemplate>
+                                    <DataTemplate x:DataType="vm:DryRunFileRow">
+                                        <StackPanel Orientation="Horizontal" Spacing="8" Margin="4,3">
+                                            <TextBlock Text="{Binding SourcePath}" FontFamily="Consolas,monospace" FontSize="12"
+                                                       TextTrimming="CharacterEllipsis" MaxWidth="560" />
+                                            <TextBlock Text="{Binding DecidingFilter}" FontSize="11" Opacity="0.6"
+                                                       VerticalAlignment="Center" TextTrimming="CharacterEllipsis" MaxWidth="380" />
+                                        </StackPanel>
+                                    </DataTemplate>
+                                </ListBox.ItemTemplate>
+                            </ListBox>
+                            <TreeView Grid.Row="1" Classes="rows" MaxHeight="260" ItemsSource="{Binding FilterTree}"
+                                      IsVisible="{Binding ShowFilterTree}"
+                                      ItemTemplate="{StaticResource DryRunNodeTemplate}" />
+                        </Grid>
                     </Expander>
 
                     <!-- unchanged (hidden while destructive-only focuses the risky subset; the toggle reveals it) -->
@@ -270,15 +304,24 @@
                         <Expander.Header>
                             <TextBlock><Run Text="Unchanged at all targets (" /><Run Text="{Binding UnchangedSkipCount}" /><Run Text=")" /></TextBlock>
                         </Expander.Header>
-                        <ListBox Classes="rows" MaxHeight="260" ItemsSource="{Binding UnchangedSkips}"
-                                 SelectionMode="Single" ScrollViewer.HorizontalScrollBarVisibility="Disabled">
-                            <ListBox.ItemTemplate>
-                                <DataTemplate x:DataType="vm:DryRunFileRow">
-                                    <TextBlock Text="{Binding SourcePath}" FontFamily="Consolas,monospace" FontSize="12"
-                                               TextTrimming="CharacterEllipsis" Margin="4,3" />
-                                </DataTemplate>
-                            </ListBox.ItemTemplate>
-                        </ListBox>
+                        <Grid RowDefinitions="Auto,Auto">
+                            <ToggleButton Grid.Row="0" HorizontalAlignment="Right" Content="Tree view"
+                                          IsChecked="{Binding ShowUnchangedTree}" FontSize="12" Margin="0,0,0,6"
+                                          ToolTip.Tip="Group the unchanged files into a navigable directory tree" />
+                            <ListBox Grid.Row="1" Classes="rows" MaxHeight="260" ItemsSource="{Binding UnchangedSkips}"
+                                     IsVisible="{Binding !ShowUnchangedTree}"
+                                     SelectionMode="Single" ScrollViewer.HorizontalScrollBarVisibility="Disabled">
+                                <ListBox.ItemTemplate>
+                                    <DataTemplate x:DataType="vm:DryRunFileRow">
+                                        <TextBlock Text="{Binding SourcePath}" FontFamily="Consolas,monospace" FontSize="12"
+                                                   TextTrimming="CharacterEllipsis" Margin="4,3" />
+                                    </DataTemplate>
+                                </ListBox.ItemTemplate>
+                            </ListBox>
+                            <TreeView Grid.Row="1" Classes="rows" MaxHeight="260" ItemsSource="{Binding UnchangedTree}"
+                                      IsVisible="{Binding ShowUnchangedTree}"
+                                      ItemTemplate="{StaticResource DryRunNodeTemplate}" />
+                        </Grid>
                     </Expander>
 
                 </Grid>

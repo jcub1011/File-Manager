@@ -9,7 +9,7 @@
         Width="1200" Height="760"
         Title="File Manager"
         ExtendClientAreaToDecorationsHint="True"
-        WindowDecorations="None">
+        WindowDecorations="BorderOnly">
 
     <Window.Styles>
         <!-- Flat, transparent icon buttons used in the title bar and profile toolbar. -->
@@ -20,8 +20,9 @@
             <Setter Property="VerticalAlignment" Value="Center" />
         </Style>
 
-        <!-- Caption buttons (minimize/maximize/close). WindowDecorations="None" means Avalonia draws
-             no system buttons, so we draw and size our own; standard 46x32 caption metrics. -->
+        <!-- Caption buttons (minimize/maximize/close). WindowDecorations="BorderOnly" keeps the OS
+             resize border but draws no system title bar/buttons, so we draw and size our own; standard
+             46x32 caption metrics. -->
         <Style Selector="Button.caption">
             <Setter Property="Background" Value="Transparent" />
             <Setter Property="BorderThickness" Value="0" />
@@ -50,9 +51,9 @@
     </Window.Styles>
 
     <DockPanel>
-        <!-- Custom title bar (Avalonia 12 WindowDecorations="None" + ElementRole markers). Because no
-             system caption buttons are drawn, there is nothing to reserve space for — no hardcoded
-             margins, DPI- and platform-independent. ElementRole="TitleBar" makes the grid the drag +
+        <!-- Custom title bar (Avalonia 12 WindowDecorations="BorderOnly" + ElementRole markers). The
+             OS keeps the resizable window frame but draws no system title bar, so there is nothing to
+             reserve space for — no hardcoded margins, DPI- and platform-independent. ElementRole="TitleBar" makes the grid the drag +
              double-click-maximize region. CRITICAL: every interactive child must carry its own role
              (User for app buttons, {Min,Max,Close}Button for the caption buttons) or the drag region
              swallows its clicks. The role only routes input — the Click handlers still do the work. -->

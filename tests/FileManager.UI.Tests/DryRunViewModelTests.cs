@@ -211,8 +211,9 @@ public sealed class DryRunViewModelTests
 
         viewModel.ShowTree = true;
 
-        // Both process files live under C:\s — the root node aggregates the whole subtree.
-        DryRunTreeNode root = Assert.Single(viewModel.TreeRows, n => n.Name == "C:");
+        // Both process files live under C:\s — the single C: root aggregates the whole subtree.
+        DryRunTreeNode root = Assert.Single(viewModel.ProcessTree);
+        Assert.Equal("C:", root.Name);
         Assert.True(root.IsDirectory);
         Assert.Equal(2, root.FileCount);       // fresh.txt + clobber.txt
         Assert.Equal(1, root.OverwriteCount);  // clobber.txt's overwrite target
@@ -221,7 +222,7 @@ public sealed class DryRunViewModelTests
     }
 
     [Fact]
-    public async Task Toggling_a_tree_node_expands_and_collapses_its_children()
+    public async Task Tree_starts_with_only_the_roots_expanded_and_expansion_round_trips()
     {
         var (viewModel, gateway) = NewViewModel();
         gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value);
@@ -229,16 +230,60 @@ public sealed class DryRunViewModelTests
         viewModel.DestructiveOnly = false;
         viewModel.ShowTree = true;
 
-        // Only the top-level root expands by default, so the "s" directory is visible but its leaves
-        // are hidden until it is expanded.
-        DryRunTreeNode sDir = Assert.Single(viewModel.TreeRows, n => n.Name == "s");
-        Assert.DoesNotContain(viewModel.TreeRows, n => n.Name.EndsWith(".txt"));
+        // The built-in TreeView owns expand/collapse now; the VM just supplies the forest with the
+        // top-level root expanded and deeper directories collapsed (children ready to realize on expand).
+        DryRunTreeNode root = Assert.Single(viewModel.ProcessTree);
+        Assert.True(root.IsExpanded);
+        DryRunTreeNode sDir = Assert.Single(root.Children);
+        Assert.Equal("s", sDir.Name);
+        Assert.True(sDir.IsDirectory);
+        Assert.False(sDir.IsExpanded);
+        Assert.NotEmpty(sDir.Children);   // fresh.txt + clobber.txt live here
 
-        viewModel.ToggleNodeCommand.Execute(sDir);
-        Assert.Contains(viewModel.TreeRows, n => n.Name.EndsWith(".txt"));
+        // IsExpanded is observable so the TreeViewItem two-way binding round-trips.
+        bool raised = false;
+        sDir.PropertyChanged += (_, e) => { if (e.PropertyName == nameof(DryRunTreeNode.IsExpanded)) raised = true; };
+        sDir.IsExpanded = true;
+        Assert.True(raised);
+    }
 
-        viewModel.ToggleNodeCommand.Execute(sDir);
-        Assert.DoesNotContain(viewModel.TreeRows, n => n.Name.EndsWith(".txt"));
+    [Fact]
+    public async Task All_categories_default_to_list_view()
+    {
+        var (viewModel, gateway) = NewViewModel();
+        gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value);
+        await viewModel.RunAsync(CancellationToken.None);
+
+        Assert.False(viewModel.ShowTree);
+        Assert.False(viewModel.ShowFilterTree);
+        Assert.False(viewModel.ShowUnchangedTree);
+        Assert.Empty(viewModel.ProcessTree);
+        Assert.Empty(viewModel.FilterTree);
+        Assert.Empty(viewModel.UnchangedTree);
+    }
+
+    [Fact]
+    public async Task Skip_category_trees_build_from_their_own_buckets_when_enabled()
+    {
+        var (viewModel, gateway) = NewViewModel();
+        gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value);
+        await viewModel.RunAsync(CancellationToken.None);
+        viewModel.DestructiveOnly = false;   // reveal the two skip buckets
+
+        viewModel.ShowFilterTree = true;
+        viewModel.ShowUnchangedTree = true;
+
+        // junk.tmp is the only filter-skip; same.txt the only unchanged. Each rolls up to its own C: root.
+        DryRunTreeNode filterRoot = Assert.Single(viewModel.FilterTree);
+        Assert.Equal("C:", filterRoot.Name);
+        Assert.Equal(1, filterRoot.FileCount);
+
+        DryRunTreeNode unchangedRoot = Assert.Single(viewModel.UnchangedTree);
+        Assert.Equal("C:", unchangedRoot.Name);
+        Assert.Equal(1, unchangedRoot.FileCount);
+
+        // Each toggle is independent — the process tree stays empty while its own toggle is off.
+        Assert.Empty(viewModel.ProcessTree);
     }
 
     [Fact]

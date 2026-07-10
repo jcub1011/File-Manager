@@ -1,4 +1,3 @@
-using Avalonia;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using FileManager.Contracts.DryRun;
@@ -44,10 +43,10 @@ public sealed record DryRunFileRow(
     public bool HasSourceDisposition => SourceDisposition is not null;
 }
 
-/// <summary>A node in the "would process" path tree: a directory or file whose counts are the
-/// rolled-up totals of everything beneath it. Building the forest over 50k paths is cheap data work;
-/// the memory win comes from flattening only the expanded nodes into the virtualized row list.</summary>
-public sealed class DryRunTreeNode
+/// <summary>A node in a category's path tree: a directory or file whose counts are the rolled-up
+/// totals of everything beneath it. Building the forest over 50k paths is cheap data work; the built-in
+/// TreeView virtualizes the realized rows and only materializes a node's children once it is expanded.</summary>
+public sealed partial class DryRunTreeNode : ObservableObject
 {
     private static readonly char[] Separators = ['\\', '/'];
 
@@ -65,9 +64,10 @@ public sealed class DryRunTreeNode
     public int Depth { get; }
     public List<DryRunTreeNode> Children { get; } = [];
 
-    /// <summary>Expand/collapse state. Not observable — toggling it rebuilds the flattened row list,
-    /// which is what re-renders the tree.</summary>
-    public bool IsExpanded { get; set; }
+    /// <summary>Expand/collapse state, bound two-way to the built-in <c>TreeViewItem.IsExpanded</c>.
+    /// Observable so the default-expanded roots (and any future programmatic change) reflect in the
+    /// control.</summary>
+    [ObservableProperty] public partial bool IsExpanded { get; set; }
 
     public int FileCount { get; private set; }
     public int OverwriteCount { get; private set; }
@@ -76,9 +76,7 @@ public sealed class DryRunTreeNode
 
     public bool HasChildren => Children.Count > 0;
 
-    // Display helpers for the row template.
-    public Thickness Indent => new(Depth * 16, 0, 0, 0);
-    public string Glyph => !HasChildren ? "" : IsExpanded ? "▾" : "▸";
+    // Display helpers for the tree row template (the TreeView draws chevrons + indentation natively).
     public string FileText => IsDirectory ? $"{FileCount:N0} files" : "";
     public bool HasOverwrites => OverwriteCount > 0;
     public bool HasRenames => RenameCount > 0;
@@ -141,18 +139,6 @@ public sealed class DryRunTreeNode
         return roots;
     }
 
-    /// <summary>Depth-first walk emitting each node whose ancestors are all expanded — the flat row
-    /// list bound to the virtualizing ListBox.</summary>
-    public static void Flatten(IReadOnlyList<DryRunTreeNode> nodes, List<DryRunTreeNode> into)
-    {
-        foreach (DryRunTreeNode node in nodes)
-        {
-            into.Add(node);
-            if (node.IsExpanded)
-                Flatten(node.Children, into);
-        }
-    }
-
     // Directories before files, then alphabetical — a familiar file-explorer ordering.
     private static void SortRecursive(List<DryRunTreeNode> nodes)
     {
@@ -185,7 +171,6 @@ public sealed partial class DryRunViewModel : ViewModelBase
     private bool _applyingReport;
     private List<DryRunFileRow> _processAll = [];
     private List<DryRunFileRow> _processMatches = [];
-    private IReadOnlyList<DryRunTreeNode> _treeRoots = [];
     private List<DryRunFileRow> _filterSkipsAll = [];
     private List<DryRunFileRow> _unchangedSkipsAll = [];
 
@@ -229,11 +214,18 @@ public sealed partial class DryRunViewModel : ViewModelBase
     [ObservableProperty] public partial IReadOnlyList<SourceFacetRow> SourceFacets { get; private set; } = [];
     [ObservableProperty] public partial bool ShowSourceFacet { get; private set; }
 
-    /// <summary>When true, the "Will process" set is shown as a navigable path tree instead of a flat
-    /// list — 50k rows collapse to a handful of directory nodes with rolled-up counts to drill into.</summary>
+    // Per-category list⇄tree toggles. All default false, so every category opens as a list; flipping one
+    // on shows that category's set as a navigable path tree — 50k rows collapse to a handful of directory
+    // nodes with rolled-up counts to drill into. The built-in TreeView virtualizes the realized rows.
     [ObservableProperty] public partial bool ShowTree { get; set; }
-    /// <summary>The flattened, expanded-only view of the path tree, bound to the virtualizing ListBox.</summary>
-    [ObservableProperty] public partial IReadOnlyList<DryRunTreeNode> TreeRows { get; private set; } = [];
+    [ObservableProperty] public partial bool ShowFilterTree { get; set; }
+    [ObservableProperty] public partial bool ShowUnchangedTree { get; set; }
+
+    /// <summary>The root forest for each category's tree, bound to a built-in <c>TreeView</c>. Empty until
+    /// that category's toggle is enabled; a node's children are only realized by the control on expand.</summary>
+    [ObservableProperty] public partial IReadOnlyList<DryRunTreeNode> ProcessTree { get; private set; } = [];
+    [ObservableProperty] public partial IReadOnlyList<DryRunTreeNode> FilterTree { get; private set; } = [];
+    [ObservableProperty] public partial IReadOnlyList<DryRunTreeNode> UnchangedTree { get; private set; } = [];
 
     public void SetProfile(Guid? profileId, string profileName)
     {
@@ -299,17 +291,16 @@ public sealed partial class DryRunViewModel : ViewModelBase
         _ = DebouncedRebuildAsync(_searchCts.Token);
     }
 
-    partial void OnShowTreeChanged(bool value)
-    {
-        if (value)
-            RebuildTree();
-        else
-        {
-            // Release the flattened node list once the tree is hidden — it can hold a lot of nodes.
-            _treeRoots = [];
-            TreeRows = [];
-        }
-    }
+    // Each toggle builds its category's forest on enable and releases it on disable — a hidden tree can
+    // hold a lot of nodes. The forest is built from the category's currently-visible (filtered) rows.
+    partial void OnShowTreeChanged(bool value) =>
+        ProcessTree = value ? DryRunTreeNode.BuildForest(_processMatches) : [];
+
+    partial void OnShowFilterTreeChanged(bool value) =>
+        FilterTree = value ? DryRunTreeNode.BuildForest(FilterSkips) : [];
+
+    partial void OnShowUnchangedTreeChanged(bool value) =>
+        UnchangedTree = value ? DryRunTreeNode.BuildForest(UnchangedSkips) : [];
 
     // A short pause after the last keystroke coalesces typing into one rebuild, so a 50k-row report's
     // list re-filter and tree rebuild don't run per character. Resumes on the UI thread (no
@@ -444,8 +435,10 @@ public sealed partial class DryRunViewModel : ViewModelBase
         FilterSkips = Filter(DestructiveOnly ? [] : _filterSkipsAll, term, sources);
         UnchangedSkips = Filter(DestructiveOnly ? [] : _unchangedSkipsAll, term, sources);
 
-        if (ShowTree)
-            RebuildTree();
+        // Rebuild whichever category trees are currently shown so they track the filtered rows.
+        if (ShowTree) ProcessTree = DryRunTreeNode.BuildForest(_processMatches);
+        if (ShowFilterTree) FilterTree = DryRunTreeNode.BuildForest(FilterSkips);
+        if (ShowUnchangedTree) UnchangedTree = DryRunTreeNode.BuildForest(UnchangedSkips);
     }
 
     /// <summary>The set of selected source roots to keep, or null when the facet is hidden or every
@@ -469,28 +462,6 @@ public sealed partial class DryRunViewModel : ViewModelBase
         return rows.ToList();
     }
 
-    private void RebuildTree()
-    {
-        _treeRoots = DryRunTreeNode.BuildForest(_processMatches);
-        FlattenTree();
-    }
-
-    private void FlattenTree()
-    {
-        List<DryRunTreeNode> rows = [];
-        DryRunTreeNode.Flatten(_treeRoots, rows);
-        TreeRows = rows;
-    }
-
-    [RelayCommand]
-    private void ToggleNode(DryRunTreeNode node)
-    {
-        if (!node.HasChildren)
-            return;
-        node.IsExpanded = !node.IsExpanded;
-        FlattenTree();
-    }
-
     /// <summary>Case-insensitive substring match on the source path or any target path.</summary>
     private static bool Matches(DryRunFileRow row, string term) =>
         row.SourcePath.Contains(term, StringComparison.OrdinalIgnoreCase)
@@ -502,11 +473,12 @@ public sealed partial class DryRunViewModel : ViewModelBase
         _filterSkipsAll = [];
         _unchangedSkipsAll = [];
         _processMatches = [];
-        _treeRoots = [];
         ProcessFiles = [];
         FilterSkips = [];
         UnchangedSkips = [];
-        TreeRows = [];
+        ProcessTree = [];
+        FilterTree = [];
+        UnchangedTree = [];
         SourceFacets = [];
         ShowSourceFacet = false;
         HasReport = false;

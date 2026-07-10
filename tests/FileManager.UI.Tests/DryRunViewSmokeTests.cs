@@ -7,8 +7,9 @@ using FileManager.UI.Views;
 namespace FileManager.UI.Tests;
 
 /// <summary>Loads the real DryRunView control against a populated view model and forces a layout pass,
-/// so runtime-only XAML failures (the $parent[ListBox] command binding, the Thickness Indent binding,
-/// style selectors, the virtualizing ListBox panels) surface as a failing test rather than in the app.</summary>
+/// so runtime-only XAML failures (the shared TreeDataTemplate, the TreeViewItem IsExpanded style binding,
+/// the VirtualizingStackPanel item panels, style selectors) surface as a failing test rather than in the
+/// app.</summary>
 [Collection(HeadlessCollection.Name)]
 public sealed class DryRunViewSmokeTests(HeadlessSessionFixture headless)
 {
@@ -97,23 +98,61 @@ public sealed class DryRunViewSmokeTests(HeadlessSessionFixture headless)
     }
 
     [Fact]
-    public async Task Tree_view_loads_and_toggling_a_node_relayouts()
+    public async Task Tree_view_loads_and_lays_out()
     {
         await headless.Session.Dispatch(() =>
         {
             DryRunViewModel vm = PopulatedViewModel();
             vm.RunAsync(CancellationToken.None).GetAwaiter().GetResult();
             vm.DestructiveOnly = false;
+            vm.ShowTree = true;               // build the forest before showing so the TreeView realizes on layout
 
-            Window window = ShowView(vm);
+            Window window = ShowView(vm);     // no throw ⇒ TreeDataTemplate + VSP styles + IsExpanded binding are valid
 
-            vm.ShowTree = true;                       // realizes the tree ListBox + Indent/command bindings
-            Assert.NotEmpty(vm.TreeRows);
+            Assert.NotEmpty(vm.ProcessTree);
+            DryRunTreeNode dir = vm.ProcessTree.First(n => n.IsDirectory && n.HasChildren);
 
-            DryRunTreeNode dir = vm.TreeRows.First(n => n.IsDirectory && n.HasChildren);
-            int before = vm.TreeRows.Count;
-            vm.ToggleNodeCommand.Execute(dir);        // drives the $parent[ListBox] command path
-            Assert.NotEqual(before, vm.TreeRows.Count);
+            // Expansion is the control's job now; flipping the model flag must not throw as the view reacts.
+            dir.IsExpanded = !dir.IsExpanded;
+            Assert.NotNull(window.Content);
+        }, CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task Skip_category_tree_loads_and_lays_out()
+    {
+        await headless.Session.Dispatch(() =>
+        {
+            FakeIpcGateway gateway = new();
+            DryRunViewModel vm = new(gateway);
+            vm.SetProfile(Guid.NewGuid(), "P");
+
+            // A report with filter-skip + unchanged rows so both skip categories' trees have content.
+            var files = new List<DryRunFileResult>();
+            for (int i = 0; i < 30; i++)
+                files.Add(new DryRunFileResult
+                {
+                    SourcePath = $@"C:\src\dir-{i % 4}\junk-{i}.tmp",
+                    Disposition = DryRunFileDisposition.WouldSkipFilter,
+                    DecidingFilter = "exclude *.tmp",
+                });
+            for (int i = 0; i < 30; i++)
+                files.Add(new DryRunFileResult
+                {
+                    SourcePath = $@"C:\src\dir-{i % 4}\same-{i}.dat",
+                    Disposition = DryRunFileDisposition.WouldSkipUnchanged,
+                    Targets = [new DryRunTargetAction { TargetPath = $@"D:\dst\same-{i}.dat", Kind = DryRunTargetKind.WouldSkipUnchanged }],
+                });
+            gateway.DryRunResult = new DryRunReport(vm.ProfileId!.Value, DateTimeOffset.UnixEpoch, files);
+            vm.RunAsync(CancellationToken.None).GetAwaiter().GetResult();
+
+            vm.ShowFilterTree = true;
+            vm.ShowUnchangedTree = true;
+
+            Window window = ShowView(vm);     // no throw ⇒ the shared tree template renders for the skip categories too
+
+            Assert.NotEmpty(vm.FilterTree);
+            Assert.NotEmpty(vm.UnchangedTree);
         }, CancellationToken.None);
     }
 }
