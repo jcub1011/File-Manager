@@ -1,6 +1,7 @@
 using FileManager.Contracts.IPC;
 using FileManager.Contracts.Primitives;
 using FileManager.Core.IPC;
+using FileManager.Core.Journal;
 using FileManager.Core.Platform;
 using FileManager.Core.Profiles;
 using FileManager.Core.Settings;
@@ -22,7 +23,8 @@ internal sealed class EngineHost(
     IProfileCatalog catalog,
     IIpcServer ipcServer,
     ISettingsProvider settings,
-    IAutostartRegistrar autostart) : BackgroundService
+    IAutostartRegistrar autostart,
+    ICrashRecovery crashRecovery) : BackgroundService
 {
     private Mutex? _singleInstanceMutex;
 
@@ -62,15 +64,37 @@ internal sealed class EngineHost(
         // 2. On-disk layout (§9).
         Directory.CreateDirectory(paths.ProfilesDirectory);
         Directory.CreateDirectory(paths.LogsDirectory);
+        Directory.CreateDirectory(paths.JobLogsDirectory);
+        Directory.CreateDirectory(paths.JournalDirectory);
+        Directory.CreateDirectory(paths.AuditDirectory);
+        Directory.CreateDirectory(paths.StateDirectory);
+        Directory.CreateDirectory(paths.WorkDirectory);
+        Directory.CreateDirectory(paths.QuarantineDirectory);
 
         // 3. Load profiles into the catalog.
         Result reload = catalog.Reload();
         if (reload.TryGetError(out string? reloadError))
             logger.LogError("Initial profile load failed: {Error}", reloadError);
 
-        // 4. [slot] ICrashRecovery.Recover() — when the journal lands, it MUST run to
-        //    completion here, before step 5 starts the IPC server and before any trigger
-        //    fires (I-RECOVER-FIRST, §7.4).
+        // 4. Crash recovery — resolves every OPEN journal entry to CLOSED. MUST run to completion
+        //    here, before step 5 starts the IPC server and before any trigger fires
+        //    (I-RECOVER-FIRST, §7.4).
+        Result<RecoveryReport, Core.Jobs.JobError> recovery = crashRecovery.Recover(stoppingToken);
+        if (recovery.TryGetValue(out RecoveryReport? report))
+        {
+            logger.LogInformation(
+                "Recovery complete: {Recovered} recovered, {Forward} forward, {Back} rolled back, {Clean} pre-placement, {Quarantined} quarantined",
+                report.JobsRecovered, report.CompletedForward, report.RolledBack, report.CleanedPrePlacement, report.QuarantinedPaths.Count);
+            foreach (string quarantined in report.QuarantinedPaths)
+                logger.LogWarning("Quarantined orphaned content: {Path}", quarantined);
+        }
+        else if (recovery.TryGetError(out Core.Jobs.JobError? recoveryError))
+        {
+            // A journal read failure must not silently start the engine as if all was well.
+            logger.LogCritical("Crash recovery failed: {Error}; stopping the service", recoveryError.Message);
+            lifetime.StopApplication();
+            return;
+        }
 
         // 5. Start the IPC server.
         Result started = ipcServer.Start();

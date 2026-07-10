@@ -107,7 +107,7 @@ public sealed class DryRunEngineTests : IDisposable
             new SourceScanner(NullLogger<SourceScanner>.Instance, fileSystem, TimeProvider.System),
             new FilterCompiler(NullLogger<FilterCompiler>.Instance, TimeProvider.System),
             new FileHasher(NullLogger<FileHasher>.Instance),
-            new ConflictResolver(NullLogger<ConflictResolver>.Instance),
+            new ConflictResolver(new(), new(), NullLogger<ConflictResolver>.Instance),
             new FakeSettings(global),
             TimeProvider.System)
         { ReportByteBudget = reportByteBudget, ChunkByteBudget = chunkByteBudget, MaxScannedCandidates = maxScannedCandidates };

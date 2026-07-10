@@ -1,4 +1,6 @@
 using FileManager.Contracts.Profiles;
+using FileManager.Core.Jobs;
+using FileManager.Core.Locking;
 using FileManager.Core.Placement;
 using Microsoft.Extensions.Logging.Abstractions;
 
@@ -7,12 +9,14 @@ namespace FileManager.Core.Tests.Placement;
 public sealed class ConflictResolverProbeTests : IDisposable
 {
     private readonly string _dir;
-    private readonly ConflictResolver _resolver = new(NullLogger<ConflictResolver>.Instance);
+    private readonly PathLockRegistry _locks = new();
+    private readonly ConflictResolver _resolver;
 
     public ConflictResolverProbeTests()
     {
         _dir = Path.Combine(Path.GetTempPath(), "fm-conflict-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(_dir);
+        _resolver = new ConflictResolver(_locks, new(), NullLogger<ConflictResolver>.Instance);
     }
 
     public void Dispose() => Directory.Delete(_dir, recursive: true);
@@ -77,7 +81,52 @@ public sealed class ConflictResolverProbeTests : IDisposable
     }
 
     [Fact]
-    public void Resolve_is_not_part_of_this_slice() =>
-        Assert.Throws<NotSupportedException>(() => _resolver.Resolve(
-            Path.Combine(_dir, "x"), ConflictResolution.Skip, null!, 0, Guid.NewGuid(), null!));
+    public async Task Resolve_skip_keeps_the_existing_file()
+    {
+        string path = Existing("kept.txt");
+        await using PathLockSet held = await _locks.AcquireAsync([], JobId.New());
+        var resolved = _resolver.Resolve(path, ConflictResolution.Skip, Sealed(), 0, Guid.NewGuid(), held);
+        Assert.True(resolved.TryGetValue(out ConflictOutcome? outcome));
+        Assert.Equal(ConflictAction.SkipExistingKept, outcome.Action);
+    }
+
+    [Fact]
+    public async Task Resolve_rename_suffix_reserves_the_first_free_lockable_candidate()
+    {
+        Existing("song.flac");
+        await using PathLockSet held = await _locks.AcquireAsync([], JobId.New());
+
+        var resolved = _resolver.Resolve(Path.Combine(_dir, "song.flac"), ConflictResolution.RenameSuffix, Sealed(), 0, Guid.NewGuid(), held);
+
+        Assert.True(resolved.TryGetValue(out ConflictOutcome? outcome));
+        Assert.Equal(ConflictAction.Write, outcome.Action);
+        Assert.Equal(Path.Combine(_dir, "song (1).flac"), outcome.FinalPath);
+        // The chosen candidate is now held by this job's lock set (reserved against sibling jobs).
+        Assert.Contains(held.Paths, p => p.Value.EndsWith("song (1).flac", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public async Task Resolve_overwrite_if_newer_priority_keeps_a_lower_index_placement()
+    {
+        Guid profileId = Guid.NewGuid();
+        string path = Existing("shared.txt");
+        var priorities = new SourcePriorityRegistry();
+        NormalizedPath.Create(path).TryGetValue(out NormalizedPath key);
+        priorities.RecordPlacement(profileId, key, sourceIndex: 0);   // a higher-priority source placed here this session
+        var resolver = new ConflictResolver(_locks, priorities, NullLogger<ConflictResolver>.Instance);
+        await using PathLockSet held = await _locks.AcquireAsync([], JobId.New());
+
+        // An incoming file from a lower-priority (higher-index) source must keep the existing one.
+        var resolved = resolver.Resolve(path, ConflictResolution.Overwrite, Sealed(), sourceIndex: 3, profileId, held);
+        Assert.True(resolved.TryGetValue(out ConflictOutcome? outcome));
+        Assert.Equal(ConflictAction.SkipExistingKept, outcome.Action);
+    }
+
+    private static SealedOutput Sealed(DateTimeOffset? sourceLastWrite = null) => new()
+    {
+        Path = "unused",
+        SizeBytes = 8,
+        Sha256 = "",
+        SourceLastWriteUtc = sourceLastWrite ?? DateTimeOffset.UtcNow,
+    };
 }

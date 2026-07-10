@@ -1,11 +1,16 @@
 using FileManager.Core;
+using FileManager.Core.Audit;
+using FileManager.Core.Disposition;
 using FileManager.Core.DryRun;
 using FileManager.Core.Files;
 using FileManager.Core.Filtering;
 using FileManager.Core.IPC;
 using FileManager.Core.IPC.Handlers;
+using FileManager.Core.Journal;
+using FileManager.Core.Locking;
 using FileManager.Core.Placement;
 using FileManager.Core.Platform;
+using FileManager.Core.Preflight;
 using FileManager.Core.Profiles;
 using FileManager.Core.Settings;
 using FileManager.Core.Watching;
@@ -68,6 +73,28 @@ internal static class Program
         services.AddSingleton<IDryRunEngine, DryRunEngine>();
         services.AddSingleton<IIpcEndpointProvider, WindowsIpcEndpointProvider>();
         services.AddSingleton<IAutostartRegistrar, WindowsAutostartRegistrar>();
+
+        // Engine settings (§9). Defaults only for now; reconciling with settings.json is a later concern.
+        services.AddSingleton(new EngineConfig());
+
+        // Durable safety substrate (§4.3, §4.6, §4.7) — the write-ahead journal, in-memory
+        // registries, atomic placement, rollback, disposition, and crash recovery. Not yet driven
+        // by a live executor; recovery runs at startup (I-RECOVER-FIRST) and the machinery is
+        // exercised by tests.
+        services.AddSingleton<PathLockRegistry>();
+        services.AddSingleton<SelfWriteSuppressionRegistry>();
+        services.AddSingleton<SourcePriorityRegistry>();
+        services.AddSingleton<IJobJournal, JobJournal>();
+        services.AddSingleton<IDispositionAuditLog, DispositionAuditLog>();
+        services.AddSingleton<ITransientRetryPolicy, TransientRetryPolicy>();
+        services.AddSingleton<IVolumeInfoProvider, WindowsVolumeInfoProvider>();
+        services.AddSingleton<IMetadataPreserver, WindowsMetadataPreserver>();
+        services.AddSingleton<ITrashService, WindowsTrashService>();
+        services.AddSingleton<IDiskPreflight, DiskPreflight>();
+        services.AddSingleton<IAtomicPlacer, AtomicPlacer>();
+        services.AddSingleton<IRollbackExecutor, RollbackExecutor>();
+        services.AddSingleton<ISourceDispositionService, SourceDispositionService>();
+        services.AddSingleton<ICrashRecovery, CrashRecovery>();
 
         // Explicit dispatch table — no reflection-based handler discovery (§1 AOT constraints).
         services.AddSingleton<GetStatusHandler>();

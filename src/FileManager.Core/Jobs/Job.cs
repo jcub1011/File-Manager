@@ -156,13 +156,30 @@ public sealed record SealedOutput
 }
 
 /// <summary>Mutable per-job execution state, owned by one pool worker; wraps the plan,
-/// the state machine, the lock set, suppression tokens, and per-target progress.</summary>
+/// the state machine, the lock set, suppression tokens, and per-target progress.
+/// <see cref="States"/> and <see cref="Targets"/> are derived from <see cref="Plan"/> on first
+/// access — the plan is set via <c>init</c>, so they cannot be built in the constructor.</summary>
 public sealed class JobExecution
 {
+    private JobStateMachine? _states;
+    private IReadOnlyList<TargetProgress>? _targets;
+
     public required JobPlan Plan { get; init; }
-    public JobStateMachine States { get; }
+
+    public JobStateMachine States => _states ??= new JobStateMachine(Plan.JobId);
+
     public SealedOutput? Output { get; set; }
-    public IReadOnlyList<TargetProgress> Targets { get; }
+
+    public IReadOnlyList<TargetProgress> Targets =>
+        _targets ??= BuildTargets(Plan);
+
+    private static IReadOnlyList<TargetProgress> BuildTargets(JobPlan plan)
+    {
+        var targets = new TargetProgress[plan.Targets.Count];
+        for (int i = 0; i < targets.Length; i++)
+            targets[i] = new TargetProgress { Plan = plan.Targets[i], State = TargetState.Pending };
+        return targets;
+    }
 }
 
 public sealed class TargetProgress

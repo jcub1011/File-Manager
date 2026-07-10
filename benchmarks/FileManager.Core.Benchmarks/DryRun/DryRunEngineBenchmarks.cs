@@ -81,7 +81,7 @@ public class DryRunEngineBenchmarks
             scanner,
             new FilterCompiler(NullLogger<FilterCompiler>.Instance, TimeProvider.System),
             new FileHasher(NullLogger<FileHasher>.Instance),
-            new ConflictResolver(NullLogger<ConflictResolver>.Instance),
+            new ConflictResolver(new(), new(), NullLogger<ConflictResolver>.Instance),
             new FixedSettings(),
             TimeProvider.System);
     }

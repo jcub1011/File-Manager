@@ -26,7 +26,7 @@ public class ConflictResolverBenchmarks
     [GlobalSetup]
     public void Setup()
     {
-        _resolver = new ConflictResolver(NullLogger<ConflictResolver>.Instance);
+        _resolver = new ConflictResolver(new(), new(), NullLogger<ConflictResolver>.Instance);
         _dir = Path.Combine(Path.GetTempPath(), "fm-bench-conflict-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(_dir);
 

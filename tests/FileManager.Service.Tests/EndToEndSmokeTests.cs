@@ -48,7 +48,7 @@ public sealed class EndToEndSmokeTests : IAsyncLifetime
         ProfileCatalog catalog = new(NullLogger<ProfileCatalog>.Instance, store);
         SourceScanner scanner = new(NullLogger<SourceScanner>.Instance, fileSystem, TimeProvider.System);
         FileHasher hasher = new(NullLogger<FileHasher>.Instance);
-        ConflictResolver resolver = new(NullLogger<ConflictResolver>.Instance);
+        ConflictResolver resolver = new(new(), new(), NullLogger<ConflictResolver>.Instance);
         SettingsService settings = new(NullLogger<SettingsService>.Instance, paths);
         DryRunEngine dryRun = new(NullLogger<DryRunEngine>.Instance, catalog, scanner, filterCompiler, hasher, resolver, settings, TimeProvider.System);
 
