@@ -41,6 +41,24 @@ public sealed record DryRunFileRow(
         IsSourceDisposalDestructive || Targets.Any(t => t.IsOverwrite);
 
     public bool HasSourceDisposition => SourceDisposition is not null;
+
+    // Per-row status pill (the merged list/tree no longer conveys disposition by which section a row
+    // sits in — every row carries its own pill).
+    public bool IsProcessed => Disposition == DryRunFileDisposition.WouldProcess;
+    public bool IsFilterSkipped => Disposition == DryRunFileDisposition.WouldSkipFilter;
+    public bool IsUnchangedSkipped => Disposition == DryRunFileDisposition.WouldSkipUnchanged;
+
+    public string StatusText => Disposition switch
+    {
+        DryRunFileDisposition.WouldProcess => "Processed",
+        DryRunFileDisposition.WouldSkipFilter => "Skipped",
+        DryRunFileDisposition.WouldSkipUnchanged => "Unchanged",
+        _ => "",
+    };
+
+    /// <summary>Filter-skipped rows are visually de-emphasized by dimming the row's content (path +
+    /// targets); the status pill stays fully legible, so it binds this on the content only.</summary>
+    public double ContentOpacity => IsFilterSkipped ? 0.55 : 1.0;
 }
 
 /// <summary>A node in a category's path tree: a directory or file whose counts are the rolled-up
@@ -69,7 +87,11 @@ public sealed partial class DryRunTreeNode : ObservableObject
     /// control.</summary>
     [ObservableProperty] public partial bool IsExpanded { get; set; }
 
-    public int FileCount { get; private set; }
+    // Disposition rollups: how many leaves beneath this node fall into each status. Shown as the
+    // node's status pills (Unchanged, Skipped, Processed order), mirroring the per-row pills.
+    public int ProcessedCount { get; private set; }
+    public int FilteredCount { get; private set; }
+    public int UnchangedCount { get; private set; }
     public int OverwriteCount { get; private set; }
     public int RenameCount { get; private set; }
     public int DisposalCount { get; private set; }
@@ -77,7 +99,13 @@ public sealed partial class DryRunTreeNode : ObservableObject
     public bool HasChildren => Children.Count > 0;
 
     // Display helpers for the tree row template (the TreeView draws chevrons + indentation natively).
-    public string FileText => IsDirectory ? $"{FileCount:N0} files" : "";
+    // Ordered to match the requested pill order: Unchanged, Skipped, Processed.
+    public bool HasUnchanged => UnchangedCount > 0;
+    public bool HasFiltered => FilteredCount > 0;
+    public bool HasProcessed => ProcessedCount > 0;
+    public string UnchangedText => $"{UnchangedCount:N0} unchanged";
+    public string FilteredText => $"{FilteredCount:N0} skipped";
+    public string ProcessedText => $"{ProcessedCount:N0} processed";
     public bool HasOverwrites => OverwriteCount > 0;
     public bool HasRenames => RenameCount > 0;
     public bool HasDisposals => DisposalCount > 0;
@@ -102,6 +130,9 @@ public sealed partial class DryRunTreeNode : ObservableObject
                 else if (target.IsRename) renames++;
             }
             int disposals = row.IsSourceDisposalDestructive ? 1 : 0;
+            int processed = row.IsProcessed ? 1 : 0;
+            int filtered = row.IsFilterSkipped ? 1 : 0;
+            int unchanged = row.IsUnchangedSkipped ? 1 : 0;
 
             string[] segments = row.SourcePath.Split(Separators, StringSplitOptions.RemoveEmptyEntries);
             if (segments.Length == 0)
@@ -124,7 +155,9 @@ public sealed partial class DryRunTreeNode : ObservableObject
                 }
 
                 // The leaf is one file; every ancestor contains it, so counts roll up the whole chain.
-                node.FileCount++;
+                node.ProcessedCount += processed;
+                node.FilteredCount += filtered;
+                node.UnchangedCount += unchanged;
                 node.OverwriteCount += overwrites;
                 node.RenameCount += renames;
                 node.DisposalCount += disposals;
@@ -169,10 +202,8 @@ public sealed partial class DryRunViewModel : ViewModelBase
     private readonly TimeSpan _searchDebounce;
     private CancellationTokenSource? _searchCts;
     private bool _applyingReport;
-    private List<DryRunFileRow> _processAll = [];
-    private List<DryRunFileRow> _processMatches = [];
-    private List<DryRunFileRow> _filterSkipsAll = [];
-    private List<DryRunFileRow> _unchangedSkipsAll = [];
+    private List<DryRunFileRow> _allRows = [];
+    private List<DryRunFileRow> _visibleMatches = [];
 
     public DryRunViewModel(IIpcGateway gateway, TimeSpan? searchDebounce = null)
     {
@@ -184,7 +215,6 @@ public sealed partial class DryRunViewModel : ViewModelBase
     [ObservableProperty] public partial string ProfileName { get; set; } = "";
     [ObservableProperty] public partial bool HasReport { get; set; }
     [ObservableProperty] public partial string? ErrorMessage { get; set; }
-    [ObservableProperty] public partial bool DestructiveOnly { get; set; }
     [ObservableProperty] public partial string SearchText { get; set; } = "";
     [ObservableProperty] public partial string GeneratedAtText { get; set; } = "";
     [ObservableProperty] public partial bool WasTruncated { get; set; }
@@ -198,6 +228,7 @@ public sealed partial class DryRunViewModel : ViewModelBase
     [ObservableProperty] public partial int OverwriteCount { get; set; }
     [ObservableProperty] public partial int RenameCount { get; set; }
     [ObservableProperty] public partial int DisposalCount { get; set; }
+    [ObservableProperty] public partial int DestructiveCount { get; set; }
     [ObservableProperty] public partial bool HasDestructiveActions { get; set; }
 
     public bool CanRun => ProfileId is not null;
@@ -205,27 +236,32 @@ public sealed partial class DryRunViewModel : ViewModelBase
     // Reference-swapped rather than mutated in place: assigning a fresh list raises one
     // PropertyChanged and re-binds ItemsSource in a single pass, instead of ~50k CollectionChanged
     // events from a Clear()+Add loop that a non-virtualizing panel would materialize one at a time.
-    [ObservableProperty] public partial IReadOnlyList<DryRunFileRow> ProcessFiles { get; private set; } = [];
-    [ObservableProperty] public partial IReadOnlyList<DryRunFileRow> FilterSkips { get; private set; } = [];
-    [ObservableProperty] public partial IReadOnlyList<DryRunFileRow> UnchangedSkips { get; private set; } = [];
+    // One merged list of every affected file (post-filter), each row carrying its own status pill.
+    [ObservableProperty] public partial IReadOnlyList<DryRunFileRow> AffectedFiles { get; private set; } = [];
 
     /// <summary>Per-source checkboxes for a multi-source report. Empty (and <see cref="ShowSourceFacet"/>
     /// false) for single-source reports, or when a legacy service omitted the per-row source root.</summary>
     [ObservableProperty] public partial IReadOnlyList<SourceFacetRow> SourceFacets { get; private set; } = [];
     [ObservableProperty] public partial bool ShowSourceFacet { get; private set; }
 
-    // Per-category list⇄tree toggles. All default false, so every category opens as a list; flipping one
-    // on shows that category's set as a navigable path tree — 50k rows collapse to a handful of directory
-    // nodes with rolled-up counts to drill into. The built-in TreeView virtualizes the realized rows.
-    [ObservableProperty] public partial bool ShowTree { get; set; }
-    [ObservableProperty] public partial bool ShowFilterTree { get; set; }
-    [ObservableProperty] public partial bool ShowUnchangedTree { get; set; }
+    // Disposition filter pills — all default true, so every report opens showing every status. Flipping
+    // one narrows the merged list/tree live. Guarded by _applyingReport so a fresh report does one rebuild.
+    // ShowProcessed and ShowDestructive are two mutually-exclusive views of the processed rows: "all of
+    // them" vs "just the risky (overwrite/disposal) subset" — selecting one clears the other. ShowFiltered
+    // and ShowUnchanged are independent, so a destructive view can still sit alongside skipped/unchanged.
+    [ObservableProperty] public partial bool ShowProcessed { get; set; } = true;
+    [ObservableProperty] public partial bool ShowDestructive { get; set; }
+    [ObservableProperty] public partial bool ShowFiltered { get; set; } = true;
+    [ObservableProperty] public partial bool ShowUnchanged { get; set; } = true;
 
-    /// <summary>The root forest for each category's tree, bound to a built-in <c>TreeView</c>. Empty until
-    /// that category's toggle is enabled; a node's children are only realized by the control on expand.</summary>
-    [ObservableProperty] public partial IReadOnlyList<DryRunTreeNode> ProcessTree { get; private set; } = [];
-    [ObservableProperty] public partial IReadOnlyList<DryRunTreeNode> FilterTree { get; private set; } = [];
-    [ObservableProperty] public partial IReadOnlyList<DryRunTreeNode> UnchangedTree { get; private set; } = [];
+    // Single list⇄tree toggle. Default false, so the report opens as a list; flipping it on shows the
+    // same visible set as a navigable path tree — 50k rows collapse to a handful of directory nodes with
+    // rolled-up counts to drill into. The built-in TreeView virtualizes the realized rows.
+    [ObservableProperty] public partial bool ShowTree { get; set; }
+
+    /// <summary>The root forest for the merged tree, bound to a built-in <c>TreeView</c>. Empty until the
+    /// tree toggle is enabled; a node's children are only realized by the control on expand.</summary>
+    [ObservableProperty] public partial IReadOnlyList<DryRunTreeNode> AffectedTree { get; private set; } = [];
 
     public void SetProfile(Guid? profileId, string profileName)
     {
@@ -277,9 +313,31 @@ public sealed partial class DryRunViewModel : ViewModelBase
         }
     }
 
-    partial void OnDestructiveOnlyChanged(bool value)
+    partial void OnShowProcessedChanged(bool value)
     {
-        if (_applyingReport) return;   // ApplyReport does exactly one rebuild at the end
+        if (_applyingReport) return;
+        // "All processed" and "destructive only" are mutually exclusive; turning this on clears the other,
+        // whose own change handler then does the single rebuild. Otherwise rebuild here.
+        if (value && ShowDestructive) { ShowDestructive = false; return; }
+        RebuildVisibleRows();
+    }
+
+    partial void OnShowDestructiveChanged(bool value)
+    {
+        if (_applyingReport) return;
+        if (value && ShowProcessed) { ShowProcessed = false; return; }
+        RebuildVisibleRows();
+    }
+
+    partial void OnShowFilteredChanged(bool value)
+    {
+        if (_applyingReport) return;
+        RebuildVisibleRows();
+    }
+
+    partial void OnShowUnchangedChanged(bool value)
+    {
+        if (_applyingReport) return;
         RebuildVisibleRows();
     }
 
@@ -291,16 +349,10 @@ public sealed partial class DryRunViewModel : ViewModelBase
         _ = DebouncedRebuildAsync(_searchCts.Token);
     }
 
-    // Each toggle builds its category's forest on enable and releases it on disable — a hidden tree can
-    // hold a lot of nodes. The forest is built from the category's currently-visible (filtered) rows.
+    // The toggle builds the forest on enable and releases it on disable — a hidden tree can hold a lot
+    // of nodes. The forest is built from the currently-visible (filtered) rows.
     partial void OnShowTreeChanged(bool value) =>
-        ProcessTree = value ? DryRunTreeNode.BuildForest(_processMatches) : [];
-
-    partial void OnShowFilterTreeChanged(bool value) =>
-        FilterTree = value ? DryRunTreeNode.BuildForest(FilterSkips) : [];
-
-    partial void OnShowUnchangedTreeChanged(bool value) =>
-        UnchangedTree = value ? DryRunTreeNode.BuildForest(UnchangedSkips) : [];
+        AffectedTree = value ? DryRunTreeNode.BuildForest(_visibleMatches) : [];
 
     // A short pause after the last keystroke coalesces typing into one rebuild, so a 50k-row report's
     // list re-filter and tree rebuild don't run per character. Resumes on the UI thread (no
@@ -332,33 +384,24 @@ public sealed partial class DryRunViewModel : ViewModelBase
             f.Targets.Select(static t => new DryRunTargetRow(t.TargetPath, t.Kind, t.Detail)).ToList()))
             .ToList();
 
-        _processAll = [];
-        _filterSkipsAll = [];
-        _unchangedSkipsAll = [];
-        foreach (DryRunFileRow row in rows)
-        {
-            switch (row.Disposition)
-            {
-                case DryRunFileDisposition.WouldProcess: _processAll.Add(row); break;
-                case DryRunFileDisposition.WouldSkipFilter: _filterSkipsAll.Add(row); break;
-                case DryRunFileDisposition.WouldSkipUnchanged: _unchangedSkipsAll.Add(row); break;
-            }
-        }
+        _allRows = rows;
 
         TotalFiles = rows.Count;
-        ProcessCount = _processAll.Count;
-        FilterSkipCount = _filterSkipsAll.Count;
-        UnchangedSkipCount = _unchangedSkipsAll.Count;
+        ProcessCount = rows.Count(static r => r.IsProcessed);
+        FilterSkipCount = rows.Count(static r => r.IsFilterSkipped);
+        UnchangedSkipCount = rows.Count(static r => r.IsUnchangedSkipped);
         OverwriteCount = rows.Sum(static r => r.Targets.Count(static t => t.IsOverwrite));
         RenameCount = rows.Sum(static r => r.Targets.Count(static t => t.IsRename));
         DisposalCount = rows.Count(static r => r.IsSourceDisposalDestructive);
+        DestructiveCount = rows.Count(static r => r.HasDestructiveAction);
         HasDestructiveActions = OverwriteCount > 0 || DisposalCount > 0;
-        // Auto-focus the review-worthy set: a run nobody can scroll through 50k rows of is only
-        // reviewable if it opens on the overwrites/disposals (spec §8). Benign runs still show
-        // everything. Full counts stay in the banner, and the toggle reveals the rest cheaply.
-        // Suppress the change-handler's rebuild here; ApplyReport does exactly one at the end (below).
+        // Every report opens with the three primary pills selected ("Would process" + Filtered +
+        // Unchanged) and "Destructive" off — nothing is hidden by default (the banner still surfaces the
+        // risky counts). Reset under the guard so the one rebuild at the end (below) picks up the reset
+        // state instead of firing per assignment.
         _applyingReport = true;
-        DestructiveOnly = HasDestructiveActions;
+        ShowDestructive = false;
+        ShowProcessed = ShowFiltered = ShowUnchanged = true;
         _applyingReport = false;
         GeneratedAtText = $"Generated {report.GeneratedAt.ToLocalTime():yyyy-MM-dd HH:mm:ss}";
         WasTruncated = report.Truncated;
@@ -391,8 +434,8 @@ public sealed partial class DryRunViewModel : ViewModelBase
         if (!anyNullRoot && roots.Count > 1)
         {
             Dictionary<string, int> processByRoot = new(StringComparer.OrdinalIgnoreCase);
-            foreach (DryRunFileRow row in _processAll)
-                if (row.SourceRoot is not null)
+            foreach (DryRunFileRow row in rows)
+                if (row.IsProcessed && row.SourceRoot is not null)
                     processByRoot[row.SourceRoot] = processByRoot.GetValueOrDefault(row.SourceRoot) + 1;
 
             roots.Sort(StringComparer.OrdinalIgnoreCase);
@@ -421,25 +464,30 @@ public sealed partial class DryRunViewModel : ViewModelBase
         string? term = string.IsNullOrWhiteSpace(SearchText) ? null : SearchText.Trim();
         // Null when every source is selected (or the facet is hidden) — the common case skips the
         // per-row source check entirely. The banner counts are never touched: they always reflect
-        // the complete run, so a source toggle only narrows the visible detail lists/tree.
+        // the complete run, so a view filter only narrows the visible list/tree.
         HashSet<string>? sources = SelectedSourceFilter();
 
-        IEnumerable<DryRunFileRow> process = DestructiveOnly
-            ? _processAll.Where(static r => r.HasDestructiveAction)
-            : _processAll;
-        if (sources is not null) process = process.Where(r => InSelectedSource(r, sources));
-        // The list virtualizes, so bind every match — no truncation. The tree aggregates the same set.
-        _processMatches = (term is null ? process : process.Where(r => Matches(r, term))).ToList();
-        ProcessFiles = _processMatches;
+        IEnumerable<DryRunFileRow> rows = _allRows.Where(IsDispositionShown);
+        if (sources is not null) rows = rows.Where(r => InSelectedSource(r, sources));
+        if (term is not null) rows = rows.Where(r => Matches(r, term));
 
-        FilterSkips = Filter(DestructiveOnly ? [] : _filterSkipsAll, term, sources);
-        UnchangedSkips = Filter(DestructiveOnly ? [] : _unchangedSkipsAll, term, sources);
+        // Sort by path, interleaving rows of every status together (not grouped by disposition). The
+        // list virtualizes, so bind every match — no truncation. The tree aggregates the same set.
+        _visibleMatches = rows.OrderBy(static r => r.SourcePath, StringComparer.OrdinalIgnoreCase).ToList();
+        AffectedFiles = _visibleMatches;
 
-        // Rebuild whichever category trees are currently shown so they track the filtered rows.
-        if (ShowTree) ProcessTree = DryRunTreeNode.BuildForest(_processMatches);
-        if (ShowFilterTree) FilterTree = DryRunTreeNode.BuildForest(FilterSkips);
-        if (ShowUnchangedTree) UnchangedTree = DryRunTreeNode.BuildForest(UnchangedSkips);
+        if (ShowTree) AffectedTree = DryRunTreeNode.BuildForest(_visibleMatches);
     }
+
+    private bool IsDispositionShown(DryRunFileRow row) => row.Disposition switch
+    {
+        // Processed rows show under "Would process" (all of them) or "Destructive" (only the risky
+        // subset) — the two are mutually exclusive, so at most one clause is ever active.
+        DryRunFileDisposition.WouldProcess => ShowProcessed || (ShowDestructive && row.HasDestructiveAction),
+        DryRunFileDisposition.WouldSkipFilter => ShowFiltered,
+        DryRunFileDisposition.WouldSkipUnchanged => ShowUnchanged,
+        _ => true,
+    };
 
     /// <summary>The set of selected source roots to keep, or null when the facet is hidden or every
     /// source is selected (no filtering needed).</summary>
@@ -454,14 +502,6 @@ public sealed partial class DryRunViewModel : ViewModelBase
     private static bool InSelectedSource(DryRunFileRow row, HashSet<string> sources) =>
         row.SourceRoot is not null && sources.Contains(row.SourceRoot);
 
-    private static IReadOnlyList<DryRunFileRow> Filter(
-        IEnumerable<DryRunFileRow> rows, string? term, HashSet<string>? sources)
-    {
-        if (sources is not null) rows = rows.Where(r => InSelectedSource(r, sources));
-        if (term is not null) rows = rows.Where(r => Matches(r, term));
-        return rows.ToList();
-    }
-
     /// <summary>Case-insensitive substring match on the source path or any target path.</summary>
     private static bool Matches(DryRunFileRow row, string term) =>
         row.SourcePath.Contains(term, StringComparison.OrdinalIgnoreCase)
@@ -469,23 +509,20 @@ public sealed partial class DryRunViewModel : ViewModelBase
 
     private void ClearReport()
     {
-        _processAll = [];
-        _filterSkipsAll = [];
-        _unchangedSkipsAll = [];
-        _processMatches = [];
-        ProcessFiles = [];
-        FilterSkips = [];
-        UnchangedSkips = [];
-        ProcessTree = [];
-        FilterTree = [];
-        UnchangedTree = [];
+        _allRows = [];
+        _visibleMatches = [];
+        AffectedFiles = [];
+        AffectedTree = [];
+        ShowDestructive = false;
+        ShowProcessed = ShowFiltered = ShowUnchanged = true;
+        ShowTree = false;
         SourceFacets = [];
         ShowSourceFacet = false;
         HasReport = false;
         ErrorMessage = null;
         SearchText = "";
         TotalFiles = ProcessCount = FilterSkipCount = UnchangedSkipCount = 0;
-        OverwriteCount = RenameCount = DisposalCount = 0;
+        OverwriteCount = RenameCount = DisposalCount = DestructiveCount = 0;
         HasDestructiveActions = false;
         GeneratedAtText = "";
         WasTruncated = false;

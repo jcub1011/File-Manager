@@ -59,7 +59,7 @@ public sealed class DryRunViewSmokeTests(HeadlessSessionFixture headless)
 
             // No exception from XAML load/layout, and the report is showing.
             Assert.True(vm.HasReport);
-            Assert.NotEmpty(vm.ProcessFiles);
+            Assert.NotEmpty(vm.AffectedFiles);
         }, CancellationToken.None);
     }
 
@@ -91,9 +91,9 @@ public sealed class DryRunViewSmokeTests(HeadlessSessionFixture headless)
             Assert.True(vm.ShowSourceFacet);
             Assert.Equal(2, vm.SourceFacets.Count);
 
-            int before = vm.ProcessFiles.Count;
+            int before = vm.AffectedFiles.Count;
             vm.SourceFacets[0].IsSelected = false;   // drives the facet checkbox → RebuildVisibleRows path
-            Assert.True(vm.ProcessFiles.Count < before);
+            Assert.True(vm.AffectedFiles.Count < before);
         }, CancellationToken.None);
     }
 
@@ -104,13 +104,12 @@ public sealed class DryRunViewSmokeTests(HeadlessSessionFixture headless)
         {
             DryRunViewModel vm = PopulatedViewModel();
             vm.RunAsync(CancellationToken.None).GetAwaiter().GetResult();
-            vm.DestructiveOnly = false;
             vm.ShowTree = true;               // build the forest before showing so the TreeView realizes on layout
 
             Window window = ShowView(vm);     // no throw ⇒ TreeDataTemplate + VSP styles + IsExpanded binding are valid
 
-            Assert.NotEmpty(vm.ProcessTree);
-            DryRunTreeNode dir = vm.ProcessTree.First(n => n.IsDirectory && n.HasChildren);
+            Assert.NotEmpty(vm.AffectedTree);
+            DryRunTreeNode dir = vm.AffectedTree.First(n => n.IsDirectory && n.HasChildren);
 
             // Expansion is the control's job now; flipping the model flag must not throw as the view reacts.
             dir.IsExpanded = !dir.IsExpanded;
@@ -119,7 +118,7 @@ public sealed class DryRunViewSmokeTests(HeadlessSessionFixture headless)
     }
 
     [Fact]
-    public async Task Skip_category_tree_loads_and_lays_out()
+    public async Task Skip_rows_render_in_the_merged_tree()
     {
         await headless.Session.Dispatch(() =>
         {
@@ -127,7 +126,8 @@ public sealed class DryRunViewSmokeTests(HeadlessSessionFixture headless)
             DryRunViewModel vm = new(gateway);
             vm.SetProfile(Guid.NewGuid(), "P");
 
-            // A report with filter-skip + unchanged rows so both skip categories' trees have content.
+            // A report with filter-skip + unchanged rows so the merged tree carries every skip status'
+            // rollup chips (exercises the chipMuted/chipAccent node chips in the shared template).
             var files = new List<DryRunFileResult>();
             for (int i = 0; i < 30; i++)
                 files.Add(new DryRunFileResult
@@ -146,13 +146,13 @@ public sealed class DryRunViewSmokeTests(HeadlessSessionFixture headless)
             gateway.DryRunResult = new DryRunReport(vm.ProfileId!.Value, DateTimeOffset.UnixEpoch, files);
             vm.RunAsync(CancellationToken.None).GetAwaiter().GetResult();
 
-            vm.ShowFilterTree = true;
-            vm.ShowUnchangedTree = true;
+            vm.ShowTree = true;
 
-            Window window = ShowView(vm);     // no throw ⇒ the shared tree template renders for the skip categories too
+            Window window = ShowView(vm);     // no throw ⇒ the shared tree template renders the skip-status chips
 
-            Assert.NotEmpty(vm.FilterTree);
-            Assert.NotEmpty(vm.UnchangedTree);
+            DryRunTreeNode root = Assert.Single(vm.AffectedTree);
+            Assert.True(root.HasFiltered);
+            Assert.True(root.HasUnchanged);
         }, CancellationToken.None);
     }
 }

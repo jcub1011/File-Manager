@@ -1,3 +1,4 @@
+using System.Linq;
 using FileManager.Contracts.DryRun;
 using FileManager.Contracts.IPC;
 using FileManager.UI.Services;
@@ -71,34 +72,86 @@ public sealed class DryRunViewModelTests
     }
 
     [Fact]
-    public async Task Groups_split_by_disposition()
+    public async Task Affected_files_merge_every_disposition_in_path_order()
     {
         var (viewModel, gateway) = NewViewModel();
         gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value);
 
         await viewModel.RunAsync(CancellationToken.None);
-        // The sample report has destructive actions, so it auto-focuses; drop that to see all buckets.
-        viewModel.DestructiveOnly = false;
 
-        Assert.Equal(2, viewModel.ProcessFiles.Count);
-        Assert.Single(viewModel.FilterSkips);
-        Assert.Single(viewModel.UnchangedSkips);
-        Assert.Contains("*.tmp", viewModel.FilterSkips[0].DecidingFilter);
+        // One merged list carries every row, each tagged with its own disposition.
+        Assert.Equal(4, viewModel.AffectedFiles.Count);
+        Assert.Equal(2, viewModel.AffectedFiles.Count(r => r.IsProcessed));
+        Assert.Single(viewModel.AffectedFiles, r => r.IsFilterSkipped);
+        Assert.Single(viewModel.AffectedFiles, r => r.IsUnchangedSkipped);
+        Assert.Contains("*.tmp", viewModel.AffectedFiles.Single(r => r.IsFilterSkipped).DecidingFilter);
+
+        // Sorted by path, interleaving dispositions rather than grouping by them.
+        var paths = viewModel.AffectedFiles.Select(r => r.SourcePath).ToList();
+        Assert.Equal(paths.OrderBy(p => p, StringComparer.OrdinalIgnoreCase).ToList(), paths);
     }
 
     [Fact]
-    public async Task Report_with_destructive_actions_auto_focuses_the_destructive_subset()
+    public async Task Row_status_helpers_reflect_disposition()
+    {
+        var (viewModel, gateway) = NewViewModel();
+        gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value);
+        await viewModel.RunAsync(CancellationToken.None);
+
+        DryRunFileRow processed = viewModel.AffectedFiles.First(r => r.IsProcessed);
+        Assert.Equal("Processed", processed.StatusText);
+        Assert.Equal(1.0, processed.ContentOpacity);
+
+        DryRunFileRow filtered = viewModel.AffectedFiles.Single(r => r.IsFilterSkipped);
+        Assert.Equal("Skipped", filtered.StatusText);
+        Assert.Equal(0.55, filtered.ContentOpacity);   // filter-skipped rows dim their content
+
+        DryRunFileRow unchanged = viewModel.AffectedFiles.Single(r => r.IsUnchangedSkipped);
+        Assert.Equal("Unchanged", unchanged.StatusText);
+        Assert.Equal(1.0, unchanged.ContentOpacity);
+    }
+
+    [Fact]
+    public async Task Report_with_destructive_actions_opens_unfiltered()
     {
         var (viewModel, gateway) = NewViewModel();
         gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value);
 
         await viewModel.RunAsync(CancellationToken.None);
 
-        Assert.True(viewModel.DestructiveOnly);
-        DryRunFileRow row = Assert.Single(viewModel.ProcessFiles);
-        Assert.EndsWith("clobber.txt", row.SourcePath);
-        Assert.Empty(viewModel.FilterSkips);
-        Assert.Empty(viewModel.UnchangedSkips);
+        // The old auto-focus behavior is gone: a risky report still opens with nothing hidden.
+        Assert.True(viewModel.HasDestructiveActions);
+        Assert.False(viewModel.ShowDestructive);
+        Assert.True(viewModel.ShowProcessed);
+        Assert.True(viewModel.ShowFiltered);
+        Assert.True(viewModel.ShowUnchanged);
+        Assert.Equal(4, viewModel.AffectedFiles.Count);
+    }
+
+    [Fact]
+    public async Task Filter_pills_narrow_the_visible_rows()
+    {
+        var (viewModel, gateway) = NewViewModel();
+        gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value);
+        await viewModel.RunAsync(CancellationToken.None);
+
+        Assert.Equal(4, viewModel.AffectedFiles.Count);
+
+        viewModel.ShowFiltered = false;
+        Assert.Equal(3, viewModel.AffectedFiles.Count);
+        Assert.DoesNotContain(viewModel.AffectedFiles, r => r.IsFilterSkipped);
+
+        viewModel.ShowUnchanged = false;
+        Assert.Equal(2, viewModel.AffectedFiles.Count);
+        Assert.All(viewModel.AffectedFiles, r => Assert.True(r.IsProcessed));
+
+        viewModel.ShowProcessed = false;
+        Assert.Empty(viewModel.AffectedFiles);
+
+        // Full-run counts on the pills/banner are untouched by the view filters.
+        Assert.Equal(2, viewModel.ProcessCount);
+        Assert.Equal(1, viewModel.FilterSkipCount);
+        Assert.Equal(1, viewModel.UnchangedSkipCount);
     }
 
     [Fact]
@@ -125,44 +178,81 @@ public sealed class DryRunViewModelTests
         await viewModel.RunAsync(CancellationToken.None);
 
         Assert.False(viewModel.HasDestructiveActions);
-        Assert.False(viewModel.DestructiveOnly);
-        Assert.Single(viewModel.ProcessFiles);
-        Assert.Single(viewModel.FilterSkips);
+        Assert.False(viewModel.ShowDestructive);
+        Assert.Equal(2, viewModel.AffectedFiles.Count);
+        Assert.Single(viewModel.AffectedFiles, r => r.IsProcessed);
+        Assert.Single(viewModel.AffectedFiles, r => r.IsFilterSkipped);
     }
 
     [Fact]
-    public async Task Destructive_only_filters_to_overwrites_and_disposals()
+    public async Task Destructive_pill_shows_only_risky_processed_rows_alongside_skips()
     {
         var (viewModel, gateway) = NewViewModel();
         gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value);
         await viewModel.RunAsync(CancellationToken.None);
 
-        viewModel.DestructiveOnly = true;
+        viewModel.ShowDestructive = true;
 
-        DryRunFileRow row = Assert.Single(viewModel.ProcessFiles);
-        Assert.EndsWith("clobber.txt", row.SourcePath);
-        Assert.Empty(viewModel.FilterSkips);
-        Assert.Empty(viewModel.UnchangedSkips);
+        // Selecting Destructive deselects "Would process" (they are mutually exclusive views of the
+        // processed rows); only the risky processed row (clobber.txt) shows, plus the untouched skips.
+        Assert.False(viewModel.ShowProcessed);
+        DryRunFileRow processed = Assert.Single(viewModel.AffectedFiles, r => r.IsProcessed);
+        Assert.EndsWith("clobber.txt", processed.SourcePath);
+        Assert.Single(viewModel.AffectedFiles, r => r.IsFilterSkipped);
+        Assert.Single(viewModel.AffectedFiles, r => r.IsUnchangedSkipped);
 
-        viewModel.DestructiveOnly = false;
-        Assert.Equal(2, viewModel.ProcessFiles.Count);
+        // Re-selecting "Would process" deselects Destructive and restores the full processed set.
+        viewModel.ShowProcessed = true;
+        Assert.False(viewModel.ShowDestructive);
+        Assert.Equal(2, viewModel.AffectedFiles.Count(r => r.IsProcessed));
     }
 
     [Fact]
-    public async Task Search_filters_the_process_list_by_path_substring()
+    public async Task Destructive_pill_with_no_risky_rows_hides_all_processed_rows()
+    {
+        var (viewModel, gateway) = NewViewModel();
+        gateway.DryRunResult = new DryRunReport(viewModel.ProfileId!.Value, DateTimeOffset.UnixEpoch,
+        [
+            new DryRunFileResult
+            {
+                SourcePath = @"C:\s\a.txt",
+                Disposition = DryRunFileDisposition.WouldProcess,
+                SourceDisposition = "KeepSource",
+                Targets = [new DryRunTargetAction { TargetPath = @"C:\t\a.txt", Kind = DryRunTargetKind.WouldWrite }],
+            },
+            new DryRunFileResult
+            {
+                SourcePath = @"C:\s\b.tmp",
+                Disposition = DryRunFileDisposition.WouldSkipFilter,
+                DecidingFilter = "exclude *.tmp",
+            },
+        ]);
+        await viewModel.RunAsync(CancellationToken.None);
+
+        Assert.Equal(0, viewModel.DestructiveCount);
+
+        viewModel.ShowDestructive = true;
+
+        // No processed row is destructive, so none show; the filter-skip row (its own pill still on)
+        // remains visible.
+        Assert.DoesNotContain(viewModel.AffectedFiles, r => r.IsProcessed);
+        Assert.Single(viewModel.AffectedFiles, r => r.IsFilterSkipped);
+    }
+
+    [Fact]
+    public async Task Search_filters_the_list_by_path_substring()
     {
         var (viewModel, gateway) = NewViewModel();
         gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value);
         await viewModel.RunAsync(CancellationToken.None);
-        viewModel.DestructiveOnly = false;   // see all process rows
 
         viewModel.SearchText = "fresh";
 
-        DryRunFileRow row = Assert.Single(viewModel.ProcessFiles);
+        DryRunFileRow row = Assert.Single(viewModel.AffectedFiles);
         Assert.EndsWith("fresh.txt", row.SourcePath);
 
         viewModel.SearchText = "";
-        Assert.Equal(2, viewModel.ProcessFiles.Count);
+        Assert.Equal(4, viewModel.AffectedFiles.Count);
     }
 
     [Fact]
@@ -171,16 +261,15 @@ public sealed class DryRunViewModelTests
         var (viewModel, gateway) = NewViewModel();
         gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value);
         await viewModel.RunAsync(CancellationToken.None);
-        viewModel.DestructiveOnly = false;
 
         viewModel.SearchText = @"t2\clobber";   // only clobber.txt has a t2 target
 
-        DryRunFileRow row = Assert.Single(viewModel.ProcessFiles);
+        DryRunFileRow row = Assert.Single(viewModel.AffectedFiles);
         Assert.EndsWith("clobber.txt", row.SourcePath);
     }
 
     [Fact]
-    public async Task Large_process_list_binds_every_row_without_truncation()
+    public async Task Large_list_binds_every_row_without_truncation()
     {
         var (viewModel, gateway) = NewViewModel();
         var files = new List<DryRunFileResult>();
@@ -197,8 +286,8 @@ public sealed class DryRunViewModelTests
         await viewModel.RunAsync(CancellationToken.None);
 
         // The list virtualizes, so all matches are bound — nothing is truncated for display.
-        Assert.False(viewModel.DestructiveOnly);
-        Assert.Equal(5_000, viewModel.ProcessFiles.Count);
+        Assert.False(viewModel.ShowDestructive);
+        Assert.Equal(5_000, viewModel.AffectedFiles.Count);
     }
 
     [Fact]
@@ -207,18 +296,36 @@ public sealed class DryRunViewModelTests
         var (viewModel, gateway) = NewViewModel();
         gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value);
         await viewModel.RunAsync(CancellationToken.None);
-        viewModel.DestructiveOnly = false;   // include both process rows (fresh.txt + clobber.txt)
 
         viewModel.ShowTree = true;
 
-        // Both process files live under C:\s — the single C: root aggregates the whole subtree.
-        DryRunTreeNode root = Assert.Single(viewModel.ProcessTree);
+        // All four files live under C:\s — the single C: root aggregates the whole subtree, with a
+        // disposition rollup for each status plus the destructive-action counts.
+        DryRunTreeNode root = Assert.Single(viewModel.AffectedTree);
         Assert.Equal("C:", root.Name);
         Assert.True(root.IsDirectory);
-        Assert.Equal(2, root.FileCount);       // fresh.txt + clobber.txt
+        Assert.Equal(2, root.ProcessedCount);  // fresh.txt + clobber.txt
+        Assert.Equal(1, root.FilteredCount);   // junk.tmp
+        Assert.Equal(1, root.UnchangedCount);  // same.txt
         Assert.Equal(1, root.OverwriteCount);  // clobber.txt's overwrite target
         Assert.Equal(1, root.RenameCount);     // clobber.txt's rename target
         Assert.Equal(1, root.DisposalCount);   // clobber.txt's MoveToTrash
+    }
+
+    [Fact]
+    public async Task Tree_reflects_the_visible_filtered_rows()
+    {
+        var (viewModel, gateway) = NewViewModel();
+        gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value);
+        await viewModel.RunAsync(CancellationToken.None);
+
+        viewModel.ShowProcessed = false;   // hide the processed rows before building the tree
+        viewModel.ShowTree = true;
+
+        DryRunTreeNode root = Assert.Single(viewModel.AffectedTree);
+        Assert.Equal(0, root.ProcessedCount);   // processed rows filtered out of the visible set
+        Assert.Equal(1, root.FilteredCount);
+        Assert.Equal(1, root.UnchangedCount);
     }
 
     [Fact]
@@ -227,18 +334,17 @@ public sealed class DryRunViewModelTests
         var (viewModel, gateway) = NewViewModel();
         gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value);
         await viewModel.RunAsync(CancellationToken.None);
-        viewModel.DestructiveOnly = false;
         viewModel.ShowTree = true;
 
         // The built-in TreeView owns expand/collapse now; the VM just supplies the forest with the
         // top-level root expanded and deeper directories collapsed (children ready to realize on expand).
-        DryRunTreeNode root = Assert.Single(viewModel.ProcessTree);
+        DryRunTreeNode root = Assert.Single(viewModel.AffectedTree);
         Assert.True(root.IsExpanded);
         DryRunTreeNode sDir = Assert.Single(root.Children);
         Assert.Equal("s", sDir.Name);
         Assert.True(sDir.IsDirectory);
         Assert.False(sDir.IsExpanded);
-        Assert.NotEmpty(sDir.Children);   // fresh.txt + clobber.txt live here
+        Assert.NotEmpty(sDir.Children);   // all four sample files live here
 
         // IsExpanded is observable so the TreeViewItem two-way binding round-trips.
         bool raised = false;
@@ -248,42 +354,14 @@ public sealed class DryRunViewModelTests
     }
 
     [Fact]
-    public async Task All_categories_default_to_list_view()
+    public async Task Report_defaults_to_list_view()
     {
         var (viewModel, gateway) = NewViewModel();
         gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value);
         await viewModel.RunAsync(CancellationToken.None);
 
         Assert.False(viewModel.ShowTree);
-        Assert.False(viewModel.ShowFilterTree);
-        Assert.False(viewModel.ShowUnchangedTree);
-        Assert.Empty(viewModel.ProcessTree);
-        Assert.Empty(viewModel.FilterTree);
-        Assert.Empty(viewModel.UnchangedTree);
-    }
-
-    [Fact]
-    public async Task Skip_category_trees_build_from_their_own_buckets_when_enabled()
-    {
-        var (viewModel, gateway) = NewViewModel();
-        gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value);
-        await viewModel.RunAsync(CancellationToken.None);
-        viewModel.DestructiveOnly = false;   // reveal the two skip buckets
-
-        viewModel.ShowFilterTree = true;
-        viewModel.ShowUnchangedTree = true;
-
-        // junk.tmp is the only filter-skip; same.txt the only unchanged. Each rolls up to its own C: root.
-        DryRunTreeNode filterRoot = Assert.Single(viewModel.FilterTree);
-        Assert.Equal("C:", filterRoot.Name);
-        Assert.Equal(1, filterRoot.FileCount);
-
-        DryRunTreeNode unchangedRoot = Assert.Single(viewModel.UnchangedTree);
-        Assert.Equal("C:", unchangedRoot.Name);
-        Assert.Equal(1, unchangedRoot.FileCount);
-
-        // Each toggle is independent — the process tree stays empty while its own toggle is off.
-        Assert.Empty(viewModel.ProcessTree);
+        Assert.Empty(viewModel.AffectedTree);
     }
 
     [Fact]
@@ -394,16 +472,17 @@ public sealed class DryRunViewModelTests
         await viewModel.RunAsync(CancellationToken.None);
 
         // Baseline: benign report shows everything from both sources.
-        Assert.False(viewModel.DestructiveOnly);
-        Assert.Equal(3, viewModel.ProcessFiles.Count);
-        Assert.Single(viewModel.FilterSkips);
+        Assert.False(viewModel.ShowDestructive);
+        Assert.Equal(4, viewModel.AffectedFiles.Count);
+        Assert.Equal(3, viewModel.AffectedFiles.Count(r => r.IsProcessed));
+        Assert.Single(viewModel.AffectedFiles, r => r.IsFilterSkipped);
 
         viewModel.SourceFacets.Single(f => f.Root == @"C:\a").IsSelected = false;
 
         // Only C:\b's rows remain visible; C:\a's process row and filter-skip drop out.
-        Assert.Equal(2, viewModel.ProcessFiles.Count);
-        Assert.All(viewModel.ProcessFiles, r => Assert.Equal(@"C:\b", r.SourceRoot));
-        Assert.Empty(viewModel.FilterSkips);
+        Assert.Equal(2, viewModel.AffectedFiles.Count);
+        Assert.All(viewModel.AffectedFiles, r => Assert.Equal(@"C:\b", r.SourceRoot));
+        Assert.DoesNotContain(viewModel.AffectedFiles, r => r.IsFilterSkipped);
 
         // The blast-radius banner always reflects the complete run — a view filter never changes it.
         Assert.Equal(4, viewModel.TotalFiles);

@@ -5,27 +5,39 @@
              x:DataType="vm:DryRunViewModel">
 
     <UserControl.Resources>
-        <!-- Shared tree row, used by all three categories' TreeViews. The built-in TreeView draws the
-             expand chevron + indentation; we only supply the node name and the rolled-up count chips.
-             ItemsSource="{Binding Children}" is what makes it hierarchical. -->
+        <!-- Shared tree row for the merged "Affected files" TreeView. The built-in TreeView draws the
+             expand chevron + indentation; we supply the node name (col 0) and a right-aligned strip of
+             status + danger chips (col 1). ItemsSource="{Binding Children}" is what makes it hierarchical. -->
         <TreeDataTemplate x:Key="DryRunNodeTemplate" x:DataType="vm:DryRunTreeNode"
                           ItemsSource="{Binding Children}">
-            <StackPanel Orientation="Horizontal" Spacing="6" Height="24">
-                <TextBlock Text="{Binding Name}" FontFamily="Consolas,monospace" VerticalAlignment="Center"
-                           Classes.dir="{Binding IsDirectory}" TextTrimming="CharacterEllipsis" MaxWidth="480" />
-                <Border Classes="chip" IsVisible="{Binding IsDirectory}">
-                    <TextBlock Text="{Binding FileText}" FontSize="11" />
-                </Border>
-                <Border Classes="chip chipDanger" IsVisible="{Binding HasOverwrites}">
-                    <TextBlock Text="{Binding OverwriteText}" FontSize="11" />
-                </Border>
-                <Border Classes="chip chipAmber" IsVisible="{Binding HasRenames}">
-                    <TextBlock Text="{Binding RenameText}" FontSize="11" />
-                </Border>
-                <Border Classes="chip chipDanger" IsVisible="{Binding HasDisposals}">
-                    <TextBlock Text="{Binding DisposalText}" FontSize="11" />
-                </Border>
-            </StackPanel>
+            <Grid ColumnDefinitions="*,Auto" Height="24">
+                <TextBlock Grid.Column="0" Text="{Binding Name}" FontFamily="Consolas,monospace"
+                           VerticalAlignment="Center" Classes.dir="{Binding IsDirectory}"
+                           TextTrimming="CharacterEllipsis" />
+                <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="6" Margin="8,0,0,0"
+                            HorizontalAlignment="Right" VerticalAlignment="Center">
+                    <!-- status rollups, in the requested order: Unchanged, Skipped, Processed -->
+                    <Border Classes="chip chipAccent" IsVisible="{Binding HasUnchanged}">
+                        <TextBlock Text="{Binding UnchangedText}" FontSize="11" />
+                    </Border>
+                    <Border Classes="chip chipMuted" IsVisible="{Binding HasFiltered}">
+                        <TextBlock Text="{Binding FilteredText}" FontSize="11" />
+                    </Border>
+                    <Border Classes="chip chipSafe" IsVisible="{Binding HasProcessed}">
+                        <TextBlock Text="{Binding ProcessedText}" FontSize="11" />
+                    </Border>
+                    <!-- secondary danger rollups -->
+                    <Border Classes="chip chipDanger" IsVisible="{Binding HasOverwrites}">
+                        <TextBlock Text="{Binding OverwriteText}" FontSize="11" />
+                    </Border>
+                    <Border Classes="chip chipAmber" IsVisible="{Binding HasRenames}">
+                        <TextBlock Text="{Binding RenameText}" FontSize="11" />
+                    </Border>
+                    <Border Classes="chip chipDanger" IsVisible="{Binding HasDisposals}">
+                        <TextBlock Text="{Binding DisposalText}" FontSize="11" />
+                    </Border>
+                </StackPanel>
+            </Grid>
         </TreeDataTemplate>
     </UserControl.Resources>
 
@@ -51,6 +63,20 @@
             <Setter Property="Background" Value="#2E7D32" />
         </Style>
         <Style Selector="Border.chipSafe TextBlock">
+            <Setter Property="Foreground" Value="White" />
+        </Style>
+        <!-- Skipped-by-filter pill: a muted grey, reads as "excluded, nothing happens". -->
+        <Style Selector="Border.chipMuted">
+            <Setter Property="Background" Value="#757575" />
+        </Style>
+        <Style Selector="Border.chipMuted TextBlock">
+            <Setter Property="Foreground" Value="White" />
+        </Style>
+        <!-- Unchanged pill: the theme accent, distinct from the safe/green "will change" pill. -->
+        <Style Selector="Border.chipAccent">
+            <Setter Property="Background" Value="{DynamicResource SystemAccentColor}" />
+        </Style>
+        <Style Selector="Border.chipAccent TextBlock">
             <Setter Property="Foreground" Value="White" />
         </Style>
 
@@ -158,15 +184,6 @@
                             <Border Classes="chip" Margin="0,0,6,0">
                                 <TextBlock><Run Text="{Binding TotalFiles}" /><Run Text=" files scanned" /></TextBlock>
                             </Border>
-                            <Border Classes="chip" Margin="0,0,6,0">
-                                <TextBlock><Run Text="{Binding ProcessCount}" /><Run Text=" would process" /></TextBlock>
-                            </Border>
-                            <Border Classes="chip" Margin="0,0,6,0">
-                                <TextBlock><Run Text="{Binding FilterSkipCount}" /><Run Text=" filtered out" /></TextBlock>
-                            </Border>
-                            <Border Classes="chip" Margin="0,0,6,0">
-                                <TextBlock><Run Text="{Binding UnchangedSkipCount}" /><Run Text=" unchanged" /></TextBlock>
-                            </Border>
                             <Border Classes="chip chipDanger" Margin="0,0,6,0" IsVisible="{Binding !!OverwriteCount}">
                                 <TextBlock><Run Text="{Binding OverwriteCount}" /><Run Text=" OVERWRITES" /></TextBlock>
                             </Border>
@@ -180,14 +197,12 @@
                                 <TextBlock Text="no destructive actions" />
                             </Border>
                         </WrapPanel>
-                        <ToggleButton Content="Destructive only" IsChecked="{Binding DestructiveOnly}" FontSize="12" />
                     </StackPanel>
                 </Border>
 
-                <!-- detail lists: the primary "Will process" list fills the bounded * region so it
-                     virtualizes; the secondary skip lists sit in Expanders with a capped MaxHeight so
-                     an expanded section still gives its ListBox a bounded viewport. -->
-                <Grid Grid.Row="2" RowDefinitions="Auto,Auto,*,Auto,Auto" RowSpacing="8">
+                <!-- detail area: one merged "Affected files" list/tree fills the bounded * region so it
+                     virtualizes. Disposition filter pills above it narrow which statuses are shown. -->
+                <Grid Grid.Row="2" RowDefinitions="Auto,Auto,Auto,*" RowSpacing="8">
 
                     <!-- source focus facet: filters which sources' rows are shown (multi-source
                          reports only). It never changes the blast-radius banner above, which always
@@ -214,9 +229,28 @@
                         </StackPanel>
                     </Border>
 
-                    <Grid Grid.Row="1" ColumnDefinitions="Auto,*,Auto,Auto">
+                    <!-- disposition filter pills. The primary pills start selected and "Destructive" off;
+                         toggling any narrows the merged list/tree. "Would process" and "Destructive" are
+                         mutually exclusive views of the processed rows (all vs the risky subset). -->
+                    <WrapPanel Grid.Row="1">
+                        <ToggleButton IsChecked="{Binding ShowProcessed}" FontSize="12" Margin="0,0,6,0">
+                            <TextBlock><Run Text="Would process (" /><Run Text="{Binding ProcessCount}" /><Run Text=")" /></TextBlock>
+                        </ToggleButton>
+                        <ToggleButton IsChecked="{Binding ShowDestructive}" FontSize="12" Margin="0,0,6,0"
+                                      ToolTip.Tip="Show only the processed rows with overwrites or disposals">
+                            <TextBlock><Run Text="Destructive (" /><Run Text="{Binding DestructiveCount}" /><Run Text=")" /></TextBlock>
+                        </ToggleButton>
+                        <ToggleButton IsChecked="{Binding ShowFiltered}" FontSize="12" Margin="0,0,6,0">
+                            <TextBlock><Run Text="Filtered out (" /><Run Text="{Binding FilterSkipCount}" /><Run Text=")" /></TextBlock>
+                        </ToggleButton>
+                        <ToggleButton IsChecked="{Binding ShowUnchanged}" FontSize="12" Margin="0,0,6,0">
+                            <TextBlock><Run Text="Unchanged (" /><Run Text="{Binding UnchangedSkipCount}" /><Run Text=")" /></TextBlock>
+                        </ToggleButton>
+                    </WrapPanel>
+
+                    <Grid Grid.Row="2" ColumnDefinitions="Auto,*,Auto,Auto">
                         <TextBlock Grid.Column="0" FontWeight="SemiBold" VerticalAlignment="Center">
-                            <Run Text="Will process (" /><Run Text="{Binding ProcessCount}" /><Run Text=")" />
+                            <Run Text="Affected files (" /><Run Text="{Binding AffectedFiles.Count}" /><Run Text=")" />
                         </TextBlock>
                         <ToggleButton Grid.Column="2" Content="Tree view" IsChecked="{Binding ShowTree}"
                                       FontSize="12" Margin="0,0,8,0" VerticalAlignment="Center"
@@ -225,104 +259,61 @@
                                  PlaceholderText="Filter by source or target path…" />
                     </Grid>
 
-                    <ListBox Grid.Row="2" Classes="rows" ItemsSource="{Binding ProcessFiles}"
+                    <ListBox Grid.Row="3" Classes="rows" ItemsSource="{Binding AffectedFiles}"
                              IsVisible="{Binding !ShowTree}"
                              SelectionMode="Single" ScrollViewer.HorizontalScrollBarVisibility="Disabled">
                         <ListBox.ItemTemplate>
                             <DataTemplate x:DataType="vm:DryRunFileRow">
                                 <Border BorderThickness="0,0,0,1" BorderBrush="{DynamicResource SystemControlBackgroundListLowBrush}"
                                         Padding="4,6">
-                                    <StackPanel Spacing="3">
-                                        <StackPanel Orientation="Horizontal" Spacing="8">
-                                            <TextBlock Text="{Binding SourcePath}" FontFamily="Consolas,monospace"
-                                                       TextTrimming="CharacterEllipsis" MaxWidth="620" />
-                                            <TextBlock Classes="kind overwrite" Text="{Binding SourceDisposition}"
-                                                       IsVisible="{Binding IsSourceDisposalDestructive}" />
+                                    <Grid ColumnDefinitions="*,Auto">
+                                        <!-- row content: dimmed for filter-skipped rows; the pill (col 1) is not -->
+                                        <StackPanel Grid.Column="0" Spacing="3" Opacity="{Binding ContentOpacity}">
+                                            <StackPanel Orientation="Horizontal" Spacing="8">
+                                                <TextBlock Text="{Binding SourcePath}" FontFamily="Consolas,monospace"
+                                                           TextTrimming="CharacterEllipsis" MaxWidth="620" />
+                                                <TextBlock Classes="kind overwrite" Text="{Binding SourceDisposition}"
+                                                           IsVisible="{Binding IsSourceDisposalDestructive}" />
+                                            </StackPanel>
+                                            <ItemsControl ItemsSource="{Binding Targets}" Margin="18,0,0,0">
+                                                <ItemsControl.ItemTemplate>
+                                                    <DataTemplate x:DataType="vm:DryRunTargetRow">
+                                                        <StackPanel Orientation="Horizontal" Spacing="8">
+                                                            <TextBlock Classes="kind" Text="{Binding KindText}" MinWidth="110"
+                                                                       Classes.overwrite="{Binding IsOverwrite}"
+                                                                       Classes.rename="{Binding IsRename}"
+                                                                       Classes.write="{Binding IsWrite}"
+                                                                       Classes.skip="{Binding IsSkip}"
+                                                                       Classes.unknown="{Binding IsUnknown}" />
+                                                            <TextBlock Text="{Binding Path}" FontFamily="Consolas,monospace" FontSize="12"
+                                                                       TextTrimming="CharacterEllipsis" MaxWidth="520" Opacity="0.85" />
+                                                            <TextBlock Text="{Binding Detail}" FontSize="11" Opacity="0.55"
+                                                                       VerticalAlignment="Center" TextTrimming="CharacterEllipsis" MaxWidth="320" />
+                                                        </StackPanel>
+                                                    </DataTemplate>
+                                                </ItemsControl.ItemTemplate>
+                                            </ItemsControl>
                                         </StackPanel>
-                                        <ItemsControl ItemsSource="{Binding Targets}" Margin="18,0,0,0">
-                                            <ItemsControl.ItemTemplate>
-                                                <DataTemplate x:DataType="vm:DryRunTargetRow">
-                                                    <StackPanel Orientation="Horizontal" Spacing="8">
-                                                        <TextBlock Classes="kind" Text="{Binding KindText}" MinWidth="110"
-                                                                   Classes.overwrite="{Binding IsOverwrite}"
-                                                                   Classes.rename="{Binding IsRename}"
-                                                                   Classes.write="{Binding IsWrite}"
-                                                                   Classes.skip="{Binding IsSkip}"
-                                                                   Classes.unknown="{Binding IsUnknown}" />
-                                                        <TextBlock Text="{Binding Path}" FontFamily="Consolas,monospace" FontSize="12"
-                                                                   TextTrimming="CharacterEllipsis" MaxWidth="520" Opacity="0.85" />
-                                                        <TextBlock Text="{Binding Detail}" FontSize="11" Opacity="0.55"
-                                                                   VerticalAlignment="Center" TextTrimming="CharacterEllipsis" MaxWidth="320" />
-                                                    </StackPanel>
-                                                </DataTemplate>
-                                            </ItemsControl.ItemTemplate>
-                                        </ItemsControl>
-                                    </StackPanel>
+
+                                        <!-- right-aligned status pill; stays fully legible (outside the dimmed column) -->
+                                        <Border Grid.Column="1" Classes="chip" Margin="8,0,0,0" VerticalAlignment="Center"
+                                                Classes.chipSafe="{Binding IsProcessed}"
+                                                Classes.chipMuted="{Binding IsFilterSkipped}"
+                                                Classes.chipAccent="{Binding IsUnchangedSkipped}">
+                                            <TextBlock Text="{Binding StatusText}" FontSize="11" />
+                                        </Border>
+                                    </Grid>
                                 </Border>
                             </DataTemplate>
                         </ListBox.ItemTemplate>
                     </ListBox>
 
-                    <!-- tree view: the same "would process" set as a navigable directory tree, using the
-                         built-in TreeView. Only expanded nodes' children are realized, and the
-                         VirtualizingStackPanel recycles rows, so a large forest stays bounded. -->
-                    <TreeView Grid.Row="2" Classes="rows" ItemsSource="{Binding ProcessTree}"
+                    <!-- tree view: the same visible set as a navigable directory tree, using the built-in
+                         TreeView. Only expanded nodes' children are realized, and the VirtualizingStackPanel
+                         recycles rows, so a large forest stays bounded. -->
+                    <TreeView Grid.Row="3" Classes="rows" ItemsSource="{Binding AffectedTree}"
                               IsVisible="{Binding ShowTree}"
                               ItemTemplate="{StaticResource DryRunNodeTemplate}" />
-
-                    <!-- filtered out (hidden while destructive-only focuses the risky subset; the toggle reveals it) -->
-                    <Expander Grid.Row="3" IsExpanded="False" IsVisible="{Binding !DestructiveOnly}">
-                        <Expander.Header>
-                            <TextBlock><Run Text="Skipped by filters (" /><Run Text="{Binding FilterSkipCount}" /><Run Text=")" /></TextBlock>
-                        </Expander.Header>
-                        <Grid RowDefinitions="Auto,Auto">
-                            <ToggleButton Grid.Row="0" HorizontalAlignment="Right" Content="Tree view"
-                                          IsChecked="{Binding ShowFilterTree}" FontSize="12" Margin="0,0,0,6"
-                                          ToolTip.Tip="Group the skipped files into a navigable directory tree" />
-                            <ListBox Grid.Row="1" Classes="rows" MaxHeight="260" ItemsSource="{Binding FilterSkips}"
-                                     IsVisible="{Binding !ShowFilterTree}"
-                                     SelectionMode="Single" ScrollViewer.HorizontalScrollBarVisibility="Disabled">
-                                <ListBox.ItemTemplate>
-                                    <DataTemplate x:DataType="vm:DryRunFileRow">
-                                        <StackPanel Orientation="Horizontal" Spacing="8" Margin="4,3">
-                                            <TextBlock Text="{Binding SourcePath}" FontFamily="Consolas,monospace" FontSize="12"
-                                                       TextTrimming="CharacterEllipsis" MaxWidth="560" />
-                                            <TextBlock Text="{Binding DecidingFilter}" FontSize="11" Opacity="0.6"
-                                                       VerticalAlignment="Center" TextTrimming="CharacterEllipsis" MaxWidth="380" />
-                                        </StackPanel>
-                                    </DataTemplate>
-                                </ListBox.ItemTemplate>
-                            </ListBox>
-                            <TreeView Grid.Row="1" Classes="rows" MaxHeight="260" ItemsSource="{Binding FilterTree}"
-                                      IsVisible="{Binding ShowFilterTree}"
-                                      ItemTemplate="{StaticResource DryRunNodeTemplate}" />
-                        </Grid>
-                    </Expander>
-
-                    <!-- unchanged (hidden while destructive-only focuses the risky subset; the toggle reveals it) -->
-                    <Expander Grid.Row="4" IsExpanded="False" IsVisible="{Binding !DestructiveOnly}">
-                        <Expander.Header>
-                            <TextBlock><Run Text="Unchanged at all targets (" /><Run Text="{Binding UnchangedSkipCount}" /><Run Text=")" /></TextBlock>
-                        </Expander.Header>
-                        <Grid RowDefinitions="Auto,Auto">
-                            <ToggleButton Grid.Row="0" HorizontalAlignment="Right" Content="Tree view"
-                                          IsChecked="{Binding ShowUnchangedTree}" FontSize="12" Margin="0,0,0,6"
-                                          ToolTip.Tip="Group the unchanged files into a navigable directory tree" />
-                            <ListBox Grid.Row="1" Classes="rows" MaxHeight="260" ItemsSource="{Binding UnchangedSkips}"
-                                     IsVisible="{Binding !ShowUnchangedTree}"
-                                     SelectionMode="Single" ScrollViewer.HorizontalScrollBarVisibility="Disabled">
-                                <ListBox.ItemTemplate>
-                                    <DataTemplate x:DataType="vm:DryRunFileRow">
-                                        <TextBlock Text="{Binding SourcePath}" FontFamily="Consolas,monospace" FontSize="12"
-                                                   TextTrimming="CharacterEllipsis" Margin="4,3" />
-                                    </DataTemplate>
-                                </ListBox.ItemTemplate>
-                            </ListBox>
-                            <TreeView Grid.Row="1" Classes="rows" MaxHeight="260" ItemsSource="{Binding UnchangedTree}"
-                                      IsVisible="{Binding ShowUnchangedTree}"
-                                      ItemTemplate="{StaticResource DryRunNodeTemplate}" />
-                        </Grid>
-                    </Expander>
 
                 </Grid>
         </Grid>

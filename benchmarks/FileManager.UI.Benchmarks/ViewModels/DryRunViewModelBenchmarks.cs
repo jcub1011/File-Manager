@@ -5,11 +5,13 @@ using FileManager.UI.ViewModels;
 namespace FileManager.UI.Benchmarks.ViewModels;
 
 /// <summary>Measures <see cref="DryRunViewModel.ApplyReport"/> — the UI-thread aggregation that runs
-/// once per dry run: a projection over every report row (with a nested projection per target), a
-/// bucketing pass, three more O(n) LINQ passes (Overwrite/Rename/Disposal counts, each with a nested
-/// per-target count), then rebuilding the visible ObservableCollections one Add at a time. The report
-/// is built once in setup; the measured call is pure aggregation. The gateway/folder-picker are never
-/// touched by ApplyReport, so null suffices — this isolates the aggregation from IPC.</summary>
+/// once per dry run: a projection over every report row (with a nested projection per target), a set of
+/// O(n) LINQ count passes (per-disposition counts plus Overwrite/Rename/Disposal, each with a nested
+/// per-target count), then a single merged <c>RebuildVisibleRows</c> pipeline that filters every row by
+/// disposition/destructive/source/search and sorts the survivors by path into one <c>AffectedFiles</c>
+/// list (no longer three-list bucketing). The report is built once in setup; the measured call is pure
+/// aggregation. The gateway/folder-picker are never touched by ApplyReport, so null suffices — this
+/// isolates the aggregation from IPC.</summary>
 [MemoryDiagnoser]
 public class DryRunViewModelBenchmarks
 {
@@ -20,8 +22,9 @@ public class DryRunViewModelBenchmarks
     [Params(1_000, 10_000, 50_000)]
     public int FileCount { get; set; }
 
-    /// <summary>Exercises the two branches of <c>RebuildVisibleRows</c>: false fills all three lists;
-    /// true additionally filters the process list to destructive rows and empties the skip lists.</summary>
+    /// <summary>Exercises both branches of the merged <c>RebuildVisibleRows</c> pipeline: false keeps
+    /// every disposition ("Would process" + Filtered + Unchanged); true switches the processed view to
+    /// the destructive-only subset (filtered/unchanged rows are untouched).</summary>
     [Params(false, true)]
     public bool DestructiveOnly { get; set; }
 
@@ -30,7 +33,7 @@ public class DryRunViewModelBenchmarks
     {
         _viewModel = new DryRunViewModel(gateway: null!)
         {
-            DestructiveOnly = DestructiveOnly,
+            ShowDestructive = DestructiveOnly,
         };
         _report = BuildReport(FileCount);
     }
