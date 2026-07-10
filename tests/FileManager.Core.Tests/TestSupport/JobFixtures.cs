@@ -1,3 +1,4 @@
+using System.IO.Hashing;
 using System.Security.Cryptography;
 using FileManager.Contracts.Profiles;
 using FileManager.Core.Files;
@@ -14,6 +15,23 @@ internal static class JobFixtures
         using FileStream stream = File.OpenRead(path);
         return Convert.ToHexString(SHA256.HashData(stream));
     }
+
+    public static string XxHash128Hex(string path)
+    {
+        using FileStream stream = File.OpenRead(path);
+        XxHash128 hasher = new();
+        hasher.Append(stream);
+        return Convert.ToHexString(hasher.GetHashAndReset());
+    }
+
+    /// <summary>The reference content hash a sealed output would carry under the given method
+    /// ("" when verification doesn't hash content).</summary>
+    public static string ContentHashFor(VerificationMethod method, string path) => method switch
+    {
+        VerificationMethod.XxHash128 => XxHash128Hex(path),
+        VerificationMethod.Sha256 => Sha256Hex(path),
+        _ => "",
+    };
 
     public static PolicySnapshot Policy(
         VerificationMethod verification = VerificationMethod.Sha256,
@@ -82,7 +100,7 @@ internal static class JobFixtures
             {
                 Path = sourcePath,
                 SizeBytes = fileInfo.Length,
-                Sha256 = policy.Verification == VerificationMethod.Sha256 ? Sha256Hex(sourcePath) : "",
+                ContentHash = ContentHashFor(policy.Verification, sourcePath),
                 SourceLastWriteUtc = source.LastWriteUtc,
             },
         };

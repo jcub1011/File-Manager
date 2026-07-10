@@ -151,7 +151,8 @@ public sealed record SealedOutput
 {
     public required string Path { get; init; }         // workspace artifact; == source path when no transformers
     public required long SizeBytes { get; init; }
-    public required string Sha256 { get; init; }       // "" when VerificationMethod.None
+    // Hashed under the job's Verification method; "" when VerificationMethod.None.
+    public required string ContentHash { get; init; }
     public required DateTimeOffset SourceLastWriteUtc { get; init; }
 }
 

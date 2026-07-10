@@ -840,13 +840,15 @@ sequencing is normative (§7.2 write-ahead table restates it as journal rows).
 
 #### IFileHasher
 
-**Responsibility:** streaming SHA-256 (`SHA256.HashDataAsync` over a `FileStream`, 1 MiB
-buffer) — never whole-file in memory (spec §11).
+**Responsibility:** streaming content hash over a `FileStream` (1 MiB buffer) — never whole-file in
+memory (spec §11). The algorithm is chosen per call from the job's `VerificationMethod`: `XxHash128`
+(XXH3, the default) or `SHA256`.
 
 ```csharp
 public interface IFileHasher
 {
-    Task<Result<string, JobError>> HashFileAsync(string path, CancellationToken ct);
+    Task<Result<string, JobError>> HashFileAsync(string path, VerificationMethod method, CancellationToken ct);
+    Task<Result<byte[], JobError>> HashFileToBytesAsync(string path, VerificationMethod method, CancellationToken ct);
 }
 ```
 
@@ -909,7 +911,7 @@ public enum UnchangedCheckResult { NoExistingFile, ExistsDifferent, Unchanged }
 
 public interface IAtomicPlacer
 {
-    /// <summary>Spec §3.4.1, BEFORE conflict resolution. Order: exists → size → (SHA256: stream
+    /// <summary>Spec §3.4.1, BEFORE conflict resolution. Order: exists → size → (hash method: stream
     /// hash of the existing target file vs the sealed output | None: best-effort mtime).
     /// Compares against the SEALED OUTPUT (post-transform), never the raw source.
     /// On Unchanged, journals target-unchanged. [seam: SizeTimestamp adds a branch here]</summary>
@@ -944,11 +946,11 @@ Placement sequence per target (normative — each numbered step maps to a §7.2 
 
 1. Journal `target-write-begin` (fsync) recording temp path, final path, and whether the final
    existed. Register temp + final + staged paths in `SelfWriteSuppressionRegistry`.
-2. Stream-copy workspace output → temp path, computing SHA-256 incrementally on the write.
+2. Stream-copy workspace output → temp path, computing the content hash incrementally on the write.
 3. **fsync point:** `fileStream.Flush(flushToDisk: true)` before closing the temp file — without
    it, "verified" would attest to cache contents, not disk contents (I-VERIFY-READBACK).
 4. **Read-back verify:** re-open the temp file and stream-hash it *through the target volume*;
-   compare to `SealedOutput.Sha256` (`None`: length check only). Journal `target-verified`.
+   compare to `SealedOutput.ContentHash` (`None`: length check only). Journal `target-verified`.
    Apply best-effort metadata now, before the rename (spec §6.4; `IMetadataPreserver`, §4.11 —
    `MetadataOnConflict.FailJob` turns a detected loss into a placement failure).
 5. Place:
@@ -1484,10 +1486,13 @@ public enum OverwriteHandling { DirectOverwrite, StageOverwrites }
 
 public enum VerificationMethod
 {
+    // ordered by recommendation, strongest first
+    [JsonStringEnumMemberName("XXH3-128")]
+    XxHash128,            // int 0 — the default content-hash algorithm
     [JsonStringEnumMemberName("SHA256")]
     Sha256,
-    None,
     SizeTimestamp,        /// [reserved — fails v1 validation]
+    None,                 // no verification — least recommended
 }
 
 public enum OnSuccessAction { KeepSource, MoveToTrash, MoveToArchive, PermanentDelete }
@@ -1771,7 +1776,7 @@ public sealed record SealedOutput
 {
     public required string Path { get; init; }         // workspace artifact; == source path when no transformers
     public required long SizeBytes { get; init; }
-    public required string Sha256 { get; init; }       // "" when VerificationMethod.None
+    public required string ContentHash { get; init; }  // hashed under the job's Verification; "" when None
     public required DateTimeOffset SourceLastWriteUtc { get; init; }
 }
 
@@ -1882,7 +1887,7 @@ public sealed record OutputSealedRecord : JournalRecord
 {
     public required string OutputPath { get; init; }
     public required long SizeBytes { get; init; }
-    public required string Sha256 { get; init; }       // "" for VerificationMethod.None
+    public required string ContentHash { get; init; }  // hashed under the job's Verification; "" for None
 }
 
 public sealed record TargetWriteBeginRecord : JournalRecord
@@ -2061,8 +2066,8 @@ Scenario: service killed between Target A's `target-staged` fsync and its rename
    IPC or triggers exist (I-RECOVER-FIRST).
 2. `IJobJournal.ReadAll` groups records; this job is OPEN (`job-opened`, no `job-closed`), has
    `output-sealed` and a `target-staged` — classified **mid-placement** (§7.3 table 1).
-3. Forward-completion gate (§7.3): `Verification == Sha256`, workspace output still present
-   with matching hash → **complete forward**. Probe Target A: final absent, temp present,
+3. Forward-completion gate (§7.3): `Verification` is a hash-based method (`XxHash128` or `SHA256`),
+   workspace output still present with matching hash → **complete forward**. Probe Target A: final absent, temp present,
    temp hash matches reference → execute the rename, journal `target-placed`. Remaining targets
    run the normal placement steps from their journaled state.
 4. All targets placed → `job-committed` → disposition per policy → `job-closed(Succeeded)`.
@@ -2095,7 +2100,7 @@ Job-level (`JobState`, §5.4):
 | 4 | `Preflighted` | 1 | memory | Self-path check + `IDiskPreflight` passed |
 | 5 | `Screened` | 2 | memory | `CompiledFilterSet` passed (excluded → `Closed(Skipped, Filtered)`) |
 | 6 | `Transforming` | 3 | memory | Workspace created at the deterministic path recorded in `job-opened` — per-step journaling is unnecessary; the workspace is findable from `JobId` alone |
-| 7 | `OutputSealed` | 3→4 | **journal** `output-sealed` | Final artifact's size + SHA-256 recorded — the *reference hash* for all verification and recovery. No-transformer jobs seal the source itself |
+| 7 | `OutputSealed` | 3→4 | **journal** `output-sealed` | Final artifact's size + content hash recorded — the *reference hash* for all verification and recovery. No-transformer jobs seal the source itself |
 | 8 | `Distributing` | 4–5 | per-target records | The per-target sub-machine runs, bounded-parallel |
 | 9 | `Committed` | 5→6 | **journal** `job-committed` | Every target `Placed` / `SatisfiedUnchanged` / `SkippedConflict`. **The WAL commit point: source disposition is authorized by this record and nothing else** |
 | 10 | `Disposing` | 6 | memory | `OnSuccess` executing |
@@ -2140,7 +2145,7 @@ steps). One row per filesystem side-effect:
 | --- | --- | --- | --- | --- |
 | 1 | (none — job admission) | `job-opened` | — | An OPEN entry with nothing else → clean workspace, close (§7.3 row A) |
 | 2 | Create workspace, copy source in, run steps | — (deterministic path in `job-opened`) | — | Workspace found and deleted by `JobId` alone |
-| 3 | (none — transform chain succeeded) | — | `output-sealed` | Presence gates forward-completion; `Sha256` is the reference for all probes |
+| 3 | (none — transform chain succeeded) | — | `output-sealed` | Presence gates forward-completion; `ContentHash` is the reference for all probes |
 | 4 | Create target temp file | `target-write-begin` | — | Recovery can find & delete a temp that may or may not exist (row C) |
 | 5 | Flush + read-back verify temp | — | `target-verified` | Temp is known-good; forward = stage/rename only (row D) |
 | 6 | Move prior version → staging | `target-staged` | — | The two-move fallback's crash window is disambiguated by probing final/staged existence (rows E–G) |
@@ -2176,10 +2181,10 @@ steps). One row per filesystem side-effect:
 **Forward-completion gate** (mid-placement): complete forward **iff** (a) `output-sealed`
 exists, **and** (b) the workspace output is still present with matching size + hash, *or* every
 unplaced target already has a temp whose hash matches, **and** (c)
-`Verification == Sha256` — under `None` there is no reference hash, so mid-placement always
-rolls back (conservative). Otherwise roll back.
+`Verification` is a hash-based method (`XxHash128` or `SHA256`) — under `None`/`SizeTimestamp` there
+is no reference hash, so mid-placement always rolls back (conservative). Otherwise roll back.
 
-**Table 2 — per-target probe rows** (mid-placement; "ref" = `output-sealed.Sha256`):
+**Table 2 — per-target probe rows** (mid-placement; "ref" = `output-sealed.ContentHash`):
 
 | Last target record | Probe | Meaning | Forward action | Rollback action |
 | --- | --- | --- | --- | --- |
@@ -2196,7 +2201,7 @@ rolls back (conservative). Otherwise roll back.
 | U. `target-unchanged` / `target-skipped` | — | satisfied without artifacts | nothing | nothing |
 
 **`VerificationMethod.None` note:** the "hash == ref" probes are unevaluable when
-`output-sealed.Sha256` is `""`. Forward-completion is already gated off (gate condition c), and
+`output-sealed.ContentHash` is `""`. Forward-completion is already gated off (gate condition c), and
 the rollback branch never needs the hash: rows F/G collapse to one action (restore staged —
 `File.Replace` when the final is present, plain move when absent — then delete temp), and a
 `target-placed` record is trusted as placed (it was written after the rename), so H1's rollback
@@ -2357,6 +2362,13 @@ implementation.
 - **v1 ships:** the schema field (must be `false`); rejection when `true`.
 - **Plugs in at:** it is *not* a filter — it needs the Target-index design (spec Appendix B);
   its natural host is a future collaborator of the unchanged-check path in `IAtomicPlacer`.
+- **Hash algorithm:** must honor the profile's `VerificationMethod` via the existing `IFileHasher`
+  (which already selects the algorithm per call), so dedupe and verification agree on the digest.
+  Because `None`/`SizeTimestamp` yield no content hash, dedupe is only meaningful under a hash-based
+  method (`XxHash128`/`SHA256`); with a non-hash method it must either no-op or be a validation
+  error rather than silently fall back to a different algorithm. Note the index is birthday-bound
+  (global), not pairwise — `XxHash128`'s 128-bit space is collision-safe at realistic scale, but any
+  dedupe *action* should confirm a hash match with a byte-compare before discarding data.
 - **Do not build:** any index abstraction.
 
 ### 10.5 Linux release [fast-follow]

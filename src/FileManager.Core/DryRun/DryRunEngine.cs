@@ -605,11 +605,11 @@ public sealed class DryRunEngine(
             var existing = FileMetadataReader.Read(prospectivePath);
             if (existing.TryGetValue(out FileMetadata? existingMeta) && existingMeta.Length == metadata.Length)
             {
-                if (policies.VerificationMethod == VerificationMethod.Sha256)
+                if (policies.VerificationMethod is VerificationMethod.Sha256 or VerificationMethod.XxHash128)
                 {
                     if (cachedSourceHash is null)
                     {
-                        var sourceHash = await hasher.HashFileToBytesAsync(sourcePath, ct).ConfigureAwait(false);
+                        var sourceHash = await hasher.HashFileToBytesAsync(sourcePath, policies.VerificationMethod, ct).ConfigureAwait(false);
                         if (sourceHash.IsCanceled)
                             // Placeholder — discarded by SimulateAsync's cancellation catch.
                             return (new DryRunTargetAction
@@ -628,7 +628,7 @@ public sealed class DryRunEngine(
                         sourceHash.TryGetValue(out cachedSourceHash);
                     }
 
-                    var targetHash = await hasher.HashFileToBytesAsync(prospectivePath, ct).ConfigureAwait(false);
+                    var targetHash = await hasher.HashFileToBytesAsync(prospectivePath, policies.VerificationMethod, ct).ConfigureAwait(false);
                     if (targetHash.IsCanceled)
                         // Placeholder — discarded by SimulateAsync's cancellation catch.
                         return (new DryRunTargetAction
@@ -652,7 +652,7 @@ public sealed class DryRunEngine(
                         {
                             TargetPath = prospectivePath,
                             Kind = DryRunTargetKind.WouldSkipUnchanged,
-                            Detail = "identical content (SHA-256)",
+                            Detail = $"identical content ({policies.VerificationMethod})",
                         }, cachedSourceHash);
                 }
                 else if (existingMeta.LastWritten == metadata.LastWritten)

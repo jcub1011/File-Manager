@@ -47,15 +47,15 @@ public sealed class AtomicPlacer(
                 return UnchangedCheckResult.ExistsDifferent;
 
             VerificationMethod method = execution.Plan.Policies.Verification;
-            if (method == VerificationMethod.Sha256)
+            if (method is VerificationMethod.Sha256 or VerificationMethod.XxHash128)
             {
-                Result<string, JobError> hashed = await hasher.HashFileAsync(finalPath, ct).ConfigureAwait(false);
+                Result<string, JobError> hashed = await hasher.HashFileAsync(finalPath, method, ct).ConfigureAwait(false);
                 if (hashed.IsCanceled)
                     return Result<UnchangedCheckResult, JobError>.Canceled();
                 if (hashed.TryGetError(out JobError? hashError))
                     return hashError;
                 hashed.TryGetValue(out string? existingHash);
-                if (!string.Equals(existingHash, output.Sha256, StringComparison.OrdinalIgnoreCase))
+                if (!string.Equals(existingHash, output.ContentHash, StringComparison.OrdinalIgnoreCase))
                     return UnchangedCheckResult.ExistsDifferent;
             }
             else
@@ -214,11 +214,11 @@ public sealed class AtomicPlacer(
                     : new JobError { Code = JobErrorCode.VerificationMismatch, Message = $"temp \"{tempPath}\" length {new FileInfo(tempPath).Length} != expected {output.SizeBytes}", Path = tempPath, TargetIndex = index };
             }
 
-            Result<string, JobError> hashed = await hasher.HashFileAsync(tempPath, ct).ConfigureAwait(false);
+            Result<string, JobError> hashed = await hasher.HashFileAsync(tempPath, method, ct).ConfigureAwait(false);
             if (hashed.IsCanceled) return Result<bool, JobError>.Canceled();
             if (hashed.TryGetError(out JobError? error)) return error;
             hashed.TryGetValue(out string? actual);
-            return string.Equals(actual, output.Sha256, StringComparison.OrdinalIgnoreCase)
+            return string.Equals(actual, output.ContentHash, StringComparison.OrdinalIgnoreCase)
                 ? true
                 : new JobError { Code = JobErrorCode.VerificationMismatch, Message = $"read-back hash mismatch at \"{tempPath}\"", Path = tempPath, TargetIndex = index };
         }

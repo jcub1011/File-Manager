@@ -258,7 +258,10 @@ CLI ([§2.2](#22-command-line-interface)):
 
 * **Verification (`VerificationMethod`, default ON):** before any source cleanup, each Target copy
   is verified against the **final transformed file in the Job's temp workspace** using one of:
-  * `SHA256` (default) — full byte-stream checksum. Authoritative; costs a full read of each copy.
+  * `XXH3-128` (default) — full byte-stream checksum using the 128-bit XXH3 (XxHash128), a fast
+    non-cryptographic hash. Costs a full read of each copy; collision-safe for integrity at any
+    realistic scale but not tamper-evident.
+  * `SHA256` — full byte-stream cryptographic checksum. Authoritative and tamper-evident; slower.
   * `None` — no verification. Permitted for throughput, **but** the GUI raises a blocking warning
     whenever `VerificationMethod = None` **and** `OnSuccess` deletes/permanently removes the source
     (see [§6.1](#61-the-one-data-losing-combination)).
@@ -299,7 +302,7 @@ For M:1 aggregation collisions, source order in the Profile defines priority whe
 **Before** `ConflictResolution` is consulted, the engine checks whether the existing Target file is
 already identical to the Job's final output:
 
-* Under `VerificationMethod: SHA256` — same size **and** same content hash.
+* Under `VerificationMethod: XXH3-128` or `SHA256` — same size **and** same content hash.
 * Under `VerificationMethod: None` — same size **and** same modified-time (best-effort).
 
 If identical, the Target write is **skipped** and logged as `SKIPPED (UnchangedAtTarget)`; the Job
@@ -493,7 +496,7 @@ are not portable across OSes).
   "Policies": {
     "ConflictResolution": "RenameSuffix",
     "OverwriteHandling": "StageOverwrites",
-    "VerificationMethod": "SHA256",
+    "VerificationMethod": "XXH3-128",
     "OnSuccess": "MoveToTrash",
     "ArchiveFolder": null,
     "OnFailure": "AbortRestoreAndClean",
@@ -522,7 +525,7 @@ are not portable across OSes).
 > **Enum authority.** Values marked *(reserved)* are schema-legal but rejected by v1 validation
 > with a "reserved for a future release" error ([§1.2](#12-release-scoping)):
 > `OnSuccess ∈ {KeepSource, MoveToTrash, MoveToArchive, PermanentDelete}`;
-> `VerificationMethod ∈ {SHA256, None, SizeTimestamp (reserved)}`;
+> `VerificationMethod ∈ {XXH3-128 (default), SHA256, SizeTimestamp (reserved), None}`;
 > `ConflictResolution ∈ {Overwrite, OverwriteIfNewer, RenameSuffix, Skip}`;
 > `OverwriteHandling ∈ {DirectOverwrite, StageOverwrites}`;
 > `SyncMode ∈ {AdditiveArchive, Mirror (reserved)}`;
@@ -809,7 +812,9 @@ notes otherwise.
   * `Mirror` reconcile pass — trigger timing, full-source enumeration, diffing, journaling, and
     dry-run integration (§3.1.1).
   * `ContentHashDedupe` — whether it hashes against a maintained Target index or computes on
-    demand.
+    demand. Must honor the profile's `VerificationMethod` (via `IFileHasher`); only meaningful under
+    a hash-based method (`XXH3-128`/`SHA256`), and any dedupe action should confirm a hash match with
+    a byte-compare before discarding data.
   * Sparse MSIX packaging and code signing for the Windows 11 `IExplorerCommand` handler (§5.3).
   * `ArgumentMode: Shell` — scope and safety posture, given that engine-side escaping is explicitly
     not promised (§9).
@@ -850,7 +855,7 @@ Preserved in `spec-draft-v2.md` (Appendix C); v3 does not alter that history.
 2. `ArgumentMode: Shell` (§4 Phase 3, §9) — v1 is `Literal`-only with the wrapper-script pattern;
    v2's "engine applies platform escaping" claim is **withdrawn** as unachievable for `cmd.exe`.
 3. `VerificationMethod: SizeTimestamp` (§3.3) — the caveat-laden Tier 1 is reserved; v1 ships
-   `SHA256` (default) and `None`.
+   `XXH3-128` (default), `SHA256`, and `None`.
 4. `ContentHashDedupe` (§5.1) — reserved pending the Target-index design.
 5. Windows 11 top-level context menu via `IExplorerCommand` + sparse MSIX (§5.3) — requires code
    signing and high-effort COM/AOT interop; the per-user registry verb is the v1 mechanism.

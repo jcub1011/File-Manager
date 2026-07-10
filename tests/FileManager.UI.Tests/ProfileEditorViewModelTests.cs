@@ -66,7 +66,7 @@ public sealed class ProfileEditorViewModelTests
         Assert.Null(draft.Triggers.Schedule);
         Assert.Null(draft.Transformers);
         Assert.Equal(ConflictResolution.Skip, draft.Policies.ConflictResolution);
-        Assert.Equal(VerificationMethod.Sha256, draft.Policies.VerificationMethod);
+        Assert.Equal(VerificationMethod.XxHash128, draft.Policies.VerificationMethod);
         Assert.Equal(OnSuccessAction.KeepSource, draft.Policies.OnSuccess);
         Assert.Equal(OverwriteHandling.StageOverwrites, draft.Policies.OverwriteHandling);
         SourceConfig source = Assert.Single(draft.Sources);

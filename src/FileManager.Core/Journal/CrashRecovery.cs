@@ -139,16 +139,18 @@ public sealed class CrashRecovery(
 
     /// <summary>Complete forward iff (a) output-sealed exists, (b) the workspace output is present
     /// with matching size+hash OR every unplaced target has a temp whose hash matches, and
-    /// (c) Verification == Sha256 (under None there is no reference hash, so mid-placement always
-    /// rolls back — conservative).</summary>
+    /// (c) Verification is a hash-based method (under None/SizeTimestamp there is no reference hash,
+    /// so mid-placement always rolls back — conservative). Re-hashing uses the same method that
+    /// produced the seal (opened.Policies.Verification).</summary>
     private bool ForwardCompletionAllowed(JobOpenedRecord opened, OutputSealedRecord? seal, TargetRecovery[] targets)
     {
-        if (seal is null || opened.Policies.Verification != VerificationMethod.Sha256)
+        VerificationMethod method = opened.Policies.Verification;
+        if (seal is null || method is VerificationMethod.None or VerificationMethod.SizeTimestamp)
             return false;
 
         if (File.Exists(seal.OutputPath)
             && new FileInfo(seal.OutputPath).Length == seal.SizeBytes
-            && HashEquals(seal.OutputPath, seal.Sha256))
+            && HashEquals(seal.OutputPath, seal.ContentHash, method))
             return true;
 
         // Workspace gone — forward only if every not-yet-placed target already has a good temp.
@@ -156,7 +158,7 @@ public sealed class CrashRecovery(
         {
             if (t.State is TargetState.Placed or TargetState.SatisfiedUnchanged or TargetState.SkippedConflict)
                 continue;
-            if (t.TempPath is null || !File.Exists(t.TempPath) || !HashEquals(t.TempPath, seal.Sha256))
+            if (t.TempPath is null || !File.Exists(t.TempPath) || !HashEquals(t.TempPath, seal.ContentHash, method))
                 return false;
         }
         return true;
@@ -172,7 +174,7 @@ public sealed class CrashRecovery(
             if (t.State == TargetState.Placed)
             {
                 // H1/H2: trust the placed record; probe only for an integrity alert.
-                if (t.FinalPath is not null && (!File.Exists(t.FinalPath) || !HashEquals(t.FinalPath, seal.Sha256)))
+                if (t.FinalPath is not null && (!File.Exists(t.FinalPath) || !HashEquals(t.FinalPath, seal.ContentHash, opened.Policies.Verification)))
                     logger.LogError("Integrity: placed target \"{Final}\" missing or mismatched after crash (job {JobId})", t.FinalPath, jobId);
                 continue;
             }
@@ -195,7 +197,7 @@ public sealed class CrashRecovery(
 
         // Ensure a verified temp exists (rows C1/C2/D3): re-copy from the workspace if the temp is
         // absent or its hash does not match the reference.
-        if (!File.Exists(t.TempPath) || !HashEquals(t.TempPath, seal.Sha256))
+        if (!File.Exists(t.TempPath) || !HashEquals(t.TempPath, seal.ContentHash, opened.Policies.Verification))
             CopyFlush(seal.OutputPath, t.TempPath);
 
         // Place (rows D1/D2/E/F).
@@ -203,7 +205,7 @@ public sealed class CrashRecovery(
         {
             File.Move(t.TempPath, t.FinalPath, overwrite: false);
         }
-        else if (HashEquals(t.FinalPath, seal.Sha256))
+        else if (HashEquals(t.FinalPath, seal.ContentHash, opened.Policies.Verification))
         {
             // F/D2: the rename already happened; the target-placed record was lost. Drop the temp.
             SafeDelete(t.TempPath);
@@ -348,9 +350,9 @@ public sealed class CrashRecovery(
 
     // --- probing / IO helpers (synchronous — recovery runs before any load) ---
 
-    private bool HashEquals(string path, string expectedHash)
+    private bool HashEquals(string path, string expectedHash, VerificationMethod method)
     {
-        Result<string, JobError> hashed = hasher.HashFileAsync(path).GetAwaiter().GetResult();
+        Result<string, JobError> hashed = hasher.HashFileAsync(path, method).GetAwaiter().GetResult();
         return hashed.TryGetValue(out string? actual) && string.Equals(actual, expectedHash, StringComparison.OrdinalIgnoreCase);
     }
 

@@ -126,7 +126,7 @@ public sealed class ConflictResolverProbeTests : IDisposable
     {
         Path = "unused",
         SizeBytes = 8,
-        Sha256 = "",
+        ContentHash = "",
         SourceLastWriteUtc = sourceLastWrite ?? DateTimeOffset.UtcNow,
     };
 }

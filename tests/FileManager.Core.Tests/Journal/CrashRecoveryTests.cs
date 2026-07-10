@@ -112,7 +112,7 @@ public sealed class CrashRecoveryTests : IDisposable
         File.WriteAllText(staged, "PRIOR");
 
         _journal.Append(Open(job, Path.Combine(_root, "src.dat"), final, targetRoot, workspace, VerificationMethod.Sha256, OnSuccessAction.KeepSource));
-        _journal.Append(new OutputSealedRecord { JobId = job, Seq = 0, AtUtc = DateTimeOffset.UnixEpoch, OutputPath = output, SizeBytes = content.Length, Sha256 = Sha(content) });
+        _journal.Append(new OutputSealedRecord { JobId = job, Seq = 0, AtUtc = DateTimeOffset.UnixEpoch, OutputPath = output, SizeBytes = content.Length, ContentHash = Sha(content) });
         _journal.Append(new TargetWriteBeginRecord { JobId = job, Seq = 0, AtUtc = DateTimeOffset.UnixEpoch, TargetIndex = 0, TempPath = temp, FinalPath = final, FinalExisted = true });
         _journal.Append(new TargetVerifiedRecord { JobId = job, Seq = 0, AtUtc = DateTimeOffset.UnixEpoch, TargetIndex = 0 });
         _journal.Append(new TargetStagedRecord { JobId = job, Seq = 0, AtUtc = DateTimeOffset.UnixEpoch, TargetIndex = 0, FinalPath = final, StagedPath = staged });
@@ -143,7 +143,7 @@ public sealed class CrashRecoveryTests : IDisposable
         File.WriteAllText(temp, "new bytes");
 
         _journal.Append(Open(job, Path.Combine(_root, "src.dat"), final, targetRoot, workspace, VerificationMethod.None, OnSuccessAction.KeepSource));
-        _journal.Append(new OutputSealedRecord { JobId = job, Seq = 0, AtUtc = DateTimeOffset.UnixEpoch, OutputPath = Path.Combine(workspace, "output"), SizeBytes = 9, Sha256 = "" });
+        _journal.Append(new OutputSealedRecord { JobId = job, Seq = 0, AtUtc = DateTimeOffset.UnixEpoch, OutputPath = Path.Combine(workspace, "output"), SizeBytes = 9, ContentHash = "" });
         _journal.Append(new TargetWriteBeginRecord { JobId = job, Seq = 0, AtUtc = DateTimeOffset.UnixEpoch, TargetIndex = 0, TempPath = temp, FinalPath = final, FinalExisted = true });
         _journal.Append(new TargetStagedRecord { JobId = job, Seq = 0, AtUtc = DateTimeOffset.UnixEpoch, TargetIndex = 0, FinalPath = final, StagedPath = staged });
 
@@ -165,7 +165,7 @@ public sealed class CrashRecoveryTests : IDisposable
         string final = Path.Combine(targetRoot, "out.dat");
 
         _journal.Append(Open(job, source, final, targetRoot, Path.Combine(_root, "work", "w"), VerificationMethod.Sha256, OnSuccessAction.MoveToTrash));
-        _journal.Append(new OutputSealedRecord { JobId = job, Seq = 0, AtUtc = DateTimeOffset.UnixEpoch, OutputPath = source, SizeBytes = 9, Sha256 = Sha("delivered") });
+        _journal.Append(new OutputSealedRecord { JobId = job, Seq = 0, AtUtc = DateTimeOffset.UnixEpoch, OutputPath = source, SizeBytes = 9, ContentHash = Sha("delivered") });
         _journal.Append(new TargetPlacedRecord { JobId = job, Seq = 0, AtUtc = DateTimeOffset.UnixEpoch, TargetIndex = 0 });
         _journal.Append(new JobCommittedRecord { JobId = job, Seq = 0, AtUtc = DateTimeOffset.UnixEpoch });
 

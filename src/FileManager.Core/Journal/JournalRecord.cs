@@ -38,7 +38,9 @@ public sealed record OutputSealedRecord : JournalRecord
 {
     public required string OutputPath { get; init; }
     public required long SizeBytes { get; init; }
-    public required string Sha256 { get; init; }       // "" for VerificationMethod.None
+    // Hashed under the job's PolicySnapshot.Verification (JobOpenedRecord); "" for
+    // VerificationMethod.None. Crash recovery re-hashes with that same method.
+    public required string ContentHash { get; init; }
 }
 
 public sealed record TargetWriteBeginRecord : JournalRecord

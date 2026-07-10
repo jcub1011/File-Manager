@@ -181,13 +181,23 @@ public enum OverwriteHandling
 
 public enum VerificationMethod
 {
+    // Members are ordered by recommendation, strongest first: XxHash128 (the default) → SHA-256 →
+    // SizeTimestamp (weak, reserved) → None (no verification, least recommended). XxHash128 (128-bit
+    // XXH3) is fast, non-cryptographic, and collision-safe for integrity at realistic scale; it
+    // occupies the zero slot so the enum default matches the app default. NOTE: journal records
+    // serialize this enum as integers (JournalJsonContext has no UseStringEnumConverter), so this
+    // ordering is a wire contract — reorder only pre-release; once WAL journals exist in the field,
+    // append instead.
+    [JsonStringEnumMemberName("XXH3-128")]
+    [Tooltip("XxHash128 (XXH3)")]
+    XxHash128,
     [JsonStringEnumMemberName("SHA256")]
     [Tooltip("SHA-256")]
     Sha256,
-    [Tooltip("None")]
-    None,
     [Tooltip("Size & Timestamp")]
     SizeTimestamp,        /// [reserved — fails v1 validation]
+    [Tooltip("None")]
+    None,
 }
 
 public enum OnSuccessAction

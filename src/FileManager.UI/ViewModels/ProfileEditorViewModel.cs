@@ -46,7 +46,7 @@ public sealed partial class ProfileEditorViewModel : ViewModelBase
     public IReadOnlyList<OverwriteHandling> OverwriteHandlingOptions { get; } =
         [OverwriteHandling.StageOverwrites, OverwriteHandling.DirectOverwrite];
     public IReadOnlyList<VerificationMethod> VerificationOptions { get; } =
-        [VerificationMethod.Sha256, VerificationMethod.None];                               // SizeTimestamp is [reserved]
+        [VerificationMethod.XxHash128, VerificationMethod.Sha256, VerificationMethod.None];  // SizeTimestamp is [reserved]
     public IReadOnlyList<OnSuccessAction> OnSuccessOptions { get; } =
         [OnSuccessAction.KeepSource, OnSuccessAction.MoveToArchive, OnSuccessAction.MoveToTrash, OnSuccessAction.PermanentDelete];
     public IReadOnlyList<MetadataOnConflict> MetadataOptions { get; } =
@@ -66,7 +66,7 @@ public sealed partial class ProfileEditorViewModel : ViewModelBase
     [ObservableProperty] public partial TargetLayout TargetLayout { get; set; } = TargetLayout.PreserveStructure;
     [ObservableProperty] public partial ConflictResolution ConflictResolution { get; set; } = ConflictResolution.Skip;
     [ObservableProperty] public partial OverwriteHandling OverwriteHandling { get; set; } = OverwriteHandling.StageOverwrites;
-    [ObservableProperty] public partial VerificationMethod VerificationMethod { get; set; } = VerificationMethod.Sha256;
+    [ObservableProperty] public partial VerificationMethod VerificationMethod { get; set; } = VerificationMethod.XxHash128;
     [ObservableProperty] public partial OnSuccessAction OnSuccess { get; set; } = OnSuccessAction.KeepSource;
     [ObservableProperty] public partial string ArchiveFolder { get; set; } = "";
     [ObservableProperty] public partial MetadataOnConflict MetadataOnConflict { get; set; } = MetadataOnConflict.WarnAndContinue;
@@ -139,7 +139,7 @@ public sealed partial class ProfileEditorViewModel : ViewModelBase
         TargetLayout = TargetLayout.PreserveStructure;
         ConflictResolution = ConflictResolution.Skip;              // safest default
         OverwriteHandling = OverwriteHandling.StageOverwrites;
-        VerificationMethod = VerificationMethod.Sha256;
+        VerificationMethod = VerificationMethod.XxHash128;
         OnSuccess = OnSuccessAction.KeepSource;
         ArchiveFolder = "";
         MetadataOnConflict = MetadataOnConflict.WarnAndContinue;

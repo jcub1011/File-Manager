@@ -117,6 +117,22 @@ public sealed class SerializationTests
     }
 
     [Fact]
+    public void XxHash128_uses_its_wire_name_and_round_trips()
+    {
+        Profile sample = SampleProfile();
+        sample = sample with { Policies = sample.Policies with { VerificationMethod = VerificationMethod.XxHash128 } };
+
+        string json = Encoding.UTF8.GetString(JsonSerializer.SerializeToUtf8Bytes(
+            sample, FileManagerJsonContext.Default.Profile));
+
+        Assert.Contains("\"XXH3-128\"", json);               // [JsonStringEnumMemberName("XXH3-128")]
+
+        Profile? roundTripped = JsonSerializer.Deserialize(json, FileManagerJsonContext.Default.Profile);
+        Assert.NotNull(roundTripped);
+        Assert.Equal(VerificationMethod.XxHash128, roundTripped.Policies.VerificationMethod);
+    }
+
+    [Fact]
     public void DryRunReport_truncated_flag_round_trips_and_is_false_when_absent()
     {
         byte[] wire = IpcSerializer.SerializeResponse(new DryRunResponse
