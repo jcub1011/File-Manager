@@ -76,9 +76,10 @@ public sealed class ProfileValidator(ILogger<ProfileValidator> logger, IFilterCo
 
     private static void CheckReservedValues(Profile candidate, List<ValidationIssue> issues)
     {
-        if (candidate.SyncMode == SyncMode.Mirror)
-            issues.Add(Error("PROFILE_RESERVED_VALUE",
-                "SyncMode \"Mirror\" is reserved for a future release."));
+        // SyncMode.Mirror is selectable and fully modeled by the dry run, but the executor does not
+        // yet perform destination deletion — the run entry point guards against actually running one
+        // (see the run-profile handler). It is intentionally NOT reserved here so a Mirror profile
+        // can be saved and dry-run-previewed.
         if (candidate.Policies.VerificationMethod == VerificationMethod.SizeTimestamp)
             issues.Add(Error("PROFILE_RESERVED_VALUE",
                 "VerificationMethod \"SizeTimestamp\" is reserved for a future release."));

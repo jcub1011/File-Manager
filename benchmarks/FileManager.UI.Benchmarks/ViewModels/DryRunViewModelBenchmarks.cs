@@ -31,10 +31,7 @@ public class DryRunViewModelBenchmarks
     [GlobalSetup]
     public void Setup()
     {
-        _viewModel = new DryRunViewModel(gateway: null!)
-        {
-            ShowDestructive = DestructiveOnly,
-        };
+        _viewModel = new DryRunViewModel(gateway: null!);
         _report = BuildReport(FileCount);
     }
 

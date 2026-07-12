@@ -186,6 +186,77 @@ public sealed class SerializationTests
     }
 
     [Fact]
+    public void DryRunReport_destinations_round_trip_and_default_to_empty_when_absent()
+    {
+        byte[] wire = IpcSerializer.SerializeResponse(new DryRunResponse
+        {
+            Report = new DryRunReport(SomeId, DateTimeOffset.UnixEpoch, [], Truncated: false,
+                Destinations:
+                [
+                    new DryRunDestinationEntry { TargetPath = @"C:\t\orphan.txt", TargetRoot = @"C:\t", Disposition = DryRunDestinationDisposition.Deleted },
+                ]),
+        });
+
+        Assert.True(IpcSerializer.DeserializeResponse(wire).TryGetValue(out IpcResponse? reparsed));
+        DryRunResponse roundTripped = Assert.IsType<DryRunResponse>(reparsed);
+        DryRunDestinationEntry entry = Assert.Single(roundTripped.Report.Destinations!);
+        Assert.Equal(@"C:\t\orphan.txt", entry.TargetPath);
+        Assert.Equal(DryRunDestinationDisposition.Deleted, entry.Disposition);
+
+        // Old-server → new-client compatibility: a report serialized before Destinations existed
+        // (no "Destinations" property) deserializes to the constructor default (null).
+        string legacy = """{"type":"dry-run-report","Report":{"ProfileId":""" + $"\"{SomeId}\"" +
+            ""","GeneratedAt":"1970-01-01T00:00:00+00:00","Files":[]}}""";
+        Assert.True(IpcSerializer.DeserializeResponse(Encoding.UTF8.GetBytes(legacy)).TryGetValue(out IpcResponse? legacyResponse));
+        DryRunResponse legacyParsed = Assert.IsType<DryRunResponse>(legacyResponse);
+        Assert.Null(legacyParsed.Report.Destinations);
+    }
+
+    [Fact]
+    public void DryRunTargetAction_target_root_round_trips_and_is_null_when_absent()
+    {
+        byte[] wire = IpcSerializer.SerializeResponse(new DryRunResponse
+        {
+            Report = new DryRunReport(SomeId, DateTimeOffset.UnixEpoch,
+            [
+                new DryRunFileResult
+                {
+                    SourcePath = @"C:\a\one.txt",
+                    Disposition = DryRunFileDisposition.WouldProcess,
+                    Targets = [new DryRunTargetAction { TargetPath = @"C:\t\one.txt", TargetRoot = @"C:\t", Kind = DryRunTargetKind.WouldWrite }],
+                },
+            ]),
+        });
+
+        Assert.True(IpcSerializer.DeserializeResponse(wire).TryGetValue(out IpcResponse? reparsed));
+        DryRunResponse roundTripped = Assert.IsType<DryRunResponse>(reparsed);
+        Assert.Equal(@"C:\t", roundTripped.Report.Files[0].Targets[0].TargetRoot);
+
+        // Old-server → new-client: a target action without TargetRoot deserializes to null.
+        string legacy = """{"type":"dry-run-report","Report":{"ProfileId":""" + $"\"{SomeId}\"" +
+            ""","GeneratedAt":"1970-01-01T00:00:00+00:00","Files":[{"SourcePath":"C:\\a\\one.txt","Disposition":"WouldProcess","Targets":[{"TargetPath":"C:\\t\\one.txt","Kind":"WouldWrite"}]}]}}""";
+        Assert.True(IpcSerializer.DeserializeResponse(Encoding.UTF8.GetBytes(legacy)).TryGetValue(out IpcResponse? legacyResponse));
+        DryRunResponse legacyParsed = Assert.IsType<DryRunResponse>(legacyResponse);
+        Assert.Null(legacyParsed.Report.Files[0].Targets[0].TargetRoot);
+    }
+
+    [Fact]
+    public void DryRunDestinationChunkResponse_round_trips()
+    {
+        byte[] wire = IpcSerializer.SerializeResponse(new DryRunDestinationChunkResponse
+        {
+            Entries =
+            [
+                new DryRunDestinationEntry { TargetPath = @"C:\t\keep.txt", TargetRoot = @"C:\t", Disposition = DryRunDestinationDisposition.Untouched },
+            ],
+        });
+
+        Assert.True(IpcSerializer.DeserializeResponse(wire).TryGetValue(out IpcResponse? reparsed));
+        DryRunDestinationChunkResponse chunk = Assert.IsType<DryRunDestinationChunkResponse>(reparsed);
+        Assert.Equal(@"C:\t\keep.txt", Assert.Single(chunk.Entries).TargetPath);
+    }
+
+    [Fact]
     public void GlobalSettings_round_trips_its_fields_over_the_wire()
     {
         byte[] wire = IpcSerializer.SerializeResponse(new SettingsResponse

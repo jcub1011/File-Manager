@@ -70,6 +70,7 @@ internal static class Program
         services.AddSingleton<ISourceScanner, SourceScanner>();
         services.AddSingleton<IFileHasher, FileHasher>();
         services.AddSingleton<IConflictResolver, ConflictResolver>();
+        services.AddSingleton<DestinationProjector>();
         services.AddSingleton<IDryRunEngine, DryRunEngine>();
         services.AddSingleton<IIpcEndpointProvider, WindowsIpcEndpointProvider>();
         services.AddSingleton<IAutostartRegistrar, WindowsAutostartRegistrar>();

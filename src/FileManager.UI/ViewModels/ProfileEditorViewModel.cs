@@ -39,7 +39,9 @@ public sealed partial class ProfileEditorViewModel : ViewModelBase
     public Action<Guid>? Saved { get; set; }
 
     // ----- enum options (static arrays: AOT-safe, no Enum.GetValues reflection) -----
-    public IReadOnlyList<SyncMode> SyncModeOptions { get; } = [SyncMode.AdditiveArchive];   // Mirror is [reserved]
+    // Mirror is selectable: the dry run fully previews its deletions. The executor does not yet
+    // perform Mirror deletion — that is a follow-up for whoever builds the run pipeline.
+    public IReadOnlyList<SyncMode> SyncModeOptions { get; } = [SyncMode.AdditiveArchive, SyncMode.Mirror];
     public IReadOnlyList<TargetLayout> TargetLayoutOptions { get; } = [TargetLayout.PreserveStructure, TargetLayout.Flatten];
     public IReadOnlyList<ConflictResolution> ConflictResolutionOptions { get; } =
         [ConflictResolution.Skip, ConflictResolution.RenameSuffix, ConflictResolution.Overwrite, ConflictResolution.OverwriteIfNewer];

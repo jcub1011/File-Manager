@@ -3,6 +3,7 @@ using FileManager.Contracts.IPC;
 using FileManager.Contracts.Primitives;
 using FileManager.Contracts.Profiles;
 using FileManager.Core.DryRun;
+using FileManager.Core.Files;
 using FileManager.Core.IPC.Handlers;
 using FileManager.Core.Profiles;
 using FileManager.Core.Tests.TestSupport;
@@ -49,9 +50,13 @@ public sealed class DryRunStreamHandlerTests
         }
     }
 
-    private static DryRunStreamHandler NewHandler(Profile profile, IDryRunEngine engine, int maxStreamedFiles) =>
-        new(NullLogger<DryRunStreamHandler>.Instance, engine, new FakeCatalog(profile), TimeProvider.System)
+    private static DryRunStreamHandler NewHandler(Profile profile, IDryRunEngine engine, int maxStreamedFiles)
+    {
+        FileSystemService fileSystem = new(NullLogger<FileSystemService>.Instance);
+        return new(NullLogger<DryRunStreamHandler>.Instance, engine, new FakeCatalog(profile), TimeProvider.System,
+            new DestinationProjector(NullLogger<DestinationProjector>.Instance, fileSystem))
         { MaxStreamedFiles = maxStreamedFiles };
+    }
 
     private static async Task<List<IpcResponse>> Collect(DryRunStreamHandler handler, Guid profileId)
     {

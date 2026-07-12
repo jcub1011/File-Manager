@@ -160,6 +160,7 @@ public sealed class IpcClient : IAsyncDisposable
                 return new IpcError("IPC_TRANSPORT", writeError);
 
             List<DryRunFileResult> files = [];
+            List<DryRunDestinationEntry> destinations = [];
             while (true)
             {
                 Result<byte[], string> frame = await IpcFrameCodec.ReadFrameAsync(_pipe, ct).ConfigureAwait(false);
@@ -179,8 +180,12 @@ public sealed class IpcClient : IAsyncDisposable
                     case DryRunChunkResponse chunk:
                         files.AddRange(chunk.Files);
                         break;
+                    case DryRunDestinationChunkResponse destChunk:
+                        destinations.AddRange(destChunk.Entries);
+                        break;
                     case DryRunCompleteResponse complete:
-                        return new DryRunReport(request.ProfileId, complete.GeneratedAt, files, complete.Truncated);
+                        return new DryRunReport(
+                            request.ProfileId, complete.GeneratedAt, files, complete.Truncated, destinations);
                     case ErrorResponse error:
                         return new IpcError(error.Code, error.Message);
                     default:

@@ -109,7 +109,8 @@ public sealed class DryRunEngineTests : IDisposable
             new FileHasher(NullLogger<FileHasher>.Instance),
             new ConflictResolver(new(), new(), NullLogger<ConflictResolver>.Instance),
             new FakeSettings(global),
-            TimeProvider.System)
+            TimeProvider.System,
+            new DestinationProjector(NullLogger<DestinationProjector>.Instance, fileSystem))
         { ReportByteBudget = reportByteBudget, ChunkByteBudget = chunkByteBudget, MaxScannedCandidates = maxScannedCandidates };
     }
 
@@ -407,6 +408,38 @@ public sealed class DryRunEngineTests : IDisposable
             filters: new FilterSet { ExcludeGlob = ["*.tmp"] }));
 
         Assert.Equal(before, SnapshotTree());
+    }
+
+    [Fact]
+    public async Task Mirror_report_previews_destination_orphans_with_zero_mutation()
+    {
+        // A source file that lands in the target, plus a pre-existing target-only file that a real
+        // Mirror run would delete. The engine wires the read-only destination sweep, so the report
+        // surfaces the orphan as Deleted — and touches nothing on disk.
+        SourceFile("keep.txt", "content");
+        TargetFile("orphan.txt", "stale");
+
+        Dictionary<string, (long Length, DateTime Mtime)> before = SnapshotTree();
+
+        DryRunReport report = await Simulate(ProfileUnderTest() with { SyncMode = SyncMode.Mirror });
+
+        DryRunDestinationEntry orphan = Assert.Single(report.Destinations);
+        Assert.EndsWith("orphan.txt", orphan.TargetPath);
+        Assert.Equal(DryRunDestinationDisposition.Deleted, orphan.Disposition);
+        Assert.Equal(before, SnapshotTree());
+    }
+
+    [Fact]
+    public async Task Additive_report_previews_preexisting_targets_as_untouched()
+    {
+        SourceFile("keep.txt", "content");
+        TargetFile("preexisting.txt", "already here");
+
+        DryRunReport report = await Simulate(ProfileUnderTest());   // AdditiveArchive
+
+        DryRunDestinationEntry entry = Assert.Single(report.Destinations);
+        Assert.EndsWith("preexisting.txt", entry.TargetPath);
+        Assert.Equal(DryRunDestinationDisposition.Untouched, entry.Disposition);
     }
 
     // ----- streaming (SimulateStreamAsync) -----

@@ -15,9 +15,6 @@ namespace FileManager.Core.Watching;
 public sealed class SourceScanner(
     ILogger<SourceScanner> logger, IFileSystemService fileSystem, TimeProvider time) : ISourceScanner
 {
-    private static readonly string[] InfrastructureDirectories = [".pipeline_tmp", ".fm_staging"];
-    private const string TempFileMarker = ".fmtmp-";
-
     public IEnumerable<Result<Payload, EnumerationFault>> Scan(
         Profile profile, TriggerKind trigger, string? scopeRoot = null)
     {
@@ -49,7 +46,7 @@ public sealed class SourceScanner(
                 if (File.Exists(scoped.Value))
                 {
                     // A file scope yields exactly one payload (infra exclusions still apply).
-                    if (!IsInfrastructurePath(scoped.Value))
+                    if (!InfrastructurePaths.IsInfrastructurePath(scoped.Value))
                         yield return new Payload(profile.Id, scoped.Value, sourceRoot.Value, trigger, time.GetUtcNow());
                     continue;
                 }
@@ -102,7 +99,7 @@ public sealed class SourceScanner(
                 entry.TryGetValue(out FileSystemEntry? item);
                 if (item!.IsDirectory)
                 {
-                    if (IsInfrastructureDirectoryName(item.FileName))
+                    if (InfrastructurePaths.IsInfrastructureDirectoryName(item.FileName))
                     {
                         logger.LogDebug("Skipping infrastructure directory {Path}", item.FullPath);
                         continue;
@@ -114,7 +111,7 @@ public sealed class SourceScanner(
                 }
                 else
                 {
-                    if (item.FileName.Contains(TempFileMarker, StringComparison.OrdinalIgnoreCase))
+                    if (InfrastructurePaths.IsTempFileName(item.FileName))
                         continue;
                     yield return new Payload(profileId, item.FullPath, sourceRoot, trigger, time.GetUtcNow(),
                         MetadataFrom(item));
@@ -146,29 +143,5 @@ public sealed class SourceScanner(
                 depth++;
         }
         return depth;
-    }
-
-    private static bool IsInfrastructurePath(string path)
-    {
-        if (Path.GetFileName(path).Contains(TempFileMarker, StringComparison.OrdinalIgnoreCase))
-            return true;
-        foreach (string segment in path.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar))
-        {
-            if (IsInfrastructureDirectoryName(segment))
-                return true;
-        }
-        return false;
-    }
-
-    // Manual scan over the fixed two-element set — avoids the per-entry enumerator that
-    // Enumerable.Contains(comparer) allocates on the scanner's hot path.
-    private static bool IsInfrastructureDirectoryName(string name)
-    {
-        foreach (string infra in InfrastructureDirectories)
-        {
-            if (string.Equals(name, infra, StringComparison.OrdinalIgnoreCase))
-                return true;
-        }
-        return false;
     }
 }

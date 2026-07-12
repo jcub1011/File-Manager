@@ -198,8 +198,15 @@ public sealed class ProfileEditorViewModelTests
     public void Reserved_enum_members_are_not_offered()
     {
         var (editor, _) = NewEditor();
-        Assert.DoesNotContain(SyncMode.Mirror, editor.SyncModeOptions);
         Assert.DoesNotContain(VerificationMethod.SizeTimestamp, editor.VerificationOptions);
+    }
+
+    [Fact]
+    public void Mirror_sync_mode_is_offered()
+    {
+        // Mirror is selectable now: the dry run fully previews it (executor deletion is a follow-up).
+        var (editor, _) = NewEditor();
+        Assert.Contains(SyncMode.Mirror, editor.SyncModeOptions);
     }
 
     [Fact]

@@ -35,7 +35,8 @@ public sealed class DryRunEngine(
     IFileHasher hasher,
     IConflictResolver conflictResolver,
     ISettingsProvider settings,
-    TimeProvider time) : IDryRunEngine
+    TimeProvider time,
+    DestinationProjector destinationProjector) : IDryRunEngine
 {
     /// <summary>Report size guards: a serialized report must fit an IPC frame (16 MiB cap, §3.1).
     /// The byte budget is the guarantee — each result is measured as serialized and the report
@@ -191,12 +192,37 @@ public sealed class DryRunEngine(
                 "(caps: {ByteCap:N0} bytes, {FileCap} files) — the scan found more",
                 profileId, files.Count, reportBytes, ReportByteBudget, MaxReportedFiles);
 
+        // Phase 3: destination-only entries (preexisting-Untouched + Mirror orphans). Suppressed
+        // entirely when the source pass truncated (the survivor set would be incomplete, so any
+        // orphan classification is untrustworthy). What survives must still fit the frame, so the
+        // entries are appended only while their upper-bound size keeps the report under the budget;
+        // an overflow drops the rest and marks the report truncated (same guarantee as Files).
+        IReadOnlyList<DryRunDestinationEntry> allDestinations =
+            destinationProjector.Project(profile, files, truncated, ct);
+        List<DryRunDestinationEntry> destinations = [];
+        foreach (DryRunDestinationEntry entry in allDestinations)
+        {
+            long size = DestinationUpperBoundBytes(entry);
+            if (reportBytes + size > ReportByteBudget)
+            {
+                truncated = true;
+                logger.LogWarning(
+                    "Dry-run report for profile {ProfileId} truncated its destination entries at {Count} " +
+                    "(byte cap {ByteCap:N0}) — more pre-existing/orphan files exist",
+                    profileId, destinations.Count, ReportByteBudget);
+                break;
+            }
+            reportBytes += size;
+            destinations.Add(entry);
+        }
+
         DateTimeOffset completedAt = time.GetUtcNow();
         logger.LogInformation(
-            "Dry-run completed for profile {ProfileId}: {FileCount} files in {ElapsedMs}ms{Truncated}",
-            profileId, files.Count, (completedAt - startedAt).TotalMilliseconds,
+            "Dry-run completed for profile {ProfileId}: {FileCount} files, {DestCount} destination entries " +
+            "in {ElapsedMs}ms{Truncated}",
+            profileId, files.Count, destinations.Count, (completedAt - startedAt).TotalMilliseconds,
             truncated ? " (report truncated)" : "");
-        return new DryRunReport(profileId, completedAt, files, truncated);
+        return new DryRunReport(profileId, completedAt, files, truncated, destinations);
     }
 
     /// <summary>Streaming counterpart to <see cref="SimulateAsync"/> (spec §8): yields the report as
@@ -465,6 +491,7 @@ public sealed class DryRunEngine(
         {
             bytes += TargetStructuralBytes;
             bytes += StringUpperBound(target.TargetPath);
+            bytes += StringUpperBound(target.TargetRoot);
             bytes += StringUpperBound(target.Detail);
         }
         return bytes;
@@ -473,6 +500,15 @@ public sealed class DryRunEngine(
     // JSON's absolute worst case is 6 UTF-8 bytes per UTF-16 code unit (\uXXXX, incl. surrogates),
     // plus the surrounding quotes — a true upper bound regardless of escaping or non-ASCII content.
     private static long StringUpperBound(string? value) => value is null ? 0 : (long)value.Length * 6 + 2;
+
+    private static long DestinationUpperBoundBytes(DryRunDestinationEntry entry)
+    {
+        long bytes = TargetStructuralBytes;
+        bytes += StringUpperBound(entry.TargetPath);
+        bytes += StringUpperBound(entry.TargetRoot);
+        bytes += StringUpperBound(entry.Detail);
+        return bytes;
+    }
 
     private async Task<DryRunFileResult?> EvaluateFileAsync(
         Profile profile,
@@ -545,6 +581,7 @@ public sealed class DryRunEngine(
                 targetActions.Add(new DryRunTargetAction
                 {
                     TargetPath = prospective,
+                    TargetRoot = target.Path,
                     Kind = DryRunTargetKind.Unknown,
                     Detail = "requires transform",
                 });
@@ -555,7 +592,9 @@ public sealed class DryRunEngine(
             (DryRunTargetAction action, cachedSourceHash) = await EvaluateTargetAsync(
                 profile.Policies, payload.SourcePath, metadata!, prospective, cachedSourceHash, ct)
                 .ConfigureAwait(false);
-            targetActions.Add(action);
+            // Stamp the destination root here, where profile.Targets is in scope (EvaluateTargetAsync
+            // only knows the prospective path). Powers the Destinations-view grouping/filtering.
+            targetActions.Add(action with { TargetRoot = target.Path });
             if (action.Kind != DryRunTargetKind.WouldSkipUnchanged)
                 allUnchanged = false;
         }

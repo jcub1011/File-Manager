@@ -31,9 +31,12 @@ public sealed class ProfileValidatorTests
             "PROFILE_SCHEMA_VERSION", ValidationSeverity.Error);
 
     [Fact]
-    public void Mirror_sync_mode_is_reserved() =>
-        AssertHas(Validate(TestProfiles.Valid() with { SyncMode = SyncMode.Mirror }),
-            "PROFILE_RESERVED_VALUE", ValidationSeverity.Error);
+    public void Mirror_sync_mode_is_allowed()
+    {
+        // Mirror is no longer reserved: it is selectable and fully previewed by the dry run (the
+        // executor's actual Mirror deletion is a separate follow-up, guarded at the run entry point).
+        Assert.Empty(Validate(TestProfiles.Valid() with { SyncMode = SyncMode.Mirror }));
+    }
 
     [Fact]
     public void SizeTimestamp_verification_is_reserved()

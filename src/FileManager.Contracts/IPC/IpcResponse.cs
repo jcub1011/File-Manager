@@ -16,6 +16,7 @@ namespace FileManager.Contracts.IPC;
 [JsonDerivedType(typeof(MatchingProfilesResponse), "matching")]
 [JsonDerivedType(typeof(DryRunResponse), "dry-run-report")]
 [JsonDerivedType(typeof(DryRunChunkResponse), "dry-run-chunk")]
+[JsonDerivedType(typeof(DryRunDestinationChunkResponse), "dry-run-dest-chunk")]
 [JsonDerivedType(typeof(DryRunCompleteResponse), "dry-run-complete")]
 [JsonDerivedType(typeof(RecentJobsResponse), "recent-jobs")]
 [JsonDerivedType(typeof(JobLogResponse), "job-log")]
@@ -38,6 +39,11 @@ public sealed record DryRunResponse : IpcResponse { public required DryRunReport
 /// zero or more of these, in source-path order, each well under the frame cap, then a single
 /// <see cref="DryRunCompleteResponse"/> terminator.</summary>
 public sealed record DryRunChunkResponse : IpcResponse { public required IReadOnlyList<DryRunFileResult> Files { get; init; } }
+/// <summary>One batch of destination-only entries (pre-existing Untouched files + Mirror orphans),
+/// streamed after the file chunks and before the <see cref="DryRunCompleteResponse"/> terminator.
+/// The write side is derived client-side from the file chunks' target actions, so this carries
+/// only what those can't express.</summary>
+public sealed record DryRunDestinationChunkResponse : IpcResponse { public required IReadOnlyList<DryRunDestinationEntry> Entries { get; init; } }
 /// <summary>Terminates a streamed dry-run report. GeneratedAt is stamped when the report finishes;
 /// Truncated is true only if a service-side safety bound cut the report short.</summary>
 public sealed record DryRunCompleteResponse : IpcResponse

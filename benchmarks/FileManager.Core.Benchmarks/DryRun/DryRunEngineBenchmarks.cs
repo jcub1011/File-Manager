@@ -70,10 +70,8 @@ public class DryRunEngineBenchmarks
         Profile profile = BaselineProfile(_sourceRoot, _targetRoot);
         _profileId = profile.Id;
 
-        var scanner = new SourceScanner(
-            NullLogger<SourceScanner>.Instance,
-            new FileSystemService(NullLogger<FileSystemService>.Instance),
-            TimeProvider.System);
+        var fileSystem = new FileSystemService(NullLogger<FileSystemService>.Instance);
+        var scanner = new SourceScanner(NullLogger<SourceScanner>.Instance, fileSystem, TimeProvider.System);
 
         _engine = new DryRunEngine(
             NullLogger<DryRunEngine>.Instance,
@@ -83,7 +81,8 @@ public class DryRunEngineBenchmarks
             new FileHasher(NullLogger<FileHasher>.Instance),
             new ConflictResolver(new(), new(), NullLogger<ConflictResolver>.Instance),
             new FixedSettings(),
-            TimeProvider.System);
+            TimeProvider.System,
+            new DestinationProjector(NullLogger<DestinationProjector>.Instance, fileSystem));
     }
 
     /// <summary>Automatic concurrency (the default) so the benchmark measures the engine's own

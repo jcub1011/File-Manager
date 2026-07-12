@@ -2,6 +2,7 @@ using FileManager.Contracts.DryRun;
 using FileManager.Contracts.IPC;
 using FileManager.Contracts.Primitives;
 using FileManager.Core.DryRun;
+using FileManager.Core.Jobs;
 using FileManager.Core.Profiles;
 using Microsoft.Extensions.Logging;
 using System;
@@ -19,9 +20,14 @@ namespace FileManager.Core.IPC.Handlers;
 /// cap. A profile that does not exist, or a setup/scan failure, is a single <see cref="ErrorResponse"/>
 /// frame (matching DryRunHandler's error codes).</summary>
 public sealed class DryRunStreamHandler(
-    ILogger<DryRunStreamHandler> logger, IDryRunEngine engine, IProfileCatalog catalog, TimeProvider time)
+    ILogger<DryRunStreamHandler> logger, IDryRunEngine engine, IProfileCatalog catalog, TimeProvider time,
+    DestinationProjector destinationProjector)
     : IIpcStreamingRequestHandler
 {
+    /// <summary>Destination entries per streamed frame. Entries are small (a path or two + a short
+    /// disposition) so a few thousand keep each frame well under the 16 MiB cap.</summary>
+    private const int DestinationChunkSize = 4096;
+
     /// <summary>Bound on the files a single streamed report forwards to the client, surfaced via
     /// <see cref="DryRunCompleteResponse.Truncated"/>. This is the user-visible half of the safety
     /// bound; the engine independently caps its candidate buffer at the same
@@ -44,7 +50,8 @@ public sealed class DryRunStreamHandler(
         IpcRequest request, [EnumeratorCancellation] CancellationToken ct = default)
     {
         var typed = (DryRunStreamRequest)request;
-        if (catalog.All.All(p => p.Id != typed.ProfileId))
+        var profile = catalog.All.FirstOrDefault(p => p.Id == typed.ProfileId);
+        if (profile is null)
         {
             logger.LogDebug("DryRunStream: requested profile {ProfileId} not found", typed.ProfileId);
             yield return new ErrorResponse { Code = "PROFILE_NOT_FOUND", Message = $"no profile with id {typed.ProfileId}" };
@@ -53,6 +60,10 @@ public sealed class DryRunStreamHandler(
 
         int emitted = 0;
         bool truncated = false;
+        // Accumulate only the (small) set of destination paths a source writes to as chunks stream
+        // by — NOT the file objects — so the destination sweep below can identify orphans without
+        // retaining the whole report in memory.
+        HashSet<NormalizedPath> survivors = [];
         await foreach (Result<IReadOnlyList<DryRunFileResult>, string> chunk in
             engine.SimulateStreamAsync(typed.ProfileId, typed.ScopePath, ct).ConfigureAwait(false))
         {
@@ -63,6 +74,7 @@ public sealed class DryRunStreamHandler(
             }
             chunk.TryGetValue(out IReadOnlyList<DryRunFileResult>? files);
             yield return new DryRunChunkResponse { Files = files! };
+            DestinationProjector.AccumulateSurvivors(survivors, files!);
 
             emitted += files!.Count;
             if (emitted >= MaxStreamedFiles)
@@ -73,6 +85,20 @@ public sealed class DryRunStreamHandler(
                 truncated = true;
                 break;
             }
+        }
+
+        // Phase 3: sweep the destination roots for pre-existing/orphan files. Suppressed when
+        // truncated (survivor set incomplete → any orphan call is untrustworthy). Chunked like the
+        // file frames so each stays under the frame cap.
+        IReadOnlyList<DryRunDestinationEntry> destinations =
+            destinationProjector.Sweep(profile, survivors, truncated, ct);
+        for (int start = 0; start < destinations.Count; start += DestinationChunkSize)
+        {
+            int count = Math.Min(DestinationChunkSize, destinations.Count - start);
+            var slice = new List<DryRunDestinationEntry>(count);
+            for (int i = 0; i < count; i++)
+                slice.Add(destinations[start + i]);
+            yield return new DryRunDestinationChunkResponse { Entries = slice };
         }
 
         yield return new DryRunCompleteResponse { GeneratedAt = time.GetUtcNow(), Truncated = truncated };
