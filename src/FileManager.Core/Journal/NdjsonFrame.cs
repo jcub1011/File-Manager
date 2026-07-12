@@ -6,8 +6,10 @@ namespace FileManager.Core.Journal;
 
 /// <summary>The `J1 &lt;crc:8-hex&gt; &lt;json&gt;\n` line framing shared by the write-ahead journal
 /// (§5.5) and the disposition audit log (§7) — both append-only, fsync'd NDJSON with a per-line
-/// checksum. .NET's System.IO.Hashing ships CRC-32 (IEEE); the doc names CRC-32C, but the exact
-/// polynomial is not load-bearing — the same function frames the write and validates the read.</summary>
+/// checksum. The checksum is CRC-32 (IEEE) via .NET's System.IO.Hashing — the exact polynomial is
+/// not load-bearing (the same function frames the write and validates the read), and CRC-32 was
+/// chosen over CRC-32C on benchmark evidence (ShortInputChecksumBenchmarks): the gap is unobservable
+/// behind the per-record fsync, and System.IO.Hashing has no Crc32C type to begin with.</summary>
 internal static class NdjsonFrame
 {
     private static ReadOnlySpan<byte> Prefix => "J1"u8;

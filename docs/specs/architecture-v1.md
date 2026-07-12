@@ -1842,11 +1842,14 @@ public sealed class JobStateMachine(JobId jobId)
 **Physical line format** (append-only NDJSON segments, §9):
 
 ```
-J1 <crc32c:8-hex> <json-payload>\n
+J1 <crc:8-hex> <json-payload>\n
 ```
 
-`J1` = format version. CRC-32C over the UTF-8 payload bytes (`System.IO.Hashing` package —
-AOT-safe; the solution's only new dependency `[flagged]`). **Torn-write handling:** the journal
+`J1` = format version. CRC-32 (IEEE) over the UTF-8 payload bytes (`System.IO.Hashing` package —
+AOT-safe; the solution's only new dependency `[flagged]`). The checksum guards against accidental
+corruption/truncation, not tampering; the exact polynomial is not load-bearing (the same function
+frames the write and validates the read), and CRC-32 was chosen over CRC-32C on benchmark evidence
+(see `ShortInputChecksumBenchmarks`) — the difference is unobservable behind the per-record fsync. **Torn-write handling:** the journal
 is fsync'd per record, so only the final line of the newest segment can be torn — a tail line
 missing `\n` or failing CRC is discarded silently (the guarded action either didn't happen or
 is resolved by recovery's filesystem probe). A CRC failure in a *non-tail* position is a

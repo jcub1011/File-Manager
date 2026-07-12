@@ -14,10 +14,10 @@ namespace FileManager.Core.Journal;
 /// before returning — that flush is the durability contract. Segments are named
 /// <c>journal-000001.ndjsonl</c> and rotate at <see cref="EngineConfig.JournalRotateAtBytes"/>.
 ///
-/// Framing per line: <c>J1 &lt;crc:8-hex&gt; &lt;json&gt;\n</c>. .NET's System.IO.Hashing ships
-/// CRC-32 (IEEE), used here as the frame checksum; the doc names CRC-32C, but the exact
-/// polynomial is not load-bearing — the same function guards write and read, giving the
-/// torn-write detection §5.5 requires.</summary>
+/// Framing per line: <c>J1 &lt;crc:8-hex&gt; &lt;json&gt;\n</c>, checksummed with CRC-32 (IEEE) via
+/// .NET's System.IO.Hashing. The exact polynomial is not load-bearing — the same function guards
+/// write and read, giving the torn-write detection §5.5 requires. See <c>NdjsonFrame</c> for the
+/// CRC-32-vs-CRC-32C rationale.</summary>
 public sealed class JobJournal : IJobJournal, IDisposable
 {
     private readonly EnginePaths _paths;

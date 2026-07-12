@@ -160,8 +160,12 @@ no watcher.
 
 ## Notable decisions & documented limitations
 
-- **CRC:** `System.IO.Hashing` ships CRC-32 (IEEE); the doc names CRC-32C. Non-load-bearing — the
-  same function frames the write and validates the read. (`NdjsonFrame`.)
+- **CRC:** the journal/audit line checksum is CRC-32 (IEEE) via `System.IO.Hashing.Crc32`
+  (`NdjsonFrame`). Non-load-bearing — the same function frames the write and validates the read.
+  Earlier drafts named CRC-32C; §5.5 is now reconciled to CRC-32. Confirmed by benchmark
+  (`ShortInputChecksumBenchmarks`): on journal-line-sized inputs CRC-32 ties or beats the
+  alternatives once the per-record fsync is accounted for, and `System.IO.Hashing` has no `Crc32C`
+  type (CRC-32C would need hand-rolled SSE4.2 intrinsics for no observable gain).
 - **Recovery disposition:** `ISourceDispositionService` gained a journal-driven overload so
   recovery's post-commit branch (§7.3 row I) reconstructs from `job-opened` rather than faking a
   `JobExecution`. Archive layout in that path falls back to flat filename placement (no profile).

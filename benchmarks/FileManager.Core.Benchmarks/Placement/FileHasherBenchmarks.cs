@@ -1,4 +1,5 @@
 using System.IO.Hashing;
+using System.Runtime.Intrinsics.X86;
 using System.Security.Cryptography;
 using BenchmarkDotNet.Attributes;
 using FileManager.Contracts.Profiles;
@@ -150,16 +151,25 @@ public class HashAlgorithmComparisonBenchmarks
     }
 }
 
-/// <summary>Backs the "leave the journal CRC-32 alone" decision: hashes short in-memory buffers the
-/// size of an NDJSON journal line with CRC-32 vs XxHash3. On tiny inputs CRC-32's hardware intrinsic
-/// is expected to match or beat xxHash (whose advantage is throughput on large data), so migrating
-/// the frame checksum would buy nothing.</summary>
+/// <summary>Picks the algorithm for the NDJSON journal/audit line checksum (§5.5 framing, `NdjsonFrame`)
+/// by measuring every realistic 32-bit-output candidate on journal-line-sized in-memory buffers. The
+/// use case is non-cryptographic corruption/truncation detection of short lines; the frame stores a
+/// 32-bit checksum (8 hex), so all candidates keep the on-disk format drop-in. The winner drives the
+/// §5.5 CRC-variant decision (resolved to CRC-32/IEEE — this suite is the evidence).
+///
+/// <para>Memory overhead has two parts. (1) <b>Per-op allocations</b> — the <c>Allocated</c> column below;
+/// all candidates use the static <c>HashTo*</c> forms and should show ~0 B/op. (2) <b>Fixed static
+/// footprint</b>, which MemoryDiagnoser does NOT capture (it is one-time, not per-op): <c>Crc32</c> and
+/// <c>Crc32C</c> carry a ~1 KiB (256-entry) lookup table in software; <c>XxHash32</c>/<c>XxHash3</c> use
+/// no table (small constant state); the <c>Crc32C_Hardware</c> path uses no table. All are tiny in
+/// absolute terms — the real decision axis is throughput (<c>Mean</c>/<c>Ratio</c>) on short inputs,
+/// where CRC-32C's large-buffer SSE4.2 advantage is not expected to materialize.</para></summary>
 [MemoryDiagnoser]
 public class ShortInputChecksumBenchmarks
 {
     private byte[] _data = null!;
 
-    [Params(64, 256, 512)]
+    [Params(64, 128, 256, 512, 1024)]
     public int SizeBytes { get; set; }
 
     [GlobalSetup]
@@ -173,8 +183,37 @@ public class ShortInputChecksumBenchmarks
     [Benchmark(Baseline = true)]
     public uint Crc32_() => Crc32.HashToUInt32(_data);
 
+    /// <summary>CRC-32C (Castagnoli) via the SSE4.2 hardware instruction — the "should we switch" candidate.
+    /// Not available as a type in System.IO.Hashing, hence hand-rolled. Returns 0 where SSE4.2 is absent
+    /// (the row is then not representative on that host).</summary>
     [Benchmark]
-    public ulong XxHash3_64() => XxHash3.HashToUInt64(_data);
+    public uint Crc32C_Hardware() => Crc32CHardware(_data);
+
+    [Benchmark]
+    public uint XxHash32_() => XxHash32.HashToUInt32(_data);
+
+    [Benchmark]
+    public uint XxHash3_trunc32() => (uint)XxHash3.HashToUInt64(_data);
+
+    /// <summary>Correct CRC-32C digest (init 0xFFFFFFFF, final xor-out) computed with the x86-64 SSE4.2
+    /// CRC32 intrinsic: 8 bytes/step via the 64-bit form, byte-wise tail. The init/final are constant-time
+    /// and do not affect the measured loop; they are included so this is a valid CRC-32C, not just a probe.</summary>
+    private static uint Crc32CHardware(ReadOnlySpan<byte> data)
+    {
+        if (!Sse42.X64.IsSupported)
+            return 0;
+
+        ulong crc = 0xFFFFFFFFul;
+        int i = 0;
+        for (; i + 8 <= data.Length; i += 8)
+            crc = Sse42.X64.Crc32(crc, BitConverter.ToUInt64(data.Slice(i, 8)));
+
+        uint crc32 = (uint)crc;
+        for (; i < data.Length; i++)
+            crc32 = Sse42.Crc32(crc32, data[i]);
+
+        return crc32 ^ 0xFFFFFFFFu;
+    }
 }
 
 /// <summary>Isolates the one tunable in <see cref="FileHasher"/>: the hard-coded 1 MiB read buffer.
