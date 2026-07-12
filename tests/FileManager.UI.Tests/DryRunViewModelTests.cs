@@ -323,39 +323,121 @@ public sealed class DryRunViewModelTests
         Assert.Equal(4, viewModel.Sources.VisibleRows.Count);
     }
 
+    // Sources nested one level under a single root, so the tree's top level is the sub-folder (not
+    // the drive) and that node rolls up the counts beneath it.
+    private static DryRunReport NestedSourcesReport(Guid profileId) => Report(profileId,
+        sourceFiles:
+        [
+            Pf(@"C:\proj\sub\one.txt", @"C:\proj"),
+            Pf(@"C:\proj\sub\two.tmp", @"C:\proj"),
+            Pf(@"C:\proj\sub\three.txt", @"C:\proj"),
+        ],
+        sourceOps:
+        [
+            SrcOp(0, @"C:\proj\sub\one.txt", @"C:\proj", OperationKind.Processed, OnSuccessAction.KeepSource),
+            SrcOp(1, @"C:\proj\sub\two.tmp", @"C:\proj", OperationKind.SkippedByFilter, detail: "exclude *.tmp"),
+            SrcOp(2, @"C:\proj\sub\three.txt", @"C:\proj", OperationKind.Processed, OnSuccessAction.MoveToTrash),
+        ],
+        destinationFiles: [],
+        destinationOps: []);
+
     [Fact]
-    public async Task Sources_tree_rolls_up_untouched_processed_deleted_pills()
+    public async Task Sources_tree_starts_at_the_common_root_and_rolls_up_pills()
     {
         var (viewModel, gateway) = NewViewModel();
-        gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value);
+        gateway.DryRunResult = NestedSourcesReport(viewModel.ProfileId!.Value);
         await viewModel.RunAsync(CancellationToken.None);
 
         viewModel.Sources.ShowTree = true;
 
-        DryRunTreeNode root = Assert.Single(viewModel.Sources.Tree);
-        Assert.Equal("C:", root.Name);
-        Assert.True(root.IsDirectory);
-        Assert.True(root.IsExpanded);
-        var texts = root.Pills.Select(p => p.Text).ToList();
-        Assert.Contains("2 untouched", texts);
+        // Top level is "sub" (under C:\proj), not the "C:" drive — no click-through.
+        DryRunTreeNode sub = Assert.Single(viewModel.Sources.Tree);
+        Assert.Equal("sub", sub.Name);
+        Assert.True(sub.IsDirectory);
+        Assert.True(sub.IsExpanded);
+        Assert.Equal(@"C:\proj\sub", sub.FullPath);   // FullPath stays absolute for the tooltip
+        var texts = sub.Pills.Select(p => p.Text).ToList();
+        Assert.Contains("1 untouched", texts);
         Assert.Contains("2 processed", texts);
         Assert.Contains("1 deleted", texts);
     }
 
+    // Destinations nested one level under a single target root.
+    private static DryRunReport NestedDestinationsReport(Guid profileId) => Report(profileId,
+        sourceFiles:
+        [
+            Pf(@"C:\in\fresh.txt", @"C:\in"),
+            Pf(@"C:\in\clob.txt", @"C:\in"),
+        ],
+        sourceOps:
+        [
+            SrcOp(0, @"C:\in\fresh.txt", @"C:\in", OperationKind.Processed, OnSuccessAction.KeepSource),
+            SrcOp(1, @"C:\in\clob.txt", @"C:\in", OperationKind.Processed, OnSuccessAction.KeepSource),
+        ],
+        destinationFiles: [Pf(@"C:\out\sub\clob.txt", @"C:\out"), Pf(@"C:\out\sub\keep.txt", @"C:\out")],
+        destinationOps:
+        [
+            DstOp(OperationKind.New, @"C:\out\sub\fresh.txt", @"C:\out", sourceIndex: 0),
+            DstOp(OperationKind.Overwrite, @"C:\out\sub\clob.txt", @"C:\out", sourceIndex: 1, subjectIndex: 0),
+            DstOp(OperationKind.Untouched, @"C:\out\sub\keep.txt", @"C:\out", subjectIndex: 1),
+        ]);
+
     [Fact]
-    public async Task Destinations_tree_rolls_up_new_overwritten_untouched_pills()
+    public async Task Destinations_tree_starts_at_the_common_root_and_rolls_up_pills()
     {
         var (viewModel, gateway) = NewViewModel();
-        gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value);
+        gateway.DryRunResult = NestedDestinationsReport(viewModel.ProfileId!.Value);
         await viewModel.RunAsync(CancellationToken.None);
 
         viewModel.Destinations.ShowTree = true;
 
-        DryRunTreeNode root = Assert.Single(viewModel.Destinations.Tree);
-        var texts = root.Pills.Select(p => p.Text).ToList();
-        Assert.Contains("2 new", texts);
+        DryRunTreeNode sub = Assert.Single(viewModel.Destinations.Tree);
+        Assert.Equal("sub", sub.Name);
+        Assert.Equal(@"C:\out\sub", sub.FullPath);
+        var texts = sub.Pills.Select(p => p.Text).ToList();
+        Assert.Contains("1 new", texts);
         Assert.Contains("1 overwritten", texts);
-        Assert.Contains("2 untouched", texts);
+        Assert.Contains("1 untouched", texts);
+    }
+
+    [Fact]
+    public async Task Common_root_is_the_single_source_directory()
+    {
+        var (viewModel, gateway) = NewViewModel();
+        gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value);   // all under C:\s → C:\t/C:\t2
+        await viewModel.RunAsync(CancellationToken.None);
+
+        Assert.Equal(@"C:\s", viewModel.Sources.CommonRoot);
+        Assert.Contains("Relative to", viewModel.Sources.CommonRootDisplay);
+        Assert.Equal(@"C:\", viewModel.Destinations.CommonRoot);   // C:\t and C:\t2 share only the drive
+    }
+
+    [Fact]
+    public async Task Common_root_is_null_and_paths_stay_absolute_when_sources_span_drives()
+    {
+        var (viewModel, gateway) = NewViewModel();
+        gateway.DryRunResult = WritesReport(viewModel.ProfileId!.Value,
+            (@"C:\a\one.txt", @"C:\a", @"E:\out\one.txt", @"E:\out"),
+            (@"D:\b\two.txt", @"D:\b", @"E:\out\two.txt", @"E:\out"));
+        await viewModel.RunAsync(CancellationToken.None);
+
+        Assert.Null(viewModel.Sources.CommonRoot);
+        Assert.Contains("Multiple drives", viewModel.Sources.CommonRootDisplay);
+        // With no common root the parent display is the absolute directory.
+        DryRunFileRow row = viewModel.Sources.VisibleRows.First(r => r.SourcePath == @"C:\a\one.txt");
+        Assert.Equal(@"C:\a\", row.ParentDisplay);
+    }
+
+    [Fact]
+    public async Task Rows_carry_a_parent_display_relative_to_the_common_root()
+    {
+        var (viewModel, gateway) = NewViewModel();
+        gateway.DryRunResult = NestedSourcesReport(viewModel.ProfileId!.Value);
+        await viewModel.RunAsync(CancellationToken.None);
+
+        DryRunFileRow row = viewModel.Sources.VisibleRows.First();
+        Assert.Equal(@"sub\", row.ParentDisplay);
+        Assert.Equal("one.txt", row.FileName);
     }
 
     [Fact]

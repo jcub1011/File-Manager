@@ -39,8 +39,29 @@ public sealed record DryRunFileRow(
     OperationKind Disposition,
     string? DecidingFilter,
     string? SourceDisposition,
-    IReadOnlyList<DryRunTargetRow> Targets)
+    IReadOnlyList<DryRunTargetRow> Targets,
+    string ParentDisplay = "")
 {
+    /// <summary>The file name alone (line 1 of the row); the directory sits on line 2.</summary>
+    public string FileName => System.IO.Path.GetFileName(SourcePath);
+
+    /// <summary>The single operation-kind pill shown in place of the (dropped) nested target list —
+    /// the most consequential of this file's target operations. Null when the file has no targets.</summary>
+    private OperationKind? PrimaryTargetKind =>
+        Targets.Count == 0 ? null
+        : Targets.Any(t => t.IsOverwrite) ? OperationKind.Overwrite
+        : Targets.Any(t => t.IsRename) ? OperationKind.Rename
+        : Targets.Any(t => t.IsWrite) ? OperationKind.New
+        : Targets.Any(t => t.IsSkip) ? OperationKind.SkipConflict
+        : OperationKind.Unknown;
+
+    public bool HasTargetKind => PrimaryTargetKind is not null;
+    public string PrimaryKindText => PrimaryTargetKind?.GetTitle() ?? "";
+    public bool IsPrimaryOverwrite => PrimaryTargetKind == OperationKind.Overwrite;
+    public bool IsPrimaryRename => PrimaryTargetKind == OperationKind.Rename;
+    public bool IsPrimaryWrite => PrimaryTargetKind == OperationKind.New;
+    public bool IsPrimarySkip => PrimaryTargetKind == OperationKind.SkipConflict;
+
     /// <summary>Anything other than keeping the source is destructive from the source's view.</summary>
     public bool IsSourceDisposalDestructive =>
         SourceDisposition is not null && SourceDisposition != nameof(Contracts.Profiles.OnSuccessAction.KeepSource);
@@ -87,8 +108,12 @@ public sealed record DryRunDestinationRow(
     string TargetRoot,
     string? SourceRoot,
     DestinationRowKind Kind,
-    string? Detail)
+    string? Detail,
+    string ParentDisplay = "")
 {
+    /// <summary>The file name alone (line 1 of the row); the directory sits on line 2.</summary>
+    public string FileName => System.IO.Path.GetFileName(TargetPath);
+
     public bool IsUntouched => Kind == DestinationRowKind.Untouched;
     public bool IsNew => Kind == DestinationRowKind.New;
     public bool IsOverwritten => Kind == DestinationRowKind.Overwritten;
@@ -168,30 +193,40 @@ public sealed partial class DryRunTreeNode : ObservableObject
     /// whole forest is assembled.</summary>
     public IReadOnlyList<TreePill> Pills { get; private set; } = [];
 
-    /// <summary>Builds the top-level forest (one root per drive/UNC head) from arbitrary rows. Each
-    /// leaf contributes one or more (kind, count) increments that roll up the whole ancestor chain;
-    /// pills are then rendered in <paramref name="specs"/> order for every kind with a non-zero
-    /// count. Top-level roots start expanded so the tree opens on something to see.</summary>
+    /// <summary>Builds the forest from arbitrary rows, with the path segments taken relative to
+    /// <paramref name="commonRoot"/> so the top level is the first folder the panel actually cares
+    /// about rather than the drive letter (<paramref name="commonRoot"/> null falls back to the full
+    /// path, e.g. when roots span drives). Each node's <see cref="FullPath"/> stays absolute for the
+    /// tooltip. Each leaf contributes (kind, count) increments that roll up the whole ancestor chain;
+    /// pills are rendered in <paramref name="specs"/> order for every kind with a non-zero count.
+    /// Top-level nodes start expanded so the tree opens on something to see.</summary>
     public static IReadOnlyList<DryRunTreeNode> BuildForest<T>(
         IReadOnlyList<T> rows,
         Func<T, string> pathSelector,
         Func<T, IReadOnlyList<(string Kind, int Increment)>> categorizer,
-        IReadOnlyList<TreePillSpec> specs)
+        IReadOnlyList<TreePillSpec> specs,
+        string? commonRoot = null)
     {
         List<DryRunTreeNode> roots = [];
         Dictionary<string, DryRunTreeNode> rootIndex = new(StringComparer.OrdinalIgnoreCase);
         Dictionary<DryRunTreeNode, Dictionary<string, DryRunTreeNode>> childIndex = new();
+        string? rootPrefix = string.IsNullOrEmpty(commonRoot) ? null : commonRoot.TrimEnd('\\', '/');
 
         foreach (T row in rows)
         {
             IReadOnlyList<(string Kind, int Increment)> increments = categorizer(row);
-            string[] segments = pathSelector(row).Split(Separators, StringSplitOptions.RemoveEmptyEntries);
+            string full = pathSelector(row);
+            string relative = DryRunPaths.RelativeForTree(full, commonRoot);
+            string[] segments = relative.Split(Separators, StringSplitOptions.RemoveEmptyEntries);
             if (segments.Length == 0)
                 continue;
 
+            // FullPath stays absolute: seed the running prefix with the common root when the path was
+            // taken relative to it; otherwise (fallback to the full path) start empty.
+            string prefix = ReferenceEquals(relative, full) ? "" : rootPrefix ?? "";
+
             List<DryRunTreeNode> level = roots;
             Dictionary<string, DryRunTreeNode> index = rootIndex;
-            string prefix = "";
             for (int i = 0; i < segments.Length; i++)
             {
                 string segment = segments[i];
@@ -335,15 +370,26 @@ public sealed partial class DryRunSourcesTab : ViewModelBase
     [ObservableProperty] public partial string SearchText { get; set; } = "";
     [ObservableProperty] public partial bool ShowTree { get; set; }
 
+    /// <summary>The folder every displayed source path is shown relative to (null when the sources
+    /// span drives, so full paths are shown). Surfaced to the user by <see cref="CommonRootDisplay"/>
+    /// and used to root the tree.</summary>
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(CommonRootDisplay))]
+    public partial string? CommonRoot { get; private set; }
+
+    public string CommonRootDisplay =>
+        CommonRoot is { Length: > 0 } root ? $"Relative to  {root}" : "Multiple drives — showing full paths";
+
     // Summary counts over the whole run (not the filtered view).
     [ObservableProperty] public partial int UntouchedCount { get; private set; }
     [ObservableProperty] public partial int ProcessedCount { get; private set; }
     [ObservableProperty] public partial int DeletedCount { get; private set; }
 
-    public void Load(IReadOnlyList<DryRunFileRow> rows)
+    public void Load(IReadOnlyList<DryRunFileRow> rows, string? commonRoot)
     {
         _applying = true;
         _all = rows.ToList();
+        CommonRoot = commonRoot;
         UntouchedCount = _all.Count(r => r.IsUntouched);
         ProcessedCount = _all.Count(r => r.IsProcessed);
         DeletedCount = _all.Count(r => r.IsDeleted);
@@ -366,6 +412,7 @@ public sealed partial class DryRunSourcesTab : ViewModelBase
         _visible = [];
         VisibleRows = [];
         Tree = [];
+        CommonRoot = null;
         SourceFacets = DestinationFacets = [];
         ShowSourceFacet = ShowDestinationFacet = false;
         SearchText = "";
@@ -435,7 +482,7 @@ public sealed partial class DryRunSourcesTab : ViewModelBase
         if (ShowTree) Tree = BuildTree(_visible);
     }
 
-    private static IReadOnlyList<DryRunTreeNode> BuildTree(IReadOnlyList<DryRunFileRow> rows) =>
+    private IReadOnlyList<DryRunTreeNode> BuildTree(IReadOnlyList<DryRunFileRow> rows) =>
         DryRunTreeNode.BuildForest(rows, static r => r.SourcePath, static r =>
         {
             List<(string, int)> cats = [];
@@ -443,7 +490,7 @@ public sealed partial class DryRunSourcesTab : ViewModelBase
             if (r.IsProcessed) cats.Add(("processed", 1));
             if (r.IsDeleted) cats.Add(("deleted", 1));
             return cats;
-        }, TreeSpecs);
+        }, TreeSpecs, CommonRoot);
 
     private static Dictionary<string, int> CountBy<T>(IEnumerable<T> items, Func<T, string> key)
     {
@@ -496,15 +543,25 @@ public sealed partial class DryRunDestinationsTab : ViewModelBase
     [ObservableProperty] public partial string SearchText { get; set; } = "";
     [ObservableProperty] public partial bool ShowTree { get; set; }
 
+    /// <summary>The folder every displayed destination path is shown relative to (null when the
+    /// targets span drives). See <see cref="DryRunSourcesTab.CommonRoot"/>.</summary>
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(CommonRootDisplay))]
+    public partial string? CommonRoot { get; private set; }
+
+    public string CommonRootDisplay =>
+        CommonRoot is { Length: > 0 } root ? $"Relative to  {root}" : "Multiple drives — showing full paths";
+
     [ObservableProperty] public partial int UntouchedCount { get; private set; }
     [ObservableProperty] public partial int NewCount { get; private set; }
     [ObservableProperty] public partial int OverwrittenCount { get; private set; }
     [ObservableProperty] public partial int DeletedCount { get; private set; }
 
-    public void Load(IReadOnlyList<DryRunDestinationRow> rows)
+    public void Load(IReadOnlyList<DryRunDestinationRow> rows, string? commonRoot)
     {
         _applying = true;
         _all = rows.ToList();
+        CommonRoot = commonRoot;
         UntouchedCount = _all.Count(r => r.IsUntouched);
         NewCount = _all.Count(r => r.IsNew);
         OverwrittenCount = _all.Count(r => r.IsOverwritten);
@@ -528,6 +585,7 @@ public sealed partial class DryRunDestinationsTab : ViewModelBase
         _visible = [];
         VisibleRows = [];
         Tree = [];
+        CommonRoot = null;
         SourceFacets = DestinationFacets = [];
         ShowSourceFacet = ShowDestinationFacet = false;
         SearchText = "";
@@ -596,7 +654,7 @@ public sealed partial class DryRunDestinationsTab : ViewModelBase
         if (ShowTree) Tree = BuildTree(_visible);
     }
 
-    private static IReadOnlyList<DryRunTreeNode> BuildTree(IReadOnlyList<DryRunDestinationRow> rows) =>
+    private IReadOnlyList<DryRunTreeNode> BuildTree(IReadOnlyList<DryRunDestinationRow> rows) =>
         DryRunTreeNode.BuildForest(rows, static r => r.TargetPath, static r =>
         {
             string kind = r.Kind switch
@@ -608,7 +666,7 @@ public sealed partial class DryRunDestinationsTab : ViewModelBase
                 _ => "unknown",
             };
             return new[] { (kind, 1) };
-        }, TreeSpecs);
+        }, TreeSpecs, CommonRoot);
 
     private static Dictionary<string, int> CountBy<T>(IEnumerable<T> items, Func<T, string> key)
     {
@@ -713,6 +771,14 @@ public sealed partial class DryRunViewModel : ViewModelBase
         Dictionary<int, VirtualFileOperation> sourceOpByIndex =
             report.SourceOperations.ToDictionary(o => o.SourceIndex);
 
+        // The folder every displayed path is shown relative to, per panel: the single source/target
+        // dir, else the common parent, else null (spanning drives → full paths). Distinct first so a
+        // huge scan doesn't re-walk identical roots.
+        string? sourceCommonRoot = DryRunPaths.CommonRoot(
+            report.SourceFiles.Select(f => f.Root).Distinct(StringComparer.OrdinalIgnoreCase));
+        string? destCommonRoot = DryRunPaths.CommonRoot(
+            report.DestinationOperations.Select(o => o.Root).Distinct(StringComparer.OrdinalIgnoreCase));
+
         List<DryRunFileRow> fileRows = new(report.SourceFiles.Count);
         for (int i = 0; i < report.SourceFiles.Count; i++)
         {
@@ -727,7 +793,8 @@ public sealed partial class DryRunViewModel : ViewModelBase
                 op?.Kind ?? OperationKind.Processed,
                 op?.Detail,
                 op?.SourceDisposition?.ToString(),
-                targets));
+                targets,
+                DryRunPaths.SplitForDisplay(file.Path, sourceCommonRoot).ParentDisplay));
         }
 
         // The destination "after" view maps 1:1 from the server's destination operations — no
@@ -739,7 +806,8 @@ public sealed partial class DryRunViewModel : ViewModelBase
             o.Root,
             o.SourceIndex >= 0 ? report.SourceFiles[o.SourceIndex].Root : null,
             MapDestinationKind(o.Kind),
-            o.Detail))
+            o.Detail,
+            DryRunPaths.SplitForDisplay(o.Path, destCommonRoot).ParentDisplay))
             .ToList();
 
         TotalFiles = report.SourceFiles.Count;
@@ -755,8 +823,8 @@ public sealed partial class DryRunViewModel : ViewModelBase
             ? $"Report truncated: showing the first {report.SourceFiles.Count:N0} files — the scan found more. Destination deletions are not shown for a truncated report. Use the filters to narrow the view."
             : "";
 
-        Sources.Load(fileRows);
-        Destinations.Load(destRows);
+        Sources.Load(fileRows, sourceCommonRoot);
+        Destinations.Load(destRows, destCommonRoot);
         HasReport = true;
     }
 

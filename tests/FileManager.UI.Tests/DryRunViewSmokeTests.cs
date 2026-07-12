@@ -1,4 +1,5 @@
 using Avalonia.Controls;
+using Avalonia.Threading;
 using Avalonia.VisualTree;
 using System.Linq;
 using FileManager.Contracts.DryRun;
@@ -94,9 +95,6 @@ public sealed class DryRunViewSmokeTests(HeadlessSessionFixture headless)
         return (window, view);
     }
 
-    private static void SelectTab(DryRunView view, int index) =>
-        view.GetVisualDescendants().OfType<TabControl>().Single().SelectedIndex = index;
-
     [Fact]
     public async Task Sources_list_view_loads_and_lays_out()
     {
@@ -124,10 +122,9 @@ public sealed class DryRunViewSmokeTests(HeadlessSessionFixture headless)
             DryRunViewModel vm = PopulatedViewModel();
             await vm.RunAsync(CancellationToken.None);
 
-            var (window, view) = ShowView(vm);
+            var (window, _) = ShowView(vm);   // both panels realize at once — no tab to select
             try
             {
-                SelectTab(view, 1);   // realize the Destinations tab's templates
                 Assert.NotEmpty(vm.Destinations.VisibleRows);
                 Assert.Contains(vm.Destinations.VisibleRows, r => r.IsDeleted);
             }
@@ -202,13 +199,53 @@ public sealed class DryRunViewSmokeTests(HeadlessSessionFixture headless)
             vm.RunAsync(CancellationToken.None).GetAwaiter().GetResult();
             vm.Destinations.ShowTree = true;
 
-            var (window, view) = ShowView(vm);
+            var (window, _) = ShowView(vm);
             try
             {
-                SelectTab(view, 1);
                 Assert.NotEmpty(vm.Destinations.Tree);
-                DryRunTreeNode root = vm.Destinations.Tree.First();
-                Assert.NotEmpty(root.Pills);          // rolled-up new/overwritten/untouched/deleted pills render
+                DryRunTreeNode node = vm.Destinations.Tree.First();
+                Assert.NotEmpty(node.Pills);          // rolled-up new/overwritten/untouched/deleted pills render
+            }
+            finally { window.Close(); }
+        }, CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task Panels_lay_out_side_by_side_in_a_narrow_window()
+    {
+        // A narrow window exercises the toolbar/search-box shrink and the min-width columns without clipping.
+        await headless.Session.Dispatch(async () =>
+        {
+            DryRunViewModel vm = PopulatedViewModel();
+            await vm.RunAsync(CancellationToken.None);
+
+            DryRunView view = new() { DataContext = vm };
+            Window window = new() { Width = 760, Height = 700, Content = view };
+            window.Show();
+            try
+            {
+                Assert.NotEmpty(vm.Sources.VisibleRows);
+                Assert.NotEmpty(vm.Destinations.VisibleRows);
+                Assert.NotNull(window.Content);
+            }
+            finally { window.Close(); }
+        }, CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task Resizing_relayouts_path_rows_without_reentrancy()
+    {
+        await headless.Session.Dispatch(async () =>
+        {
+            DryRunViewModel vm = PopulatedViewModel();
+            await vm.RunAsync(CancellationToken.None);
+
+            var (window, _) = ShowView(vm);
+            try
+            {
+                window.Width = 640;             // PathText must re-truncate on a second layout pass
+                Dispatcher.UIThread.RunJobs();  // completing (no hang / stack overflow) ⇒ no measure/arrange loop
+                Assert.NotNull(window.Content);
             }
             finally { window.Close(); }
         }, CancellationToken.None);
