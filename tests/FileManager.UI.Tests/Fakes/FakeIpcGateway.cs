@@ -30,7 +30,15 @@ internal sealed class FakeIpcGateway : IIpcGateway
     public Result<bool, IpcError> DeleteResult { get; set; } = true;
 
     public Result<DryRunReport, IpcError> DryRunResult { get; set; } =
-        new DryRunReport(Guid.Empty, DateTimeOffset.UnixEpoch, []);
+        new DryRunReport
+        {
+            ProfileId = Guid.Empty,
+            GeneratedAt = DateTimeOffset.UnixEpoch,
+            SourceFiles = [],
+            DestinationFiles = [],
+            SourceOperations = [],
+            DestinationOperations = [],
+        };
 
     public Result<GlobalSettings, IpcError> GetSettingsResult { get; set; } = GlobalSettings.Default;
     public Result<GlobalSettings, IpcError> SaveSettingsResult { get; set; } = GlobalSettings.Default;

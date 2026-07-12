@@ -30,21 +30,33 @@ public sealed class DryRunStreamHandlerTests
             Guid profileId, string? scopePath, CancellationToken ct = default) =>
             throw new NotSupportedException();
 
-        public async IAsyncEnumerable<Result<IReadOnlyList<DryRunFileResult>, string>> SimulateStreamAsync(
+        public async IAsyncEnumerable<Result<DryRunChunk, string>> SimulateStreamAsync(
             Guid profileId, string? scopePath, [EnumeratorCancellation] CancellationToken ct = default)
         {
             for (int emitted = 0; emitted < totalFiles;)
             {
                 int n = Math.Min(chunkSize, totalFiles - emitted);
-                List<DryRunFileResult> files = Enumerable.Range(0, n)
-                    .Select(i => new DryRunFileResult
+                int start = emitted;
+                List<PhysicalFile> files = Enumerable.Range(0, n)
+                    .Select(i => new PhysicalFile
                     {
-                        SourcePath = $@"C:\x\{emitted + i}.dat",
-                        Disposition = DryRunFileDisposition.WouldProcess,
+                        Path = $@"C:\x\{start + i}.dat",
+                        Root = @"C:\x",
+                        Length = 0,
+                        LastWritten = DateTimeOffset.UnixEpoch,
+                    })
+                    .ToList();
+                List<VirtualFileOperation> ops = Enumerable.Range(0, n)
+                    .Select(i => new VirtualFileOperation
+                    {
+                        Path = $@"C:\x\{start + i}.dat",
+                        Root = @"C:\x",
+                        Kind = OperationKind.Processed,
+                        SourceIndex = start + i,
                     })
                     .ToList();
                 emitted += n;
-                yield return Result<IReadOnlyList<DryRunFileResult>, string>.Success(files);
+                yield return Result<DryRunChunk, string>.Success(new DryRunChunk(files, [], ops, []));
                 await Task.Yield();
             }
         }
@@ -76,7 +88,7 @@ public sealed class DryRunStreamHandlerTests
 
         DryRunCompleteResponse complete = Assert.IsType<DryRunCompleteResponse>(frames[^1]);
         Assert.True(complete.Truncated);
-        int emitted = frames.OfType<DryRunChunkResponse>().Sum(c => c.Files.Count);
+        int emitted = frames.OfType<DryRunChunkResponse>().Sum(c => c.SourceFiles.Count);
         Assert.Equal(8, emitted);   // stops at the cap rather than forwarding all 100
     }
 
@@ -90,7 +102,7 @@ public sealed class DryRunStreamHandlerTests
 
         DryRunCompleteResponse complete = Assert.IsType<DryRunCompleteResponse>(frames[^1]);
         Assert.False(complete.Truncated);
-        Assert.Equal(8, frames.OfType<DryRunChunkResponse>().Sum(c => c.Files.Count));
+        Assert.Equal(8, frames.OfType<DryRunChunkResponse>().Sum(c => c.SourceFiles.Count));
     }
 
     [Fact]

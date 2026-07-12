@@ -12,9 +12,30 @@ public interface IDryRunEngine
     Task<Result<DryRunReport, string>> SimulateAsync(
         Guid profileId, string? scopePath, CancellationToken ct = default);
 
-    /// <summary>Streams the report as source-path-ordered chunks (no single-frame size ceiling). A
-    /// fatal setup/scan error is a single failure item that ends the stream; cancellation surfaces
-    /// as <see cref="OperationCanceledException"/> from the enumerator.</summary>
-    IAsyncEnumerable<Result<IReadOnlyList<DryRunFileResult>, string>> SimulateStreamAsync(
+    /// <summary>Streams the report as chunks (no single-frame size ceiling). Each chunk carries a
+    /// slice of the four report collections with <b>globally-assigned</b> indices — the consumer
+    /// appends chunks in receive order so an op's SourceIndex/SubjectIndex stays a valid position
+    /// into the fully assembled lists. A fatal setup/scan error is a single failure item that ends
+    /// the stream; cancellation surfaces as <see cref="OperationCanceledException"/> from the
+    /// enumerator. The stream carries only the per-source-file phase; the destination sweep
+    /// (orphans / untouched) is run by the handler after the file phase.</summary>
+    IAsyncEnumerable<Result<DryRunChunk, string>> SimulateStreamAsync(
         Guid profileId, string? scopePath, CancellationToken ct = default);
 }
+
+/// <summary>One streamed slice of a dry-run report. Indices in the operations are already global
+/// (positions into the fully assembled report lists), so the client simply concatenates chunks in
+/// receive order.</summary>
+public sealed record DryRunChunk(
+    IReadOnlyList<PhysicalFile> SourceFiles,
+    IReadOnlyList<PhysicalFile> DestinationFiles,
+    IReadOnlyList<VirtualFileOperation> SourceOperations,
+    IReadOnlyList<VirtualFileOperation> DestinationOperations);
+
+/// <summary>The destination sweep's output: pre-existing files under the target roots that no source
+/// writes to, each paired with its operation. <see cref="Ops"/>[i] references <see cref="Files"/>[i]
+/// (its <c>SubjectIndex</c> is <c>i</c>); a caller merging this into a larger report offsets those
+/// indices by the count of destination files already collected.</summary>
+public readonly record struct DestinationSweepResult(
+    IReadOnlyList<PhysicalFile> Files,
+    IReadOnlyList<VirtualFileOperation> Ops);

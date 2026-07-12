@@ -11,69 +11,59 @@ using System.Threading;
 
 namespace FileManager.Core.DryRun;
 
-/// <summary>Read-only (I-DRYRUN-RO) sweep of the profile's target roots that produces the
-/// destination-only entries the Destinations view can't derive from the source-oriented
-/// <see cref="DryRunFileResult.Targets"/>: pre-existing files no source writes to
-/// (<see cref="DryRunDestinationDisposition.Untouched"/>), and — under <c>SyncMode.Mirror</c> —
-/// orphans a real mirror run would delete (<see cref="DryRunDestinationDisposition.Deleted"/>).
-///
-/// The write side (New/Overwritten/Renamed) is fully present in <c>Files[].Targets</c> and derived
-/// UI-side, so it is deliberately NOT re-emitted here — this only fills the gaps a source-oriented
-/// report leaves. Uses only <see cref="IFileSystemService.EnumerateEntries"/> (single-level,
-/// non-throwing, read-only), so it mutates nothing.
+/// <summary>Read-only (I-DRYRUN-RO) sweep of the profile's target roots that discovers pre-existing
+/// files no source writes to and classifies each: left in place
+/// (<see cref="OperationKind.Untouched"/>), an orphan a real <c>SyncMode.Mirror</c> run would delete
+/// (<see cref="OperationKind.Deleted"/>), or a reparse point the sweep declines to judge
+/// (<see cref="OperationKind.Unknown"/>). The per-source-file phase already emits every destination
+/// write (New/Overwrite/Rename/Skip) as an operation, so this only fills the gaps that phase leaves.
+/// Uses only <see cref="IFileSystemService.EnumerateEntries"/> (single-level, non-throwing,
+/// read-only), so it mutates nothing.
 ///
 /// The two entry points let the caller choose how survivors are collected: <see cref="Project"/>
-/// takes the full file list (batched path, unit tests), while <see cref="AccumulateSurvivors"/> +
-/// <see cref="Sweep"/> let a streaming caller feed file chunks incrementally and retain only the
-/// (small) survivor path set rather than every file object.</summary>
+/// takes the full destination-operations list (batched path, unit tests), while
+/// <see cref="AccumulateSurvivors"/> + <see cref="Sweep"/> let a streaming caller feed operation
+/// chunks incrementally and retain only the (small) survivor path set.</summary>
 public sealed class DestinationProjector(ILogger<DestinationProjector> logger, IFileSystemService fileSystem)
 {
-    /// <summary>Adds every destination path a batch of source files accounts for to
-    /// <paramref name="survivors"/>. Safe to call repeatedly across streamed chunks.</summary>
-    public static void AccumulateSurvivors(ISet<NormalizedPath> survivors, IReadOnlyList<DryRunFileResult> files)
+    /// <summary>Adds every resulting destination path a batch of destination operations accounts for
+    /// to <paramref name="survivors"/> — so the sweep never re-reports a path a source already writes
+    /// to (or the pre-existing file a rename was routed around, which the engine emits as an explicit
+    /// Untouched op). Safe to call repeatedly across streamed chunks.</summary>
+    public static void AccumulateSurvivors(ISet<NormalizedPath> survivors, IReadOnlyList<VirtualFileOperation> destinationOperations)
     {
         ArgumentNullException.ThrowIfNull(survivors);
-        ArgumentNullException.ThrowIfNull(files);
-        foreach (DryRunFileResult file in files)
-        {
-            foreach (DryRunTargetAction target in file.Targets)
-            {
-                AddNormalized(survivors, target.TargetPath);
-                // A rename leaves the pre-existing file at TargetPath (the survivor that forced the
-                // suffix) AND writes a new file at Detail (the suffixed final path). Both are
-                // "accounted for" — without the Detail path the conflict winner would be swept up as
-                // an orphan and mis-flagged Deleted.
-                if (target.Kind == DryRunTargetKind.WouldRenameTo && target.Detail is not null)
-                    AddNormalized(survivors, target.Detail);
-            }
-        }
+        ArgumentNullException.ThrowIfNull(destinationOperations);
+        foreach (VirtualFileOperation op in destinationOperations)
+            AddNormalized(survivors, op.Path);
     }
 
-    /// <summary>Convenience for the batched path and unit tests: builds the survivor set from the
-    /// full file list, then sweeps.</summary>
-    public IReadOnlyList<DryRunDestinationEntry> Project(
-        Profile profile, IReadOnlyList<DryRunFileResult> files, bool truncated, CancellationToken ct)
+    /// <summary>Convenience for the batched path and unit tests: builds the survivor set from the full
+    /// destination-operations list, then sweeps.</summary>
+    public DestinationSweepResult Project(
+        Profile profile, IReadOnlyList<VirtualFileOperation> destinationOperations, bool truncated, CancellationToken ct)
     {
         HashSet<NormalizedPath> survivors = [];
-        AccumulateSurvivors(survivors, files);
+        AccumulateSurvivors(survivors, destinationOperations);
         return Sweep(profile, survivors, truncated, ct);
     }
 
     /// <summary>Sweeps the profile's target roots and classifies each pre-existing file not in
-    /// <paramref name="survivors"/>.</summary>
+    /// <paramref name="survivors"/>. Each returned op's <see cref="VirtualFileOperation.SubjectIndex"/>
+    /// indexes into the returned <see cref="DestinationSweepResult.Files"/> (op[i] → file[i]); a caller
+    /// merging into a larger report offsets by the destination files already collected.</summary>
     /// <param name="truncated">When the source pass was cut short, the survivor set is a prefix, so
     /// every "no source writes here" judgement is untrustworthy — a file we'd call an orphan (or
     /// Untouched) may well be written by an un-evaluated source. In that case we emit NOTHING rather
-    /// than fabricate deletions/untouched entries; the UI still shows the derived writes and surfaces
-    /// the truncation banner.</param>
-    public IReadOnlyList<DryRunDestinationEntry> Sweep(
+    /// than fabricate deletions/untouched entries.</param>
+    public DestinationSweepResult Sweep(
         Profile profile, ISet<NormalizedPath> survivors, bool truncated, CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(profile);
         ArgumentNullException.ThrowIfNull(survivors);
 
         if (truncated)
-            return [];
+            return new DestinationSweepResult([], []);
 
         // Normalize source roots once, for the target-under-source exclusion: a target root may
         // legally contain the source files (the validator only warns on overlap), and those source
@@ -85,7 +75,8 @@ public sealed class DestinationProjector(ILogger<DestinationProjector> logger, I
 
         bool mirror = profile.SyncMode == SyncMode.Mirror;
 
-        List<DryRunDestinationEntry> entries = [];
+        List<PhysicalFile> files = [];
+        List<VirtualFileOperation> ops = [];
         // Dedup across target roots that overlap (one nested under another) so a file enumerated
         // twice is reported once.
         HashSet<NormalizedPath> reported = [];
@@ -95,9 +86,9 @@ public sealed class DestinationProjector(ILogger<DestinationProjector> logger, I
                 break;
             if (!NormalizedPath.Create(target.Path).TryGetValue(out NormalizedPath targetRoot))
                 continue;
-            SweepRoot(targetRoot, survivors, sourceRoots, mirror, entries, reported, ct);
+            SweepRoot(targetRoot, survivors, sourceRoots, mirror, files, ops, reported, ct);
         }
-        return entries;
+        return new DestinationSweepResult(files, ops);
     }
 
     /// <summary>Explicit-stack DFS over a single target root, mirroring the source scanner's walk but
@@ -110,7 +101,8 @@ public sealed class DestinationProjector(ILogger<DestinationProjector> logger, I
         ISet<NormalizedPath> survivors,
         List<NormalizedPath> sourceRoots,
         bool mirror,
-        List<DryRunDestinationEntry> entries,
+        List<PhysicalFile> files,
+        List<VirtualFileOperation> ops,
         HashSet<NormalizedPath> reported,
         CancellationToken ct)
     {
@@ -160,23 +152,34 @@ public sealed class DestinationProjector(ILogger<DestinationProjector> logger, I
                 if (!NormalizedPath.Create(item.FullPath).TryGetValue(out NormalizedPath filePath))
                     continue;
                 if (survivors.Contains(filePath))
-                    continue;   // a source writes here — derived UI-side from Files[].Targets
+                    continue;   // a source writes here — already an operation from the file phase
                 if (IsUnderAnySource(filePath, sourceRoots))
                     continue;   // a source file that happens to live under a target root
                 if (!reported.Add(filePath))
                     continue;   // already reported via an overlapping target root
 
-                DryRunDestinationDisposition disposition = isReparse
-                    ? DryRunDestinationDisposition.Unknown              // can't judge a reparse point
+                OperationKind kind = isReparse
+                    ? OperationKind.Unknown              // can't judge a reparse point
                     : mirror
-                        ? DryRunDestinationDisposition.Deleted          // orphan a mirror would remove
-                        : DryRunDestinationDisposition.Untouched;       // pre-existing, left in place
+                        ? OperationKind.Deleted          // orphan a mirror would remove
+                        : OperationKind.Untouched;       // pre-existing, left in place
 
-                entries.Add(new DryRunDestinationEntry
+                int subjectIndex = files.Count;
+                files.Add(new PhysicalFile
                 {
-                    TargetPath = item.FullPath,
-                    TargetRoot = targetRoot.Value,
-                    Disposition = disposition,
+                    Path = item.FullPath,
+                    Root = targetRoot.Value,
+                    Length = item.Size,
+                    LastWritten = item.Modified,
+                    IsReparsePoint = isReparse,
+                });
+                ops.Add(new VirtualFileOperation
+                {
+                    Path = item.FullPath,
+                    Root = targetRoot.Value,
+                    Kind = kind,
+                    SourceIndex = -1,
+                    SubjectIndex = subjectIndex,
                     Detail = isReparse ? "reparse point (symlink/junction)" : null,
                 });
             }

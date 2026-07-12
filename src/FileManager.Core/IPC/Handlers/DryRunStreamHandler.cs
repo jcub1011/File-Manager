@@ -24,8 +24,8 @@ public sealed class DryRunStreamHandler(
     DestinationProjector destinationProjector)
     : IIpcStreamingRequestHandler
 {
-    /// <summary>Destination entries per streamed frame. Entries are small (a path or two + a short
-    /// disposition) so a few thousand keep each frame well under the 16 MiB cap.</summary>
+    /// <summary>Destination sweep entries per streamed frame. Each entry is small (a physical file +
+    /// its operation) so a few thousand keep each frame well under the 16 MiB cap.</summary>
     private const int DestinationChunkSize = 4096;
 
     /// <summary>Bound on the files a single streamed report forwards to the client, surfaced via
@@ -59,12 +59,16 @@ public sealed class DryRunStreamHandler(
         }
 
         int emitted = 0;
+        // Destination files seen across the file phase — the running offset applied to the sweep's
+        // SubjectIndex values so they stay global once the sweep frames are appended after the file
+        // frames (the client concatenates chunks in receive order).
+        int destinationCount = 0;
         bool truncated = false;
-        // Accumulate only the (small) set of destination paths a source writes to as chunks stream
-        // by — NOT the file objects — so the destination sweep below can identify orphans without
-        // retaining the whole report in memory.
+        // Accumulate only the (small) set of destination paths a source writes to (every destination
+        // operation's resulting path) as chunks stream by — NOT the file objects — so the destination
+        // sweep below can identify orphans without retaining the whole report in memory.
         HashSet<NormalizedPath> survivors = [];
-        await foreach (Result<IReadOnlyList<DryRunFileResult>, string> chunk in
+        await foreach (Result<DryRunChunk, string> chunk in
             engine.SimulateStreamAsync(typed.ProfileId, typed.ScopePath, ct).ConfigureAwait(false))
         {
             if (chunk.TryGetError(out string? error))
@@ -72,11 +76,18 @@ public sealed class DryRunStreamHandler(
                 yield return new ErrorResponse { Code = "DRY_RUN_FAILED", Message = error };
                 yield break;
             }
-            chunk.TryGetValue(out IReadOnlyList<DryRunFileResult>? files);
-            yield return new DryRunChunkResponse { Files = files! };
-            DestinationProjector.AccumulateSurvivors(survivors, files!);
+            chunk.TryGetValue(out DryRunChunk? slice);
+            yield return new DryRunChunkResponse
+            {
+                SourceFiles = slice!.SourceFiles,
+                DestinationFiles = slice.DestinationFiles,
+                SourceOperations = slice.SourceOperations,
+                DestinationOperations = slice.DestinationOperations,
+            };
+            DestinationProjector.AccumulateSurvivors(survivors, slice.DestinationOperations);
+            destinationCount += slice.DestinationFiles.Count;
 
-            emitted += files!.Count;
+            emitted += slice.SourceFiles.Count;
             if (emitted >= MaxStreamedFiles)
             {
                 logger.LogWarning(
@@ -88,17 +99,22 @@ public sealed class DryRunStreamHandler(
         }
 
         // Phase 3: sweep the destination roots for pre-existing/orphan files. Suppressed when
-        // truncated (survivor set incomplete → any orphan call is untrustworthy). Chunked like the
-        // file frames so each stays under the frame cap.
-        IReadOnlyList<DryRunDestinationEntry> destinations =
-            destinationProjector.Sweep(profile, survivors, truncated, ct);
-        for (int start = 0; start < destinations.Count; start += DestinationChunkSize)
+        // truncated (survivor set incomplete → any orphan call is untrustworthy). The sweep's ops
+        // reference their own files 0-based; offset both the file positions and the ops' SubjectIndex
+        // by the file-phase destination count so indices stay global. Chunked so each frame stays
+        // under the cap.
+        DestinationSweepResult sweep = destinationProjector.Sweep(profile, survivors, truncated, ct);
+        for (int start = 0; start < sweep.Files.Count; start += DestinationChunkSize)
         {
-            int count = Math.Min(DestinationChunkSize, destinations.Count - start);
-            var slice = new List<DryRunDestinationEntry>(count);
+            int count = Math.Min(DestinationChunkSize, sweep.Files.Count - start);
+            var sliceFiles = new List<PhysicalFile>(count);
+            var sliceOps = new List<VirtualFileOperation>(count);
             for (int i = 0; i < count; i++)
-                slice.Add(destinations[start + i]);
-            yield return new DryRunDestinationChunkResponse { Entries = slice };
+            {
+                sliceFiles.Add(sweep.Files[start + i]);
+                sliceOps.Add(sweep.Ops[start + i] with { SubjectIndex = destinationCount + start + i });
+            }
+            yield return new DryRunChunkResponse { DestinationFiles = sliceFiles, DestinationOperations = sliceOps };
         }
 
         yield return new DryRunCompleteResponse { GeneratedAt = time.GetUtcNow(), Truncated = truncated };

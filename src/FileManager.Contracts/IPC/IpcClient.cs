@@ -159,8 +159,12 @@ public sealed class IpcClient : IAsyncDisposable
             if (writeResult.TryGetError(out string? writeError))
                 return new IpcError("IPC_TRANSPORT", writeError);
 
-            List<DryRunFileResult> files = [];
-            List<DryRunDestinationEntry> destinations = [];
+            // Appended in receive order so the file lists' indices stay global — an op's
+            // SourceIndex/SubjectIndex is a position into the fully assembled lists.
+            List<PhysicalFile> sourceFiles = [];
+            List<PhysicalFile> destinationFiles = [];
+            List<VirtualFileOperation> sourceOperations = [];
+            List<VirtualFileOperation> destinationOperations = [];
             while (true)
             {
                 Result<byte[], string> frame = await IpcFrameCodec.ReadFrameAsync(_pipe, ct).ConfigureAwait(false);
@@ -178,14 +182,22 @@ public sealed class IpcClient : IAsyncDisposable
                 switch (response!)
                 {
                     case DryRunChunkResponse chunk:
-                        files.AddRange(chunk.Files);
-                        break;
-                    case DryRunDestinationChunkResponse destChunk:
-                        destinations.AddRange(destChunk.Entries);
+                        sourceFiles.AddRange(chunk.SourceFiles);
+                        destinationFiles.AddRange(chunk.DestinationFiles);
+                        sourceOperations.AddRange(chunk.SourceOperations);
+                        destinationOperations.AddRange(chunk.DestinationOperations);
                         break;
                     case DryRunCompleteResponse complete:
-                        return new DryRunReport(
-                            request.ProfileId, complete.GeneratedAt, files, complete.Truncated, destinations);
+                        return new DryRunReport
+                        {
+                            ProfileId = request.ProfileId,
+                            GeneratedAt = complete.GeneratedAt,
+                            SourceFiles = sourceFiles,
+                            DestinationFiles = destinationFiles,
+                            SourceOperations = sourceOperations,
+                            DestinationOperations = destinationOperations,
+                            Truncated = complete.Truncated,
+                        };
                     case ErrorResponse error:
                         return new IpcError(error.Code, error.Message);
                     default:

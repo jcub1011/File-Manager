@@ -19,15 +19,15 @@ namespace FileManager.UI.ViewModels;
 //  Row / node models shared by the two tabs (Sources, Destinations).
 // ─────────────────────────────────────────────────────────────────────────────────────────────
 
-public sealed record DryRunTargetRow(string Path, string? TargetRoot, DryRunTargetKind Kind, string? Detail)
+public sealed record DryRunTargetRow(string Path, string? TargetRoot, OperationKind Kind, string? Detail)
 {
     public string KindText => Kind.GetTitle();
 
-    public bool IsOverwrite => Kind == DryRunTargetKind.WouldOverwrite;
-    public bool IsRename => Kind == DryRunTargetKind.WouldRenameTo;
-    public bool IsWrite => Kind == DryRunTargetKind.WouldWrite;
-    public bool IsSkip => Kind is DryRunTargetKind.WouldSkipConflict or DryRunTargetKind.WouldSkipUnchanged;
-    public bool IsUnknown => Kind == DryRunTargetKind.Unknown;
+    public bool IsOverwrite => Kind == OperationKind.Overwrite;
+    public bool IsRename => Kind == OperationKind.Rename;
+    public bool IsWrite => Kind == OperationKind.New;
+    public bool IsSkip => Kind is OperationKind.SkipConflict or OperationKind.SkipUnchanged;
+    public bool IsUnknown => Kind == OperationKind.Unknown;
 }
 
 /// <summary>A source file in the Sources tab. Carries its own pills: Untouched (nothing happens to
@@ -36,7 +36,7 @@ public sealed record DryRunTargetRow(string Path, string? TargetRoot, DryRunTarg
 public sealed record DryRunFileRow(
     string SourcePath,
     string? SourceRoot,
-    DryRunFileDisposition Disposition,
+    OperationKind Disposition,
     string? DecidingFilter,
     string? SourceDisposition,
     IReadOnlyList<DryRunTargetRow> Targets)
@@ -50,9 +50,9 @@ public sealed record DryRunFileRow(
 
     public bool HasSourceDisposition => SourceDisposition is not null;
 
-    public bool IsProcessed => Disposition == DryRunFileDisposition.WouldProcess;
-    public bool IsFilterSkipped => Disposition == DryRunFileDisposition.WouldSkipFilter;
-    public bool IsUnchangedSkipped => Disposition == DryRunFileDisposition.WouldSkipUnchanged;
+    public bool IsProcessed => Disposition == OperationKind.Processed;
+    public bool IsFilterSkipped => Disposition == OperationKind.SkippedByFilter;
+    public bool IsUnchangedSkipped => Disposition == OperationKind.SkippedUnchanged;
 
     /// <summary>Untouched: nothing happens to this source file — it was filtered out or is unchanged.</summary>
     public bool IsUntouched => IsFilterSkipped || IsUnchangedSkipped;
@@ -76,9 +76,9 @@ public sealed record DryRunFileRow(
         || Targets.Any(t => t.Path.Contains(term, StringComparison.OrdinalIgnoreCase));
 }
 
-/// <summary>How a destination-side file is affected in the Destinations tab. Unlike the wire-level
-/// <see cref="DryRunDestinationDisposition"/> (which only carries the entries the engine sweeps),
-/// this adds the write-side kinds the UI derives from <see cref="DryRunFileRow.Targets"/>.</summary>
+/// <summary>How a destination-side file is affected in the Destinations tab. A display-oriented
+/// projection of the destination <see cref="OperationKind"/>s (e.g. both New and a conflict Rename
+/// present as <see cref="New"/>; the several skip/keep kinds collapse to <see cref="Untouched"/>).</summary>
 public enum DestinationRowKind { Untouched, New, Overwritten, Deleted, Unknown }
 
 /// <summary>A resulting destination file in the Destinations tab.</summary>
@@ -705,27 +705,54 @@ public sealed partial class DryRunViewModel : ViewModelBase
 
     internal void ApplyReport(DryRunReport report)
     {
-        List<DryRunFileRow> fileRows = report.Files.Select(static f => new DryRunFileRow(
-            f.SourcePath,
-            f.SourceRoot,
-            f.Disposition,
-            f.DecidingFilter,
-            f.SourceDisposition,
-            f.Targets.Select(static t => new DryRunTargetRow(t.TargetPath, t.TargetRoot, t.Kind, t.Detail)).ToList()))
+        // Destination ops grouped by the source file they carry content from (SourceIndex); the
+        // rename-around Untouched and swept orphans have SourceIndex == -1 and so attach to no source.
+        ILookup<int, VirtualFileOperation> destOpsBySource =
+            report.DestinationOperations.ToLookup(o => o.SourceIndex);
+        // One source op per source file, addressable by the file's index.
+        Dictionary<int, VirtualFileOperation> sourceOpByIndex =
+            report.SourceOperations.ToDictionary(o => o.SourceIndex);
+
+        List<DryRunFileRow> fileRows = new(report.SourceFiles.Count);
+        for (int i = 0; i < report.SourceFiles.Count; i++)
+        {
+            PhysicalFile file = report.SourceFiles[i];
+            sourceOpByIndex.TryGetValue(i, out VirtualFileOperation? op);
+            List<DryRunTargetRow> targets = destOpsBySource[i]
+                .Select(t => new DryRunTargetRow(t.Path, t.Root, t.Kind, t.Detail))
+                .ToList();
+            fileRows.Add(new DryRunFileRow(
+                file.Path,
+                file.Root,
+                op?.Kind ?? OperationKind.Processed,
+                op?.Detail,
+                op?.SourceDisposition?.ToString(),
+                targets));
+        }
+
+        // The destination "after" view maps 1:1 from the server's destination operations — no
+        // client-side reconstruction. A New/Rename op's content comes from a source file, so its
+        // SourceRoot resolves via SourceIndex; a pre-existing/orphan op has SourceIndex == -1 (→ null,
+        // HasSource == false).
+        List<DryRunDestinationRow> destRows = report.DestinationOperations.Select(o => new DryRunDestinationRow(
+            o.Path,
+            o.Root,
+            o.SourceIndex >= 0 ? report.SourceFiles[o.SourceIndex].Root : null,
+            MapDestinationKind(o.Kind),
+            o.Detail))
             .ToList();
 
-        List<DryRunDestinationRow> destRows = BuildDestinationRows(fileRows, report.Destinations ?? []);
-
-        TotalFiles = fileRows.Count;
-        OverwriteCount = fileRows.Sum(static r => r.Targets.Count(static t => t.IsOverwrite));
-        RenameCount = fileRows.Sum(static r => r.Targets.Count(static t => t.IsRename));
+        TotalFiles = report.SourceFiles.Count;
+        OverwriteCount = report.DestinationOperations.Count(static o => o.Kind == OperationKind.Overwrite);
+        RenameCount = report.DestinationOperations.Count(static o => o.Kind == OperationKind.Rename);
         DisposalCount = fileRows.Count(static r => r.IsSourceDisposalDestructive);
-        HasDestructiveActions = OverwriteCount > 0 || DisposalCount > 0 || destRows.Any(static r => r.IsDeleted);
+        HasDestructiveActions = OverwriteCount > 0 || DisposalCount > 0
+            || report.DestinationOperations.Any(static o => o.Kind == OperationKind.Deleted);
 
         GeneratedAtText = $"Generated {report.GeneratedAt.ToLocalTime():yyyy-MM-dd HH:mm:ss}";
         WasTruncated = report.Truncated;
         TruncationNotice = report.Truncated
-            ? $"Report truncated: showing the first {report.Files.Count:N0} files — the scan found more. Destination deletions are not shown for a truncated report. Use the filters to narrow the view."
+            ? $"Report truncated: showing the first {report.SourceFiles.Count:N0} files — the scan found more. Destination deletions are not shown for a truncated report. Use the filters to narrow the view."
             : "";
 
         Sources.Load(fileRows);
@@ -733,63 +760,21 @@ public sealed partial class DryRunViewModel : ViewModelBase
         HasReport = true;
     }
 
-    /// <summary>Derives the destination view's rows: the write side (New / Overwritten / Untouched)
-    /// from each source file's target actions, plus the engine's destination-only extras
-    /// (pre-existing Untouched files and Mirror-orphan Deletions). The two are disjoint by path — the
-    /// engine excludes every survivor path from the extras.</summary>
-    private static List<DryRunDestinationRow> BuildDestinationRows(
-        IReadOnlyList<DryRunFileRow> files, IReadOnlyList<DryRunDestinationEntry> extras)
+    /// <summary>Projects a destination <see cref="OperationKind"/> onto the display-oriented
+    /// <see cref="DestinationRowKind"/>. The server already split a conflict rename into a Rename op
+    /// (a new file at the suffixed path) plus an Untouched op (the kept original), so both are mapped
+    /// straight through.</summary>
+    private static DestinationRowKind MapDestinationKind(OperationKind kind) => kind switch
     {
-        List<DryRunDestinationRow> rows = [];
-        foreach (DryRunFileRow file in files)
-        {
-            foreach (DryRunTargetRow target in file.Targets)
-            {
-                string root = target.TargetRoot ?? "";
-                switch (target.Kind)
-                {
-                    case DryRunTargetKind.WouldWrite:
-                        rows.Add(new(target.Path, root, file.SourceRoot, DestinationRowKind.New, null));
-                        break;
-                    case DryRunTargetKind.WouldOverwrite:
-                        rows.Add(new(target.Path, root, file.SourceRoot, DestinationRowKind.Overwritten, target.Detail));
-                        break;
-                    case DryRunTargetKind.WouldRenameTo:
-                        // The new file lands at the suffixed path (Detail); the pre-existing file at
-                        // the original path is kept, so it's Untouched in the resulting structure.
-                        rows.Add(new(target.Detail ?? target.Path, root, file.SourceRoot, DestinationRowKind.New,
-                            "renamed to avoid a conflict"));
-                        rows.Add(new(target.Path, root, file.SourceRoot, DestinationRowKind.Untouched,
-                            "kept (an incoming file was renamed around it)"));
-                        break;
-                    case DryRunTargetKind.WouldSkipConflict:
-                        rows.Add(new(target.Path, root, file.SourceRoot, DestinationRowKind.Untouched,
-                            "existing file kept (skip)"));
-                        break;
-                    case DryRunTargetKind.WouldSkipUnchanged:
-                        rows.Add(new(target.Path, root, file.SourceRoot, DestinationRowKind.Untouched,
-                            "identical — unchanged"));
-                        break;
-                    default:
-                        rows.Add(new(target.Path, root, file.SourceRoot, DestinationRowKind.Unknown, target.Detail));
-                        break;
-                }
-            }
-        }
-
-        foreach (DryRunDestinationEntry extra in extras)
-        {
-            DestinationRowKind kind = extra.Disposition switch
-            {
-                DryRunDestinationDisposition.Untouched => DestinationRowKind.Untouched,
-                DryRunDestinationDisposition.Deleted => DestinationRowKind.Deleted,
-                _ => DestinationRowKind.Unknown,
-            };
-            rows.Add(new(extra.TargetPath, extra.TargetRoot, null, kind, extra.Detail));
-        }
-
-        return rows;
-    }
+        OperationKind.New => DestinationRowKind.New,
+        OperationKind.Overwrite => DestinationRowKind.Overwritten,
+        OperationKind.Rename => DestinationRowKind.New,
+        OperationKind.SkipConflict => DestinationRowKind.Untouched,
+        OperationKind.SkipUnchanged => DestinationRowKind.Untouched,
+        OperationKind.Untouched => DestinationRowKind.Untouched,
+        OperationKind.Deleted => DestinationRowKind.Deleted,
+        _ => DestinationRowKind.Unknown,
+    };
 
     private void ClearReport()
     {

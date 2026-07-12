@@ -16,7 +16,6 @@ namespace FileManager.Contracts.IPC;
 [JsonDerivedType(typeof(MatchingProfilesResponse), "matching")]
 [JsonDerivedType(typeof(DryRunResponse), "dry-run-report")]
 [JsonDerivedType(typeof(DryRunChunkResponse), "dry-run-chunk")]
-[JsonDerivedType(typeof(DryRunDestinationChunkResponse), "dry-run-dest-chunk")]
 [JsonDerivedType(typeof(DryRunCompleteResponse), "dry-run-complete")]
 [JsonDerivedType(typeof(RecentJobsResponse), "recent-jobs")]
 [JsonDerivedType(typeof(JobLogResponse), "job-log")]
@@ -36,14 +35,19 @@ public sealed record ValidationResponse : IpcResponse { public required IReadOnl
 public sealed record MatchingProfilesResponse : IpcResponse { public required IReadOnlyList<ProfileMatchDto> Matches { get; init; } }
 public sealed record DryRunResponse : IpcResponse { public required DryRunReport Report { get; init; } }
 /// <summary>One batch of a streamed dry-run report (see DryRunStreamRequest). The service sends
-/// zero or more of these, in source-path order, each well under the frame cap, then a single
-/// <see cref="DryRunCompleteResponse"/> terminator.</summary>
-public sealed record DryRunChunkResponse : IpcResponse { public required IReadOnlyList<DryRunFileResult> Files { get; init; } }
-/// <summary>One batch of destination-only entries (pre-existing Untouched files + Mirror orphans),
-/// streamed after the file chunks and before the <see cref="DryRunCompleteResponse"/> terminator.
-/// The write side is derived client-side from the file chunks' target actions, so this carries
-/// only what those can't express.</summary>
-public sealed record DryRunDestinationChunkResponse : IpcResponse { public required IReadOnlyList<DryRunDestinationEntry> Entries { get; init; } }
+/// zero or more of these, each well under the frame cap, then a single
+/// <see cref="DryRunCompleteResponse"/> terminator. Each carries a slice of the four report
+/// collections; the client appends them <b>in receive order</b> so the file lists' indices stay
+/// global (an op's SourceIndex/SubjectIndex is a position into the fully assembled lists). Sweep
+/// frames leave the source collections empty; their <c>SubjectIndex</c> values are already offset
+/// by the running <see cref="DestinationFiles"/> count.</summary>
+public sealed record DryRunChunkResponse : IpcResponse
+{
+    public IReadOnlyList<PhysicalFile> SourceFiles { get; init; } = [];
+    public IReadOnlyList<PhysicalFile> DestinationFiles { get; init; } = [];
+    public IReadOnlyList<VirtualFileOperation> SourceOperations { get; init; } = [];
+    public IReadOnlyList<VirtualFileOperation> DestinationOperations { get; init; } = [];
+}
 /// <summary>Terminates a streamed dry-run report. GeneratedAt is stamped when the report finishes;
 /// Truncated is true only if a service-side safety bound cut the report short.</summary>
 public sealed record DryRunCompleteResponse : IpcResponse

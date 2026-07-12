@@ -113,7 +113,7 @@ public class DryRunEngineBenchmarks
     {
         var result = await _engine.SimulateAsync(_profileId, scopePath: null);
         result.TryGetValue(out var report);
-        return report!.Files.Count;   // consume so the JIT can't elide the work
+        return report!.SourceFiles.Count;   // consume so the JIT can't elide the work
     }
 
     /// <summary>Spreads <paramref name="fileCount"/> files with real content across a balanced tree,

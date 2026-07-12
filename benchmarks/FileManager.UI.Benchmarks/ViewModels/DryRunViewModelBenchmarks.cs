@@ -1,32 +1,27 @@
 using BenchmarkDotNet.Attributes;
 using FileManager.Contracts.DryRun;
+using FileManager.Contracts.Profiles;
 using FileManager.UI.ViewModels;
 
 namespace FileManager.UI.Benchmarks.ViewModels;
 
 /// <summary>Measures <see cref="DryRunViewModel.ApplyReport"/> — the UI-thread aggregation that runs
-/// once per dry run: a projection over every report row (with a nested projection per target), a set of
-/// O(n) LINQ count passes (per-disposition counts plus Overwrite/Rename/Disposal, each with a nested
-/// per-target count), then a single merged <c>RebuildVisibleRows</c> pipeline that filters every row by
-/// disposition/destructive/source/search and sorts the survivors by path into one <c>AffectedFiles</c>
-/// list (no longer three-list bucketing). The report is built once in setup; the measured call is pure
-/// aggregation. The gateway/folder-picker are never touched by ApplyReport, so null suffices — this
-/// isolates the aggregation from IPC.</summary>
+/// once per dry run under the physical-files + operations model: it builds a <c>SourceIndex</c> lookup
+/// over the destination operations, projects every source file into a row (pairing it with its source
+/// operation and gathering its target rows from that lookup), projects every destination operation 1:1
+/// into a destination row, runs a handful of O(n) count passes for the blast-radius banner, then hands
+/// both row lists to the two tabs' <c>Load</c>. The report is built once in setup; the measured call is
+/// pure aggregation. The gateway/folder-picker are never touched by ApplyReport, so null suffices —
+/// this isolates the aggregation from IPC.</summary>
 [MemoryDiagnoser]
 public class DryRunViewModelBenchmarks
 {
     private DryRunViewModel _viewModel = null!;
     private DryRunReport _report = null!;
 
-    /// <summary>Report rows to aggregate; 50k is the engine's <c>MaxReportedFiles</c> cap.</summary>
+    /// <summary>Source files to aggregate; 50k is the engine's <c>MaxReportedFiles</c> cap.</summary>
     [Params(1_000, 10_000, 50_000)]
     public int FileCount { get; set; }
-
-    /// <summary>Exercises both branches of the merged <c>RebuildVisibleRows</c> pipeline: false keeps
-    /// every disposition ("Would process" + Filtered + Unchanged); true switches the processed view to
-    /// the destructive-only subset (filtered/unchanged rows are untouched).</summary>
-    [Params(false, true)]
-    public bool DestructiveOnly { get; set; }
 
     [GlobalSetup]
     public void Setup()
@@ -38,68 +33,103 @@ public class DryRunViewModelBenchmarks
     [Benchmark]
     public void ApplyReport() => _viewModel.ApplyReport(_report);
 
-    /// <summary>Spreads files across the three dispositions with a mix of target kinds so every
-    /// LINQ pass in ApplyReport does real work: WouldProcess rows carry two targets (one an overwrite
-    /// every few rows) and a destructive source disposition, so Overwrite/Rename/Disposal counts and
-    /// the destructive filter are all non-trivial.</summary>
+    /// <summary>Spreads files across the three source dispositions with a mix of destination operation
+    /// kinds so every projection and count pass in ApplyReport does real work: processed rows fan out to
+    /// two targets (one an overwrite/rename every few rows) and carry a destructive source disposition,
+    /// so the Overwrite/Rename/Disposal counts and the SourceIndex lookup are all non-trivial. Every
+    /// destination operation references its source file by index, exactly as the engine emits it.</summary>
     private static DryRunReport BuildReport(int fileCount)
     {
-        var files = new List<DryRunFileResult>(fileCount);
+        var sourceFiles = new List<PhysicalFile>(fileCount);
+        var sourceOps = new List<VirtualFileOperation>(fileCount);
+        var destinationFiles = new List<PhysicalFile>();
+        var destinationOps = new List<VirtualFileOperation>();
+
         for (int i = 0; i < fileCount; i++)
         {
             string source = $@"C:\src\dir-{i % 64}\file-{i}.dat";
+            sourceFiles.Add(new PhysicalFile
+            {
+                Path = source,
+                Root = @"C:\src",
+                Length = i,
+                LastWritten = DateTimeOffset.UnixEpoch,
+            });
+
             switch (i % 3)
             {
-                case 0:   // WouldProcess with targets — the rows the count passes iterate
-                    files.Add(new DryRunFileResult
+                case 0:   // Processed with two targets — the rows the count passes iterate.
+                    sourceOps.Add(new VirtualFileOperation
                     {
-                        SourcePath = source,
-                        Disposition = DryRunFileDisposition.WouldProcess,
-                        SourceDisposition = i % 6 == 0 ? "MoveToTrash" : "KeepSource",
-                        Targets =
-                        [
-                            new DryRunTargetAction
-                            {
-                                TargetPath = $@"C:\dst\file-{i}.dat",
-                                Kind = i % 4 == 0 ? DryRunTargetKind.WouldOverwrite : DryRunTargetKind.WouldWrite,
-                                Detail = "existing file",
-                            },
-                            new DryRunTargetAction
-                            {
-                                TargetPath = $@"C:\dst2\file-{i}.dat",
-                                Kind = i % 5 == 0 ? DryRunTargetKind.WouldRenameTo : DryRunTargetKind.WouldWrite,
-                                Detail = i % 5 == 0 ? $@"C:\dst2\file-{i} (1).dat" : null,
-                            },
-                        ],
+                        Path = source,
+                        Root = @"C:\src",
+                        Kind = OperationKind.Processed,
+                        SourceIndex = i,
+                        SourceDisposition = i % 6 == 0 ? OnSuccessAction.MoveToTrash : OnSuccessAction.KeepSource,
                     });
+
+                    string firstTarget = $@"C:\dst\file-{i}.dat";
+                    if (i % 4 == 0)
+                    {
+                        int subject = destinationFiles.Count;
+                        destinationFiles.Add(new PhysicalFile { Path = firstTarget, Root = @"C:\dst", Length = i, LastWritten = DateTimeOffset.UnixEpoch });
+                        destinationOps.Add(new VirtualFileOperation { Path = firstTarget, Root = @"C:\dst", Kind = OperationKind.Overwrite, SourceIndex = i, SubjectIndex = subject, Detail = "existing file" });
+                    }
+                    else
+                    {
+                        destinationOps.Add(new VirtualFileOperation { Path = firstTarget, Root = @"C:\dst", Kind = OperationKind.New, SourceIndex = i });
+                    }
+
+                    if (i % 5 == 0)
+                    {
+                        // A conflict rename: the suffixed new file plus the kept-original Untouched op.
+                        string original = $@"C:\dst2\file-{i}.dat";
+                        int subject = destinationFiles.Count;
+                        destinationFiles.Add(new PhysicalFile { Path = original, Root = @"C:\dst2", Length = i, LastWritten = DateTimeOffset.UnixEpoch });
+                        destinationOps.Add(new VirtualFileOperation { Path = $@"C:\dst2\file-{i} (1).dat", Root = @"C:\dst2", Kind = OperationKind.Rename, SourceIndex = i, Detail = "renamed to avoid a conflict" });
+                        destinationOps.Add(new VirtualFileOperation { Path = original, Root = @"C:\dst2", Kind = OperationKind.Untouched, SubjectIndex = subject, Detail = "kept" });
+                    }
+                    else
+                    {
+                        destinationOps.Add(new VirtualFileOperation { Path = $@"C:\dst2\file-{i}.dat", Root = @"C:\dst2", Kind = OperationKind.New, SourceIndex = i });
+                    }
                     break;
+
                 case 1:
-                    files.Add(new DryRunFileResult
+                    sourceOps.Add(new VirtualFileOperation
                     {
-                        SourcePath = source,
-                        Disposition = DryRunFileDisposition.WouldSkipFilter,
-                        DecidingFilter = "exclude *.tmp",
+                        Path = source,
+                        Root = @"C:\src",
+                        Kind = OperationKind.SkippedByFilter,
+                        SourceIndex = i,
+                        Detail = "exclude *.tmp",
                     });
                     break;
+
                 default:
-                    files.Add(new DryRunFileResult
+                    sourceOps.Add(new VirtualFileOperation
                     {
-                        SourcePath = source,
-                        Disposition = DryRunFileDisposition.WouldSkipUnchanged,
-                        Targets =
-                        [
-                            new DryRunTargetAction
-                            {
-                                TargetPath = $@"C:\dst\file-{i}.dat",
-                                Kind = DryRunTargetKind.WouldSkipUnchanged,
-                                Detail = "identical content (SHA-256)",
-                            },
-                        ],
+                        Path = source,
+                        Root = @"C:\src",
+                        Kind = OperationKind.SkippedUnchanged,
+                        SourceIndex = i,
                     });
+                    string unchanged = $@"C:\dst\file-{i}.dat";
+                    int unchangedSubject = destinationFiles.Count;
+                    destinationFiles.Add(new PhysicalFile { Path = unchanged, Root = @"C:\dst", Length = i, LastWritten = DateTimeOffset.UnixEpoch });
+                    destinationOps.Add(new VirtualFileOperation { Path = unchanged, Root = @"C:\dst", Kind = OperationKind.SkipUnchanged, SourceIndex = i, SubjectIndex = unchangedSubject, Detail = "identical content (SHA-256)" });
                     break;
             }
         }
 
-        return new DryRunReport(Guid.NewGuid(), DateTimeOffset.UtcNow, files, Truncated: false);
+        return new DryRunReport
+        {
+            ProfileId = Guid.NewGuid(),
+            GeneratedAt = DateTimeOffset.UtcNow,
+            SourceFiles = sourceFiles,
+            DestinationFiles = destinationFiles,
+            SourceOperations = sourceOps,
+            DestinationOperations = destinationOps,
+        };
     }
 }

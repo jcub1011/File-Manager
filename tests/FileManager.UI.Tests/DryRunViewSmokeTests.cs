@@ -2,6 +2,7 @@ using Avalonia.Controls;
 using Avalonia.VisualTree;
 using System.Linq;
 using FileManager.Contracts.DryRun;
+using FileManager.Contracts.Profiles;
 using FileManager.UI.Tests.Fakes;
 using FileManager.UI.ViewModels;
 using FileManager.UI.Views;
@@ -23,32 +24,67 @@ public sealed class DryRunViewSmokeTests(HeadlessSessionFixture headless)
         DryRunViewModel vm = new(gateway, searchDebounce: TimeSpan.Zero);
         vm.SetProfile(Guid.NewGuid(), "P");
 
-        var files = new List<DryRunFileResult>();
+        var sourceFiles = new List<PhysicalFile>();
+        var sourceOps = new List<VirtualFileOperation>();
+        var destinationFiles = new List<PhysicalFile>();
+        var destinationOps = new List<VirtualFileOperation>();
         for (int i = 0; i < 200; i++)
-            files.Add(new DryRunFileResult
+        {
+            string source = $@"C:\src\dir-{i % 8}\file-{i}.dat";
+            string target = $@"D:\dst\file-{i}.dat";
+            sourceFiles.Add(Pf(source, @"C:\src"));
+            sourceOps.Add(SrcOp(i, source, @"C:\src", OperationKind.Processed,
+                i % 5 == 0 ? OnSuccessAction.MoveToTrash : OnSuccessAction.KeepSource));
+            if (i % 3 == 0)
             {
-                SourcePath = $@"C:\src\dir-{i % 8}\file-{i}.dat",
-                SourceRoot = @"C:\src",
-                Disposition = DryRunFileDisposition.WouldProcess,
-                SourceDisposition = i % 5 == 0 ? "MoveToTrash" : "KeepSource",
-                Targets =
-                [
-                    new DryRunTargetAction
-                    {
-                        TargetPath = $@"D:\dst\file-{i}.dat",
-                        TargetRoot = @"D:\dst",
-                        Kind = i % 3 == 0 ? DryRunTargetKind.WouldOverwrite : DryRunTargetKind.WouldWrite,
-                    },
-                ],
-            });
-        gateway.DryRunResult = new DryRunReport(vm.ProfileId!.Value, DateTimeOffset.UnixEpoch, files,
-            Destinations:
-            [
-                new DryRunDestinationEntry { TargetPath = @"D:\dst\preexisting.dat", TargetRoot = @"D:\dst", Disposition = DryRunDestinationDisposition.Untouched },
-                new DryRunDestinationEntry { TargetPath = @"D:\dst\orphan.dat", TargetRoot = @"D:\dst", Disposition = DryRunDestinationDisposition.Deleted },
-            ]);
+                int subject = destinationFiles.Count;
+                destinationFiles.Add(Pf(target, @"D:\dst"));
+                destinationOps.Add(DstOp(OperationKind.Overwrite, target, @"D:\dst", sourceIndex: i, subjectIndex: subject));
+            }
+            else
+            {
+                destinationOps.Add(DstOp(OperationKind.New, target, @"D:\dst", sourceIndex: i));
+            }
+        }
+        // Pre-existing untouched + a Mirror orphan (Deleted), destination-only (SourceIndex == -1).
+        int keepSubject = destinationFiles.Count;
+        destinationFiles.Add(Pf(@"D:\dst\preexisting.dat", @"D:\dst"));
+        destinationOps.Add(DstOp(OperationKind.Untouched, @"D:\dst\preexisting.dat", @"D:\dst", subjectIndex: keepSubject));
+        int orphanSubject = destinationFiles.Count;
+        destinationFiles.Add(Pf(@"D:\dst\orphan.dat", @"D:\dst"));
+        destinationOps.Add(DstOp(OperationKind.Deleted, @"D:\dst\orphan.dat", @"D:\dst", subjectIndex: orphanSubject));
+
+        gateway.DryRunResult = Report(vm.ProfileId!.Value, sourceFiles, sourceOps, destinationFiles, destinationOps);
         return vm;
     }
+
+    // New-model fixture helpers (see DryRunViewModelTests for the model shape).
+    private static PhysicalFile Pf(string path, string root) =>
+        new() { Path = path, Root = root, Length = 0, LastWritten = DateTimeOffset.UnixEpoch, IsReparsePoint = false };
+
+    private static VirtualFileOperation SrcOp(
+        int index, string path, string root, OperationKind kind, OnSuccessAction? disposition = null, string? detail = null) =>
+        new() { Path = path, Root = root, Kind = kind, SourceIndex = index, SubjectIndex = -1, SourceDisposition = disposition, Detail = detail };
+
+    private static VirtualFileOperation DstOp(
+        OperationKind kind, string path, string root, int sourceIndex = -1, int subjectIndex = -1, string? detail = null) =>
+        new() { Path = path, Root = root, Kind = kind, SourceIndex = sourceIndex, SubjectIndex = subjectIndex, Detail = detail };
+
+    private static DryRunReport Report(
+        Guid profileId,
+        IReadOnlyList<PhysicalFile> sourceFiles,
+        IReadOnlyList<VirtualFileOperation> sourceOps,
+        IReadOnlyList<PhysicalFile> destinationFiles,
+        IReadOnlyList<VirtualFileOperation> destinationOps) =>
+        new()
+        {
+            ProfileId = profileId,
+            GeneratedAt = DateTimeOffset.UnixEpoch,
+            SourceFiles = sourceFiles,
+            DestinationFiles = destinationFiles,
+            SourceOperations = sourceOps,
+            DestinationOperations = destinationOps,
+        };
 
     private static (Window Window, DryRunView View) ShowView(DryRunViewModel vm)
     {
@@ -108,17 +144,18 @@ public sealed class DryRunViewSmokeTests(HeadlessSessionFixture headless)
             DryRunViewModel vm = new(gateway, searchDebounce: TimeSpan.Zero);
             vm.SetProfile(Guid.NewGuid(), "P");
 
-            var files = new List<DryRunFileResult>();
+            var sourceFiles = new List<PhysicalFile>();
+            var sourceOps = new List<VirtualFileOperation>();
+            var destinationOps = new List<VirtualFileOperation>();
             for (int i = 0; i < 40; i++)
-                files.Add(new DryRunFileResult
-                {
-                    SourcePath = $@"C:\src-{i % 2}\file-{i}.dat",
-                    SourceRoot = $@"C:\src-{i % 2}",
-                    Disposition = DryRunFileDisposition.WouldProcess,
-                    SourceDisposition = "KeepSource",
-                    Targets = [new DryRunTargetAction { TargetPath = $@"D:\dst\file-{i}.dat", TargetRoot = @"D:\dst", Kind = DryRunTargetKind.WouldWrite }],
-                });
-            gateway.DryRunResult = new DryRunReport(vm.ProfileId!.Value, DateTimeOffset.UnixEpoch, files);
+            {
+                string source = $@"C:\src-{i % 2}\file-{i}.dat";
+                string root = $@"C:\src-{i % 2}";
+                sourceFiles.Add(Pf(source, root));
+                sourceOps.Add(SrcOp(i, source, root, OperationKind.Processed, OnSuccessAction.KeepSource));
+                destinationOps.Add(DstOp(OperationKind.New, $@"D:\dst\file-{i}.dat", @"D:\dst", sourceIndex: i));
+            }
+            gateway.DryRunResult = Report(vm.ProfileId!.Value, sourceFiles, sourceOps, [], destinationOps);
             await vm.RunAsync(CancellationToken.None);
 
             var (window, _) = ShowView(vm);

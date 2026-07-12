@@ -40,24 +40,30 @@ public sealed class DestinationProjectorTests : IDisposable
         return full;
     }
 
-    private static DryRunFileResult WriteTo(string targetPath, DryRunTargetKind kind = DryRunTargetKind.WouldWrite, string? detail = null) => new()
+    // A destination operation naming a resulting path — the sweep treats every op's Path as a
+    // survivor, so its Kind is irrelevant to the survivor logic.
+    private static VirtualFileOperation WriteTo(string targetPath, OperationKind kind = OperationKind.New) => new()
     {
-        SourcePath = @"C:\ignored\f.txt",
-        Disposition = DryRunFileDisposition.WouldProcess,
-        Targets = [new DryRunTargetAction { TargetPath = targetPath, Kind = kind, Detail = detail }],
+        Path = targetPath,
+        Root = @"C:\ignored",
+        Kind = kind,
+        SourceIndex = 0,
     };
 
-    private IReadOnlyList<DryRunDestinationEntry> Project(Profile profile, params DryRunFileResult[] files) =>
-        NewProjector().Project(profile, files, truncated: false, CancellationToken.None);
+    private DestinationSweepResult Project(Profile profile, params VirtualFileOperation[] destinationOps) =>
+        NewProjector().Project(profile, destinationOps, truncated: false, CancellationToken.None);
 
     [Fact]
     public void Mirror_orphan_is_deleted()
     {
         string orphan = TargetFile("orphan.txt");
 
-        DryRunDestinationEntry entry = Assert.Single(Project(Mirror()));
-        Assert.Equal(orphan, entry.TargetPath);
-        Assert.Equal(DryRunDestinationDisposition.Deleted, entry.Disposition);
+        DestinationSweepResult result = Project(Mirror());
+        VirtualFileOperation op = Assert.Single(result.Ops);
+        Assert.Equal(orphan, op.Path);
+        Assert.Equal(OperationKind.Deleted, op.Kind);
+        // The op references its own swept physical file.
+        Assert.Equal(orphan, result.Files[op.SubjectIndex].Path);
     }
 
     [Fact]
@@ -65,8 +71,8 @@ public sealed class DestinationProjectorTests : IDisposable
     {
         TargetFile("keep.txt");
 
-        DryRunDestinationEntry entry = Assert.Single(Project(Additive()));
-        Assert.Equal(DryRunDestinationDisposition.Untouched, entry.Disposition);
+        VirtualFileOperation op = Assert.Single(Project(Additive()).Ops);
+        Assert.Equal(OperationKind.Untouched, op.Kind);
     }
 
     [Fact]
@@ -74,7 +80,7 @@ public sealed class DestinationProjectorTests : IDisposable
     {
         string keep = TargetFile("keep.txt");
 
-        Assert.Empty(Project(Mirror(), WriteTo(keep)));
+        Assert.Empty(Project(Mirror(), WriteTo(keep)).Ops);
     }
 
     [Fact]
@@ -83,8 +89,11 @@ public sealed class DestinationProjectorTests : IDisposable
         string original = TargetFile("dup.txt");
         string suffixed = TargetFile("dup (1).txt");   // the renamed-to output would land here
 
-        // WouldRenameTo: original (the survivor that forced the suffix) + Detail (the new path).
-        Assert.Empty(Project(Mirror(), WriteTo(original, DryRunTargetKind.WouldRenameTo, detail: suffixed)));
+        // A rename emits two destination ops — Rename at the suffixed path and Untouched at the kept
+        // original — so both paths are survivors and neither is swept as an orphan.
+        Assert.Empty(Project(Mirror(),
+            WriteTo(suffixed, OperationKind.Rename),
+            WriteTo(original, OperationKind.Untouched)).Ops);
     }
 
     [Fact]
@@ -98,8 +107,8 @@ public sealed class DestinationProjectorTests : IDisposable
         File.WriteAllText(Path.Combine(nestedSource, "data.txt"), "x");   // a source file living under the target
         string realOrphan = TargetFile("other.txt");
 
-        DryRunDestinationEntry entry = Assert.Single(Project(profile));
-        Assert.Equal(realOrphan, entry.TargetPath);   // the source file is not previewed as a deletion
+        VirtualFileOperation op = Assert.Single(Project(profile).Ops);
+        Assert.Equal(realOrphan, op.Path);   // the source file is not previewed as a deletion
     }
 
     [Fact]
@@ -110,8 +119,8 @@ public sealed class DestinationProjectorTests : IDisposable
         TargetFile("foo.fmtmp-123");
         string real = TargetFile("real.txt");
 
-        DryRunDestinationEntry entry = Assert.Single(Project(Mirror()));
-        Assert.Equal(real, entry.TargetPath);
+        VirtualFileOperation op = Assert.Single(Project(Mirror()).Ops);
+        Assert.Equal(real, op.Path);
     }
 
     [Fact]
@@ -120,9 +129,9 @@ public sealed class DestinationProjectorTests : IDisposable
         string deep = TargetFile(Path.Combine("a", "b", "c", "deep.txt"));
         Profile profile = Mirror() with { Filters = new FilterSet { MaxDepth = 1 } };   // a source-side limit
 
-        DryRunDestinationEntry entry = Assert.Single(Project(profile));
-        Assert.Equal(deep, entry.TargetPath);
-        Assert.Equal(DryRunDestinationDisposition.Deleted, entry.Disposition);
+        VirtualFileOperation op = Assert.Single(Project(profile).Ops);
+        Assert.Equal(deep, op.Path);
+        Assert.Equal(OperationKind.Deleted, op.Kind);
     }
 
     [Fact]
@@ -130,7 +139,7 @@ public sealed class DestinationProjectorTests : IDisposable
     {
         TargetFile("orphan.txt");
 
-        Assert.Empty(NewProjector().Project(Mirror(), [], truncated: true, CancellationToken.None));
+        Assert.Empty(NewProjector().Project(Mirror(), [], truncated: true, CancellationToken.None).Ops);
     }
 
     [Fact]
@@ -142,7 +151,7 @@ public sealed class DestinationProjectorTests : IDisposable
         string onDisk = TargetFile("Keep.txt");
         string writtenAs = Path.Combine(_target, "keep.txt");   // different case
 
-        Assert.Empty(Project(Mirror(), WriteTo(writtenAs)));
+        Assert.Empty(Project(Mirror(), WriteTo(writtenAs)).Ops);
         Assert.NotEqual(onDisk, writtenAs);   // sanity: the strings really differ in case
     }
 
@@ -150,6 +159,6 @@ public sealed class DestinationProjectorTests : IDisposable
     public void Missing_target_root_yields_no_entries_and_does_not_throw()
     {
         Profile profile = Mirror() with { Targets = [new TargetConfig { Path = Path.Combine(_root, "does-not-exist") }] };
-        Assert.Empty(Project(profile));
+        Assert.Empty(Project(profile).Ops);
     }
 }

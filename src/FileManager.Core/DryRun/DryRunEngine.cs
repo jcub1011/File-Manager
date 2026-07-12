@@ -24,9 +24,12 @@ using System.Threading.Tasks;
 namespace FileManager.Core.DryRun;
 
 /// <summary>Spec §8: simulates a full run with ZERO filesystem mutation (I-DRYRUN-RO) — every
-/// collaborator here is read-only (scan, stat, hash, existence probes). Reports matches with
-/// deciding filters, unchanged skips, per-target write/overwrite/rename outcomes, and the
-/// source disposition that would occur.</summary>
+/// collaborator here is read-only (scan, stat, hash, existence probes). Produces a bipartite plan
+/// graph: the source/destination <see cref="PhysicalFile"/> lists are the ground-truth nodes, and
+/// the source/destination <see cref="VirtualFileOperation"/> lists are the plan, referencing files
+/// by integer index. Index assignment is deterministic (candidates are sorted by source path, then
+/// bundles are appended in that order), so a truncated report is a valid prefix and the streamed and
+/// batched reports agree.</summary>
 public sealed class DryRunEngine(
     ILogger<DryRunEngine> logger,
     IProfileCatalog catalog,
@@ -39,16 +42,16 @@ public sealed class DryRunEngine(
     DestinationProjector destinationProjector) : IDryRunEngine
 {
     /// <summary>Report size guards: a serialized report must fit an IPC frame (16 MiB cap, §3.1).
-    /// The byte budget is the guarantee — each result is measured as serialized and the report
+    /// The byte budget is the guarantee — each record is measured as serialized and the report
     /// truncates when the running total would exceed it (16 MiB minus the response envelope and
     /// headroom for future additive fields). The file-count cap is a secondary bound on UI
-    /// row-building work. A paged/streamed report is a future additive Contracts change.</summary>
+    /// row-building work.</summary>
     internal const int MaxReportBytes = 12 * 1024 * 1024;
     internal const int MaxReportedFiles = 50_000;
 
     /// <summary>Streaming (<see cref="SimulateStreamAsync"/>) has no report ceiling — the report is
     /// split across many frames, so a chunk only needs to sit comfortably under the 16 MiB frame
-    /// cap. A traditional ~1 MiB per chunk (bounded by the cheap <see cref="UpperBoundBytes"/>
+    /// cap. A traditional ~1 MiB per chunk (bounded by the cheap <see cref="UpperBoundBytes(PhysicalFile)"/>
     /// estimate, so the true serialized size is always smaller) keeps per-message memory low and
     /// leaves generous headroom under the cap. On a local pipe the extra frames cost nothing.</summary>
     internal const int ChunkByteThreshold = 1 * 1024 * 1024;
@@ -58,7 +61,7 @@ public sealed class DryRunEngine(
     /// sort by source path, so a pathological scan of millions of files would otherwise buffer — and
     /// then hash — all of them before the first chunk. This bound caps the buffered candidates
     /// (and therefore the evaluation work), the same way <see cref="MaxReportedFiles"/> bounds the
-    /// batched path; it is set far above the old ~50k cap. Hitting it marks the report truncated.</summary>
+    /// batched path. Hitting it marks the report truncated.</summary>
     internal const int MaxStreamedFiles = 500_000;
 
     /// <summary>Candidates are evaluated in batches so the byte budget can halt evaluation early
@@ -103,9 +106,9 @@ public sealed class DryRunEngine(
         bool hasTransformers = profile.Transformers is { Count: > 0 };
         bool truncated = false;
 
-        // Phase 1: drain the scan into a bounded candidate list. Fault handling matches the old
-        // inline loop — a fatal fault aborts the whole run; warnings are logged and skipped. The
-        // file cap bounds both the buffered payloads and the parallel evaluation work below.
+        // Phase 1: drain the scan into a bounded candidate list. A fatal fault aborts the whole run;
+        // warnings are logged and skipped. The file cap bounds both the buffered payloads and the
+        // parallel evaluation work below.
         List<Payload> candidates = [];
         foreach (var scanned in scanner.Scan(profile, TriggerKind.Cli, scopePath))
         {
@@ -120,8 +123,6 @@ public sealed class DryRunEngine(
                         profileId, fault.Message);
                     return $"scan failed: {fault.Message}";
                 }
-                // Warnings are logged, not reported — the frozen DryRunReport has no warnings
-                // field; adding one later is an additive Contracts change.
                 logger.LogWarning("Dry-run enumeration warning: {Message}", fault.Message);
                 continue;
             }
@@ -137,25 +138,23 @@ public sealed class DryRunEngine(
         }
 
         // Phase 2: fix the output order up front by sorting candidates by source path, then evaluate
-        // them in that order. Truncation keeps a path-ordered *prefix* (SourcePath == payload path,
-        // and filtered candidates evaluate to null and never count), so once the byte budget fills,
-        // every remaining candidate sorts after the last kept file and would be truncated anyway —
-        // evaluating it (including hashing its contents) would be wasted I/O, so we stop. Evaluating
-        // in bounded batches keeps the concurrency of an all-at-once pass while capping the work
-        // wasted past the truncation point to at most one batch. Every collaborator is read-only
-        // (I-DRYRUN-RO) and stateless, so the parallel evaluation is race-free; positional writes
-        // into the batch array make the kept order deterministic regardless of completion order.
+        // them in that order. A source file's index is its sorted position, so truncation keeps a
+        // path-ordered *prefix* and no retained operation references a dropped file. Evaluating in
+        // bounded batches keeps the concurrency of an all-at-once pass while capping the work wasted
+        // past the truncation point to at most one batch. Every collaborator is read-only
+        // (I-DRYRUN-RO) and stateless, so the parallel evaluation is race-free; positional writes into
+        // the batch array make the append order deterministic regardless of completion order.
         candidates.Sort(static (a, b) =>
             string.Compare(a.SourcePath, b.SourcePath, StringComparison.OrdinalIgnoreCase));
 
         int maxConcurrency = ResolveWorkers(profile);
-        using ByteBudget budget = new(ReportByteBudget);
+        using ReportBuilder builder = new(ReportByteBudget);
         try
         {
-            for (int start = 0; start < candidates.Count && !budget.Truncated; start += EvaluationBatchSize)
+            for (int start = 0; start < candidates.Count && !builder.Truncated; start += EvaluationBatchSize)
             {
                 int count = Math.Min(EvaluationBatchSize, candidates.Count - start);
-                DryRunFileResult?[] batch = new DryRunFileResult?[count];
+                FileEvaluation?[] batch = new FileEvaluation?[count];
                 await Parallel.ForEachAsync(
                     Enumerable.Range(0, count),
                     new ParallelOptions { MaxDegreeOfParallelism = maxConcurrency, CancellationToken = ct },
@@ -166,11 +165,11 @@ public sealed class DryRunEngine(
                             .ConfigureAwait(false);
                     }).ConfigureAwait(false);
 
-                foreach (DryRunFileResult? result in batch)
+                foreach (FileEvaluation? evaluation in batch)
                 {
-                    if (result is null)
+                    if (evaluation is null)
                         continue;
-                    if (!budget.TryAdd(result))
+                    if (!builder.TryAddBundle(evaluation))
                         break;      // budget full — Truncated is set, so the outer loop also stops
                 }
             }
@@ -182,58 +181,61 @@ public sealed class DryRunEngine(
             return Result<DryRunReport, string>.Canceled();
         }
 
-        List<DryRunFileResult> files = budget.Kept;
-        truncated |= budget.Truncated;
-        long reportBytes = budget.ReportBytes;
+        truncated |= builder.Truncated;
 
         if (truncated)
             logger.LogWarning(
-                "Dry-run report for profile {ProfileId} truncated at {FileCount} files / ~{Bytes:N0} bytes " +
+                "Dry-run report for profile {ProfileId} truncated at {FileCount} source files / ~{Bytes:N0} bytes " +
                 "(caps: {ByteCap:N0} bytes, {FileCap} files) — the scan found more",
-                profileId, files.Count, reportBytes, ReportByteBudget, MaxReportedFiles);
+                profileId, builder.SourceFiles.Count, builder.ReportBytes, ReportByteBudget, MaxReportedFiles);
 
-        // Phase 3: destination-only entries (preexisting-Untouched + Mirror orphans). Suppressed
+        // Phase 3: destination-only entries (pre-existing Untouched + Mirror orphans). Suppressed
         // entirely when the source pass truncated (the survivor set would be incomplete, so any
-        // orphan classification is untrustworthy). What survives must still fit the frame, so the
-        // entries are appended only while their upper-bound size keeps the report under the budget;
-        // an overflow drops the rest and marks the report truncated (same guarantee as Files).
-        IReadOnlyList<DryRunDestinationEntry> allDestinations =
-            destinationProjector.Project(profile, files, truncated, ct);
-        List<DryRunDestinationEntry> destinations = [];
-        foreach (DryRunDestinationEntry entry in allDestinations)
+        // orphan classification is untrustworthy). Appended only while their size keeps the report
+        // under budget; an overflow drops the rest and marks the report truncated.
+        DestinationSweepResult sweep =
+            destinationProjector.Project(profile, builder.DestinationOperations, truncated, ct);
+        for (int i = 0; i < sweep.Files.Count; i++)
         {
-            long size = DestinationUpperBoundBytes(entry);
-            if (reportBytes + size > ReportByteBudget)
+            if (!builder.TryAddSweepEntry(sweep.Files[i], sweep.Ops[i]))
             {
                 truncated = true;
                 logger.LogWarning(
-                    "Dry-run report for profile {ProfileId} truncated its destination entries at {Count} " +
+                    "Dry-run report for profile {ProfileId} truncated its destination entries " +
                     "(byte cap {ByteCap:N0}) — more pre-existing/orphan files exist",
-                    profileId, destinations.Count, ReportByteBudget);
+                    profileId, ReportByteBudget);
                 break;
             }
-            reportBytes += size;
-            destinations.Add(entry);
         }
 
         DateTimeOffset completedAt = time.GetUtcNow();
         logger.LogInformation(
-            "Dry-run completed for profile {ProfileId}: {FileCount} files, {DestCount} destination entries " +
+            "Dry-run completed for profile {ProfileId}: {SourceCount} source files, {DestCount} destination files " +
             "in {ElapsedMs}ms{Truncated}",
-            profileId, files.Count, destinations.Count, (completedAt - startedAt).TotalMilliseconds,
-            truncated ? " (report truncated)" : "");
-        return new DryRunReport(profileId, completedAt, files, truncated, destinations);
+            profileId, builder.SourceFiles.Count, builder.DestinationFiles.Count,
+            (completedAt - startedAt).TotalMilliseconds, truncated ? " (report truncated)" : "");
+
+        return new DryRunReport
+        {
+            ProfileId = profileId,
+            GeneratedAt = completedAt,
+            SourceFiles = builder.SourceFiles,
+            DestinationFiles = builder.DestinationFiles,
+            SourceOperations = builder.SourceOperations,
+            DestinationOperations = builder.DestinationOperations,
+            Truncated = truncated,
+        };
     }
 
-    /// <summary>Streaming counterpart to <see cref="SimulateAsync"/> (spec §8): yields the report as
-    /// a sequence of source-path-ordered chunks instead of one bounded, truncatable report, so a
-    /// run larger than the single-frame budget reports every file. Reuses the same scan → sort →
-    /// batched read-only evaluation; only the accumulation differs — results are buffered and a
-    /// chunk is emitted once its cheap upper-bound size crosses <see cref="ChunkByteThreshold"/>.
-    /// A fatal setup/scan error is yielded as a single failure item and ends the stream; cancellation
-    /// surfaces as <see cref="OperationCanceledException"/> from the enumerator (the async-stream
-    /// convention), never a partial "success".</summary>
-    public async IAsyncEnumerable<Result<IReadOnlyList<DryRunFileResult>, string>> SimulateStreamAsync(
+    /// <summary>Streaming counterpart to <see cref="SimulateAsync"/> (spec §8): yields the per-source-file
+    /// phase as a sequence of chunks instead of one bounded, truncatable report, so a run larger than
+    /// the single-frame budget reports every file. Reuses the same scan → sort → batched read-only
+    /// evaluation; results are buffered into a chunk and flushed once its cheap upper-bound size
+    /// crosses <see cref="ChunkByteThreshold"/>. Indices are assigned globally across chunks so the
+    /// consumer can concatenate them. The destination sweep is left to the handler (which runs it
+    /// after the file phase). A fatal setup/scan error is a single failure item that ends the stream;
+    /// cancellation surfaces as <see cref="OperationCanceledException"/> from the enumerator.</summary>
+    public async IAsyncEnumerable<Result<DryRunChunk, string>> SimulateStreamAsync(
         Guid profileId, string? scopePath, [EnumeratorCancellation] CancellationToken ct = default)
     {
         DateTimeOffset startedAt = time.GetUtcNow();
@@ -260,14 +262,9 @@ public sealed class DryRunEngine(
 
         bool hasTransformers = profile.Transformers is { Count: > 0 };
 
-        // Phase 1: drain the scan into a candidate list. The buffer must be fully materialized to
-        // sort by source path (phase 2), so it is bounded by MaxScannedCandidates — a memory/CPU
-        // backstop, far above the batched path's ceiling, that stops a pathological scan from
-        // buffering and hashing millions of files. A fatal fault ends the stream with a failure;
-        // warnings are logged and skipped (matching SimulateAsync). Cancellation throws, which the
-        // consumer treats as a cancelled run.
+        // Phase 1: drain the scan into a candidate list bounded by MaxScannedCandidates. A fatal fault
+        // ends the stream with a failure; warnings are logged and skipped.
         List<Payload> candidates = [];
-        bool scanTruncated = false;
         foreach (var scanned in scanner.Scan(profile, TriggerKind.Cli, scopePath))
         {
             ct.ThrowIfCancellationRequested();
@@ -290,7 +287,6 @@ public sealed class DryRunEngine(
                     "Dry-run (stream) for profile {ProfileId} hit the {Cap:N0}-candidate safety bound; " +
                     "report truncated — the scan found more",
                     profileId, MaxScannedCandidates);
-                scanTruncated = true;
                 break;
             }
 
@@ -299,19 +295,17 @@ public sealed class DryRunEngine(
         }
 
         // Phase 2: fix the output order (source path), evaluate in bounded batches, and flush a chunk
-        // whenever the buffer's upper-bound size crosses the threshold. Same read-only, race-free
-        // evaluation as SimulateAsync; positional writes keep the kept order deterministic.
+        // whenever the buffer's upper-bound size crosses the threshold. Indices are global across
+        // chunks (tracked by the accumulator) so the client simply concatenates.
         candidates.Sort(static (a, b) =>
             string.Compare(a.SourcePath, b.SourcePath, StringComparison.OrdinalIgnoreCase));
 
         int maxConcurrency = ResolveWorkers(profile);
-        List<DryRunFileResult> chunk = [];
-        long chunkBytes = 0;
-        int totalKept = 0;
+        StreamAccumulator accumulator = new();
         for (int start = 0; start < candidates.Count; start += EvaluationBatchSize)
         {
             int count = Math.Min(EvaluationBatchSize, candidates.Count - start);
-            DryRunFileResult?[] batch = new DryRunFileResult?[count];
+            FileEvaluation?[] batch = new FileEvaluation?[count];
             await Parallel.ForEachAsync(
                 Enumerable.Range(0, count),
                 new ParallelOptions { MaxDegreeOfParallelism = maxConcurrency, CancellationToken = ct },
@@ -322,30 +316,23 @@ public sealed class DryRunEngine(
                         .ConfigureAwait(false);
                 }).ConfigureAwait(false);
 
-            foreach (DryRunFileResult? result in batch)
+            foreach (FileEvaluation? evaluation in batch)
             {
-                if (result is null)
+                if (evaluation is null)
                     continue;
-                chunk.Add(result);
-                totalKept++;
-                chunkBytes += UpperBoundBytes(result);
-                if (chunkBytes >= ChunkByteBudget)
-                {
-                    yield return Result<IReadOnlyList<DryRunFileResult>, string>.Success(chunk);
-                    chunk = [];
-                    chunkBytes = 0;
-                }
+                accumulator.Add(evaluation);
+                if (accumulator.Bytes >= ChunkByteBudget)
+                    yield return Result<DryRunChunk, string>.Success(accumulator.Flush());
             }
         }
-        if (chunk.Count > 0)
-            yield return Result<IReadOnlyList<DryRunFileResult>, string>.Success(chunk);
+        if (accumulator.HasData)
+            yield return Result<DryRunChunk, string>.Success(accumulator.Flush());
 
         DateTimeOffset completedAt = time.GetUtcNow();
         if (logger.IsEnabled(LogLevel.Information))
             logger.LogInformation(
-                "Dry-run (stream) completed for profile {ProfileId}: {FileCount} files in {ElapsedMs}ms{Truncated}",
-                profileId, totalKept, (completedAt - startedAt).TotalMilliseconds,
-                scanTruncated ? " (candidate cap reached)" : "");
+                "Dry-run (stream) completed for profile {ProfileId}: {SourceCount} source files in {ElapsedMs}ms",
+                profileId, accumulator.TotalSourceFiles, (completedAt - startedAt).TotalMilliseconds);
     }
 
     /// <summary>Compiles one filter set per source, keyed by the source root the scanner stamps on
@@ -398,119 +385,212 @@ public sealed class DryRunEngine(
     // hashers the disk, not the CPU, is the bottleneck. Floor of 1 covers single-core machines.
     private static int AutoWorkers() => Math.Max(1, Math.Min(8, Environment.ProcessorCount - 1));
 
-    /// <summary>Streaming truncation to the serialized byte budget, fed results in final
-    /// (source-path) order as they are evaluated. Serialization is not free, so it is skipped
-    /// entirely while a conservative upper-bound estimate proves the report still fits — the common
-    /// case. Only once the upper bound could cross the budget does it fall back to exact measurement
-    /// (re-establishing the running total from the already-kept results), preserving precise
-    /// truncation near the cap. <see cref="TryAdd"/> returns false the moment the budget is crossed
-    /// so the caller can stop evaluating further candidates instead of hashing files that cannot
-    /// fit.</summary>
-    private sealed class ByteBudget(long budget) : IDisposable
+    /// <summary>One source file's contribution to the report: the source file node, its source-side
+    /// operation (Processed / Skipped + disposition), and the destination files/operations its targets
+    /// produce. Indices are bundle-local: a destination op's <c>SourceIndex == 0</c> means "this
+    /// bundle's source file" (else <c>-1</c>), and its <c>SubjectIndex</c> is a 0-based position into
+    /// this bundle's <see cref="DestinationFiles"/> (else <c>-1</c>). The report builders remap these
+    /// to global positions on append.</summary>
+    private sealed record FileEvaluation(
+        PhysicalFile SourceFile,
+        VirtualFileOperation SourceOp,
+        IReadOnlyList<PhysicalFile> DestinationFiles,
+        IReadOnlyList<VirtualFileOperation> DestinationOps);
+
+    /// <summary>Appends a bundle's records into the four report lists, remapping bundle-local indices
+    /// to the global positions given by <paramref name="sourceIndex"/> (this bundle's source-file
+    /// position) and <paramref name="destBase"/> (the count of destination files already present).</summary>
+    private static void AppendGlobalized(
+        FileEvaluation bundle, int sourceIndex, int destBase,
+        List<PhysicalFile> sourceFiles, List<PhysicalFile> destinationFiles,
+        List<VirtualFileOperation> sourceOps, List<VirtualFileOperation> destinationOps)
     {
-        private readonly List<DryRunFileResult> _kept = [];
-        private long _total;
-        private bool _exactMode;
-        private ArrayBufferWriter<byte>? _measureBuffer;
-        private Utf8JsonWriter? _measureWriter;
+        sourceFiles.Add(bundle.SourceFile);
+        sourceOps.Add(bundle.SourceOp with { SourceIndex = sourceIndex });
+        foreach (PhysicalFile file in bundle.DestinationFiles)
+            destinationFiles.Add(file);
+        foreach (VirtualFileOperation op in bundle.DestinationOps)
+            destinationOps.Add(op with
+            {
+                SourceIndex = op.SourceIndex == 0 ? sourceIndex : -1,
+                SubjectIndex = op.SubjectIndex >= 0 ? destBase + op.SubjectIndex : -1,
+            });
+    }
 
-        /// <summary>The kept results, in the order they were added.</summary>
-        public List<DryRunFileResult> Kept => _kept;
+    /// <summary>Batched-report accumulator with truncation to the serialized byte budget, fed bundles
+    /// in final (source-path) order. Serialization is not free, so it is skipped while a conservative
+    /// upper-bound estimate proves the report still fits — the common case. Only once the upper bound
+    /// could cross the budget does it fall back to exact measurement (re-establishing the running total
+    /// from what's already kept). A bundle is added atomically, so a retained operation never
+    /// references a dropped file.</summary>
+    private sealed class ReportBuilder(long budget) : IDisposable
+    {
+        public List<PhysicalFile> SourceFiles { get; } = [];
+        public List<PhysicalFile> DestinationFiles { get; } = [];
+        public List<VirtualFileOperation> SourceOperations { get; } = [];
+        public List<VirtualFileOperation> DestinationOperations { get; } = [];
 
-        /// <summary>True once a result was rejected because keeping it would cross the budget.</summary>
+        /// <summary>True once a unit was rejected because keeping it would cross the budget.</summary>
         public bool Truncated { get; private set; }
 
         /// <summary>Exact once measuring, otherwise the running upper-bound estimate.</summary>
         public long ReportBytes => _total;
 
-        /// <summary>Keeps <paramref name="result"/> if it fits; otherwise sets
-        /// <see cref="Truncated"/> and returns false without keeping it.</summary>
-        public bool TryAdd(DryRunFileResult result)
+        private long _total;
+        private bool _exact;
+        private ArrayBufferWriter<byte>? _buffer;
+        private Utf8JsonWriter? _writer;
+
+        /// <summary>Adds a whole per-file bundle atomically. Returns false (and sets
+        /// <see cref="Truncated"/>) without keeping it if it would cross the budget.</summary>
+        public bool TryAddBundle(FileEvaluation bundle)
         {
-            if (!_exactMode)
+            if (!TryReserve(BundleUpperBound(bundle), () => BundleExactBytes(bundle)))
+                return false;
+            AppendGlobalized(bundle, SourceFiles.Count, DestinationFiles.Count,
+                SourceFiles, DestinationFiles, SourceOperations, DestinationOperations);
+            return true;
+        }
+
+        /// <summary>Adds one swept (file, op) pair atomically, wiring the op's SubjectIndex to the
+        /// file's new position.</summary>
+        public bool TryAddSweepEntry(PhysicalFile file, VirtualFileOperation op)
+        {
+            if (!TryReserve(UpperBoundBytes(file) + UpperBoundBytes(op),
+                    () => ExactBytes(file) + ExactBytes(op)))
+                return false;
+            int subjectIndex = DestinationFiles.Count;
+            DestinationFiles.Add(file);
+            DestinationOperations.Add(op with { SubjectIndex = subjectIndex });
+            return true;
+        }
+
+        private bool TryReserve(long upperBound, Func<long> exactBytes)
+        {
+            if (!_exact)
             {
-                long upperBound = UpperBoundBytes(result);
                 if (_total + upperBound <= budget)
                 {
-                    // Actual serialized size <= upper bound <= budget, so this is provably safe to
-                    // keep without serializing anything.
                     _total += upperBound;
-                    _kept.Add(result);
                     return true;
                 }
-
                 // The upper bound could exceed the budget — switch to exact measurement and
                 // re-establish the running total as the exact size of what's already kept.
-                _exactMode = true;
-                _measureBuffer = new ArrayBufferWriter<byte>();
-                _measureWriter = new Utf8JsonWriter(_measureBuffer);
-                _total = 0;
-                foreach (DryRunFileResult keptResult in _kept)
-                    _total += ExactBytes(keptResult, _measureBuffer, _measureWriter);
+                _exact = true;
+                _buffer = new ArrayBufferWriter<byte>();
+                _writer = new Utf8JsonWriter(_buffer);
+                _total = ExactTotalOfKept();
             }
 
-            int resultBytes = ExactBytes(result, _measureBuffer!, _measureWriter!);
-            if (_total + resultBytes > budget)
+            long exact = exactBytes();
+            if (_total + exact > budget)
             {
                 Truncated = true;
                 return false;
             }
-            _total += resultBytes;
-            _kept.Add(result);
+            _total += exact;
             return true;
         }
 
-        public void Dispose() => _measureWriter?.Dispose();
-    }
-
-    // Measured exactly (a standalone record serializes byte-identically to the same record as a
-    // Files[] element) using the reused writer so measuring doesn't allocate a byte[] per result.
-    private static int ExactBytes(DryRunFileResult result, ArrayBufferWriter<byte> buffer, Utf8JsonWriter writer)
-    {
-        buffer.ResetWrittenCount();
-        writer.Reset(buffer);
-        JsonSerializer.Serialize(writer, result, FileManagerJsonContext.Default.DryRunFileResult);
-        return buffer.WrittenCount;
-    }
-
-    // Fixed structural overhead (braces, property names, enum text, quotes) — generous so it is a
-    // true upper bound alongside the 6-bytes-per-char string bound.
-    private const int ResultStructuralBytes = 320;
-    private const int TargetStructuralBytes = 128;
-
-    private static long UpperBoundBytes(DryRunFileResult result)
-    {
-        long bytes = ResultStructuralBytes;
-        bytes += StringUpperBound(result.SourcePath);
-        bytes += StringUpperBound(result.SourceRoot);
-        bytes += StringUpperBound(result.DecidingFilter);
-        bytes += StringUpperBound(result.SourceDisposition);
-        foreach (string command in result.ExpandedCommands)
-            bytes += StringUpperBound(command);
-        foreach (DryRunTargetAction target in result.Targets)
+        private long ExactTotalOfKept()
         {
-            bytes += TargetStructuralBytes;
-            bytes += StringUpperBound(target.TargetPath);
-            bytes += StringUpperBound(target.TargetRoot);
-            bytes += StringUpperBound(target.Detail);
+            long total = 0;
+            foreach (PhysicalFile f in SourceFiles) total += ExactBytes(f);
+            foreach (PhysicalFile f in DestinationFiles) total += ExactBytes(f);
+            foreach (VirtualFileOperation o in SourceOperations) total += ExactBytes(o);
+            foreach (VirtualFileOperation o in DestinationOperations) total += ExactBytes(o);
+            return total;
         }
+
+        private long BundleExactBytes(FileEvaluation bundle)
+        {
+            long total = ExactBytes(bundle.SourceFile) + ExactBytes(bundle.SourceOp);
+            foreach (PhysicalFile f in bundle.DestinationFiles) total += ExactBytes(f);
+            foreach (VirtualFileOperation o in bundle.DestinationOps) total += ExactBytes(o);
+            return total;
+        }
+
+        private int ExactBytes(PhysicalFile file)
+        {
+            _buffer!.ResetWrittenCount();
+            _writer!.Reset(_buffer);
+            JsonSerializer.Serialize(_writer, file, FileManagerJsonContext.Default.PhysicalFile);
+            return _buffer.WrittenCount;
+        }
+
+        private int ExactBytes(VirtualFileOperation op)
+        {
+            _buffer!.ResetWrittenCount();
+            _writer!.Reset(_buffer);
+            JsonSerializer.Serialize(_writer, op, FileManagerJsonContext.Default.VirtualFileOperation);
+            return _buffer.WrittenCount;
+        }
+
+        public void Dispose() => _writer?.Dispose();
+    }
+
+    /// <summary>Streaming accumulator: buffers one chunk's records while tracking global source/dest
+    /// counts across all chunks, so operation indices stay valid positions into the fully assembled
+    /// report. Sizing uses the cheap upper-bound estimate only (a chunk just needs to sit under the
+    /// frame cap).</summary>
+    private sealed class StreamAccumulator
+    {
+        private List<PhysicalFile> _sourceFiles = [];
+        private List<PhysicalFile> _destinationFiles = [];
+        private List<VirtualFileOperation> _sourceOps = [];
+        private List<VirtualFileOperation> _destinationOps = [];
+        private int _globalSourceCount;
+        private int _globalDestCount;
+
+        public long Bytes { get; private set; }
+        public int TotalSourceFiles => _globalSourceCount;
+        public bool HasData => _sourceFiles.Count > 0 || _destinationFiles.Count > 0;
+
+        public void Add(FileEvaluation bundle)
+        {
+            AppendGlobalized(bundle, _globalSourceCount, _globalDestCount,
+                _sourceFiles, _destinationFiles, _sourceOps, _destinationOps);
+            _globalSourceCount += 1;
+            _globalDestCount += bundle.DestinationFiles.Count;
+            Bytes += BundleUpperBound(bundle);
+        }
+
+        public DryRunChunk Flush()
+        {
+            DryRunChunk chunk = new(_sourceFiles, _destinationFiles, _sourceOps, _destinationOps);
+            _sourceFiles = [];
+            _destinationFiles = [];
+            _sourceOps = [];
+            _destinationOps = [];
+            Bytes = 0;
+            return chunk;
+        }
+    }
+
+    // Fixed structural overhead (braces, property names, enum text, numeric fields, quotes) — generous
+    // so it is a true upper bound alongside the 6-bytes-per-char string bound.
+    private const int PhysicalFileStructuralBytes = 256;
+    private const int OperationStructuralBytes = 320;
+
+    private static long BundleUpperBound(FileEvaluation bundle)
+    {
+        long bytes = UpperBoundBytes(bundle.SourceFile) + UpperBoundBytes(bundle.SourceOp);
+        foreach (PhysicalFile f in bundle.DestinationFiles) bytes += UpperBoundBytes(f);
+        foreach (VirtualFileOperation o in bundle.DestinationOps) bytes += UpperBoundBytes(o);
         return bytes;
     }
+
+    private static long UpperBoundBytes(PhysicalFile file) =>
+        PhysicalFileStructuralBytes + StringUpperBound(file.Path) + StringUpperBound(file.Root);
+
+    private static long UpperBoundBytes(VirtualFileOperation op) =>
+        OperationStructuralBytes + StringUpperBound(op.Path) + StringUpperBound(op.Root) + StringUpperBound(op.Detail);
 
     // JSON's absolute worst case is 6 UTF-8 bytes per UTF-16 code unit (\uXXXX, incl. surrogates),
     // plus the surrounding quotes — a true upper bound regardless of escaping or non-ASCII content.
     private static long StringUpperBound(string? value) => value is null ? 0 : (long)value.Length * 6 + 2;
 
-    private static long DestinationUpperBoundBytes(DryRunDestinationEntry entry)
-    {
-        long bytes = TargetStructuralBytes;
-        bytes += StringUpperBound(entry.TargetPath);
-        bytes += StringUpperBound(entry.TargetRoot);
-        bytes += StringUpperBound(entry.Detail);
-        return bytes;
-    }
-
-    private async Task<DryRunFileResult?> EvaluateFileAsync(
+    private async Task<FileEvaluation?> EvaluateFileAsync(
         Profile profile,
         Payload payload,
         Dictionary<string, CompiledFilterSet> filtersBySourceRoot,
@@ -533,6 +613,15 @@ public sealed class DryRunEngine(
             metadataResult.TryGetValue(out metadata);
         }
 
+        PhysicalFile sourceFile = new()
+        {
+            Path = payload.SourcePath,
+            Root = payload.SourceRoot,
+            Length = metadata!.Length,
+            LastWritten = metadata.LastWritten,
+            IsReparsePoint = metadata.IsSymlink,
+        };
+
         string relativePath = Path.GetRelativePath(payload.SourceRoot, payload.SourcePath);
         int depth = SeparatorCount(relativePath);
 
@@ -542,17 +631,21 @@ public sealed class DryRunEngine(
             // a pattern rule would actually consult it (the attribute filter, always present, does
             // not), so the common no-glob profile allocates no normalized string.
             string? normalized = filters.HasPatternRules ? NormalizeSeparators(relativePath) : null;
-            FilterInput input = new(payload.SourcePath, relativePath, depth, metadata!, normalized);
+            FilterInput input = new(payload.SourcePath, relativePath, depth, metadata, normalized);
             FilterDecision decision = filters.Evaluate(in input);
             if (!decision.Matched)
             {
-                return new DryRunFileResult
-                {
-                    SourcePath = payload.SourcePath,
-                    SourceRoot = payload.SourceRoot,
-                    Disposition = DryRunFileDisposition.WouldSkipFilter,
-                    DecidingFilter = decision.DecidingRule,
-                };
+                return new FileEvaluation(
+                    sourceFile,
+                    new VirtualFileOperation
+                    {
+                        Path = payload.SourcePath,
+                        Root = payload.SourceRoot,
+                        Kind = OperationKind.SkippedByFilter,
+                        Detail = decision.DecidingRule,
+                    },
+                    [],
+                    []);
             }
         }
 
@@ -561,9 +654,9 @@ public sealed class DryRunEngine(
         // Only the flatten branch uses the bare file name; PreserveStructure never allocates it.
         string? fileName = flatten ? Path.GetFileName(payload.SourcePath) : null;
 
-        List<DryRunTargetAction> targetActions = new(profile.Targets.Count);
+        List<PhysicalFile> destinationFiles = [];
+        List<VirtualFileOperation> destinationOps = [];
         byte[]? cachedSourceHash = null;
-        bool allUnchanged = true;
 
         foreach (TargetConfig target in profile.Targets)
         {
@@ -575,42 +668,54 @@ public sealed class DryRunEngine(
 
             if (hasTransformers)
             {
-                // §4.10: the transformed output does not exist to hash or compare, so every
-                // target outcome for a transformer profile is Unknown. (Reachable only via
-                // hand-edited JSON in this slice — the UI never emits transformers.)
-                targetActions.Add(new DryRunTargetAction
+                // §4.10: the transformed output does not exist to hash or compare, so every target
+                // outcome for a transformer profile is Unknown. (Reachable only via hand-edited JSON
+                // in this slice — the UI never emits transformers.)
+                destinationOps.Add(new VirtualFileOperation
                 {
-                    TargetPath = prospective,
-                    TargetRoot = target.Path,
-                    Kind = DryRunTargetKind.Unknown,
+                    Path = prospective,
+                    Root = target.Path,
+                    Kind = OperationKind.Unknown,
+                    SourceIndex = 0,   // content from this source; remapped to the global index on append
+                    SubjectIndex = -1,
                     Detail = "requires transform",
                 });
-                allUnchanged = false;
                 continue;
             }
 
-            (DryRunTargetAction action, cachedSourceHash) = await EvaluateTargetAsync(
-                profile.Policies, payload.SourcePath, metadata!, prospective, cachedSourceHash, ct)
+            TargetEvaluation te = await EvaluateTargetAsync(
+                profile.Policies, payload.SourcePath, metadata, prospective, target.Path, cachedSourceHash, ct)
                 .ConfigureAwait(false);
-            // Stamp the destination root here, where profile.Targets is in scope (EvaluateTargetAsync
-            // only knows the prospective path). Powers the Destinations-view grouping/filtering.
-            targetActions.Add(action with { TargetRoot = target.Path });
-            if (action.Kind != DryRunTargetKind.WouldSkipUnchanged)
-                allUnchanged = false;
+            cachedSourceHash = te.SourceHash;
+
+            // Splice this target's pre-existing file (if any) into the bundle's destination-file list
+            // and rewrite the ops that reference it (SubjectIndex == 0) to that bundle-local position.
+            int localSubjectIndex = destinationFiles.Count;
+            bool hasExisting = te.ExistingFile is not null;
+            if (hasExisting)
+                destinationFiles.Add(te.ExistingFile!);
+            foreach (VirtualFileOperation op in te.Ops)
+                destinationOps.Add(op with
+                {
+                    SubjectIndex = op.SubjectIndex == 0 && hasExisting ? localSubjectIndex : -1,
+                });
         }
 
-        allUnchanged = allUnchanged && targetActions.Count > 0;
+        // The file processes unless every target is an unchanged skip (an all-unchanged job closes
+        // Skipped without committing, §3.4.1, so no source disposition runs). Only SkipUnchanged
+        // counts as unchanged; SkipConflict, renames and writes are all "processing".
+        bool allUnchanged = destinationOps.Count > 0
+            && destinationOps.All(o => o.Kind == OperationKind.SkipUnchanged);
 
-        return new DryRunFileResult
+        VirtualFileOperation sourceOp = new()
         {
-            SourcePath = payload.SourcePath,
-            SourceRoot = payload.SourceRoot,
-            Disposition = allUnchanged ? DryRunFileDisposition.WouldSkipUnchanged : DryRunFileDisposition.WouldProcess,
-            Targets = targetActions,
-            // An all-unchanged job closes Skipped without committing (§3.4.1), so no disposition
-            // runs — SourceDisposition is only meaningful when the file would actually process.
-            SourceDisposition = allUnchanged ? null : profile.Policies.OnSuccess.ToString(),
+            Path = payload.SourcePath,
+            Root = payload.SourceRoot,
+            Kind = allUnchanged ? OperationKind.SkippedUnchanged : OperationKind.Processed,
+            SourceDisposition = allUnchanged ? null : profile.Policies.OnSuccess,
         };
+
+        return new FileEvaluation(sourceFile, sourceOp, destinationFiles, destinationOps);
     }
 
     private static int SeparatorCount(string value)
@@ -627,124 +732,123 @@ public sealed class DryRunEngine(
     private static string NormalizeSeparators(string relativePath) =>
         Path.DirectorySeparatorChar == '/' ? relativePath : relativePath.Replace('\\', '/');
 
+    /// <summary>One target's evaluation: the operation(s) it produces, the pre-existing destination
+    /// file it touches (if any), and the (possibly newly computed) cached source hash. Within
+    /// <see cref="Ops"/>, <c>SourceIndex == 0</c> means "the source file", and <c>SubjectIndex == 0</c>
+    /// means "<see cref="ExistingFile"/>"; the caller remaps both to bundle-local positions.</summary>
+    private readonly record struct TargetEvaluation(
+        IReadOnlyList<VirtualFileOperation> Ops, PhysicalFile? ExistingFile, byte[]? SourceHash);
+
     /// <summary>Per-target simulation, in the executor's order: unchanged-check FIRST
     /// (spec §3.4.1, before conflict resolution), then the read-only conflict probe.</summary>
-    private async Task<(DryRunTargetAction Action, byte[]? SourceHash)> EvaluateTargetAsync(
+    private async Task<TargetEvaluation> EvaluateTargetAsync(
         PolicySettings policies,
         string sourcePath,
         FileMetadata metadata,
         string prospectivePath,
+        string targetRoot,
         byte[]? cachedSourceHash,
         CancellationToken ct)
     {
         bool finalExists = File.Exists(prospectivePath);
 
+        // Read the existing file's metadata once (up front) and reuse it for both the unchanged-check
+        // and the PhysicalFile node — no second stat, no File.GetLastWriteTimeUtc.
+        FileMetadata? existingMeta = null;
         if (finalExists)
         {
             var existing = FileMetadataReader.Read(prospectivePath);
-            if (existing.TryGetValue(out FileMetadata? existingMeta) && existingMeta.Length == metadata.Length)
+            existing.TryGetValue(out existingMeta);   // null if the read raced/failed
+        }
+        PhysicalFile? existingFile = existingMeta is null ? null : new PhysicalFile
+        {
+            Path = prospectivePath,
+            Root = targetRoot,
+            Length = existingMeta.Length,
+            LastWritten = existingMeta.LastWritten,
+            IsReparsePoint = existingMeta.IsSymlink,
+        };
+        int subject = existingFile is not null ? 0 : -1;
+
+        VirtualFileOperation Op(OperationKind kind, string path, int sourceIndex, int subjectIndex, string? detail) => new()
+        {
+            Path = path,
+            Root = targetRoot,
+            Kind = kind,
+            SourceIndex = sourceIndex,
+            SubjectIndex = subjectIndex,
+            Detail = detail,
+        };
+
+        TargetEvaluation Single(VirtualFileOperation op, byte[]? hash) =>
+            new([op], existingFile, hash);
+
+        if (existingMeta is not null && existingMeta.Length == metadata.Length)
+        {
+            if (policies.VerificationMethod is VerificationMethod.Sha256 or VerificationMethod.XxHash128)
             {
-                if (policies.VerificationMethod is VerificationMethod.Sha256 or VerificationMethod.XxHash128)
+                if (cachedSourceHash is null)
                 {
-                    if (cachedSourceHash is null)
-                    {
-                        var sourceHash = await hasher.HashFileToBytesAsync(sourcePath, policies.VerificationMethod, ct).ConfigureAwait(false);
-                        if (sourceHash.IsCanceled)
-                            // Placeholder — discarded by SimulateAsync's cancellation catch.
-                            return (new DryRunTargetAction
-                            {
-                                TargetPath = prospectivePath,
-                                Kind = DryRunTargetKind.Unknown,
-                                Detail = "canceled",
-                            }, cachedSourceHash);
-                        if (sourceHash.TryGetError(out JobError? hashError))
-                            return (new DryRunTargetAction
-                            {
-                                TargetPath = prospectivePath,
-                                Kind = DryRunTargetKind.Unknown,
-                                Detail = $"could not hash the source: {hashError.Message}",
-                            }, null);
-                        sourceHash.TryGetValue(out cachedSourceHash);
-                    }
-
-                    var targetHash = await hasher.HashFileToBytesAsync(prospectivePath, policies.VerificationMethod, ct).ConfigureAwait(false);
-                    if (targetHash.IsCanceled)
+                    var sourceHash = await hasher.HashFileToBytesAsync(sourcePath, policies.VerificationMethod, ct).ConfigureAwait(false);
+                    if (sourceHash.IsCanceled)
                         // Placeholder — discarded by SimulateAsync's cancellation catch.
-                        return (new DryRunTargetAction
-                        {
-                            TargetPath = prospectivePath,
-                            Kind = DryRunTargetKind.Unknown,
-                            Detail = "canceled",
-                        }, cachedSourceHash);
-                    if (targetHash.TryGetError(out JobError? targetHashError))
-                        return (new DryRunTargetAction
-                        {
-                            TargetPath = prospectivePath,
-                            Kind = DryRunTargetKind.Unknown,
-                            Detail = $"could not hash the existing target: {targetHashError.Message}",
-                        }, cachedSourceHash);
-                    targetHash.TryGetValue(out byte[]? existingHash);
+                        return Single(Op(OperationKind.Unknown, prospectivePath, 0, subject, "canceled"), cachedSourceHash);
+                    if (sourceHash.TryGetError(out JobError? hashError))
+                        return Single(Op(OperationKind.Unknown, prospectivePath, 0, subject,
+                            $"could not hash the source: {hashError.Message}"), null);
+                    sourceHash.TryGetValue(out cachedSourceHash);
+                }
 
-                    if (cachedSourceHash is not null && existingHash is not null
-                        && existingHash.AsSpan().SequenceEqual(cachedSourceHash))
-                        return (new DryRunTargetAction
-                        {
-                            TargetPath = prospectivePath,
-                            Kind = DryRunTargetKind.WouldSkipUnchanged,
-                            Detail = $"identical content ({policies.VerificationMethod})",
-                        }, cachedSourceHash);
-                }
-                else if (existingMeta.LastWritten == metadata.LastWritten)
-                {
-                    // VerificationMethod.None: best-effort size + mtime equality (spec §3.4.1).
-                    return (new DryRunTargetAction
-                    {
-                        TargetPath = prospectivePath,
-                        Kind = DryRunTargetKind.WouldSkipUnchanged,
-                        Detail = "same size and modified time (best-effort — VerificationMethod is None)",
-                    }, cachedSourceHash);
-                }
+                var targetHash = await hasher.HashFileToBytesAsync(prospectivePath, policies.VerificationMethod, ct).ConfigureAwait(false);
+                if (targetHash.IsCanceled)
+                    return Single(Op(OperationKind.Unknown, prospectivePath, 0, subject, "canceled"), cachedSourceHash);
+                if (targetHash.TryGetError(out JobError? targetHashError))
+                    return Single(Op(OperationKind.Unknown, prospectivePath, 0, subject,
+                        $"could not hash the existing target: {targetHashError.Message}"), cachedSourceHash);
+                targetHash.TryGetValue(out byte[]? existingHash);
+
+                if (cachedSourceHash is not null && existingHash is not null
+                    && existingHash.AsSpan().SequenceEqual(cachedSourceHash))
+                    return Single(Op(OperationKind.SkipUnchanged, prospectivePath, 0, subject,
+                        $"identical content ({policies.VerificationMethod})"), cachedSourceHash);
+            }
+            else if (existingMeta.LastWritten == metadata.LastWritten)
+            {
+                // VerificationMethod.None: best-effort size + mtime equality (spec §3.4.1).
+                return Single(Op(OperationKind.SkipUnchanged, prospectivePath, 0, subject,
+                    "same size and modified time (best-effort — VerificationMethod is None)"), cachedSourceHash);
             }
         }
 
         var probe = conflictResolver.Probe(prospectivePath, policies.ConflictResolution, metadata.LastWritten);
         if (probe.TryGetError(out JobError? probeError))
-            return (new DryRunTargetAction
-            {
-                TargetPath = prospectivePath,
-                Kind = DryRunTargetKind.Unknown,
-                Detail = probeError.Message,
-            }, cachedSourceHash);
+            return Single(Op(OperationKind.Unknown, prospectivePath, 0, subject, probeError.Message), cachedSourceHash);
         probe.TryGetValue(out ConflictOutcome? outcome);
 
         if (outcome!.Action == ConflictAction.SkipExistingKept)
-            return (new DryRunTargetAction
-            {
-                TargetPath = prospectivePath,
-                Kind = DryRunTargetKind.WouldSkipConflict,
-                Detail = $"existing file kept ({policies.ConflictResolution})",
-            }, cachedSourceHash);
+            return Single(Op(OperationKind.SkipConflict, prospectivePath, 0, subject,
+                $"existing file kept ({policies.ConflictResolution})"), cachedSourceHash);
 
         if (!string.Equals(outcome.FinalPath, prospectivePath, StringComparison.OrdinalIgnoreCase))
-            return (new DryRunTargetAction
-            {
-                TargetPath = prospectivePath,
-                Kind = DryRunTargetKind.WouldRenameTo,
-                Detail = outcome.FinalPath,
-            }, cachedSourceHash);
+        {
+            // A rename routes the incoming file to a suffixed path AND leaves the pre-existing file in
+            // place — emitted as two destination operations. The Rename is a target of this source; the
+            // kept original is destination-only (SourceIndex == -1) so it never shows as a source target.
+            VirtualFileOperation renameOp = Op(OperationKind.Rename, outcome.FinalPath, 0, -1,
+                "renamed to avoid a conflict with the existing file");
+            VirtualFileOperation keptOp = Op(OperationKind.Untouched, prospectivePath, -1, subject,
+                "kept (an incoming file was renamed around it)");
+            return new TargetEvaluation([renameOp, keptOp], existingFile, cachedSourceHash);
+        }
 
         if (finalExists)
-            return (new DryRunTargetAction
-            {
-                TargetPath = prospectivePath,
-                Kind = DryRunTargetKind.WouldOverwrite,
-                Detail = $"existing file last modified {File.GetLastWriteTimeUtc(prospectivePath):yyyy-MM-dd HH:mm:ss} UTC",
-            }, cachedSourceHash);
-
-        return (new DryRunTargetAction
         {
-            TargetPath = prospectivePath,
-            Kind = DryRunTargetKind.WouldWrite,
-        }, cachedSourceHash);
+            string? detail = existingMeta is not null
+                ? $"existing file last modified {existingMeta.LastWritten:yyyy-MM-dd HH:mm:ss} UTC"
+                : "would overwrite the existing file";
+            return Single(Op(OperationKind.Overwrite, prospectivePath, 0, subject, detail), cachedSourceHash);
+        }
+
+        return Single(Op(OperationKind.New, prospectivePath, 0, -1, null), cachedSourceHash);
     }
 }

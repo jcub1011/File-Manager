@@ -39,14 +39,25 @@ public sealed class IpcServerStreamingTests : IAsyncLifetime
 
             for (int b = 0; b < 3; b++)
             {
-                List<DryRunFileResult> files = Enumerable.Range(0, 4)
-                    .Select(i => new DryRunFileResult
+                List<PhysicalFile> files = Enumerable.Range(0, 4)
+                    .Select(i => new PhysicalFile
                     {
-                        SourcePath = $@"C:\src\b{b}\f{i}.dat",
-                        Disposition = DryRunFileDisposition.WouldProcess,
+                        Path = $@"C:\src\b{b}\f{i}.dat",
+                        Root = @"C:\src",
+                        Length = 0,
+                        LastWritten = DateTimeOffset.UnixEpoch,
                     })
                     .ToList();
-                yield return new DryRunChunkResponse { Files = files };
+                List<VirtualFileOperation> ops = Enumerable.Range(0, 4)
+                    .Select(i => new VirtualFileOperation
+                    {
+                        Path = $@"C:\src\b{b}\f{i}.dat",
+                        Root = @"C:\src",
+                        Kind = OperationKind.Processed,
+                        SourceIndex = b * 4 + i,
+                    })
+                    .ToList();
+                yield return new DryRunChunkResponse { SourceFiles = files, SourceOperations = ops };
 
                 if (typed.ScopePath == "error-midway" && b == 1)
                 {
@@ -101,10 +112,10 @@ public sealed class IpcServerStreamingTests : IAsyncLifetime
         {
             var result = await client!.DryRunStreamAsync(new DryRunStreamRequest { ProfileId = Guid.NewGuid() });
             Assert.True(result.TryGetValue(out DryRunReport? report));
-            Assert.Equal(12, report!.Files.Count);
+            Assert.Equal(12, report!.SourceFiles.Count);
             Assert.False(report.Truncated);
-            Assert.Equal(@"C:\src\b0\f0.dat", report.Files[0].SourcePath);   // order preserved across chunks
-            Assert.Equal(@"C:\src\b2\f3.dat", report.Files[^1].SourcePath);
+            Assert.Equal(@"C:\src\b0\f0.dat", report.SourceFiles[0].Path);   // order preserved across chunks
+            Assert.Equal(@"C:\src\b2\f3.dat", report.SourceFiles[^1].Path);
 
             // The same connection still serves the next request — the stream did not desync it.
             var followUp = await client.RequestAsync<StatusResponse>(new GetStatusRequest());

@@ -1,6 +1,7 @@
 using System.Linq;
 using FileManager.Contracts.DryRun;
 using FileManager.Contracts.IPC;
+using FileManager.Contracts.Profiles;
 using FileManager.UI.Services;
 using FileManager.UI.Tests.Fakes;
 using FileManager.UI.ViewModels;
@@ -18,41 +19,75 @@ public sealed class DryRunViewModelTests
         return (viewModel, gateway);
     }
 
-    // fresh.txt: new write (KeepSource). clobber.txt: overwrites one target + renames around another,
-    // and its source is trashed (processed AND deleted). junk.tmp: filtered out. same.txt: unchanged.
-    private static DryRunReport SampleReport(Guid profileId) => new(profileId, DateTimeOffset.UnixEpoch,
-    [
-        new DryRunFileResult
+    // ── New-model fixture helpers ──────────────────────────────────────────────────────────────
+    // A dry-run report is now a bipartite graph: PhysicalFile nodes (SourceFiles / DestinationFiles)
+    // plus VirtualFileOperation edges (SourceOperations / DestinationOperations) that reference files
+    // by integer index. The VM pairs SourceFiles[i] with the source op whose SourceIndex == i, groups
+    // destination ops by SourceIndex for that file's target rows, and maps every destination op 1:1 to
+    // a destination row (SourceRoot resolved via SourceIndex).
+
+    private static PhysicalFile Pf(string path, string root) =>
+        new() { Path = path, Root = root, Length = 0, LastWritten = DateTimeOffset.UnixEpoch, IsReparsePoint = false };
+
+    private static VirtualFileOperation SrcOp(
+        int index, string path, string root, OperationKind kind,
+        OnSuccessAction? disposition = null, string? detail = null) =>
+        new() { Path = path, Root = root, Kind = kind, SourceIndex = index, SubjectIndex = -1, SourceDisposition = disposition, Detail = detail };
+
+    private static VirtualFileOperation DstOp(
+        OperationKind kind, string path, string root, int sourceIndex = -1, int subjectIndex = -1, string? detail = null) =>
+        new() { Path = path, Root = root, Kind = kind, SourceIndex = sourceIndex, SubjectIndex = subjectIndex, Detail = detail };
+
+    private static DryRunReport Report(
+        Guid profileId,
+        IReadOnlyList<PhysicalFile> sourceFiles,
+        IReadOnlyList<VirtualFileOperation> sourceOps,
+        IReadOnlyList<PhysicalFile> destinationFiles,
+        IReadOnlyList<VirtualFileOperation> destinationOps,
+        bool truncated = false) =>
+        new()
         {
-            SourcePath = @"C:\s\fresh.txt", SourceRoot = @"C:\s",
-            Disposition = DryRunFileDisposition.WouldProcess,
-            SourceDisposition = "KeepSource",
-            Targets = [new DryRunTargetAction { TargetPath = @"C:\t\fresh.txt", TargetRoot = @"C:\t", Kind = DryRunTargetKind.WouldWrite }],
-        },
-        new DryRunFileResult
-        {
-            SourcePath = @"C:\s\clobber.txt", SourceRoot = @"C:\s",
-            Disposition = DryRunFileDisposition.WouldProcess,
-            SourceDisposition = "MoveToTrash",
-            Targets =
-            [
-                new DryRunTargetAction { TargetPath = @"C:\t\clobber.txt", TargetRoot = @"C:\t", Kind = DryRunTargetKind.WouldOverwrite },
-                new DryRunTargetAction { TargetPath = @"C:\t2\clobber.txt", TargetRoot = @"C:\t2", Kind = DryRunTargetKind.WouldRenameTo, Detail = @"C:\t2\clobber (1).txt" },
-            ],
-        },
-        new DryRunFileResult
-        {
-            SourcePath = @"C:\s\junk.tmp", SourceRoot = @"C:\s",
-            Disposition = DryRunFileDisposition.WouldSkipFilter,
-            DecidingFilter = "Exclude pattern glob *.tmp",
-        },
-        new DryRunFileResult
-        {
-            SourcePath = @"C:\s\same.txt", SourceRoot = @"C:\s",
-            Disposition = DryRunFileDisposition.WouldSkipUnchanged,
-            Targets = [new DryRunTargetAction { TargetPath = @"C:\t\same.txt", TargetRoot = @"C:\t", Kind = DryRunTargetKind.WouldSkipUnchanged }],
-        },
-    ]);
+            ProfileId = profileId,
+            GeneratedAt = DateTimeOffset.UnixEpoch,
+            SourceFiles = sourceFiles,
+            DestinationFiles = destinationFiles,
+            SourceOperations = sourceOps,
+            DestinationOperations = destinationOps,
+            Truncated = truncated,
+        };
+
+    // fresh.txt: new write (KeepSource). clobber.txt: overwrites one target + renames around another
+    // (the kept original is a destination-only Untouched op), and its source is trashed (processed AND
+    // deleted). junk.tmp: filtered out. same.txt: unchanged.
+    private static DryRunReport SampleReport(Guid profileId) => Report(profileId,
+        sourceFiles:
+        [
+            Pf(@"C:\s\fresh.txt", @"C:\s"),     // 0
+            Pf(@"C:\s\clobber.txt", @"C:\s"),   // 1
+            Pf(@"C:\s\junk.tmp", @"C:\s"),      // 2
+            Pf(@"C:\s\same.txt", @"C:\s"),      // 3
+        ],
+        sourceOps:
+        [
+            SrcOp(0, @"C:\s\fresh.txt", @"C:\s", OperationKind.Processed, OnSuccessAction.KeepSource),
+            SrcOp(1, @"C:\s\clobber.txt", @"C:\s", OperationKind.Processed, OnSuccessAction.MoveToTrash),
+            SrcOp(2, @"C:\s\junk.tmp", @"C:\s", OperationKind.SkippedByFilter, detail: "Exclude pattern glob *.tmp"),
+            SrcOp(3, @"C:\s\same.txt", @"C:\s", OperationKind.SkippedUnchanged),
+        ],
+        destinationFiles:
+        [
+            Pf(@"C:\t\clobber.txt", @"C:\t"),    // 0 — the overwrite subject
+            Pf(@"C:\t2\clobber.txt", @"C:\t2"),  // 1 — the rename kept-original subject
+            Pf(@"C:\t\same.txt", @"C:\t"),       // 2 — the skip-unchanged subject
+        ],
+        destinationOps:
+        [
+            DstOp(OperationKind.New, @"C:\t\fresh.txt", @"C:\t", sourceIndex: 0),
+            DstOp(OperationKind.Overwrite, @"C:\t\clobber.txt", @"C:\t", sourceIndex: 1, subjectIndex: 0),
+            DstOp(OperationKind.Rename, @"C:\t2\clobber (1).txt", @"C:\t2", sourceIndex: 1, detail: "renamed to avoid a conflict"),
+            DstOp(OperationKind.Untouched, @"C:\t2\clobber.txt", @"C:\t2", subjectIndex: 1, detail: "kept (an incoming file was renamed around it)"),
+            DstOp(OperationKind.SkipUnchanged, @"C:\t\same.txt", @"C:\t", sourceIndex: 3, subjectIndex: 2),
+        ]);
 
     [Fact]
     public async Task Blast_radius_banner_reflects_the_report()
@@ -99,6 +134,27 @@ public sealed class DryRunViewModelTests
     }
 
     [Fact]
+    public async Task A_conflict_rename_keeps_the_original_as_a_destination_only_untouched_row()
+    {
+        // The kept-around original is emitted by the server as a destination op with SourceIndex == -1,
+        // so it must NOT appear among the source file's target rows — clobber shows exactly its real
+        // targets (Overwrite + Rename), and the kept original surfaces only in the Destinations view.
+        var (viewModel, gateway) = NewViewModel();
+        gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value);
+        await viewModel.RunAsync(CancellationToken.None);
+
+        DryRunFileRow clobber = viewModel.Sources.VisibleRows.Single(r => r.SourcePath.EndsWith("clobber.txt"));
+        Assert.Equal(2, clobber.Targets.Count);
+        Assert.Contains(clobber.Targets, t => t.IsOverwrite);
+        Assert.Contains(clobber.Targets, t => t.IsRename);
+        Assert.DoesNotContain(clobber.Targets, t => t.Path == @"C:\t2\clobber.txt");   // the kept original is not a target
+
+        DryRunDestinationRow kept = viewModel.Destinations.VisibleRows.Single(r => r.TargetPath == @"C:\t2\clobber.txt");
+        Assert.True(kept.IsUntouched);
+        Assert.False(kept.HasSource);   // SourceIndex == -1
+    }
+
+    [Fact]
     public async Task Sources_rows_sort_by_path()
     {
         var (viewModel, gateway) = NewViewModel();
@@ -115,12 +171,10 @@ public sealed class DryRunViewModelTests
         // Distinct source/target roots and paths that would sort differently by full path but must
         // line up by path-relative-to-root so the two previews are comparable row-for-row.
         var (viewModel, gateway) = NewViewModel();
-        gateway.DryRunResult = new DryRunReport(viewModel.ProfileId!.Value, DateTimeOffset.UnixEpoch,
-            [
-                Write(@"C:\src\a\z.txt", @"C:\src", @"D:\dst\a\z.txt", @"D:\dst"),
-                Write(@"C:\src\a\a.txt", @"C:\src", @"D:\dst\a\a.txt", @"D:\dst"),
-                Write(@"C:\src\m.txt", @"C:\src", @"D:\dst\m.txt", @"D:\dst"),
-            ]);
+        gateway.DryRunResult = WritesReport(viewModel.ProfileId!.Value,
+            (@"C:\src\a\z.txt", @"C:\src", @"D:\dst\a\z.txt", @"D:\dst"),
+            (@"C:\src\a\a.txt", @"C:\src", @"D:\dst\a\a.txt", @"D:\dst"),
+            (@"C:\src\m.txt", @"C:\src", @"D:\dst\m.txt", @"D:\dst"));
 
         await viewModel.RunAsync(CancellationToken.None);
 
@@ -132,12 +186,21 @@ public sealed class DryRunViewModelTests
         Assert.Equal(sourceRel, destRel);   // identical relative-path ordering in both tabs
     }
 
-    private static DryRunFileResult Write(string sourcePath, string sourceRoot, string targetPath, string targetRoot) => new()
+    // Builds a report of plain new-writes: one source file + one New destination op per write.
+    private static DryRunReport WritesReport(Guid profileId, params (string Src, string SrcRoot, string Dst, string DstRoot)[] writes)
     {
-        SourcePath = sourcePath, SourceRoot = sourceRoot,
-        Disposition = DryRunFileDisposition.WouldProcess, SourceDisposition = "KeepSource",
-        Targets = [new DryRunTargetAction { TargetPath = targetPath, TargetRoot = targetRoot, Kind = DryRunTargetKind.WouldWrite }],
-    };
+        var sourceFiles = new List<PhysicalFile>();
+        var sourceOps = new List<VirtualFileOperation>();
+        var destinationOps = new List<VirtualFileOperation>();
+        for (int i = 0; i < writes.Length; i++)
+        {
+            (string src, string srcRoot, string dst, string dstRoot) = writes[i];
+            sourceFiles.Add(Pf(src, srcRoot));
+            sourceOps.Add(SrcOp(i, src, srcRoot, OperationKind.Processed, OnSuccessAction.KeepSource));
+            destinationOps.Add(DstOp(OperationKind.New, dst, dstRoot, sourceIndex: i));
+        }
+        return Report(profileId, sourceFiles, sourceOps, [], destinationOps);
+    }
 
     [Fact]
     public async Task Destinations_tab_derives_new_overwritten_and_untouched_from_targets()
@@ -161,19 +224,19 @@ public sealed class DryRunViewModelTests
     public async Task Destinations_tab_shows_preexisting_and_mirror_orphans_from_report_extras()
     {
         var (viewModel, gateway) = NewViewModel();
-        gateway.DryRunResult = new DryRunReport(viewModel.ProfileId!.Value, DateTimeOffset.UnixEpoch,
+        gateway.DryRunResult = Report(viewModel.ProfileId!.Value,
+            sourceFiles: [Pf(@"C:\s\a.txt", @"C:\s")],
+            sourceOps: [SrcOp(0, @"C:\s\a.txt", @"C:\s", OperationKind.Processed, OnSuccessAction.KeepSource)],
+            destinationFiles:
             [
-                new DryRunFileResult
-                {
-                    SourcePath = @"C:\s\a.txt", SourceRoot = @"C:\s",
-                    Disposition = DryRunFileDisposition.WouldProcess, SourceDisposition = "KeepSource",
-                    Targets = [new DryRunTargetAction { TargetPath = @"C:\t\a.txt", TargetRoot = @"C:\t", Kind = DryRunTargetKind.WouldWrite }],
-                },
+                Pf(@"C:\t\keep.txt", @"C:\t"),      // 0 — pre-existing, untouched
+                Pf(@"C:\t\orphan.txt", @"C:\t"),    // 1 — Mirror orphan
             ],
-            Destinations:
+            destinationOps:
             [
-                new DryRunDestinationEntry { TargetPath = @"C:\t\keep.txt", TargetRoot = @"C:\t", Disposition = DryRunDestinationDisposition.Untouched },
-                new DryRunDestinationEntry { TargetPath = @"C:\t\orphan.txt", TargetRoot = @"C:\t", Disposition = DryRunDestinationDisposition.Deleted },
+                DstOp(OperationKind.New, @"C:\t\a.txt", @"C:\t", sourceIndex: 0),
+                DstOp(OperationKind.Untouched, @"C:\t\keep.txt", @"C:\t", subjectIndex: 0),
+                DstOp(OperationKind.Deleted, @"C:\t\orphan.txt", @"C:\t", subjectIndex: 1),
             ]);
 
         await viewModel.RunAsync(CancellationToken.None);
@@ -390,30 +453,26 @@ public sealed class DryRunViewModelTests
     }
 
     // Two sources (C:\a with one process + one filter-skip, C:\b with two process).
-    private static DryRunReport MultiSourceReport(Guid profileId) => new(profileId, DateTimeOffset.UnixEpoch,
-    [
-        new DryRunFileResult
-        {
-            SourcePath = @"C:\a\one.txt", SourceRoot = @"C:\a",
-            Disposition = DryRunFileDisposition.WouldProcess, SourceDisposition = "KeepSource",
-            Targets = [new DryRunTargetAction { TargetPath = @"C:\t\one.txt", TargetRoot = @"C:\t", Kind = DryRunTargetKind.WouldWrite }],
-        },
-        new DryRunFileResult
-        {
-            SourcePath = @"C:\a\junk.tmp", SourceRoot = @"C:\a",
-            Disposition = DryRunFileDisposition.WouldSkipFilter, DecidingFilter = "exclude *.tmp",
-        },
-        new DryRunFileResult
-        {
-            SourcePath = @"C:\b\three.txt", SourceRoot = @"C:\b",
-            Disposition = DryRunFileDisposition.WouldProcess, SourceDisposition = "KeepSource",
-            Targets = [new DryRunTargetAction { TargetPath = @"C:\t\three.txt", TargetRoot = @"C:\t", Kind = DryRunTargetKind.WouldWrite }],
-        },
-        new DryRunFileResult
-        {
-            SourcePath = @"C:\b\four.txt", SourceRoot = @"C:\b",
-            Disposition = DryRunFileDisposition.WouldProcess, SourceDisposition = "KeepSource",
-            Targets = [new DryRunTargetAction { TargetPath = @"C:\t\four.txt", TargetRoot = @"C:\t", Kind = DryRunTargetKind.WouldWrite }],
-        },
-    ]);
+    private static DryRunReport MultiSourceReport(Guid profileId) => Report(profileId,
+        sourceFiles:
+        [
+            Pf(@"C:\a\one.txt", @"C:\a"),     // 0
+            Pf(@"C:\a\junk.tmp", @"C:\a"),    // 1
+            Pf(@"C:\b\three.txt", @"C:\b"),   // 2
+            Pf(@"C:\b\four.txt", @"C:\b"),    // 3
+        ],
+        sourceOps:
+        [
+            SrcOp(0, @"C:\a\one.txt", @"C:\a", OperationKind.Processed, OnSuccessAction.KeepSource),
+            SrcOp(1, @"C:\a\junk.tmp", @"C:\a", OperationKind.SkippedByFilter, detail: "exclude *.tmp"),
+            SrcOp(2, @"C:\b\three.txt", @"C:\b", OperationKind.Processed, OnSuccessAction.KeepSource),
+            SrcOp(3, @"C:\b\four.txt", @"C:\b", OperationKind.Processed, OnSuccessAction.KeepSource),
+        ],
+        destinationFiles: [],
+        destinationOps:
+        [
+            DstOp(OperationKind.New, @"C:\t\one.txt", @"C:\t", sourceIndex: 0),
+            DstOp(OperationKind.New, @"C:\t\three.txt", @"C:\t", sourceIndex: 2),
+            DstOp(OperationKind.New, @"C:\t\four.txt", @"C:\t", sourceIndex: 3),
+        ]);
 }

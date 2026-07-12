@@ -2,6 +2,7 @@ using BenchmarkDotNet.Attributes;
 using FileManager.Contracts.DryRun;
 using FileManager.Contracts.IPC;
 using FileManager.Contracts.Primitives;
+using FileManager.Contracts.Profiles;
 
 namespace FileManager.Contracts.Benchmarks.IPC;
 
@@ -24,27 +25,47 @@ public class IpcFrameCodecBenchmarks
     [GlobalSetup]
     public void Setup()
     {
-        List<DryRunFileResult> files = new(FileCount);
+        List<PhysicalFile> sourceFiles = new(FileCount);
+        List<PhysicalFile> destinationFiles = new(FileCount);
+        List<VirtualFileOperation> sourceOperations = new(FileCount);
+        List<VirtualFileOperation> destinationOperations = new(FileCount);
         for (int i = 0; i < FileCount; i++)
         {
-            files.Add(new DryRunFileResult
+            string sourcePath = $@"C:\src\dir{i % 16}\sub{i % 8}\file-{i}.dat";
+            string targetPath = $@"C:\dst\dir{i % 16}\file-{i}.dat";
+            sourceFiles.Add(new PhysicalFile
             {
-                SourcePath = $@"C:\src\dir{i % 16}\sub{i % 8}\file-{i}.dat",
-                Disposition = DryRunFileDisposition.WouldProcess,
-                Targets =
-                [
-                    new DryRunTargetAction
-                    {
-                        TargetPath = $@"C:\dst\dir{i % 16}\file-{i}.dat",
-                        Kind = DryRunTargetKind.WouldWrite,
-                        Detail = null,
-                    },
-                ],
-                SourceDisposition = "KeepSource",
+                Path = sourcePath,
+                Root = @"C:\src",
+                Length = 1024,
+                LastWritten = DateTimeOffset.UnixEpoch,
+            });
+            sourceOperations.Add(new VirtualFileOperation
+            {
+                Path = sourcePath,
+                Root = @"C:\src",
+                Kind = OperationKind.Processed,
+                SourceIndex = i,
+                SourceDisposition = OnSuccessAction.KeepSource,
+            });
+            destinationOperations.Add(new VirtualFileOperation
+            {
+                Path = targetPath,
+                Root = @"C:\dst",
+                Kind = OperationKind.New,
+                SourceIndex = i,
             });
         }
 
-        DryRunReport report = new(Guid.NewGuid(), DateTimeOffset.UnixEpoch, files);
+        DryRunReport report = new()
+        {
+            ProfileId = Guid.NewGuid(),
+            GeneratedAt = DateTimeOffset.UnixEpoch,
+            SourceFiles = sourceFiles,
+            DestinationFiles = destinationFiles,
+            SourceOperations = sourceOperations,
+            DestinationOperations = destinationOperations,
+        };
         _response = new DryRunResponse { Report = report };
         _payload = IpcSerializer.SerializeResponse(_response);
     }

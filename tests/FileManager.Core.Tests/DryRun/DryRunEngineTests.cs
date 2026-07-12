@@ -114,16 +114,21 @@ public sealed class DryRunEngineTests : IDisposable
         { ReportByteBudget = reportByteBudget, ChunkByteBudget = chunkByteBudget, MaxScannedCandidates = maxScannedCandidates };
     }
 
-    private static async Task<List<DryRunFileResult>> CollectStream(
+    /// <summary>Concatenates a stream's source files with their source operations (paired by the
+    /// global index — the position in the concatenated list, matching each op's SourceIndex).</summary>
+    private static async Task<List<(string SourcePath, OperationKind Kind)>> CollectStream(
         DryRunEngine engine, Guid profileId, string? scope = null, CancellationToken ct = default)
     {
-        List<DryRunFileResult> files = [];
-        await foreach (Result<IReadOnlyList<DryRunFileResult>, string> chunk in engine.SimulateStreamAsync(profileId, scope, ct))
+        List<PhysicalFile> files = [];
+        Dictionary<int, VirtualFileOperation> ops = [];
+        await foreach (Result<DryRunChunk, string> chunk in engine.SimulateStreamAsync(profileId, scope, ct))
         {
-            Assert.True(chunk.TryGetValue(out IReadOnlyList<DryRunFileResult>? batch), "stream yielded a failure chunk");
-            files.AddRange(batch!);
+            Assert.True(chunk.TryGetValue(out DryRunChunk? c), "stream yielded a failure chunk");
+            files.AddRange(c!.SourceFiles);
+            foreach (VirtualFileOperation op in c.SourceOperations)
+                ops[op.SourceIndex] = op;
         }
-        return files;
+        return files.Select((f, i) => (f.Path, ops[i].Kind)).ToList();
     }
 
     private sealed class FakeSettings(GlobalSettings current) : ISettingsProvider
@@ -155,7 +160,51 @@ public sealed class DryRunEngineTests : IDisposable
     {
         var simulated = await NewEngine(profile).SimulateAsync(profile.Id, scope);
         Assert.True(simulated.TryGetValue(out DryRunReport? report));
+        AssertIndicesValid(report!);
         return report;
+    }
+
+    // ----- helpers over the new report shape -----
+
+    private static VirtualFileOperation SourceOpFor(DryRunReport report, string sourcePathSuffix)
+    {
+        int index = IndexOfSource(report, sourcePathSuffix);
+        return report.SourceOperations.Single(o => o.SourceIndex == index);
+    }
+
+    private static IReadOnlyList<VirtualFileOperation> DestOpsForSource(DryRunReport report, string sourcePathSuffix)
+    {
+        int index = IndexOfSource(report, sourcePathSuffix);
+        return report.DestinationOperations.Where(o => o.SourceIndex == index).ToList();
+    }
+
+    private static int IndexOfSource(DryRunReport report, string sourcePathSuffix)
+    {
+        for (int i = 0; i < report.SourceFiles.Count; i++)
+            if (report.SourceFiles[i].Path.EndsWith(sourcePathSuffix, StringComparison.OrdinalIgnoreCase))
+                return i;
+        Assert.Fail($"no source file ending in '{sourcePathSuffix}'");
+        return -1;
+    }
+
+    /// <summary>Referential-integrity invariant: every operation index is either -1 or a valid
+    /// position in the correct list, and an in-place subject's path matches the op's path.</summary>
+    private static void AssertIndicesValid(DryRunReport report)
+    {
+        foreach (VirtualFileOperation op in report.SourceOperations)
+        {
+            Assert.InRange(op.SourceIndex, 0, report.SourceFiles.Count - 1);
+            Assert.Equal(-1, op.SubjectIndex);
+        }
+        foreach (VirtualFileOperation op in report.DestinationOperations)
+        {
+            Assert.True(op.SourceIndex == -1 || (op.SourceIndex >= 0 && op.SourceIndex < report.SourceFiles.Count),
+                $"destination op SourceIndex {op.SourceIndex} out of range (SourceFiles={report.SourceFiles.Count})");
+            Assert.True(op.SubjectIndex == -1 || (op.SubjectIndex >= 0 && op.SubjectIndex < report.DestinationFiles.Count),
+                $"destination op SubjectIndex {op.SubjectIndex} out of range (DestinationFiles={report.DestinationFiles.Count})");
+            if (op.SubjectIndex >= 0)
+                Assert.Equal(report.DestinationFiles[op.SubjectIndex].Path, op.Path);
+        }
     }
 
     private void SourceFile(string name, string content = "content")
@@ -178,20 +227,21 @@ public sealed class DryRunEngineTests : IDisposable
         SourceFile("new.txt");
         DryRunReport report = await Simulate(ProfileUnderTest());
 
-        DryRunFileResult file = Assert.Single(report.Files);
-        Assert.Equal(DryRunFileDisposition.WouldProcess, file.Disposition);
-        Assert.EndsWith("source", file.SourceRoot!, StringComparison.OrdinalIgnoreCase);
-        DryRunTargetAction action = Assert.Single(file.Targets);
-        Assert.Equal(DryRunTargetKind.WouldWrite, action.Kind);
-        Assert.Equal(Path.Combine(_target, "new.txt"), action.TargetPath);
+        PhysicalFile file = Assert.Single(report.SourceFiles);
+        Assert.EndsWith("source", file.Root, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(OperationKind.Processed, Assert.Single(report.SourceOperations).Kind);
+
+        VirtualFileOperation action = Assert.Single(report.DestinationOperations);
+        Assert.Equal(OperationKind.New, action.Kind);
+        Assert.Equal(Path.Combine(_target, "new.txt"), action.Path);
         Assert.False(report.Truncated);
     }
 
     [Fact]
     public async Task Each_result_is_stamped_with_its_originating_source_root()
     {
-        // Two sources, one file each: every result must carry the root it was enumerated under so the
-        // GUI can group/filter a multi-source report by source.
+        // Two sources, one file each: every source file must carry the root it was enumerated under so
+        // the GUI can group/filter a multi-source report by source.
         string sourceB = Path.Combine(_root, "source-b");
         Directory.CreateDirectory(sourceB);
         File.WriteAllText(Path.Combine(_source, "a.txt"), "a");
@@ -204,11 +254,11 @@ public sealed class DryRunEngineTests : IDisposable
 
         DryRunReport report = await Simulate(profile);
 
-        DryRunFileResult a = Assert.Single(report.Files, f => f.SourcePath.EndsWith("a.txt"));
-        DryRunFileResult b = Assert.Single(report.Files, f => f.SourcePath.EndsWith("b.txt"));
-        Assert.EndsWith("source", a.SourceRoot!, StringComparison.OrdinalIgnoreCase);      // ...\source
-        Assert.EndsWith("source-b", b.SourceRoot!, StringComparison.OrdinalIgnoreCase);    // ...\source-b
-        Assert.NotEqual(a.SourceRoot, b.SourceRoot);
+        PhysicalFile a = Assert.Single(report.SourceFiles, f => f.Path.EndsWith("a.txt"));
+        PhysicalFile b = Assert.Single(report.SourceFiles, f => f.Path.EndsWith("b.txt"));
+        Assert.EndsWith("source", a.Root, StringComparison.OrdinalIgnoreCase);      // ...\source
+        Assert.EndsWith("source-b", b.Root, StringComparison.OrdinalIgnoreCase);    // ...\source-b
+        Assert.NotEqual(a.Root, b.Root);
     }
 
     [Fact]
@@ -225,10 +275,11 @@ public sealed class DryRunEngineTests : IDisposable
         Assert.True(simulated.TryGetValue(out DryRunReport? report));
 
         Assert.True(report!.Truncated);
-        Assert.InRange(report.Files.Count, 1, 19);
+        Assert.InRange(report.SourceFiles.Count, 1, 19);
+        AssertIndicesValid(report);
 
-        // The measurement is a true upper bound: the full wire response is the measured file
-        // results plus commas and a bounded envelope.
+        // The measurement is a true upper bound: the full wire response is the measured records plus
+        // commas and a bounded envelope.
         int wireBytes = IpcSerializer.SerializeResponse(new DryRunResponse { Report = report }).Length;
         Assert.True(wireBytes <= budget + 512,
             $"serialized response was {wireBytes} bytes for a {budget}-byte report budget");
@@ -245,7 +296,7 @@ public sealed class DryRunEngineTests : IDisposable
 
         DryRunReport report = await Simulate(ProfileUnderTest());
 
-        List<string> paths = report.Files.Select(f => f.SourcePath).ToList();
+        List<string> paths = report.SourceFiles.Select(f => f.Path).ToList();
         Assert.Equal(names.Length, paths.Count);
         Assert.Equal(paths.OrderBy(p => p, StringComparer.OrdinalIgnoreCase).ToList(), paths);
     }
@@ -263,9 +314,10 @@ public sealed class DryRunEngineTests : IDisposable
         Assert.True(simulated.TryGetValue(out DryRunReport? report));
 
         Assert.True(report!.Truncated);
-        Assert.InRange(report.Files.Count, 1, 39);
+        Assert.InRange(report.SourceFiles.Count, 1, 39);
+        AssertIndicesValid(report);
 
-        List<string> kept = report.Files.Select(f => Path.GetFileName(f.SourcePath)).ToList();
+        List<string> kept = report.SourceFiles.Select(f => Path.GetFileName(f.Path)).ToList();
         List<string> expectedPrefix = Enumerable.Range(0, 40).Select(i => $"{i:D3}.txt")
             .OrderBy(n => n, StringComparer.OrdinalIgnoreCase).Take(kept.Count).ToList();
         Assert.Equal(expectedPrefix, kept);
@@ -278,12 +330,12 @@ public sealed class DryRunEngineTests : IDisposable
         SourceFile("notes.txt");
         DryRunReport report = await Simulate(ProfileUnderTest(filters: new FilterSet { Include = ["*.wav"] }));
 
-        DryRunFileResult skipped = Assert.Single(report.Files, f => f.SourcePath.EndsWith("notes.txt"));
-        Assert.Equal(DryRunFileDisposition.WouldSkipFilter, skipped.Disposition);
-        Assert.Contains("*.wav", skipped.DecidingFilter);
+        VirtualFileOperation skipped = SourceOpFor(report, "notes.txt");
+        Assert.Equal(OperationKind.SkippedByFilter, skipped.Kind);
+        Assert.Contains("*.wav", skipped.Detail);
+        Assert.Empty(DestOpsForSource(report, "notes.txt"));   // a filtered file writes nowhere
 
-        DryRunFileResult matched = Assert.Single(report.Files, f => f.SourcePath.EndsWith("song.wav"));
-        Assert.Equal(DryRunFileDisposition.WouldProcess, matched.Disposition);
+        Assert.Equal(OperationKind.Processed, SourceOpFor(report, "song.wav").Kind);
     }
 
     [Fact]
@@ -293,11 +345,11 @@ public sealed class DryRunEngineTests : IDisposable
         TargetFile("same.txt", "identical bytes");
         DryRunReport report = await Simulate(ProfileUnderTest(onSuccess: OnSuccessAction.MoveToTrash));
 
-        DryRunFileResult file = Assert.Single(report.Files);
-        Assert.Equal(DryRunFileDisposition.WouldSkipUnchanged, file.Disposition);
-        Assert.Equal(DryRunTargetKind.WouldSkipUnchanged, Assert.Single(file.Targets).Kind);
+        VirtualFileOperation sourceOp = Assert.Single(report.SourceOperations);
+        Assert.Equal(OperationKind.SkippedUnchanged, sourceOp.Kind);
+        Assert.Equal(OperationKind.SkipUnchanged, Assert.Single(report.DestinationOperations).Kind);
         // §3.4.1: an all-unchanged job closes Skipped without committing — no disposition runs.
-        Assert.Null(file.SourceDisposition);
+        Assert.Null(sourceOp.SourceDisposition);
     }
 
     [Fact]
@@ -307,8 +359,7 @@ public sealed class DryRunEngineTests : IDisposable
         TargetFile("clash.txt", "BBBB");   // same length, different bytes
         DryRunReport report = await Simulate(ProfileUnderTest(conflict: ConflictResolution.Overwrite));
 
-        DryRunTargetAction action = Assert.Single(Assert.Single(report.Files).Targets);
-        Assert.Equal(DryRunTargetKind.WouldOverwrite, action.Kind);
+        Assert.Equal(OperationKind.Overwrite, Assert.Single(report.DestinationOperations).Kind);
     }
 
     [Fact]
@@ -318,9 +369,18 @@ public sealed class DryRunEngineTests : IDisposable
         TargetFile("dup.txt", "old");
         DryRunReport report = await Simulate(ProfileUnderTest(conflict: ConflictResolution.RenameSuffix));
 
-        DryRunTargetAction action = Assert.Single(Assert.Single(report.Files).Targets);
-        Assert.Equal(DryRunTargetKind.WouldRenameTo, action.Kind);
-        Assert.Equal(Path.Combine(_target, "dup (1).txt"), action.Detail);
+        // A rename emits a Rename op at the suffixed path (a target of the source) and an Untouched op
+        // for the kept original (destination-only, SourceIndex == -1).
+        VirtualFileOperation rename = Assert.Single(report.DestinationOperations, o => o.Kind == OperationKind.Rename);
+        Assert.Equal(Path.Combine(_target, "dup (1).txt"), rename.Path);
+        Assert.Equal(0, rename.SourceIndex);   // single source file → index 0
+
+        VirtualFileOperation kept = Assert.Single(report.DestinationOperations, o => o.Kind == OperationKind.Untouched);
+        Assert.Equal(Path.Combine(_target, "dup.txt"), kept.Path);
+        Assert.Equal(-1, kept.SourceIndex);
+
+        // Only the rename is a target of the source; the kept original is not.
+        Assert.Equal([OperationKind.Rename], DestOpsForSource(report, "dup.txt").Select(o => o.Kind));
     }
 
     [Fact]
@@ -331,10 +391,10 @@ public sealed class DryRunEngineTests : IDisposable
         DryRunReport report = await Simulate(ProfileUnderTest(conflict: ConflictResolution.Skip,
             onSuccess: OnSuccessAction.MoveToTrash));
 
-        DryRunFileResult file = Assert.Single(report.Files);
-        Assert.Equal(DryRunTargetKind.WouldSkipConflict, Assert.Single(file.Targets).Kind);
-        Assert.Equal(DryRunFileDisposition.WouldProcess, file.Disposition);
-        Assert.Equal(nameof(OnSuccessAction.MoveToTrash), file.SourceDisposition);
+        Assert.Equal(OperationKind.SkipConflict, Assert.Single(report.DestinationOperations).Kind);
+        VirtualFileOperation sourceOp = Assert.Single(report.SourceOperations);
+        Assert.Equal(OperationKind.Processed, sourceOp.Kind);
+        Assert.Equal(OnSuccessAction.MoveToTrash, sourceOp.SourceDisposition);
     }
 
     [Fact]
@@ -345,11 +405,11 @@ public sealed class DryRunEngineTests : IDisposable
         // Make the existing target NEWER than the source → skip; then OLDER → overwrite.
         File.SetLastWriteTimeUtc(Path.Combine(_target, "timed.txt"), DateTime.UtcNow.AddHours(1));
         DryRunReport newerTarget = await Simulate(ProfileUnderTest(conflict: ConflictResolution.OverwriteIfNewer));
-        Assert.Equal(DryRunTargetKind.WouldSkipConflict, Assert.Single(Assert.Single(newerTarget.Files).Targets).Kind);
+        Assert.Equal(OperationKind.SkipConflict, Assert.Single(newerTarget.DestinationOperations).Kind);
 
         File.SetLastWriteTimeUtc(Path.Combine(_target, "timed.txt"), DateTime.UtcNow.AddHours(-1));
         DryRunReport olderTarget = await Simulate(ProfileUnderTest(conflict: ConflictResolution.OverwriteIfNewer));
-        Assert.Equal(DryRunTargetKind.WouldOverwrite, Assert.Single(Assert.Single(olderTarget.Files).Targets).Kind);
+        Assert.Equal(OperationKind.Overwrite, Assert.Single(olderTarget.DestinationOperations).Kind);
     }
 
     [Fact]
@@ -358,8 +418,8 @@ public sealed class DryRunEngineTests : IDisposable
         SourceFile(Path.Combine("nested", "deep", "file.txt"));
         DryRunReport report = await Simulate(ProfileUnderTest());
 
-        DryRunTargetAction action = Assert.Single(Assert.Single(report.Files).Targets);
-        Assert.Equal(Path.Combine(_target, "nested", "deep", "file.txt"), action.TargetPath);
+        VirtualFileOperation action = Assert.Single(report.DestinationOperations);
+        Assert.Equal(Path.Combine(_target, "nested", "deep", "file.txt"), action.Path);
     }
 
     [Fact]
@@ -423,9 +483,10 @@ public sealed class DryRunEngineTests : IDisposable
 
         DryRunReport report = await Simulate(ProfileUnderTest() with { SyncMode = SyncMode.Mirror });
 
-        DryRunDestinationEntry orphan = Assert.Single(report.Destinations);
-        Assert.EndsWith("orphan.txt", orphan.TargetPath);
-        Assert.Equal(DryRunDestinationDisposition.Deleted, orphan.Disposition);
+        VirtualFileOperation orphan = Assert.Single(report.DestinationOperations, o => o.Kind == OperationKind.Deleted);
+        Assert.EndsWith("orphan.txt", orphan.Path);
+        Assert.Equal(-1, orphan.SourceIndex);   // an orphan has no incoming source
+        Assert.EndsWith("orphan.txt", report.DestinationFiles[orphan.SubjectIndex].Path);
         Assert.Equal(before, SnapshotTree());
     }
 
@@ -437,9 +498,41 @@ public sealed class DryRunEngineTests : IDisposable
 
         DryRunReport report = await Simulate(ProfileUnderTest());   // AdditiveArchive
 
-        DryRunDestinationEntry entry = Assert.Single(report.Destinations);
-        Assert.EndsWith("preexisting.txt", entry.TargetPath);
-        Assert.Equal(DryRunDestinationDisposition.Untouched, entry.Disposition);
+        VirtualFileOperation entry = Assert.Single(report.DestinationOperations, o => o.Kind == OperationKind.Untouched);
+        Assert.EndsWith("preexisting.txt", entry.Path);
+    }
+
+    // ----- referential-integrity invariants -----
+
+    [Fact]
+    public async Task Operation_indices_are_valid_across_a_mixed_run()
+    {
+        SourceFile("fresh.txt", "brand new");                    // New
+        SourceFile("same.txt", "identical"); TargetFile("same.txt", "identical");   // SkipUnchanged
+        SourceFile("dup.txt", "changed content"); TargetFile("dup.txt", "x");        // Rename (+ kept Untouched)
+        SourceFile("junk.tmp", "junk");                          // filtered
+
+        DryRunReport report = await Simulate(ProfileUnderTest(
+            conflict: ConflictResolution.RenameSuffix,
+            onSuccess: OnSuccessAction.MoveToTrash,
+            filters: new FilterSet { ExcludeGlob = ["*.tmp"] }) with { SyncMode = SyncMode.Mirror });
+
+        AssertIndicesValid(report);   // also runs inside Simulate; explicit here for intent
+        Assert.Equal(report.SourceFiles.Count, report.SourceOperations.Count);
+    }
+
+    [Fact]
+    public async Task Truncated_report_contains_no_out_of_range_indices()
+    {
+        for (int i = 0; i < 40; i++)
+            SourceFile($"{i:D3}.txt", $"content {i}");
+        Profile profile = ProfileUnderTest();
+
+        var simulated = await NewEngine(1500, profile).SimulateAsync(profile.Id, null);
+        Assert.True(simulated.TryGetValue(out DryRunReport? report));
+
+        Assert.True(report!.Truncated);
+        AssertIndicesValid(report);   // bundle-boundary truncation ⇒ no retained op references a dropped file
     }
 
     // ----- streaming (SimulateStreamAsync) -----
@@ -457,7 +550,7 @@ public sealed class DryRunEngineTests : IDisposable
         DryRunEngine engine = NewEngine(
             DryRunEngine.MaxReportBytes, DryRunEngine.ChunkByteThreshold, maxScannedCandidates: 5,
             GlobalSettings.Default, profile);
-        List<DryRunFileResult> streamed = await CollectStream(engine, profile.Id);
+        List<(string SourcePath, OperationKind Kind)> streamed = await CollectStream(engine, profile.Id);
 
         Assert.Equal(5, streamed.Count);
     }
@@ -471,11 +564,13 @@ public sealed class DryRunEngineTests : IDisposable
         Profile profile = ProfileUnderTest();
 
         DryRunReport batched = await Simulate(profile);
-        List<DryRunFileResult> streamed = await CollectStream(NewEngine(profile), profile.Id);
+        Dictionary<int, VirtualFileOperation> batchedOps = batched.SourceOperations.ToDictionary(o => o.SourceIndex);
+        List<(string, OperationKind)> batchedPairs =
+            batched.SourceFiles.Select((f, i) => (f.Path, batchedOps[i].Kind)).ToList();
 
-        Assert.Equal(
-            batched.Files.Select(f => (f.SourcePath, f.Disposition)).ToList(),
-            streamed.Select(f => (f.SourcePath, f.Disposition)).ToList());
+        List<(string SourcePath, OperationKind Kind)> streamed = await CollectStream(NewEngine(profile), profile.Id);
+
+        Assert.Equal(batchedPairs, streamed);
     }
 
     [Fact]
@@ -490,10 +585,11 @@ public sealed class DryRunEngineTests : IDisposable
         var batched = await NewEngine(1500, profile).SimulateAsync(profile.Id, null);
         Assert.True(batched.TryGetValue(out DryRunReport? truncatedReport));
         Assert.True(truncatedReport!.Truncated);
-        Assert.InRange(truncatedReport.Files.Count, 1, 39);
+        Assert.InRange(truncatedReport.SourceFiles.Count, 1, 39);
 
         // Same tiny budget as the *chunk* budget — still every file comes back.
-        List<DryRunFileResult> streamed = await CollectStream(NewEngine(1500, 1500, GlobalSettings.Default, profile), profile.Id);
+        List<(string SourcePath, OperationKind Kind)> streamed =
+            await CollectStream(NewEngine(1500, 1500, GlobalSettings.Default, profile), profile.Id);
         Assert.Equal(40, streamed.Count);
         Assert.Equal(
             Enumerable.Range(0, 40).Select(i => $"{i:D3}.txt").OrderBy(n => n, StringComparer.OrdinalIgnoreCase).ToList(),
@@ -509,26 +605,26 @@ public sealed class DryRunEngineTests : IDisposable
 
         // A small chunk budget forces several chunks; each stays under the 16 MiB frame cap by design.
         DryRunEngine engine = NewEngine(DryRunEngine.MaxReportBytes, 512, GlobalSettings.Default, profile);
-        List<IReadOnlyList<DryRunFileResult>> chunks = [];
-        await foreach (Result<IReadOnlyList<DryRunFileResult>, string> chunk in engine.SimulateStreamAsync(profile.Id, null))
+        List<DryRunChunk> chunks = [];
+        await foreach (Result<DryRunChunk, string> chunk in engine.SimulateStreamAsync(profile.Id, null))
         {
-            Assert.True(chunk.TryGetValue(out IReadOnlyList<DryRunFileResult>? batch));
+            Assert.True(chunk.TryGetValue(out DryRunChunk? batch));
             chunks.Add(batch!);
         }
 
         Assert.True(chunks.Count > 1, $"expected multiple chunks, got {chunks.Count}");
-        Assert.All(chunks, c => Assert.NotEmpty(c));
-        Assert.Equal(30, chunks.Sum(c => c.Count));
+        Assert.All(chunks, c => Assert.NotEmpty(c.SourceFiles));
+        Assert.Equal(30, chunks.Sum(c => c.SourceFiles.Count));
     }
 
     [Fact]
     public async Task Stream_unknown_profile_yields_a_single_failure_item()
     {
-        List<Result<IReadOnlyList<DryRunFileResult>, string>> items = [];
+        List<Result<DryRunChunk, string>> items = [];
         await foreach (var item in NewEngine(ProfileUnderTest()).SimulateStreamAsync(Guid.NewGuid(), null))
             items.Add(item);
 
-        Result<IReadOnlyList<DryRunFileResult>, string> only = Assert.Single(items);
+        Result<DryRunChunk, string> only = Assert.Single(items);
         Assert.True(only.TryGetError(out string? error));
         Assert.Contains("not found", error);
     }

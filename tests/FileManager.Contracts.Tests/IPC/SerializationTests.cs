@@ -58,8 +58,8 @@ public sealed class SerializationTests
         { new ProfileResponse { Profile = SampleProfile() }, "profile" },
         { new ValidationResponse { Issues = [new ValidationIssue(ValidationSeverity.BlockingWarning, "C", "m")] }, "validation" },
         { new MatchingProfilesResponse { Matches = [] }, "matching" },
-        { new DryRunResponse { Report = new DryRunReport(SomeId, DateTimeOffset.UnixEpoch, []) }, "dry-run-report" },
-        { new DryRunChunkResponse { Files = [new DryRunFileResult { SourcePath = @"C:\x", Disposition = DryRunFileDisposition.WouldProcess }] }, "dry-run-chunk" },
+        { new DryRunResponse { Report = SampleReport() }, "dry-run-report" },
+        { new DryRunChunkResponse { SourceFiles = [SampleSourceFile()], SourceOperations = [SampleSourceOp()] }, "dry-run-chunk" },
         { new DryRunCompleteResponse { GeneratedAt = DateTimeOffset.UnixEpoch, Truncated = false }, "dry-run-complete" },
         { new RecentJobsResponse { Jobs = [] }, "recent-jobs" },
         { new JobLogResponse { Lines = ["a"] }, "job-log" },
@@ -133,127 +133,109 @@ public sealed class SerializationTests
     }
 
     [Fact]
-    public void DryRunReport_truncated_flag_round_trips_and_is_false_when_absent()
+    public void DryRunReport_round_trips_all_four_collections_with_indices()
     {
-        byte[] wire = IpcSerializer.SerializeResponse(new DryRunResponse
-        {
-            Report = new DryRunReport(SomeId, DateTimeOffset.UnixEpoch, [], Truncated: true),
-        });
+        byte[] wire = IpcSerializer.SerializeResponse(new DryRunResponse { Report = SampleReport() });
+
+        // OperationKind serializes as a string, consistent with the rest of the wire format.
+        using JsonDocument document = JsonDocument.Parse(wire);
+        Assert.Equal("Processed", document.RootElement
+            .GetProperty("Report").GetProperty("SourceOperations")[0].GetProperty("Kind").GetString());
+
+        Assert.True(IpcSerializer.DeserializeResponse(wire).TryGetValue(out IpcResponse? reparsed));
+        DryRunReport report = Assert.IsType<DryRunResponse>(reparsed).Report;
+
+        Assert.Equal(@"C:\a\one.txt", Assert.Single(report.SourceFiles).Path);
+        Assert.Equal(@"C:\t\one.txt", Assert.Single(report.DestinationFiles).Path);
+
+        VirtualFileOperation sourceOp = Assert.Single(report.SourceOperations);
+        Assert.Equal(OperationKind.Processed, sourceOp.Kind);
+        Assert.Equal(0, sourceOp.SourceIndex);
+        Assert.Equal(OnSuccessAction.KeepSource, sourceOp.SourceDisposition);
+
+        // Indices survive the round-trip and resolve into the file lists.
+        VirtualFileOperation destOp = Assert.Single(report.DestinationOperations);
+        Assert.Equal(OperationKind.Overwrite, destOp.Kind);
+        Assert.Equal(0, destOp.SourceIndex);
+        Assert.Equal(0, destOp.SubjectIndex);
+        Assert.Equal(@"C:\a\one.txt", report.SourceFiles[destOp.SourceIndex].Path);
+        Assert.Equal(@"C:\t\one.txt", report.DestinationFiles[destOp.SubjectIndex].Path);
+    }
+
+    [Fact]
+    public void DryRunReport_truncated_flag_round_trips_and_defaults_false_when_absent()
+    {
+        byte[] wire = IpcSerializer.SerializeResponse(new DryRunResponse { Report = SampleReport() with { Truncated = true } });
         using JsonDocument document = JsonDocument.Parse(wire);
         Assert.True(document.RootElement.GetProperty("Report").GetProperty("Truncated").GetBoolean());
 
         Assert.True(IpcSerializer.DeserializeResponse(wire).TryGetValue(out IpcResponse? reparsed));
-        DryRunResponse roundTripped = Assert.IsType<DryRunResponse>(reparsed);
-        Assert.True(roundTripped.Report.Truncated);
+        Assert.True(Assert.IsType<DryRunResponse>(reparsed).Report.Truncated);
 
-        // Old-server → new-client compatibility: a report serialized before the flag existed
-        // (no "Truncated" property) deserializes to the constructor default, false.
-        string legacy = """{"type":"dry-run-report","Report":{"ProfileId":""" + $"\"{SomeId}\"" +
-            ""","GeneratedAt":"1970-01-01T00:00:00+00:00","Files":[]}}""";
-        Assert.True(IpcSerializer.DeserializeResponse(Encoding.UTF8.GetBytes(legacy)).TryGetValue(out IpcResponse? legacyResponse));
-        DryRunResponse legacyParsed = Assert.IsType<DryRunResponse>(legacyResponse);
-        Assert.False(legacyParsed.Report.Truncated);
+        // A report whose "Truncated" property is absent deserializes to the default, false.
+        string json = Encoding.UTF8.GetString(IpcSerializer.SerializeResponse(new DryRunResponse { Report = SampleReport() }));
+        JsonObject obj = JsonNode.Parse(json)!.AsObject();
+        Assert.True(obj["Report"]!.AsObject().Remove("Truncated"));
+        Assert.True(IpcSerializer.DeserializeResponse(Encoding.UTF8.GetBytes(obj.ToJsonString())).TryGetValue(out IpcResponse? without));
+        Assert.False(Assert.IsType<DryRunResponse>(without).Report.Truncated);
     }
 
     [Fact]
-    public void DryRunFileResult_source_root_round_trips_and_is_null_when_absent()
+    public void PhysicalFile_round_trips_standalone()
     {
-        byte[] wire = IpcSerializer.SerializeResponse(new DryRunResponse
+        PhysicalFile file = new()
         {
-            Report = new DryRunReport(SomeId, DateTimeOffset.UnixEpoch,
+            Path = @"C:\a\one.txt",
+            Root = @"C:\a",
+            Length = 42,
+            LastWritten = DateTimeOffset.UnixEpoch,
+            IsReparsePoint = true,
+        };
+        byte[] wire = JsonSerializer.SerializeToUtf8Bytes(file, FileManagerJsonContext.Default.PhysicalFile);
+        PhysicalFile? roundTripped = JsonSerializer.Deserialize(wire, FileManagerJsonContext.Default.PhysicalFile);
+        Assert.Equal(file, roundTripped);
+    }
+
+    [Fact]
+    public void VirtualFileOperation_round_trips_standalone()
+    {
+        VirtualFileOperation op = new()
+        {
+            Path = @"C:\t\one (1).txt",
+            Root = @"C:\t",
+            Kind = OperationKind.Rename,
+            SourceIndex = 3,
+            SubjectIndex = -1,
+            SourceDisposition = OnSuccessAction.MoveToTrash,
+            Detail = "renamed to avoid a conflict",
+        };
+        byte[] wire = JsonSerializer.SerializeToUtf8Bytes(op, FileManagerJsonContext.Default.VirtualFileOperation);
+        VirtualFileOperation? roundTripped = JsonSerializer.Deserialize(wire, FileManagerJsonContext.Default.VirtualFileOperation);
+        Assert.Equal(op, roundTripped);
+    }
+
+    [Fact]
+    public void DryRunChunkResponse_round_trips_its_four_collections()
+    {
+        byte[] wire = IpcSerializer.SerializeResponse(new DryRunChunkResponse
+        {
+            SourceFiles = [SampleSourceFile()],
+            DestinationFiles = [SampleDestinationFile()],
+            SourceOperations = [SampleSourceOp()],
+            DestinationOperations =
             [
-                new DryRunFileResult
-                {
-                    SourcePath = @"C:\a\one.txt",
-                    SourceRoot = @"C:\a",
-                    Disposition = DryRunFileDisposition.WouldProcess,
-                },
-            ]),
-        });
-
-        Assert.True(IpcSerializer.DeserializeResponse(wire).TryGetValue(out IpcResponse? reparsed));
-        DryRunResponse roundTripped = Assert.IsType<DryRunResponse>(reparsed);
-        Assert.Equal(@"C:\a", roundTripped.Report.Files[0].SourceRoot);
-
-        // Old-server → new-client compatibility: a result serialized before SourceRoot existed
-        // (no "SourceRoot" property) deserializes to null.
-        string legacy = """{"type":"dry-run-report","Report":{"ProfileId":""" + $"\"{SomeId}\"" +
-            ""","GeneratedAt":"1970-01-01T00:00:00+00:00","Files":[""" +
-            """{"SourcePath":"C:\\a\\one.txt","Disposition":"WouldProcess"}]}}""";
-        Assert.True(IpcSerializer.DeserializeResponse(Encoding.UTF8.GetBytes(legacy)).TryGetValue(out IpcResponse? legacyResponse));
-        DryRunResponse legacyParsed = Assert.IsType<DryRunResponse>(legacyResponse);
-        Assert.Null(legacyParsed.Report.Files[0].SourceRoot);
-    }
-
-    [Fact]
-    public void DryRunReport_destinations_round_trip_and_default_to_empty_when_absent()
-    {
-        byte[] wire = IpcSerializer.SerializeResponse(new DryRunResponse
-        {
-            Report = new DryRunReport(SomeId, DateTimeOffset.UnixEpoch, [], Truncated: false,
-                Destinations:
-                [
-                    new DryRunDestinationEntry { TargetPath = @"C:\t\orphan.txt", TargetRoot = @"C:\t", Disposition = DryRunDestinationDisposition.Deleted },
-                ]),
-        });
-
-        Assert.True(IpcSerializer.DeserializeResponse(wire).TryGetValue(out IpcResponse? reparsed));
-        DryRunResponse roundTripped = Assert.IsType<DryRunResponse>(reparsed);
-        DryRunDestinationEntry entry = Assert.Single(roundTripped.Report.Destinations!);
-        Assert.Equal(@"C:\t\orphan.txt", entry.TargetPath);
-        Assert.Equal(DryRunDestinationDisposition.Deleted, entry.Disposition);
-
-        // Old-server → new-client compatibility: a report serialized before Destinations existed
-        // (no "Destinations" property) deserializes to the constructor default (null).
-        string legacy = """{"type":"dry-run-report","Report":{"ProfileId":""" + $"\"{SomeId}\"" +
-            ""","GeneratedAt":"1970-01-01T00:00:00+00:00","Files":[]}}""";
-        Assert.True(IpcSerializer.DeserializeResponse(Encoding.UTF8.GetBytes(legacy)).TryGetValue(out IpcResponse? legacyResponse));
-        DryRunResponse legacyParsed = Assert.IsType<DryRunResponse>(legacyResponse);
-        Assert.Null(legacyParsed.Report.Destinations);
-    }
-
-    [Fact]
-    public void DryRunTargetAction_target_root_round_trips_and_is_null_when_absent()
-    {
-        byte[] wire = IpcSerializer.SerializeResponse(new DryRunResponse
-        {
-            Report = new DryRunReport(SomeId, DateTimeOffset.UnixEpoch,
-            [
-                new DryRunFileResult
-                {
-                    SourcePath = @"C:\a\one.txt",
-                    Disposition = DryRunFileDisposition.WouldProcess,
-                    Targets = [new DryRunTargetAction { TargetPath = @"C:\t\one.txt", TargetRoot = @"C:\t", Kind = DryRunTargetKind.WouldWrite }],
-                },
-            ]),
-        });
-
-        Assert.True(IpcSerializer.DeserializeResponse(wire).TryGetValue(out IpcResponse? reparsed));
-        DryRunResponse roundTripped = Assert.IsType<DryRunResponse>(reparsed);
-        Assert.Equal(@"C:\t", roundTripped.Report.Files[0].Targets[0].TargetRoot);
-
-        // Old-server → new-client: a target action without TargetRoot deserializes to null.
-        string legacy = """{"type":"dry-run-report","Report":{"ProfileId":""" + $"\"{SomeId}\"" +
-            ""","GeneratedAt":"1970-01-01T00:00:00+00:00","Files":[{"SourcePath":"C:\\a\\one.txt","Disposition":"WouldProcess","Targets":[{"TargetPath":"C:\\t\\one.txt","Kind":"WouldWrite"}]}]}}""";
-        Assert.True(IpcSerializer.DeserializeResponse(Encoding.UTF8.GetBytes(legacy)).TryGetValue(out IpcResponse? legacyResponse));
-        DryRunResponse legacyParsed = Assert.IsType<DryRunResponse>(legacyResponse);
-        Assert.Null(legacyParsed.Report.Files[0].Targets[0].TargetRoot);
-    }
-
-    [Fact]
-    public void DryRunDestinationChunkResponse_round_trips()
-    {
-        byte[] wire = IpcSerializer.SerializeResponse(new DryRunDestinationChunkResponse
-        {
-            Entries =
-            [
-                new DryRunDestinationEntry { TargetPath = @"C:\t\keep.txt", TargetRoot = @"C:\t", Disposition = DryRunDestinationDisposition.Untouched },
+                new VirtualFileOperation { Path = @"C:\t\one.txt", Root = @"C:\t", Kind = OperationKind.Overwrite, SourceIndex = 0, SubjectIndex = 0 },
             ],
         });
 
         Assert.True(IpcSerializer.DeserializeResponse(wire).TryGetValue(out IpcResponse? reparsed));
-        DryRunDestinationChunkResponse chunk = Assert.IsType<DryRunDestinationChunkResponse>(reparsed);
-        Assert.Equal(@"C:\t\keep.txt", Assert.Single(chunk.Entries).TargetPath);
+        DryRunChunkResponse chunk = Assert.IsType<DryRunChunkResponse>(reparsed);
+        Assert.Equal(@"C:\a\one.txt", Assert.Single(chunk.SourceFiles).Path);
+        Assert.Equal(@"C:\t\one.txt", Assert.Single(chunk.DestinationFiles).Path);
+        Assert.Equal(OperationKind.Processed, Assert.Single(chunk.SourceOperations).Kind);
+        VirtualFileOperation destOp = Assert.Single(chunk.DestinationOperations);
+        Assert.Equal(0, destOp.SourceIndex);
+        Assert.Equal(0, destOp.SubjectIndex);
     }
 
     [Fact]
@@ -306,6 +288,54 @@ public sealed class SerializationTests
         Assert.True(IpcSerializer.DeserializeRequest("""{"type":"no-such-request"}"""u8.ToArray()).TryGetError(out string? unknown));
         Assert.Contains("malformed request", unknown);
     }
+
+    private static PhysicalFile SampleSourceFile() => new()
+    {
+        Path = @"C:\a\one.txt",
+        Root = @"C:\a",
+        Length = 10,
+        LastWritten = DateTimeOffset.UnixEpoch,
+    };
+
+    private static PhysicalFile SampleDestinationFile() => new()
+    {
+        Path = @"C:\t\one.txt",
+        Root = @"C:\t",
+        Length = 20,
+        LastWritten = DateTimeOffset.UnixEpoch,
+    };
+
+    private static VirtualFileOperation SampleSourceOp() => new()
+    {
+        Path = @"C:\a\one.txt",
+        Root = @"C:\a",
+        Kind = OperationKind.Processed,
+        SourceIndex = 0,
+        SourceDisposition = OnSuccessAction.KeepSource,
+    };
+
+    /// <summary>A minimal report exercising all four collections: one source file overwritten at one
+    /// destination, with the destination op referencing both by index.</summary>
+    private static DryRunReport SampleReport() => new()
+    {
+        ProfileId = SomeId,
+        GeneratedAt = DateTimeOffset.UnixEpoch,
+        SourceFiles = [SampleSourceFile()],
+        DestinationFiles = [SampleDestinationFile()],
+        SourceOperations = [SampleSourceOp()],
+        DestinationOperations =
+        [
+            new VirtualFileOperation
+            {
+                Path = @"C:\t\one.txt",
+                Root = @"C:\t",
+                Kind = OperationKind.Overwrite,
+                SourceIndex = 0,
+                SubjectIndex = 0,
+                Detail = "existing file last modified 1970-01-01",
+            },
+        ],
+    };
 
     internal static Profile SampleProfile() => new()
     {

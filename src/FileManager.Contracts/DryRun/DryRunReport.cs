@@ -1,99 +1,116 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using FileManager.Contracts;
+using FileManager.Contracts.Profiles;
 
 namespace FileManager.Contracts.DryRun;
 
-public sealed record DryRunReport(
-    Guid ProfileId, DateTimeOffset GeneratedAt, IReadOnlyList<DryRunFileResult> Files,
-    // Additive (old peers omit it and deserialize the default): true when the engine stopped
-    // reporting before the scan ran out — the report shows a prefix, not everything found.
-    bool Truncated = false,
-    // Additive (old peers omit it and deserialize to []): the destination-only entries the
-    // Destinations view needs that are NOT derivable from Files[].Targets — pre-existing files
-    // no source writes to (Untouched), and Mirror orphans (Deleted). The write side
-    // (New/Overwritten/Renamed) is derived UI-side from Files[].Targets, so it is not repeated here.
-    IReadOnlyList<DryRunDestinationEntry>? Destinations = null);
-
-public enum DryRunFileDisposition
+/// <summary>
+/// A dry-run simulation modeled as a bipartite plan graph. The <see cref="SourceFiles"/> and
+/// <see cref="DestinationFiles"/> lists are the <em>nodes</em> — the actual living files discovered
+/// on disk under the profile's source roots and target roots respectively, pure ground truth with
+/// no verdicts. The <see cref="SourceOperations"/> and <see cref="DestinationOperations"/> lists are
+/// the <em>edges/annotations</em> — what the program would do, referencing the files they act on
+/// <b>by integer index</b> into the two file lists.
+/// <para>
+/// List order is a stable contract: an operation's <see cref="VirtualFileOperation.SourceIndex"/> /
+/// <see cref="VirtualFileOperation.SubjectIndex"/> is a position into these lists, so the engine's
+/// emit order must equal the streaming client's assembly order. Truncation happens only at whole
+/// per-file-bundle boundaries, so a retained operation never references a dropped file.
+/// </para>
+/// </summary>
+public sealed record DryRunReport
 {
-    [Tooltip("Would Process")]
-    WouldProcess,
-    [Tooltip("Would Skip (Filtered)")]
-    WouldSkipFilter,
-    [Tooltip("Would Skip (Unchanged)")]
-    WouldSkipUnchanged,
+    public required Guid ProfileId { get; init; }
+    public required DateTimeOffset GeneratedAt { get; init; }
+    /// <summary>Files discovered under the profile's source roots. Index space for
+    /// <see cref="VirtualFileOperation.SourceIndex"/>.</summary>
+    public required IReadOnlyList<PhysicalFile> SourceFiles { get; init; }
+    /// <summary>Pre-existing files discovered under the profile's target roots. Index space for
+    /// <see cref="VirtualFileOperation.SubjectIndex"/>.</summary>
+    public required IReadOnlyList<PhysicalFile> DestinationFiles { get; init; }
+    /// <summary>One operation per source file describing its fate (Processed / Skipped) and the
+    /// disposition of the original. Source-side <see cref="OperationKind"/>s only.</summary>
+    public required IReadOnlyList<VirtualFileOperation> SourceOperations { get; init; }
+    /// <summary>The destination "after" view: every resulting path with its operation
+    /// (New/Overwrite/Rename/Skip/Untouched/Deleted/Unknown). Destination-side
+    /// <see cref="OperationKind"/>s only.</summary>
+    public required IReadOnlyList<VirtualFileOperation> DestinationOperations { get; init; }
+    /// <summary>True when the engine stopped before the scan ran out — the report shows a prefix,
+    /// not everything found. Mirror <see cref="OperationKind.Deleted"/> entries are never inferred
+    /// on a truncated report.</summary>
+    public bool Truncated { get; init; }
 }
 
-public sealed record DryRunFileResult
+/// <summary>An actual file discovered on disk — pure ground truth, no verdict. <see cref="Length"/>
+/// and <see cref="LastWritten"/> come free from the enumeration/stat snapshot (no extra I/O).</summary>
+public sealed record PhysicalFile
 {
-    public required string SourcePath { get; init; }
-    // Additive (old peers omit it and deserialize to null): the Source root this file was
-    // enumerated under, so the GUI can group/filter a multi-source report by source.
-    public string? SourceRoot { get; init; }
-    public required DryRunFileDisposition Disposition { get; init; }
-    public string? DecidingFilter { get; init; }                  // set for WouldSkipFilter
-    /// <summary>Fully token-expanded argv per transformer step, joined for display. Empty if no transformers.</summary>
-    public IReadOnlyList<string> ExpandedCommands { get; init; } = [];
-    public IReadOnlyList<DryRunTargetAction> Targets { get; init; } = [];
-    /// <summary>e.g. "MoveToTrash", "KeepSource". Deletions/overwrites are the report's whole point (spec §8).</summary>
-    public string? SourceDisposition { get; init; }
+    public required string Path { get; init; }          // absolute
+    /// <summary>The source root or target root this file was discovered under — the group/facet key.</summary>
+    public required string Root { get; init; }
+    public required long Length { get; init; }
+    public required DateTimeOffset LastWritten { get; init; }
+    public bool IsReparsePoint { get; init; }
 }
 
-public enum DryRunTargetKind
+/// <summary>What the program would do to a file. References the physical file(s) it acts on by
+/// integer index into <see cref="DryRunReport.SourceFiles"/> / <see cref="DryRunReport.DestinationFiles"/>.
+/// List membership (Source vs Destination operations) determines the "side"; there is no side
+/// discriminator.</summary>
+public sealed record VirtualFileOperation
 {
-    [Tooltip("Write")]
-    WouldWrite,
+    /// <summary>Source op: the source file's path. Destination op: the resulting path (which may be
+    /// a not-yet-existing New/Rename path).</summary>
+    public required string Path { get; init; }
+    /// <summary>The source/target root this op's path sits under — facet key and cross-tab
+    /// relative-path alignment.</summary>
+    public required string Root { get; init; }
+    public required OperationKind Kind { get; init; }
+    /// <summary>Index into <see cref="DryRunReport.SourceFiles"/> for the content origin (a source
+    /// op: the file itself; a destination New/Overwrite/Rename op: the incoming content).
+    /// <c>-1</c> when there is none.</summary>
+    public int SourceIndex { get; init; } = -1;
+    /// <summary>Index into <see cref="DryRunReport.DestinationFiles"/> for the pre-existing file this
+    /// destination op touches (Overwrite/SkipConflict/SkipUnchanged/Untouched/Deleted/Unknown).
+    /// <c>-1</c> when there is none (New/Rename, and all source ops).</summary>
+    public int SubjectIndex { get; init; } = -1;
+    /// <summary>Source ops only: what happens to the original after a successful copy
+    /// (KeepSource / MoveToTrash / MoveToArchive / PermanentDelete). Null when the file does not
+    /// process (all-unchanged or skipped).</summary>
+    public OnSuccessAction? SourceDisposition { get; init; }
+    /// <summary>Display string: e.g. the existing file's mtime, the suffixed rename name, the
+    /// deciding filter rule, or the unchanged reason.</summary>
+    public string? Detail { get; init; }
+}
+
+/// <summary>The fate of a file. Source-side kinds describe a scanned source file; destination-side
+/// kinds describe a resulting destination path. The two operation lists keep them apart.</summary>
+public enum OperationKind
+{
+    // ---- Source side ----
+    [Tooltip("Processed")]
+    Processed,
+    [Tooltip("Skipped (Filtered)")]
+    SkippedByFilter,
+    [Tooltip("Skipped (Unchanged)")]
+    SkippedUnchanged,
+
+    // ---- Destination side ----
+    [Tooltip("New")]
+    New,
     [Tooltip("Overwrite")]
-    WouldOverwrite,
-    [Tooltip("Rename")]
-    WouldRenameTo,
+    Overwrite,
+    [Tooltip("Renamed")]
+    Rename,
     [Tooltip("Skip (Conflict)")]
-    WouldSkipConflict,
+    SkipConflict,
     [Tooltip("Skip (Unchanged)")]
-    WouldSkipUnchanged,
-    [Tooltip("Unknown")]
-    Unknown,
-}
-
-public sealed record DryRunTargetAction
-{
-    public required string TargetPath { get; init; }
-    // Additive (old peers omit it and deserialize to null): the profile Target root this action's
-    // path sits under, so the Destinations view can group/filter by destination and the Sources view
-    // can filter its rows by which destination(s) they land in.
-    public string? TargetRoot { get; init; }
-    public required DryRunTargetKind Kind { get; init; }
-    public string? Detail { get; init; }   // e.g. existing file's mtime, or the suffixed name
-}
-
-/// <summary>Disposition of a destination-side entry that the Destinations view can't derive from
-/// the source-oriented <see cref="DryRunFileResult.Targets"/>. New/Overwritten/Renamed are derived
-/// UI-side from the target actions; only these remain.</summary>
-public enum DryRunDestinationDisposition
-{
-    /// <summary>A file already present under a target root that no source writes to. In
-    /// AdditiveArchive it simply stays; it is shown so the resulting tree is complete.</summary>
+    SkipUnchanged,
     [Tooltip("Untouched")]
     Untouched,
-    /// <summary>A Mirror orphan: a file under a target root with no corresponding source, which a
-    /// real Mirror run would delete. Only emitted for a complete (non-truncated) scan under
-    /// <c>SyncMode.Mirror</c>.</summary>
     [Tooltip("Deleted")]
     Deleted,
-    /// <summary>A reparse point / unclassifiable entry the sweep declines to judge (never Deleted).</summary>
     [Tooltip("Unknown")]
     Unknown,
-}
-
-/// <summary>A destination-only entry (see <see cref="DryRunDestinationDisposition"/>): a file that
-/// exists under a profile target root and is not accounted for by any source write.</summary>
-public sealed record DryRunDestinationEntry
-{
-    public required string TargetPath { get; init; }
-    /// <summary>The profile Target root this file sits under — the Destinations-view "filter by
-    /// destination" key.</summary>
-    public required string TargetRoot { get; init; }
-    public required DryRunDestinationDisposition Disposition { get; init; }
-    public string? Detail { get; init; }
 }
