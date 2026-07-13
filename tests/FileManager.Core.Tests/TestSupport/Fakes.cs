@@ -21,6 +21,9 @@ internal sealed class FakeVolumeInfoProvider : IVolumeInfoProvider
     }
 
     public bool IsNetworkPath(string path) => Network;
+
+    public Result<VolumeCapacity, string> GetVolumeCapacity(string path) =>
+        new VolumeCapacity(long.MaxValue / 2, Free, 1);
 }
 
 /// <summary>No-op metadata preservation; a test can make <see cref="Apply"/> fail to exercise the

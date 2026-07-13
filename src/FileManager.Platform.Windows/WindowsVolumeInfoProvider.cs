@@ -51,6 +51,41 @@ public sealed partial class WindowsVolumeInfoProvider(ILogger<WindowsVolumeInfoP
         }
     }
 
+    public Result<VolumeCapacity, string> GetVolumeCapacity(string path)
+    {
+        try
+        {
+            string dir = DirectoryOf(path);
+            if (!GetDiskFreeSpaceExW(dir, out _, out ulong totalBytes, out ulong totalFree))
+            {
+                int err = Marshal.GetLastPInvokeError();
+                return Result<VolumeCapacity, string>.Failure(
+                    $"could not query capacity for \"{path}\" (win32 {err})");
+            }
+
+            // Cluster size is a best-effort refinement of the footprint math — some volumes (certain
+            // UNC shares) reject GetDiskFreeSpace. Fall back to 1 (no rounding) rather than failing
+            // the whole projection.
+            long cluster = 1;
+            if (GetDiskFreeSpaceW(RootOf(dir), out uint sectorsPerCluster, out uint bytesPerSector, out _, out _))
+            {
+                long candidate = (long)sectorsPerCluster * bytesPerSector;
+                if (candidate > 0)
+                    cluster = candidate;
+            }
+
+            return new VolumeCapacity(
+                (long)Math.Min(totalBytes, long.MaxValue),
+                (long)Math.Min(totalFree, long.MaxValue),
+                cluster);
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "Capacity query failed for {Path}", path);
+            return Result<VolumeCapacity, string>.Failure($"could not query capacity for \"{path}\": {ex.Message}");
+        }
+    }
+
     public bool IsNetworkPath(string path)
     {
         try
@@ -81,6 +116,18 @@ public sealed partial class WindowsVolumeInfoProvider(ILogger<WindowsVolumeInfoP
         return Path.GetDirectoryName(full) ?? full;
     }
 
+    /// <summary>The volume root GetDiskFreeSpaceW wants (drive root "C:\" or UNC share root with a
+    /// trailing separator). Falls back to the directory itself when a root can't be derived.</summary>
+    private static string RootOf(string directory)
+    {
+        string? root = Path.GetPathRoot(directory);
+        if (string.IsNullOrEmpty(root))
+            return directory;
+        return root.EndsWith(Path.DirectorySeparatorChar) || root.EndsWith(Path.AltDirectorySeparatorChar)
+            ? root
+            : root + Path.DirectorySeparatorChar;
+    }
+
     [LibraryImport("kernel32.dll", EntryPoint = "GetDiskFreeSpaceExW", SetLastError = true, StringMarshalling = StringMarshalling.Utf16)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static partial bool GetDiskFreeSpaceExW(
@@ -89,4 +136,10 @@ public sealed partial class WindowsVolumeInfoProvider(ILogger<WindowsVolumeInfoP
 
     [LibraryImport("kernel32.dll", EntryPoint = "GetDriveTypeW", StringMarshalling = StringMarshalling.Utf16)]
     private static partial uint GetDriveTypeW(string lpRootPathName);
+
+    [LibraryImport("kernel32.dll", EntryPoint = "GetDiskFreeSpaceW", SetLastError = true, StringMarshalling = StringMarshalling.Utf16)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static partial bool GetDiskFreeSpaceW(
+        string lpRootPathName, out uint lpSectorsPerCluster, out uint lpBytesPerSector,
+        out uint lpNumberOfFreeClusters, out uint lpTotalNumberOfClusters);
 }

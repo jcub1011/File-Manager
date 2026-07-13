@@ -3,6 +3,7 @@ using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using FileManager.Contracts.DryRun;
 using FileManager.Contracts.IPC;
+using FileManager.Contracts.Primitives;
 using FileManager.UI.Extensions;
 using FileManager.UI.Services;
 using Serilog;
@@ -40,10 +41,14 @@ public sealed record DryRunFileRow(
     string? DecidingFilter,
     string? SourceDisposition,
     IReadOnlyList<DryRunTargetRow> Targets,
+    long SizeBytes = 0,
     string ParentDisplay = "")
 {
     /// <summary>The file name alone (line 1 of the row); the directory sits on line 2.</summary>
     public string FileName => System.IO.Path.GetFileName(SourcePath);
+
+    /// <summary>The source file's size, human-readable (right-aligned on the row).</summary>
+    public string SizeText => ByteSize.Format(SizeBytes);
 
     /// <summary>The single operation-kind pill shown in place of the (dropped) nested target list —
     /// the most consequential of this file's target operations. Null when the file has no targets.</summary>
@@ -112,9 +117,14 @@ public sealed record DryRunDestinationEntry(
     DestinationRowKind Kind,
     string? Detail,
     string ParentDisplay,
-    string RelativeDisplay)
+    string RelativeDisplay,
+    long SizeBytes = 0)
 {
     public string FileName => System.IO.Path.GetFileName(TargetPath);
+
+    /// <summary>The resulting file's size, human-readable: the incoming content for a write, or the
+    /// existing file for an untouched/deleted entry.</summary>
+    public string SizeText => ByteSize.Format(SizeBytes);
 
     public bool IsUntouched => Kind == DestinationRowKind.Untouched;
     public bool IsNew => Kind == DestinationRowKind.New;
@@ -193,6 +203,7 @@ public sealed partial class DryRunTreeNode : ObservableObject
     private static readonly char[] Separators = ['\\', '/'];
 
     private readonly Dictionary<string, int> _counts = new(StringComparer.Ordinal);
+    private long _sizeBytes;
 
     private DryRunTreeNode(string name, string fullPath, bool isDirectory, int depth)
     {
@@ -213,6 +224,12 @@ public sealed partial class DryRunTreeNode : ObservableObject
 
     public bool HasChildren => Children.Count > 0;
 
+    /// <summary>Rolled-up total byte size of everything beneath this node.</summary>
+    public long SizeBytes => _sizeBytes;
+
+    /// <summary>The rolled-up size, human-readable (shown right-aligned beside the node's pills).</summary>
+    public string SizeText => ByteSize.Format(_sizeBytes);
+
     /// <summary>The rolled-up summary pills, in the tree's declared spec order. Built after the
     /// whole forest is assembled.</summary>
     public IReadOnlyList<TreePill> Pills { get; private set; } = [];
@@ -230,7 +247,8 @@ public sealed partial class DryRunTreeNode : ObservableObject
         Func<T, IReadOnlyList<(string Kind, int Increment)>> categorizer,
         IReadOnlyList<TreePillSpec> specs,
         string? commonRoot = null,
-        IReadOnlySet<string>? expandedPaths = null)
+        IReadOnlySet<string>? expandedPaths = null,
+        Func<T, long>? sizeSelector = null)
     {
         List<DryRunTreeNode> roots = [];
         Dictionary<string, DryRunTreeNode> rootIndex = new(StringComparer.OrdinalIgnoreCase);
@@ -240,6 +258,7 @@ public sealed partial class DryRunTreeNode : ObservableObject
         foreach (T row in rows)
         {
             IReadOnlyList<(string Kind, int Increment)> increments = categorizer(row);
+            long size = sizeSelector?.Invoke(row) ?? 0;
             string full = pathSelector(row);
             string relative = DryRunPaths.RelativeForTree(full, commonRoot);
             string[] segments = relative.Split(Separators, StringSplitOptions.RemoveEmptyEntries);
@@ -268,9 +287,11 @@ public sealed partial class DryRunTreeNode : ObservableObject
                     index[segment] = node;
                 }
 
-                // The leaf is one row; every ancestor contains it, so counts roll up the whole chain.
+                // The leaf is one row; every ancestor contains it, so counts and sizes roll up the
+                // whole chain.
                 foreach ((string kind, int increment) in increments)
                     node._counts[kind] = node._counts.GetValueOrDefault(kind) + increment;
+                node._sizeBytes += size;
 
                 level = node.Children;
                 if (!childIndex.TryGetValue(node, out index!))
@@ -539,7 +560,8 @@ public sealed partial class DryRunSourcesTab : ViewModelBase
             return cats;
             // A prior forest (Tree non-empty) → restore its expansion; the very first build → null so
             // the BuildForest default (top level expanded) applies.
-        }, TreeSpecs, CommonRoot, Tree.Count > 0 ? DryRunTreeNode.CollectExpanded(Tree) : null);
+        }, TreeSpecs, CommonRoot, Tree.Count > 0 ? DryRunTreeNode.CollectExpanded(Tree) : null,
+           static r => r.SizeBytes);
 
     private static Dictionary<string, int> CountBy<T>(IEnumerable<T> items, Func<T, string> key)
     {
@@ -739,7 +761,8 @@ public sealed partial class DryRunDestinationsTab : ViewModelBase
                 _ => "unknown",
             };
             return new[] { (kind, 1) };
-        }, TreeSpecs, CommonRoot, Tree.Count > 0 ? DryRunTreeNode.CollectExpanded(Tree) : null);
+        }, TreeSpecs, CommonRoot, Tree.Count > 0 ? DryRunTreeNode.CollectExpanded(Tree) : null,
+           static e => e.SizeBytes);
 
     private static Dictionary<string, int> CountBy<T>(IEnumerable<T> items, Func<T, string> key)
     {
@@ -757,6 +780,123 @@ public sealed partial class DryRunDestinationsTab : ViewModelBase
                 counts[k] = counts.GetValueOrDefault(k) + 1;
         return counts;
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+//  Space preview: per-volume used / free / bounded-maximum, plus a per-target-root drill-down.
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+
+/// <summary>The byte/space picture for the whole run: global data-moved / net-change figures and one
+/// <see cref="VolumeSpaceRow"/> per destination volume. Built from <see cref="SpaceProjection"/>;
+/// absent (null on the root VM) when the report is truncated or carried no projection.</summary>
+public sealed class DryRunSpaceViewModel
+{
+    public DryRunSpaceViewModel(SpaceProjection projection)
+    {
+        TransferredText = ByteSize.Format(projection.TotalBytesWritten);
+        NetChangeText = SignedText(projection.TotalNetChangeBytes);
+        Volumes = projection.Volumes
+            .Select(v => new VolumeSpaceRow(v, projection.SafetyMarginBytes))
+            .ToList();
+    }
+
+    public string TransferredText { get; }
+    public string NetChangeText { get; }
+    public IReadOnlyList<VolumeSpaceRow> Volumes { get; }
+
+    /// <summary>A net change is signed for the reader: "+1.2 GB" grows the drives, "-400 MB" frees them.</summary>
+    internal static string SignedText(long bytes) => bytes > 0 ? $"+{ByteSize.Format(bytes)}" : ByteSize.Format(bytes);
+}
+
+/// <summary>One destination volume's row: the storage-bar inputs, human-readable labels, and a
+/// state-driven warning level. The four "used" figures are nested thresholds
+/// (used ≤ settled ≤ peak ≤ ceiling), fed straight to <c>StorageBar</c>.</summary>
+public sealed class VolumeSpaceRow
+{
+    public VolumeSpaceRow(VolumeSpaceEstimate v, long marginBytes)
+    {
+        VolumeRoot = v.VolumeRoot;
+        CapacityKnown = v.CapacityKnown;
+
+        CapacityBytes = v.TotalCapacityBytes;
+        UsedNowBytes = v.UsedNowBytes;
+        SettledBytes = v.SettledUsedBytes;
+        RealisticPeakBytes = v.RealisticPeakUsedBytes;
+        SafeCeilingBytes = v.SafeCeilingUsedBytes;
+        MarginBytes = marginBytes;
+
+        WrittenText = ByteSize.Format(v.BytesWrittenBytes);
+        NetChangeText = DryRunSpaceViewModel.SignedText(v.NetChangeBytes);
+        CapacityText = ByteSize.Format(v.TotalCapacityBytes);
+        UsedNowText = ByteSize.Format(v.UsedNowBytes);
+        SettledUsedText = ByteSize.Format(v.SettledUsedBytes);
+        SettledFreeText = ByteSize.Format(Math.Max(0, v.TotalCapacityBytes - v.SettledUsedBytes));
+        PeakText = ByteSize.Format(v.RealisticPeakUsedBytes);
+        CeilingText = ByteSize.Format(v.SafeCeilingUsedBytes);
+
+        Folders = v.Folders
+            .Select(f => new FolderSpaceRow(f))
+            .ToList();
+
+        // Warnings mirror the bar: red once the realistic peak crosses capacity − margin (likely
+        // won't fit / very tight), amber once only the safe ceiling does (worst case gets close).
+        long marginLine = v.TotalCapacityBytes - marginBytes;
+        if (CapacityKnown && v.RealisticPeakUsedBytes > marginLine)
+        {
+            IsDanger = true;
+            WarningText = "The peak usage may exceed the free space on this drive.";
+        }
+        else if (CapacityKnown && v.SafeCeilingUsedBytes > marginLine)
+        {
+            IsWarning = true;
+            WarningText = "The worst-case usage is close to filling this drive.";
+        }
+    }
+
+    public string VolumeRoot { get; }
+    public bool CapacityKnown { get; }
+
+    // StorageBar inputs (doubles for the control's styled properties).
+    public double CapacityBytes { get; }
+    public double UsedNowBytes { get; }
+    public double SettledBytes { get; }
+    public double RealisticPeakBytes { get; }
+    public double SafeCeilingBytes { get; }
+    public double MarginBytes { get; }
+
+    public string WrittenText { get; }
+    public string NetChangeText { get; }
+    public string CapacityText { get; }
+    public string UsedNowText { get; }
+    public string SettledUsedText { get; }
+    public string SettledFreeText { get; }
+    public string PeakText { get; }
+    public string CeilingText { get; }
+
+    public IReadOnlyList<FolderSpaceRow> Folders { get; }
+    public bool HasFolders => Folders.Count > 0;
+
+    public bool IsDanger { get; }
+    public bool IsWarning { get; }
+    public bool HasWarning => IsDanger || IsWarning;
+    public string WarningText { get; } = "";
+}
+
+/// <summary>One target-root row in a volume's drill-down.</summary>
+public sealed class FolderSpaceRow
+{
+    public FolderSpaceRow(FolderSpaceBreakdown f)
+    {
+        Root = f.Root;
+        WrittenText = ByteSize.Format(f.BytesWrittenBytes);
+        NetChangeText = DryRunSpaceViewModel.SignedText(f.NetChangeBytes);
+        FileCountText = $"{f.FileCount:N0} file{(f.FileCount == 1 ? "" : "s")}";
+    }
+
+    public string Root { get; }
+    public string WrittenText { get; }
+    public string NetChangeText { get; }
+    public string FileCountText { get; }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────
@@ -794,6 +934,11 @@ public sealed partial class DryRunViewModel : ViewModelBase
     [ObservableProperty] public partial int RenameCount { get; set; }
     [ObservableProperty] public partial int DisposalCount { get; set; }
     [ObservableProperty] public partial bool HasDestructiveActions { get; set; }
+
+    /// <summary>The byte/space projection for this run, or null when none was computed (a truncated
+    /// report, or a profile whose volumes could not be resolved). The Space panel binds its
+    /// visibility to this being non-null.</summary>
+    [ObservableProperty] public partial DryRunSpaceViewModel? Space { get; set; }
 
     public bool CanRun => ProfileId is not null;
 
@@ -882,25 +1027,33 @@ public sealed partial class DryRunViewModel : ViewModelBase
                 op?.Detail,
                 op?.SourceDisposition?.ToString(),
                 targets,
+                file.Length,
                 DryRunPaths.SplitForDisplay(file.Path, sourceCommonRoot).ParentDisplay));
         }
+
+        // The byte size behind a destination op: the incoming content (its source file) for a write,
+        // else the pre-existing file it touches (untouched / deleted / kept original), else nothing.
+        long OpSize(VirtualFileOperation o) =>
+            o.SourceIndex >= 0 && o.SourceIndex < report.SourceFiles.Count ? report.SourceFiles[o.SourceIndex].Length
+            : o.SubjectIndex >= 0 && o.SubjectIndex < report.DestinationFiles.Count ? report.DestinationFiles[o.SubjectIndex].Length
+            : 0;
 
         // The destination "after" view groups the server's destination operations by the source file
         // they carry content from: a file replicated to N targets is one row listing N destinations
         // (each keeping its own status), instead of N near-identical rows. Ops with SourceIndex == -1
         // (a pre-existing untouched file, a kept-around conflict original, a Mirror orphan) have no
         // originating source and become their own single-entry rows.
-        static DryRunDestinationEntry Entry(VirtualFileOperation o, string? destCommonRoot)
+        static DryRunDestinationEntry Entry(VirtualFileOperation o, string? destCommonRoot, long sizeBytes)
         {
             (string file, string parent) = DryRunPaths.SplitForDisplay(o.Path, destCommonRoot);
             return new DryRunDestinationEntry(
-                o.Path, o.Root, MapDestinationKind(o.Kind), o.Detail, parent, parent + file);
+                o.Path, o.Root, MapDestinationKind(o.Kind), o.Detail, parent, parent + file, sizeBytes);
         }
 
         List<DryRunDestinationRow> destRows = [];
         for (int i = 0; i < report.SourceFiles.Count; i++)
         {
-            List<DryRunDestinationEntry> entries = destOpsBySource[i].Select(o => Entry(o, destCommonRoot)).ToList();
+            List<DryRunDestinationEntry> entries = destOpsBySource[i].Select(o => Entry(o, destCommonRoot, OpSize(o))).ToList();
             if (entries.Count == 0)
                 continue;   // a filtered/unchanged source that produced no destination op
             PhysicalFile file = report.SourceFiles[i];
@@ -914,7 +1067,7 @@ public sealed partial class DryRunViewModel : ViewModelBase
         }
         foreach (VirtualFileOperation o in report.DestinationOperations.Where(o => o.SourceIndex < 0))
             destRows.Add(new DryRunDestinationRow(
-                System.IO.Path.GetFileName(o.Path), null, null, "", [Entry(o, destCommonRoot)]));
+                System.IO.Path.GetFileName(o.Path), null, null, "", [Entry(o, destCommonRoot, OpSize(o))]));
 
         TotalFiles = report.SourceFiles.Count;
         OverwriteCount = report.DestinationOperations.Count(static o => o.Kind == OperationKind.Overwrite);
@@ -928,6 +1081,10 @@ public sealed partial class DryRunViewModel : ViewModelBase
         TruncationNotice = report.Truncated
             ? $"Report truncated: showing the first {report.SourceFiles.Count:N0} files — the scan found more. Destination deletions are not shown for a truncated report. Use the filters to narrow the view."
             : "";
+
+        Space = report.Space is { Volumes.Count: > 0 } projection
+            ? new DryRunSpaceViewModel(projection)
+            : null;
 
         Sources.Load(fileRows, sourceCommonRoot);
         Destinations.Load(destRows, destCommonRoot);
@@ -956,6 +1113,7 @@ public sealed partial class DryRunViewModel : ViewModelBase
         Destinations.Clear();
         HasReport = false;
         ErrorMessage = null;
+        Space = null;
         TotalFiles = OverwriteCount = RenameCount = DisposalCount = 0;
         HasDestructiveActions = false;
         GeneratedAtText = "";

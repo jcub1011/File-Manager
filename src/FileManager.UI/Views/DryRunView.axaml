@@ -13,11 +13,13 @@
              serves both tabs. -->
         <TreeDataTemplate x:Key="DryRunNodeTemplate" x:DataType="vm:DryRunTreeNode"
                           ItemsSource="{Binding Children}">
-            <Grid ColumnDefinitions="*,Auto" Height="24" ToolTip.Tip="{Binding FullPath}">
+            <Grid ColumnDefinitions="*,Auto,Auto" Height="24" ToolTip.Tip="{Binding FullPath}">
                 <TextBlock Grid.Column="0" Text="{Binding Name}" FontFamily="{StaticResource MonoFontFamily}"
                            VerticalAlignment="Center" Classes.dir="{Binding IsDirectory}"
                            TextTrimming="CharacterEllipsis" />
-                <ItemsControl Grid.Column="1" ItemsSource="{Binding Pills}" Margin="8,0,0,0">
+                <TextBlock Grid.Column="1" Text="{Binding SizeText}" FontSize="11" Opacity="0.6"
+                           VerticalAlignment="Center" Margin="8,0,0,0" />
+                <ItemsControl Grid.Column="2" ItemsSource="{Binding Pills}" Margin="8,0,0,0">
                     <ItemsControl.ItemsPanel>
                         <ItemsPanelTemplate>
                             <StackPanel Orientation="Horizontal" Spacing="6" />
@@ -39,6 +41,57 @@
         <DataTemplate x:Key="FacetTemplate" x:DataType="vm:DryRunFacetRow">
             <CheckBox IsChecked="{Binding IsSelected}" Margin="0,0,12,0"
                       Content="{Binding Label}" ToolTip.Tip="{Binding Key}" />
+        </DataTemplate>
+
+        <!-- One destination volume: header (root + settled used/free), the nested-increment storage
+             bar, a details line, an optional warning, and an optional per-target-root drill-down. -->
+        <DataTemplate x:Key="VolumeSpaceTemplate" x:DataType="vm:VolumeSpaceRow">
+            <Border BorderThickness="0,0,0,1" BorderBrush="{DynamicResource SystemControlBackgroundListLowBrush}"
+                    Padding="0,6">
+                <StackPanel Spacing="4">
+                    <Grid ColumnDefinitions="Auto,*">
+                        <TextBlock Grid.Column="0" Text="{Binding VolumeRoot}" FontWeight="SemiBold"
+                                   FontFamily="{StaticResource MonoFontFamily}" VerticalAlignment="Center" />
+                        <TextBlock Grid.Column="1" FontSize="11" Opacity="0.7" HorizontalAlignment="Right"
+                                   VerticalAlignment="Center" IsVisible="{Binding CapacityKnown}">
+                            <Run Text="{Binding SettledUsedText}" /><Run Text=" used · " /><Run Text="{Binding SettledFreeText}" /><Run Text=" free of " /><Run Text="{Binding CapacityText}" />
+                        </TextBlock>
+                    </Grid>
+
+                    <ctrl:StorageBar Height="20" IsVisible="{Binding CapacityKnown}"
+                                     CapacityBytes="{Binding CapacityBytes}" UsedNowBytes="{Binding UsedNowBytes}"
+                                     SettledBytes="{Binding SettledBytes}" RealisticPeakBytes="{Binding RealisticPeakBytes}"
+                                     SafeCeilingBytes="{Binding SafeCeilingBytes}" MarginBytes="{Binding MarginBytes}" />
+
+                    <TextBlock IsVisible="{Binding !CapacityKnown}" FontSize="11" Opacity="0.7"
+                               Text="Free space could not be determined for this volume." />
+
+                    <TextBlock FontSize="11" Opacity="0.7">
+                        <Run Text="peak " /><Run Text="{Binding PeakText}" /><Run Text="  ·  worst case " /><Run Text="{Binding CeilingText}" /><Run Text="  ·  data written " /><Run Text="{Binding WrittenText}" /><Run Text="  ·  net " /><Run Text="{Binding NetChangeText}" />
+                    </TextBlock>
+
+                    <Border Classes="chip" HorizontalAlignment="Left" IsVisible="{Binding HasWarning}"
+                            Classes.chipDanger="{Binding IsDanger}" Classes.chipAmber="{Binding IsWarning}">
+                        <TextBlock Text="{Binding WarningText}" FontSize="11" />
+                    </Border>
+
+                    <Expander IsVisible="{Binding HasFolders}" Header="By folder" Padding="0" Margin="0,2,0,0">
+                        <ItemsControl ItemsSource="{Binding Folders}">
+                            <ItemsControl.ItemTemplate>
+                                <DataTemplate x:DataType="vm:FolderSpaceRow">
+                                    <Grid ColumnDefinitions="*,Auto,Auto,Auto" Margin="0,2">
+                                        <TextBlock Grid.Column="0" Text="{Binding Root}" FontFamily="{StaticResource MonoFontFamily}"
+                                                   FontSize="11" TextTrimming="CharacterEllipsis" ToolTip.Tip="{Binding Root}" />
+                                        <TextBlock Grid.Column="1" Text="{Binding FileCountText}" FontSize="11" Opacity="0.6" Margin="12,0,0,0" />
+                                        <TextBlock Grid.Column="2" Text="{Binding WrittenText}" FontSize="11" Margin="12,0,0,0" />
+                                        <TextBlock Grid.Column="3" Text="{Binding NetChangeText}" FontSize="11" Opacity="0.8" Margin="12,0,0,0" />
+                                    </Grid>
+                                </DataTemplate>
+                            </ItemsControl.ItemTemplate>
+                        </ItemsControl>
+                    </Expander>
+                </StackPanel>
+            </Border>
         </DataTemplate>
     </UserControl.Resources>
 
@@ -155,7 +208,7 @@
                        IsVisible="{Binding ErrorMessage, Converter={x:Static ObjectConverters.IsNotNull}}" />
         </StackPanel>
 
-        <Grid Margin="0,8,0,0" IsVisible="{Binding HasReport}" RowDefinitions="Auto,Auto,*">
+        <Grid Margin="0,8,0,0" IsVisible="{Binding HasReport}" RowDefinitions="Auto,Auto,Auto,*">
 
             <!-- truncation notice -->
             <Border Grid.Row="0" Classes="chipAmber" CornerRadius="6" Padding="10" Margin="0,0,0,8"
@@ -191,10 +244,30 @@
                 </StackPanel>
             </Border>
 
+            <!-- storage / space preview: per-volume used·free·bounded-maximum, with a per-folder
+                 drill-down. Hidden when no projection was computed (truncated report, or volumes that
+                 could not be resolved). -->
+            <Border Grid.Row="2" Background="{DynamicResource SystemControlBackgroundListLowBrush}"
+                    CornerRadius="6" Padding="10" Margin="0,0,0,8"
+                    IsVisible="{Binding Space, Converter={x:Static ObjectConverters.IsNotNull}}">
+                <StackPanel Spacing="6">
+                    <StackPanel Orientation="Horizontal" Spacing="6">
+                        <TextBlock FontWeight="Bold" Text="Storage" VerticalAlignment="Center" />
+                        <Border Classes="chip" Margin="6,0,0,0">
+                            <TextBlock><Run Text="{Binding Space.TransferredText}" /><Run Text=" to transfer" /></TextBlock>
+                        </Border>
+                        <Border Classes="chip">
+                            <TextBlock><Run Text="{Binding Space.NetChangeText}" /><Run Text=" net change" /></TextBlock>
+                        </Border>
+                    </StackPanel>
+                    <ItemsControl ItemsSource="{Binding Space.Volumes}" ItemTemplate="{StaticResource VolumeSpaceTemplate}" />
+                </StackPanel>
+            </Border>
+
             <!-- Sources and Destinations side by side (draggable split) so the whole picture is
                  visible at once. Paths are shown relative to each panel's common root to reclaim the
                  horizontal space that repeated drive prefixes used to waste. -->
-            <Grid Grid.Row="2">
+            <Grid Grid.Row="3">
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="*" MinWidth="360" />
                     <ColumnDefinition Width="Auto" />
@@ -300,10 +373,13 @@
                                             </Border>
                                         </StackPanel>
 
-                                        <!-- line 2: parent directory, relative to the common root (folder-boundary truncated) -->
-                                        <ctrl:PathText Grid.Row="1" Grid.Column="0" Grid.ColumnSpan="2" Text="{Binding ParentDisplay}"
+                                        <!-- line 2: parent directory (relative, folder-truncated) + right-aligned size -->
+                                        <ctrl:PathText Grid.Row="1" Grid.Column="0" Text="{Binding ParentDisplay}"
                                                        Mode="FolderMiddleEllipsis" FontFamily="{StaticResource MonoFontFamily}"
                                                        FontSize="11" Margin="0,2,0,0" Opacity="0.6" />
+                                        <TextBlock Grid.Row="1" Grid.Column="1" Text="{Binding SizeText}"
+                                                   FontSize="11" Opacity="0.6" VerticalAlignment="Center"
+                                                   HorizontalAlignment="Right" Margin="8,2,0,0" />
                                     </Grid>
                                 </Border>
                             </DataTemplate>
@@ -405,9 +481,12 @@
                                                     Classes.chipMuted="{Binding Primary.IsUnknown}">
                                                 <TextBlock Text="{Binding Primary.StatusText}" FontSize="11" />
                                             </Border>
-                                            <ctrl:PathText Grid.Row="1" Grid.Column="0" Grid.ColumnSpan="2" Text="{Binding Primary.ParentDisplay}"
+                                            <ctrl:PathText Grid.Row="1" Grid.Column="0" Text="{Binding Primary.ParentDisplay}"
                                                            Mode="FolderMiddleEllipsis" FontFamily="{StaticResource MonoFontFamily}"
                                                            FontSize="11" Margin="0,2,0,0" Opacity="0.6" />
+                                            <TextBlock Grid.Row="1" Grid.Column="1" Text="{Binding Primary.SizeText}"
+                                                       FontSize="11" Opacity="0.6" VerticalAlignment="Center"
+                                                       HorizontalAlignment="Right" Margin="8,2,0,0" />
                                         </Grid>
 
                                         <!-- Source-backed row: the source file on top, then every destination it fans
@@ -439,6 +518,8 @@
                                                                            VerticalAlignment="Center" />
                                                                 <TextBlock Text="{Binding StatusText}" FontSize="10" FontWeight="SemiBold"
                                                                            Opacity="0.85" VerticalAlignment="Center" />
+                                                                <TextBlock Text="{Binding SizeText}" FontSize="10" Opacity="0.7"
+                                                                           VerticalAlignment="Center" />
                                                             </StackPanel>
                                                         </Border>
                                                     </DataTemplate>

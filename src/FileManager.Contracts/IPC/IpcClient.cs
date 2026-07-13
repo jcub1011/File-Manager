@@ -197,6 +197,7 @@ public sealed class IpcClient : IAsyncDisposable
                             SourceOperations = sourceOperations,
                             DestinationOperations = destinationOperations,
                             Truncated = complete.Truncated,
+                            Space = complete.Space,
                         };
                     case ErrorResponse error:
                         return new IpcError(error.Code, error.Message);

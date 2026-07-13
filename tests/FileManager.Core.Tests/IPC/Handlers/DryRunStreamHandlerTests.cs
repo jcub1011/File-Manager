@@ -2,6 +2,7 @@ using FileManager.Contracts.DryRun;
 using FileManager.Contracts.IPC;
 using FileManager.Contracts.Primitives;
 using FileManager.Contracts.Profiles;
+using FileManager.Core;
 using FileManager.Core.DryRun;
 using FileManager.Core.Files;
 using FileManager.Core.IPC.Handlers;
@@ -66,7 +67,8 @@ public sealed class DryRunStreamHandlerTests
     {
         FileSystemService fileSystem = new(NullLogger<FileSystemService>.Instance);
         return new(NullLogger<DryRunStreamHandler>.Instance, engine, new FakeCatalog(profile), TimeProvider.System,
-            new DestinationProjector(NullLogger<DestinationProjector>.Instance, fileSystem))
+            new DestinationProjector(NullLogger<DestinationProjector>.Instance, fileSystem),
+            new FakeVolumeInfoProvider(), new EngineConfig())
         { MaxStreamedFiles = maxStreamedFiles };
     }
 

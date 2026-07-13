@@ -40,6 +40,12 @@ public sealed record DryRunReport
     /// not everything found. Mirror <see cref="OperationKind.Deleted"/> entries are never inferred
     /// on a truncated report.</summary>
     public bool Truncated { get; init; }
+
+    /// <summary>The byte-level space projection (data moved, at-rest growth, per-volume used/free and
+    /// bounded-maximum). Null when not computed — the single-frame <c>DryRunHandler</c> path never
+    /// fills it, and the streaming path skips it on a truncated report (a partial graph would yield
+    /// unsound totals).</summary>
+    public SpaceProjection? Space { get; init; }
 }
 
 /// <summary>An actual file discovered on disk — pure ground truth, no verdict. <see cref="Length"/>

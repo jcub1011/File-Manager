@@ -136,6 +136,12 @@ public sealed class DiskPreflightTests : IDisposable
             Match(path) is { } m ? Result<long, string>.Success(m.Free) : Result<long, string>.Success(long.MaxValue / 2);
 
         public bool IsNetworkPath(string path) => false;
+
+        public Result<VolumeCapacity, string> GetVolumeCapacity(string path)
+        {
+            long free = Match(path) is { } m ? m.Free : long.MaxValue / 2;
+            return new VolumeCapacity(long.MaxValue / 2, free, 1);
+        }
     }
 
     /// <summary>Resolves every path except one containing "unresolvable", for which the volume key
@@ -151,5 +157,8 @@ public sealed class DiskPreflightTests : IDisposable
                 : Result<string, string>.Success(Path.GetPathRoot(Path.GetFullPath(path))?.ToLowerInvariant() ?? path);
 
         public bool IsNetworkPath(string path) => false;
+
+        public Result<VolumeCapacity, string> GetVolumeCapacity(string path) =>
+            new VolumeCapacity(long.MaxValue / 2, long.MaxValue / 2, 1);
     }
 }

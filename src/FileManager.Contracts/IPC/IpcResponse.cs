@@ -54,6 +54,10 @@ public sealed record DryRunCompleteResponse : IpcResponse
 {
     public required System.DateTimeOffset GeneratedAt { get; init; }
     public required bool Truncated { get; init; }
+
+    /// <summary>The whole-report byte/space projection, computed service-side after assembly. Null on
+    /// a truncated report (unsound over a partial graph) or when a volume set could not be resolved.</summary>
+    public SpaceProjection? Space { get; init; }
 }
 public sealed record RecentJobsResponse : IpcResponse { public required IReadOnlyList<JobSummaryDto> Jobs { get; init; } }
 public sealed record JobLogResponse : IpcResponse { public required IReadOnlyList<string> Lines { get; init; } }

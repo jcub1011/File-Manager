@@ -266,6 +266,56 @@ public sealed class DryRunViewSmokeTests(HeadlessSessionFixture headless)
     }
 
     [Fact]
+    public async Task Storage_panel_and_bars_lay_out_with_a_projection()
+    {
+        // Exercises the StorageBar render (capacity-known bar + margin line), the per-folder Expander,
+        // and the capacity-unknown text branch — runtime-only paths not reachable from the VM tests.
+        await headless.Session.Dispatch(async () =>
+        {
+            FakeIpcGateway gateway = new();
+            DryRunViewModel vm = new(gateway, searchDebounce: TimeSpan.Zero);
+            vm.SetProfile(Guid.NewGuid(), "P");
+            DryRunReport report = Report(vm.ProfileId!.Value,
+                [Pf(@"C:\s\a.dat", @"C:\s")],
+                [SrcOp(0, @"C:\s\a.dat", @"C:\s", OperationKind.Processed, OnSuccessAction.KeepSource)],
+                [],
+                [DstOp(OperationKind.New, @"D:\d\a.dat", @"D:\d", sourceIndex: 0)]);
+            var space = new SpaceProjection
+            {
+                TotalBytesWritten = 5000,
+                TotalNetChangeBytes = 4000,
+                SafetyMarginBytes = 100,
+                Volumes =
+                [
+                    new VolumeSpaceEstimate
+                    {
+                        VolumeRoot = "D:", CapacityKnown = true, TotalCapacityBytes = 1000, UsedNowBytes = 500, FreeNowBytes = 500,
+                        ClusterBytes = 1, BytesWrittenBytes = 5000, NetChangeBytes = 400, SettledUsedBytes = 900,
+                        RealisticPeakUsedBytes = 950, SafeCeilingUsedBytes = 980,
+                        Folders =
+                        [
+                            new FolderSpaceBreakdown { Root = @"D:\d", BytesWrittenBytes = 4000, NetChangeBytes = 300, FileCount = 1 },
+                            new FolderSpaceBreakdown { Root = @"D:\e", BytesWrittenBytes = 1000, NetChangeBytes = 100, FileCount = 1 },
+                        ],
+                    },
+                    new VolumeSpaceEstimate { VolumeRoot = "Z:", CapacityKnown = false, BytesWrittenBytes = 10, NetChangeBytes = 10 },
+                ],
+            };
+            gateway.DryRunResult = report with { Space = space };
+            await vm.RunAsync(CancellationToken.None);
+
+            var (window, _) = ShowView(vm);
+            try
+            {
+                Assert.NotNull(vm.Space);
+                Assert.Equal(2, vm.Space!.Volumes.Count);
+                Assert.NotNull(window.Content);
+            }
+            finally { window.Close(); }
+        }, CancellationToken.None);
+    }
+
+    [Fact]
     public async Task Resizing_relayouts_path_rows_without_reentrancy()
     {
         await headless.Session.Dispatch(async () =>

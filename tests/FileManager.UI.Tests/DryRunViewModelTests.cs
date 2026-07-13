@@ -566,6 +566,77 @@ public sealed class DryRunViewModelTests
         Assert.Contains("cancelled", viewModel.ErrorMessage, StringComparison.OrdinalIgnoreCase);
     }
 
+    [Fact]
+    public async Task File_and_destination_rows_carry_formatted_sizes()
+    {
+        var (viewModel, gateway) = NewViewModel();
+        gateway.DryRunResult = Report(viewModel.ProfileId!.Value,
+            sourceFiles: [new PhysicalFile { Path = @"C:\s\a.dat", Root = @"C:\s", Length = 1536, LastWritten = DateTimeOffset.UnixEpoch }],
+            sourceOps: [SrcOp(0, @"C:\s\a.dat", @"C:\s", OperationKind.Processed, OnSuccessAction.KeepSource)],
+            destinationFiles: [],
+            destinationOps: [DstOp(OperationKind.New, @"D:\d\a.dat", @"D:\d", sourceIndex: 0)]);
+
+        await viewModel.RunAsync(CancellationToken.None);
+
+        Assert.Equal("1.5 KB", Assert.Single(viewModel.Sources.VisibleRows).SizeText);
+        var entry = viewModel.Destinations.VisibleRows.SelectMany(r => r.Destinations).Single();
+        Assert.Equal("1.5 KB", entry.SizeText);   // the incoming content size
+    }
+
+    [Fact]
+    public async Task Space_projection_populates_volume_rows_with_state_driven_warnings()
+    {
+        var (viewModel, gateway) = NewViewModel();
+        var space = new SpaceProjection
+        {
+            TotalBytesWritten = 5000,
+            TotalNetChangeBytes = 4000,
+            SafetyMarginBytes = 100,
+            Volumes =
+            [
+                // peak (950) crosses capacity − margin (900) → danger.
+                new VolumeSpaceEstimate
+                {
+                    VolumeRoot = "D:", CapacityKnown = true, TotalCapacityBytes = 1000, UsedNowBytes = 500, FreeNowBytes = 500,
+                    ClusterBytes = 1, BytesWrittenBytes = 5000, NetChangeBytes = 400, SettledUsedBytes = 900,
+                    RealisticPeakUsedBytes = 950, SafeCeilingUsedBytes = 980,
+                },
+                // everything well under capacity − margin (1900) → calm.
+                new VolumeSpaceEstimate
+                {
+                    VolumeRoot = "E:", CapacityKnown = true, TotalCapacityBytes = 2000, UsedNowBytes = 100, FreeNowBytes = 1900,
+                    ClusterBytes = 1, BytesWrittenBytes = 100, NetChangeBytes = 100, SettledUsedBytes = 200,
+                    RealisticPeakUsedBytes = 300, SafeCeilingUsedBytes = 500,
+                },
+            ],
+        };
+        gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value) with { Space = space };
+
+        await viewModel.RunAsync(CancellationToken.None);
+
+        Assert.NotNull(viewModel.Space);
+        Assert.StartsWith("+", viewModel.Space!.NetChangeText);
+        Assert.Equal(2, viewModel.Space.Volumes.Count);
+
+        VolumeSpaceRow d = viewModel.Space.Volumes.Single(v => v.VolumeRoot == "D:");
+        Assert.True(d.IsDanger);
+        Assert.True(d.HasWarning);
+        Assert.Equal(1000, d.CapacityBytes);
+        Assert.Equal(950, d.RealisticPeakBytes);
+
+        VolumeSpaceRow e = viewModel.Space.Volumes.Single(v => v.VolumeRoot == "E:");
+        Assert.False(e.HasWarning);
+    }
+
+    [Fact]
+    public async Task Space_is_null_when_the_report_carries_no_projection()
+    {
+        var (viewModel, gateway) = NewViewModel();
+        gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value);   // Space defaults null
+        await viewModel.RunAsync(CancellationToken.None);
+        Assert.Null(viewModel.Space);
+    }
+
     // Two sources (C:\a with one process + one filter-skip, C:\b with two process).
     private static DryRunReport MultiSourceReport(Guid profileId) => Report(profileId,
         sourceFiles:

@@ -239,6 +239,65 @@ public sealed class SerializationTests
     }
 
     [Fact]
+    public void SpaceProjection_round_trips_on_the_completion_frame()
+    {
+        var projection = new SpaceProjection
+        {
+            TotalBytesWritten = 5_000_000,
+            TotalNetChangeBytes = -1_234,
+            SafetyMarginBytes = 64L * 1024 * 1024,
+            Volumes =
+            [
+                new VolumeSpaceEstimate
+                {
+                    VolumeRoot = "D:",
+                    CapacityKnown = true,
+                    TotalCapacityBytes = 2_000_000_000,
+                    UsedNowBytes = 500_000_000,
+                    FreeNowBytes = 1_500_000_000,
+                    ClusterBytes = 4096,
+                    BytesWrittenBytes = 5_000_000,
+                    NetChangeBytes = -1_234,
+                    SettledUsedBytes = 499_998_766,
+                    RealisticPeakUsedBytes = 520_000_000,
+                    SafeCeilingUsedBytes = 560_000_000,
+                    Folders = [new FolderSpaceBreakdown { Root = @"D:\backup", BytesWrittenBytes = 5_000_000, NetChangeBytes = -1_234, FileCount = 3 }],
+                },
+            ],
+        };
+
+        byte[] wire = IpcSerializer.SerializeResponse(new DryRunCompleteResponse
+        {
+            GeneratedAt = DateTimeOffset.UnixEpoch,
+            Truncated = false,
+            Space = projection,
+        });
+
+        Assert.True(IpcSerializer.DeserializeResponse(wire).TryGetValue(out IpcResponse? reparsed));
+        SpaceProjection? space = Assert.IsType<DryRunCompleteResponse>(reparsed).Space;
+        Assert.NotNull(space);
+        Assert.Equal(5_000_000, space.TotalBytesWritten);
+        Assert.Equal(-1_234, space.TotalNetChangeBytes);
+        VolumeSpaceEstimate volume = Assert.Single(space.Volumes);
+        Assert.Equal("D:", volume.VolumeRoot);
+        Assert.True(volume.CapacityKnown);
+        Assert.Equal(4096, volume.ClusterBytes);
+        Assert.Equal(560_000_000, volume.SafeCeilingUsedBytes);
+        FolderSpaceBreakdown folder = Assert.Single(volume.Folders);
+        Assert.Equal(@"D:\backup", folder.Root);
+        Assert.Equal(3, folder.FileCount);
+    }
+
+    [Fact]
+    public void DryRunCompleteResponse_space_defaults_null_when_absent()
+    {
+        byte[] wire = IpcSerializer.SerializeResponse(
+            new DryRunCompleteResponse { GeneratedAt = DateTimeOffset.UnixEpoch, Truncated = false });
+        Assert.True(IpcSerializer.DeserializeResponse(wire).TryGetValue(out IpcResponse? reparsed));
+        Assert.Null(Assert.IsType<DryRunCompleteResponse>(reparsed).Space);
+    }
+
+    [Fact]
     public void GlobalSettings_round_trips_its_fields_over_the_wire()
     {
         byte[] wire = IpcSerializer.SerializeResponse(new SettingsResponse

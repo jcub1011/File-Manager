@@ -10,4 +10,14 @@ public interface IVolumeInfoProvider
     Result<string, string> GetVolumeKey(string path);
 
     bool IsNetworkPath(string path);
+
+    /// <summary>Total capacity, free space, and allocation-unit (cluster) size for the volume holding
+    /// <paramref name="path"/>. Powers the dry-run space preview's "used / still free" and the
+    /// cluster rounding of on-disk footprints. May fail on volumes that do not report capacity (some
+    /// UNC shares); callers treat that as "capacity unknown" rather than a hard error.</summary>
+    Result<VolumeCapacity, string> GetVolumeCapacity(string path);
 }
+
+/// <summary>A volume's total/free capacity plus its allocation-unit size. <see cref="BytesPerCluster"/>
+/// is 1 when unknown (i.e. no rounding).</summary>
+public readonly record struct VolumeCapacity(long TotalBytes, long FreeBytes, long BytesPerCluster);

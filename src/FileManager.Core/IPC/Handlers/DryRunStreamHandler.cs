@@ -1,8 +1,10 @@
 using FileManager.Contracts.DryRun;
 using FileManager.Contracts.IPC;
 using FileManager.Contracts.Primitives;
+using FileManager.Contracts.Profiles;
 using FileManager.Core.DryRun;
 using FileManager.Core.Jobs;
+using FileManager.Core.Platform;
 using FileManager.Core.Profiles;
 using Microsoft.Extensions.Logging;
 using System;
@@ -21,7 +23,7 @@ namespace FileManager.Core.IPC.Handlers;
 /// frame (matching DryRunHandler's error codes).</summary>
 public sealed class DryRunStreamHandler(
     ILogger<DryRunStreamHandler> logger, IDryRunEngine engine, IProfileCatalog catalog, TimeProvider time,
-    DestinationProjector destinationProjector)
+    DestinationProjector destinationProjector, IVolumeInfoProvider volumes, EngineConfig config)
     : IIpcStreamingRequestHandler
 {
     /// <summary>Destination sweep entries per streamed frame. Each entry is small (a physical file +
@@ -64,6 +66,11 @@ public sealed class DryRunStreamHandler(
         // frames (the client concatenates chunks in receive order).
         int destinationCount = 0;
         bool truncated = false;
+        // Byte/space projection, folded from the same chunks as they stream by (no extra buffering).
+        // A chunk's op indices are global; passing the running (emitted, destinationCount) as bases
+        // lets the estimator resolve them against the chunk's own file lists.
+        var estimator = new DryRunSpaceEstimator(volumes, config.PreflightSafetyMarginBytes);
+        bool stageOverwrites = profile.Policies.OverwriteHandling == OverwriteHandling.StageOverwrites;
         // Accumulate only the (small) set of destination paths a source writes to (every destination
         // operation's resulting path) as chunks stream by — NOT the file objects — so the destination
         // sweep below can identify orphans without retaining the whole report in memory.
@@ -87,6 +94,9 @@ public sealed class DryRunStreamHandler(
                 SourceOperations = slice.SourceOperations,
                 DestinationOperations = slice.DestinationOperations,
             };
+            estimator.Accumulate(
+                slice.SourceFiles, slice.DestinationFiles, slice.SourceOperations, slice.DestinationOperations,
+                emitted, destinationCount, stageOverwrites);
             DestinationProjector.AccumulateSurvivors(survivors, slice.DestinationOperations);
             destinationCount += slice.DestinationFiles.Count;
 
@@ -117,6 +127,9 @@ public sealed class DryRunStreamHandler(
                 typed.ProfileId, MaxStreamedFiles);
             truncated = true;
         }
+        // The sweep's ops index their own file list directly (Ops[i].SubjectIndex == i), so feed it
+        // as a standalone chunk with both bases 0. Deleted orphans free space; Untouched/Unknown don't.
+        estimator.Accumulate([], sweep.Files, [], sweep.Ops, 0, 0, stageOverwrites);
         for (int start = 0; start < sweep.Files.Count; start += DestinationChunkSize)
         {
             int count = Math.Min(DestinationChunkSize, sweep.Files.Count - start);
@@ -130,6 +143,8 @@ public sealed class DryRunStreamHandler(
             yield return new DryRunChunkResponse { DestinationFiles = sliceFiles, DestinationOperations = sliceOps };
         }
 
-        yield return new DryRunCompleteResponse { GeneratedAt = time.GetUtcNow(), Truncated = truncated };
+        // Skip the projection on a truncated report — totals over a partial graph would be unsound.
+        SpaceProjection? space = truncated ? null : estimator.Finalize(config.MaxWorkers);
+        yield return new DryRunCompleteResponse { GeneratedAt = time.GetUtcNow(), Truncated = truncated, Space = space };
     }
 }
