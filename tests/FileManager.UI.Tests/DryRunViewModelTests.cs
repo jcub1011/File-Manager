@@ -1,6 +1,7 @@
 using System.Linq;
 using FileManager.Contracts.DryRun;
 using FileManager.Contracts.IPC;
+using FileManager.Contracts.Primitives;
 using FileManager.Contracts.Profiles;
 using FileManager.UI.Services;
 using FileManager.UI.Tests.Fakes;
@@ -623,6 +624,11 @@ public sealed class DryRunViewModelTests
         Assert.True(d.HasWarning);
         Assert.Equal(1000, d.CapacityBytes);
         Assert.Equal(950, d.RealisticPeakBytes);
+
+        // Header labels reflect the CURRENT drive state; SUAR reflects the settled after-run total.
+        Assert.Equal(ByteSize.Format(500), d.UsedNowText);
+        Assert.Equal(ByteSize.Format(500), d.CurrentFreeText);
+        Assert.Equal(ByteSize.Format(900), d.SettledUsedText);
 
         VolumeSpaceRow e = viewModel.Space.Volumes.Single(v => v.VolumeRoot == "E:");
         Assert.False(e.HasWarning);

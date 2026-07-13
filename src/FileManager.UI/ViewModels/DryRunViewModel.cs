@@ -826,11 +826,10 @@ public sealed class VolumeSpaceRow
         MarginBytes = marginBytes;
 
         WrittenText = ByteSize.Format(v.BytesWrittenBytes);
-        NetChangeText = DryRunSpaceViewModel.SignedText(v.NetChangeBytes);
         CapacityText = ByteSize.Format(v.TotalCapacityBytes);
         UsedNowText = ByteSize.Format(v.UsedNowBytes);
+        CurrentFreeText = ByteSize.Format(v.FreeNowBytes);
         SettledUsedText = ByteSize.Format(v.SettledUsedBytes);
-        SettledFreeText = ByteSize.Format(Math.Max(0, v.TotalCapacityBytes - v.SettledUsedBytes));
         PeakText = ByteSize.Format(v.RealisticPeakUsedBytes);
         CeilingText = ByteSize.Format(v.SafeCeilingUsedBytes);
 
@@ -865,11 +864,10 @@ public sealed class VolumeSpaceRow
     public double MarginBytes { get; }
 
     public string WrittenText { get; }
-    public string NetChangeText { get; }
     public string CapacityText { get; }
     public string UsedNowText { get; }
+    public string CurrentFreeText { get; }
     public string SettledUsedText { get; }
-    public string SettledFreeText { get; }
     public string PeakText { get; }
     public string CeilingText { get; }
 
