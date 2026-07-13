@@ -24,6 +24,11 @@ public sealed class DryRunSpaceEstimator
     private readonly IVolumeInfoProvider _volumes;
     private readonly long _safetyMargin;
     private readonly Dictionary<string, VolumeTally> _byVolume = new(StringComparer.Ordinal);
+    // Memoizes root path → tally so the volume-key normalization (GetFullPath + GetPathRoot + lower)
+    // runs once per distinct root instead of once per operation. The distinct roots of a run are the
+    // profile's source/target roots — a handful — while operations number in the hundreds of thousands.
+    // _byVolume stays canonical: two roots on one volume resolve to the same shared tally.
+    private readonly Dictionary<string, VolumeTally> _byRoot = new(StringComparer.OrdinalIgnoreCase);
 
     public DryRunSpaceEstimator(IVolumeInfoProvider volumes, long safetyMarginBytes)
     {
@@ -188,19 +193,23 @@ public sealed class DryRunSpaceEstimator
 
     private VolumeTally VolumeFor(string path)
     {
-        string key = _volumes.GetVolumeKey(path).TryGetValue(out string? k) ? k : path;
-        if (_byVolume.TryGetValue(key, out VolumeTally? tally))
-            return tally;
+        if (_byRoot.TryGetValue(path, out VolumeTally? cached))
+            return cached;
 
-        tally = new VolumeTally { VolumeRoot = DisplayRoot(key) };
-        if (_volumes.GetVolumeCapacity(path).TryGetValue(out VolumeCapacity cap))
+        string key = _volumes.GetVolumeKey(path).TryGetValue(out string? k) ? k : path;
+        if (!_byVolume.TryGetValue(key, out VolumeTally? tally))
         {
-            tally.CapacityKnown = true;
-            tally.TotalCapacity = cap.TotalBytes;
-            tally.FreeNow = cap.FreeBytes;
-            tally.Cluster = Math.Max(1, cap.BytesPerCluster);
+            tally = new VolumeTally { VolumeRoot = DisplayRoot(key) };
+            if (_volumes.GetVolumeCapacity(path).TryGetValue(out VolumeCapacity cap))
+            {
+                tally.CapacityKnown = true;
+                tally.TotalCapacity = cap.TotalBytes;
+                tally.FreeNow = cap.FreeBytes;
+                tally.Cluster = Math.Max(1, cap.BytesPerCluster);
+            }
+            _byVolume[key] = tally;
         }
-        _byVolume[key] = tally;
+        _byRoot[path] = tally;
         return tally;
     }
 

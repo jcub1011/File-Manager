@@ -9,6 +9,7 @@ using FileManager.Core.Profiles;
 using Microsoft.Extensions.Logging;
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Threading;
@@ -71,6 +72,11 @@ public sealed class DryRunStreamHandler(
         // lets the estimator resolve them against the chunk's own file lists.
         var estimator = new DryRunSpaceEstimator(volumes, config.PreflightSafetyMarginBytes);
         bool stageOverwrites = profile.Policies.OverwriteHandling == OverwriteHandling.StageOverwrites;
+        // Phase attribution for the whole streamed run (the engine logs its own scan/evaluate split):
+        // total wall time, the destination sweep, and the estimator's cumulative share. The estimator
+        // watch is started/stopped around each fold so it accumulates only its own time.
+        Stopwatch totalWatch = Stopwatch.StartNew();
+        Stopwatch estimatorWatch = new();
         // Accumulate only the (small) set of destination paths a source writes to (every destination
         // operation's resulting path) as chunks stream by — NOT the file objects — so the destination
         // sweep below can identify orphans without retaining the whole report in memory.
@@ -94,9 +100,11 @@ public sealed class DryRunStreamHandler(
                 SourceOperations = slice.SourceOperations,
                 DestinationOperations = slice.DestinationOperations,
             };
+            estimatorWatch.Start();
             estimator.Accumulate(
                 slice.SourceFiles, slice.DestinationFiles, slice.SourceOperations, slice.DestinationOperations,
                 emitted, destinationCount, stageOverwrites);
+            estimatorWatch.Stop();
             DestinationProjector.AccumulateSurvivors(survivors, slice.DestinationOperations);
             destinationCount += slice.DestinationFiles.Count;
 
@@ -118,8 +126,11 @@ public sealed class DryRunStreamHandler(
         // under the cap.
         // Bound the sweep by the same overall file budget the source phase uses, so a target root
         // with millions of pre-existing files can't buffer an unbounded op-per-file set service-side.
+        long engineMs = totalWatch.ElapsedMilliseconds;
         int sweepBudget = Math.Max(0, MaxStreamedFiles - destinationCount);
+        Stopwatch sweepWatch = Stopwatch.StartNew();
         DestinationSweepResult sweep = destinationProjector.Sweep(profile, survivors, truncated, ct, sweepBudget);
+        sweepWatch.Stop();
         if (sweep.Truncated)
         {
             logger.LogWarning(
@@ -129,7 +140,9 @@ public sealed class DryRunStreamHandler(
         }
         // The sweep's ops index their own file list directly (Ops[i].SubjectIndex == i), so feed it
         // as a standalone chunk with both bases 0. Deleted orphans free space; Untouched/Unknown don't.
+        estimatorWatch.Start();
         estimator.Accumulate([], sweep.Files, [], sweep.Ops, 0, 0, stageOverwrites);
+        estimatorWatch.Stop();
         for (int start = 0; start < sweep.Files.Count; start += DestinationChunkSize)
         {
             int count = Math.Min(DestinationChunkSize, sweep.Files.Count - start);
@@ -144,7 +157,16 @@ public sealed class DryRunStreamHandler(
         }
 
         // Skip the projection on a truncated report — totals over a partial graph would be unsound.
+        estimatorWatch.Start();
         SpaceProjection? space = truncated ? null : estimator.Finalize(config.MaxWorkers);
+        estimatorWatch.Stop();
+        if (logger.IsEnabled(LogLevel.Information))
+            logger.LogInformation(
+                "Dry-run stream timings for profile {ProfileId}: total {TotalMs}ms " +
+                "(engine stream {EngineMs}ms, destination sweep {SweepMs}ms, space estimator {EstimatorMs}ms), " +
+                "{SourceCount} source files, {DestCount} destination files (+{SweepCount} swept)",
+                typed.ProfileId, totalWatch.ElapsedMilliseconds, engineMs, sweepWatch.ElapsedMilliseconds,
+                estimatorWatch.ElapsedMilliseconds, emitted, destinationCount, sweep.Files.Count);
         yield return new DryRunCompleteResponse { GeneratedAt = time.GetUtcNow(), Truncated = truncated, Space = space };
     }
 }

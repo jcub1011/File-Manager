@@ -18,21 +18,29 @@ public sealed class DryRunSpaceEstimatorTests
         public Dictionary<string, (long Total, long Free, long Cluster)> Caps { get; } = new(StringComparer.OrdinalIgnoreCase);
         public HashSet<string> FailCapacity { get; } = new(StringComparer.OrdinalIgnoreCase);
 
+        /// <summary>External <see cref="GetVolumeKey"/> calls — the estimator memoizes per root, so
+        /// this should track distinct roots, not operations.</summary>
+        public int VolumeKeyCalls { get; private set; }
+
         public Result<long, string> GetAvailableFreeBytes(string path) => long.MaxValue / 2;
         public bool IsNetworkPath(string path) => false;
 
         public Result<string, string> GetVolumeKey(string path)
         {
-            string root = Path.GetPathRoot(Path.GetFullPath(path)) ?? path;
-            return Result<string, string>.Success(root.TrimEnd('\\', '/').ToLowerInvariant());
+            VolumeKeyCalls++;
+            return Result<string, string>.Success(KeyOf(path));
         }
+
+        // Uncounted key derivation so GetVolumeCapacity's internal lookup doesn't skew VolumeKeyCalls.
+        private static string KeyOf(string path) =>
+            (Path.GetPathRoot(Path.GetFullPath(path)) ?? path).TrimEnd('\\', '/').ToLowerInvariant();
 
         public Result<VolumeCapacity, string> GetVolumeCapacity(string path)
         {
-            GetVolumeKey(path).TryGetValue(out string? key);
-            if (FailCapacity.Contains(key!))
+            string key = KeyOf(path);
+            if (FailCapacity.Contains(key))
                 return Result<VolumeCapacity, string>.Failure("capacity unavailable");
-            return Caps.TryGetValue(key!, out (long Total, long Free, long Cluster) c)
+            return Caps.TryGetValue(key, out (long Total, long Free, long Cluster) c)
                 ? new VolumeCapacity(c.Total, c.Free, c.Cluster)
                 : new VolumeCapacity(long.MaxValue / 2, long.MaxValue / 4, 1);
         }
@@ -228,5 +236,34 @@ public sealed class DryRunSpaceEstimatorTests
         Assert.Equal(2, v.Folders.Count);
         Assert.Equal(new[] { @"D:\one", @"D:\two" }, v.Folders.Select(f => f.Root).ToArray());
         Assert.Equal(100, v.Folders.First(f => f.Root == @"D:\one").BytesWrittenBytes);
+    }
+
+    [Fact]
+    public void Volume_key_is_resolved_once_per_distinct_root_and_same_volume_roots_share_a_tally()
+    {
+        var volumes = new FakeVolumes();
+        volumes.Caps["d:"] = (Total: 1_000_000, Free: 900_000, Cluster: 1);
+        var estimator = new DryRunSpaceEstimator(volumes, 0);
+
+        // Two streamed chunks, each writing under both D:\one and D:\two — four ops over two roots.
+        for (int chunk = 0; chunk < 2; chunk++)
+        {
+            estimator.Accumulate(
+                sourceFiles: [Pf(@"C:\s\a.dat", @"C:\s", 100), Pf(@"C:\s\b.dat", @"C:\s", 200)],
+                destinationFiles: [],
+                sourceOperations: [Src(0, @"C:\s\a.dat", @"C:\s"), Src(1, @"C:\s\b.dat", @"C:\s")],
+                destinationOperations:
+                [
+                    Dst(OperationKind.New, @"D:\one\a.dat", @"D:\one", sourceIndex: 0),
+                    Dst(OperationKind.New, @"D:\two\b.dat", @"D:\two", sourceIndex: 1),
+                ],
+                sourceBase: 0, destBase: 0, stageOverwrites: false);
+        }
+
+        // Both roots resolve to the one D: volume and share its tally...
+        VolumeSpaceEstimate v = Single(estimator.Finalize(1));
+        Assert.Equal(600, v.BytesWrittenBytes);
+        // ...and the key normalization ran once per distinct root, not once per operation.
+        Assert.Equal(2, volumes.VolumeKeyCalls);
     }
 }

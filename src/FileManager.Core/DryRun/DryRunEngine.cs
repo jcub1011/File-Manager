@@ -14,6 +14,7 @@ using FileManager.Contracts.Settings;
 using System;
 using System.Buffers;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Runtime.CompilerServices;
@@ -109,6 +110,7 @@ public sealed class DryRunEngine(
         // Phase 1: drain the scan into a bounded candidate list. A fatal fault aborts the whole run;
         // warnings are logged and skipped. The file cap bounds both the buffered payloads and the
         // parallel evaluation work below.
+        Stopwatch scanWatch = Stopwatch.StartNew();
         List<Payload> candidates = [];
         foreach (var scanned in scanner.Scan(profile, TriggerKind.Cli, scopePath))
         {
@@ -144,10 +146,13 @@ public sealed class DryRunEngine(
         // past the truncation point to at most one batch. Every collaborator is read-only
         // (I-DRYRUN-RO) and stateless, so the parallel evaluation is race-free; positional writes into
         // the batch array make the append order deterministic regardless of completion order.
+        scanWatch.Stop();
         candidates.Sort(static (a, b) =>
             string.Compare(a.SourcePath, b.SourcePath, StringComparison.OrdinalIgnoreCase));
 
         int maxConcurrency = ResolveWorkers(profile);
+        RunCounters counters = new();
+        Stopwatch evalWatch = Stopwatch.StartNew();
         using ReportBuilder builder = new(ReportByteBudget);
         try
         {
@@ -161,7 +166,7 @@ public sealed class DryRunEngine(
                     async (j, token) =>
                     {
                         batch[j] = await EvaluateFileAsync(
-                            profile, candidates[start + j], filtersBySourceRoot!, hasTransformers, token)
+                            profile, candidates[start + j], filtersBySourceRoot!, hasTransformers, counters, token)
                             .ConfigureAwait(false);
                     }).ConfigureAwait(false);
 
@@ -180,6 +185,7 @@ public sealed class DryRunEngine(
             // cancellation turns the whole run into Canceled rather than a misleading partial report.
             return Result<DryRunReport, string>.Canceled();
         }
+        evalWatch.Stop();
 
         truncated |= builder.Truncated;
 
@@ -211,9 +217,12 @@ public sealed class DryRunEngine(
         DateTimeOffset completedAt = time.GetUtcNow();
         logger.LogInformation(
             "Dry-run completed for profile {ProfileId}: {SourceCount} source files, {DestCount} destination files " +
-            "in {ElapsedMs}ms{Truncated}",
+            "in {ElapsedMs}ms{Truncated} (scan {ScanMs}ms, evaluation {EvalMs}ms; {Probes} existence probes, " +
+            "{Stats} existing-target stats, {HashCount} files hashed / {HashBytes:N0} bytes)",
             profileId, builder.SourceFiles.Count, builder.DestinationFiles.Count,
-            (completedAt - startedAt).TotalMilliseconds, truncated ? " (report truncated)" : "");
+            (completedAt - startedAt).TotalMilliseconds, truncated ? " (report truncated)" : "",
+            scanWatch.ElapsedMilliseconds, evalWatch.ElapsedMilliseconds,
+            counters.ExistenceProbes, counters.ExistingStats, counters.FilesHashed, counters.BytesHashed);
 
         return new DryRunReport
         {
@@ -264,6 +273,7 @@ public sealed class DryRunEngine(
 
         // Phase 1: drain the scan into a candidate list bounded by MaxScannedCandidates. A fatal fault
         // ends the stream with a failure; warnings are logged and skipped.
+        Stopwatch scanWatch = Stopwatch.StartNew();
         List<Payload> candidates = [];
         bool scanTruncated = false;
         foreach (var scanned in scanner.Scan(profile, TriggerKind.Cli, scopePath))
@@ -296,6 +306,8 @@ public sealed class DryRunEngine(
             candidates.Add(payload!);
         }
 
+        scanWatch.Stop();
+
         // Phase 2: fix the output order (source path), evaluate in bounded batches, and flush a chunk
         // whenever the buffer's upper-bound size crosses the threshold. Indices are global across
         // chunks (tracked by the accumulator) so the client simply concatenates.
@@ -303,6 +315,8 @@ public sealed class DryRunEngine(
             string.Compare(a.SourcePath, b.SourcePath, StringComparison.OrdinalIgnoreCase));
 
         int maxConcurrency = ResolveWorkers(profile);
+        RunCounters counters = new();
+        Stopwatch evalWatch = Stopwatch.StartNew();
         StreamAccumulator accumulator = new();
         bool anyEmitted = false;
         for (int start = 0; start < candidates.Count; start += EvaluationBatchSize)
@@ -315,7 +329,7 @@ public sealed class DryRunEngine(
                 async (j, token) =>
                 {
                     batch[j] = await EvaluateFileAsync(
-                        profile, candidates[start + j], filtersBySourceRoot!, hasTransformers, token)
+                        profile, candidates[start + j], filtersBySourceRoot!, hasTransformers, counters, token)
                         .ConfigureAwait(false);
                 }).ConfigureAwait(false);
 
@@ -343,11 +357,16 @@ public sealed class DryRunEngine(
         if (scanTruncated && !anyEmitted)
             yield return Result<DryRunChunk, string>.Success(new DryRunChunk([], [], [], [], ScanTruncated: true));
 
+        evalWatch.Stop();
         DateTimeOffset completedAt = time.GetUtcNow();
         if (logger.IsEnabled(LogLevel.Information))
             logger.LogInformation(
-                "Dry-run (stream) completed for profile {ProfileId}: {SourceCount} source files in {ElapsedMs}ms",
-                profileId, accumulator.TotalSourceFiles, (completedAt - startedAt).TotalMilliseconds);
+                "Dry-run (stream) completed for profile {ProfileId}: {SourceCount} source files in {ElapsedMs}ms " +
+                "(scan {ScanMs}ms, evaluation {EvalMs}ms; {Probes} existence probes, {Stats} existing-target stats, " +
+                "{HashCount} files hashed / {HashBytes:N0} bytes)",
+                profileId, accumulator.TotalSourceFiles, (completedAt - startedAt).TotalMilliseconds,
+                scanWatch.ElapsedMilliseconds, evalWatch.ElapsedMilliseconds,
+                counters.ExistenceProbes, counters.ExistingStats, counters.FilesHashed, counters.BytesHashed);
     }
 
     /// <summary>Compiles one filter set per source, keyed by the source root the scanner stamps on
@@ -411,6 +430,31 @@ public sealed class DryRunEngine(
         VirtualFileOperation SourceOp,
         IReadOnlyList<PhysicalFile> DestinationFiles,
         IReadOnlyList<VirtualFileOperation> DestinationOps);
+
+    /// <summary>Per-run I/O accounting for the evaluation phase, surfaced in the completion log so a
+    /// slow run attributes its time to a phase without a profiler. Incremented under
+    /// <see cref="Parallel.ForEachAsync"/>, so all writes are interlocked.</summary>
+    private sealed class RunCounters
+    {
+        private long _existenceProbes;
+        private long _existingStats;
+        private long _filesHashed;
+        private long _bytesHashed;
+
+        public long ExistenceProbes => Interlocked.Read(ref _existenceProbes);
+        public long ExistingStats => Interlocked.Read(ref _existingStats);
+        public long FilesHashed => Interlocked.Read(ref _filesHashed);
+        public long BytesHashed => Interlocked.Read(ref _bytesHashed);
+
+        public void CountExistenceProbe() => Interlocked.Increment(ref _existenceProbes);
+        public void CountExistingStat() => Interlocked.Increment(ref _existingStats);
+
+        public void CountHash(long bytes)
+        {
+            Interlocked.Increment(ref _filesHashed);
+            Interlocked.Add(ref _bytesHashed, bytes);
+        }
+    }
 
     /// <summary>Appends a bundle's records into the four report lists, remapping bundle-local indices
     /// to the global positions given by <paramref name="sourceIndex"/> (this bundle's source-file
@@ -610,6 +654,7 @@ public sealed class DryRunEngine(
         Payload payload,
         Dictionary<string, CompiledFilterSet> filtersBySourceRoot,
         bool hasTransformers,
+        RunCounters counters,
         CancellationToken ct)
     {
         // The scanner captures the stat snapshot for free during enumeration; only fall back to a
@@ -699,7 +744,7 @@ public sealed class DryRunEngine(
             }
 
             TargetEvaluation te = await EvaluateTargetAsync(
-                profile.Policies, payload.SourcePath, metadata, prospective, target.Path, cachedSourceHash, ct)
+                profile.Policies, payload.SourcePath, metadata, prospective, target.Path, cachedSourceHash, counters, ct)
                 .ConfigureAwait(false);
             cachedSourceHash = te.SourceHash;
 
@@ -763,8 +808,10 @@ public sealed class DryRunEngine(
         string prospectivePath,
         string targetRoot,
         byte[]? cachedSourceHash,
+        RunCounters counters,
         CancellationToken ct)
     {
+        counters.CountExistenceProbe();
         bool finalExists = File.Exists(prospectivePath);
 
         // Read the existing file's metadata once (up front) and reuse it for both the unchanged-check
@@ -772,6 +819,7 @@ public sealed class DryRunEngine(
         FileMetadata? existingMeta = null;
         if (finalExists)
         {
+            counters.CountExistingStat();
             var existing = FileMetadataReader.Read(prospectivePath);
             existing.TryGetValue(out existingMeta);   // null if the read raced/failed
         }
@@ -804,6 +852,7 @@ public sealed class DryRunEngine(
             {
                 if (cachedSourceHash is null)
                 {
+                    counters.CountHash(metadata.Length);
                     var sourceHash = await hasher.HashFileToBytesAsync(sourcePath, policies.VerificationMethod, ct).ConfigureAwait(false);
                     if (sourceHash.IsCanceled)
                         // Placeholder — discarded by SimulateAsync's cancellation catch.
@@ -814,6 +863,7 @@ public sealed class DryRunEngine(
                     sourceHash.TryGetValue(out cachedSourceHash);
                 }
 
+                counters.CountHash(existingMeta.Length);
                 var targetHash = await hasher.HashFileToBytesAsync(prospectivePath, policies.VerificationMethod, ct).ConfigureAwait(false);
                 if (targetHash.IsCanceled)
                     return Single(Op(OperationKind.Unknown, prospectivePath, 0, subject, "canceled"), cachedSourceHash);
