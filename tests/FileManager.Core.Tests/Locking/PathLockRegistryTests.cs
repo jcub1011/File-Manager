@@ -68,4 +68,44 @@ public sealed class PathLockRegistryTests
         await using PathLockSet next = await registry.AcquireAsync([path], JobId.New());
         Assert.Contains(path, next.Paths);
     }
+
+    [Fact]
+    public async Task Overlapping_multi_path_acquire_is_handed_over_only_after_the_first_releases()
+    {
+        var registry = new PathLockRegistry();
+        NormalizedPath a = P(@"C:\a\1.txt");
+        NormalizedPath b = P(@"C:\a\2.txt");
+        NormalizedPath c = P(@"C:\a\3.txt");
+
+        // First job holds {a, b}; the paths are acquired in ordinal order regardless of argument order.
+        PathLockSet first = await registry.AcquireAsync([b, a], JobId.New());
+
+        // Second job wants {b, c} — it overlaps on b, so it blocks until the first set is disposed.
+        ValueTask<PathLockSet> secondTask = registry.AcquireAsync([c, b], JobId.New());
+        Assert.False(secondTask.IsCompleted);
+
+        await first.DisposeAsync();
+        PathLockSet second = await secondTask;               // ownership handed over on release
+        Assert.Contains(b, second.Paths);
+        Assert.Contains(c, second.Paths);
+        await second.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task Precancelled_token_throws_for_an_uncontended_path_and_leaves_no_lock_held()
+    {
+        var registry = new PathLockRegistry();
+        NormalizedPath path = P(@"C:\a\free.txt");   // uncontended — nobody holds it
+
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            async () => await registry.AcquireAsync([path], JobId.New(), cts.Token));
+
+        // The cancelled acquire reserved nothing, so another owner takes the path immediately.
+        ValueTask<PathLockSet> follow = registry.AcquireAsync([path], JobId.New());
+        Assert.True(follow.IsCompleted);
+        await using PathLockSet next = await follow;
+        Assert.Contains(path, next.Paths);
+    }
 }

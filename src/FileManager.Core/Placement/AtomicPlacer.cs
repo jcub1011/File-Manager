@@ -30,6 +30,10 @@ public sealed class AtomicPlacer(
     private const string TempSuffix = ".fmtmp-";
     private const string StagingDirName = ".fm_staging";
 
+    /// <summary>Timestamp comparison tolerance for the VerificationMethod.None unchanged-check —
+    /// FAT/exFAT round last-write times to ~2 s, so an exact-tick compare would never short-circuit.</summary>
+    private static readonly TimeSpan TimestampTolerance = TimeSpan.FromSeconds(2);
+
     public async Task<Result<UnchangedCheckResult, JobError>> CheckUnchangedAsync(
         JobExecution execution, int targetIndex, string finalPath, CancellationToken ct = default)
     {
@@ -60,8 +64,10 @@ public sealed class AtomicPlacer(
             }
             else
             {
-                // VerificationMethod.None: best-effort — same size and same last-write time.
-                if (File.GetLastWriteTimeUtc(finalPath) != output.SourceLastWriteUtc.UtcDateTime)
+                // VerificationMethod.None: best-effort — same size and (within FAT/exFAT rounding)
+                // same last-write time.
+                TimeSpan drift = (File.GetLastWriteTimeUtc(finalPath) - output.SourceLastWriteUtc.UtcDateTime).Duration();
+                if (drift > TimestampTolerance)
                     return UnchangedCheckResult.ExistsDifferent;
             }
 
@@ -90,6 +96,13 @@ public sealed class AtomicPlacer(
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
             return new JobError { Code = JobErrorCode.TargetWriteFailed, Message = $"unchanged-check failed for \"{finalPath}\": {ex.Message}", Path = finalPath, TargetIndex = targetIndex };
+        }
+        catch (Exception ex)
+        {
+            // Last-resort catch-all at this task boundary: an unexpected fault must be logged and
+            // surfaced as a JobError, never propagate out of the safety-critical placer.
+            logger.LogError(ex, "Unexpected error during unchanged-check for \"{Final}\"", finalPath);
+            return new JobError { Code = JobErrorCode.TargetWriteFailed, Message = $"unchanged-check failed unexpectedly for \"{finalPath}\": {ex.Message}", Path = finalPath, TargetIndex = targetIndex };
         }
     }
 
@@ -152,9 +165,26 @@ public sealed class AtomicPlacer(
             if (metaResult.TryGetError(out string? metaError))
                 return new JobError { Code = JobErrorCode.MetadataConflict, Message = metaError, Path = finalPath, TargetIndex = index };
 
-            // 5. Place.
+            // 5. Place. For a staged overwrite the staging intent is journaled and state set ONCE
+            //    here — before the retried move — so a transient replace failure can never emit
+            //    duplicate target-staged rows or re-mutate target state on each retry.
+            if (request.FinalExists && request.OverwriteHandling == OverwriteHandling.StageOverwrites)
+            {
+                JobError? stageJournalError = Journal(new TargetStagedRecord
+                {
+                    JobId = jobId, Seq = 0, AtUtc = time.GetUtcNow(),
+                    TargetIndex = index, FinalPath = finalPath, StagedPath = stagedPath,
+                });
+                if (stageJournalError is not null)
+                    return stageJournalError;
+
+                Directory.CreateDirectory(Path.GetDirectoryName(stagedPath)!);
+                tp.StagedPath = stagedPath;
+                tp.State = TargetState.Staged;
+            }
+
             Result<bool, JobError> placed = await retry.ExecuteAsync(
-                "place", c => PlaceAsync(request, tempPath, finalPath, stagedPath, tp, c), ct).ConfigureAwait(false);
+                "place", c => PlaceAsync(request, tempPath, finalPath, stagedPath, c), ct).ConfigureAwait(false);
             if (placed.IsCanceled) return Result<PlacementResult, JobError>.Canceled();
             if (placed.TryGetError(out JobError? placeError)) return placeError;
 
@@ -169,6 +199,13 @@ public sealed class AtomicPlacer(
         catch (OperationCanceledException)
         {
             return Result<PlacementResult, JobError>.Canceled();
+        }
+        catch (Exception ex)
+        {
+            // Last-resort catch-all at this task boundary: the most safety-critical method must never
+            // let an unexpected exception escape uncaught — log it and surface a JobError.
+            logger.LogError(ex, "Unexpected error placing target {Index} of job {JobId}", index, jobId);
+            return new JobError { Code = JobErrorCode.PlacementFailed, Message = $"unexpected placement error for \"{finalPath}\": {ex.Message}", Path = finalPath, TargetIndex = index };
         }
         finally
         {
@@ -226,10 +263,21 @@ public sealed class AtomicPlacer(
         {
             return Result<bool, JobError>.Canceled();
         }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // The VerificationMethod.None branch touches FileInfo.Length, which can throw an I/O
+            // error the try above would otherwise let escape. Treat as a transient write failure.
+            return new JobError { Code = JobErrorCode.TargetWriteFailed, Message = $"read-back verify failed for \"{tempPath}\": {ex.Message}", Path = tempPath, TargetIndex = index };
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "Unexpected error verifying temp \"{Temp}\"", tempPath);
+            return new JobError { Code = JobErrorCode.TargetWriteFailed, Message = $"read-back verify failed unexpectedly for \"{tempPath}\": {ex.Message}", Path = tempPath, TargetIndex = index };
+        }
     }
 
     private Task<Result<bool, JobError>> PlaceAsync(
-        PlacementRequest request, string tempPath, string finalPath, string stagedPath, TargetProgress tp, CancellationToken ct)
+        PlacementRequest request, string tempPath, string finalPath, string stagedPath, CancellationToken ct)
     {
         try
         {
@@ -241,17 +289,8 @@ public sealed class AtomicPlacer(
             }
             else if (request.OverwriteHandling == OverwriteHandling.StageOverwrites)
             {
-                JobError? stageJournalError = Journal(new TargetStagedRecord
-                {
-                    JobId = request.Execution.Plan.JobId.Value, Seq = 0, AtUtc = time.GetUtcNow(),
-                    TargetIndex = request.TargetIndex, FinalPath = finalPath, StagedPath = stagedPath,
-                });
-                if (stageJournalError is not null)
-                    return Task.FromResult<Result<bool, JobError>>(stageJournalError);
-
-                Directory.CreateDirectory(Path.GetDirectoryName(stagedPath)!);
-                tp.StagedPath = stagedPath;
-                tp.State = TargetState.Staged;
+                // Staging intent was journaled and target state set once by the caller (before this
+                // retried step); here we only perform the idempotent atomic replace.
                 ReplaceWithStaging(tempPath, finalPath, stagedPath);
             }
             else
@@ -286,9 +325,22 @@ public sealed class AtomicPlacer(
             // Fallback for volumes that reject ReplaceFile (some SMB servers): journaled two-step.
             // The crash window between the two moves is covered by the target-staged recovery rows.
             logger.LogWarning(ex, "File.Replace rejected for {Final}; falling back to two-step move", finalPath);
-            File.Move(finalPath, stagedPath);
-            File.Move(tempPath, finalPath);
+            TwoStepReplace(tempPath, finalPath, stagedPath);
         }
+    }
+
+    /// <summary>The two-step fallback, made idempotent so the retry policy can re-run it safely: if a
+    /// prior attempt already moved the prior version out (final now absent), don't move it again —
+    /// just finish by moving the temp into place. Without this, a retry after the first move succeeded
+    /// but the second failed would throw FileNotFound forever and strand the final name absent.</summary>
+    private static void TwoStepReplace(string tempPath, string finalPath, string stagedPath)
+    {
+        if (File.Exists(finalPath))
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(stagedPath)!);
+            File.Move(finalPath, stagedPath, overwrite: false);
+        }
+        File.Move(tempPath, finalPath, overwrite: false);
     }
 
     private SuppressionToken RegisterSuppression(string path)

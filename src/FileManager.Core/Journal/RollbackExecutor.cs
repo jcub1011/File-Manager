@@ -19,10 +19,30 @@ public sealed class RollbackExecutor(IJobJournal journal, TimeProvider time, ILo
 {
     private const int MaxAttempts = 3;
 
+    /// <summary>Backoff between rollback I/O attempts so a transient lock (AV / indexer / another
+    /// handle) can clear before the retry. Test seam: unit tests set this to zero.</summary>
+    internal TimeSpan RetryDelay { get; init; } = TimeSpan.FromMilliseconds(150);
+
     public Result<RollbackResult, JobError> Rollback(RollbackContext context, CancellationToken ct = default)
     {
         Guid jobId = context.JobId.Value;
+        try
+        {
+            return RollbackCore(context, jobId, ct);
+        }
+        catch (Exception ex)
+        {
+            // Last-resort catch-all: an unexpected fault (e.g. a malformed reconstructed path, a
+            // SecurityException) must never leave the job OPEN — it would re-enter crash recovery on
+            // every startup (a livelock). Log it and still write a terminal close so the job resolves.
+            logger.LogError(ex, "Rollback of job {JobId} failed unexpectedly; forcing terminal close", jobId);
+            Journal(new JobClosedRecord { JobId = jobId, Seq = 0, AtUtc = time.GetUtcNow(), Outcome = JobOutcome.RollbackFailed });
+            return new JobError { Code = JobErrorCode.RollbackIncomplete, Message = $"rollback failed unexpectedly: {ex.Message}" };
+        }
+    }
 
+    private Result<RollbackResult, JobError> RollbackCore(RollbackContext context, Guid jobId, CancellationToken ct)
+    {
         // 1. Journal rollback-begin (fsync). (Cancelling/awaiting outstanding target tasks is the
         //    live executor's concern; recovery reconstructs state and calls in with no live tasks.)
         JobError? beginError = Journal(new RollbackBeginRecord
@@ -183,13 +203,18 @@ public sealed class RollbackExecutor(IJobJournal journal, TimeProvider time, ILo
                 io();
                 return null;
             }
-            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            catch (Exception ex)
             {
+                // Catch-all (directive): a rollback step must never throw out of here — every failure
+                // becomes a residual string the caller records, so the sweep continues and the job
+                // still closes. IOException/UnauthorizedAccessException are the expected transients.
                 if (attempt == MaxAttempts)
                 {
                     logger.LogWarning(ex, "Rollback step failed after {Attempts} attempts: {Description}", MaxAttempts, description);
                     return $"{description}: {ex.Message}";
                 }
+                if (RetryDelay > TimeSpan.Zero)
+                    Thread.Sleep(RetryDelay);
             }
         }
         return null;
@@ -200,7 +225,7 @@ public sealed class RollbackExecutor(IJobJournal journal, TimeProvider time, ILo
         if (string.IsNullOrEmpty(dir) || !Directory.Exists(dir))
             return;
         try { Directory.Delete(dir, recursive: true); }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        catch (Exception ex)
         {
             logger.LogWarning(ex, "Could not delete directory {Dir} during rollback", dir);
         }

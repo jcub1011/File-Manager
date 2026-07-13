@@ -77,9 +77,12 @@ public sealed class DryRunStreamHandler(
                 yield break;
             }
             chunk.TryGetValue(out DryRunChunk? slice);
+            // The engine sets ScanTruncated once its candidate scan is cut short. OR it in BEFORE the
+            // sweep so a prefix-only survivor set never drives a (bogus) Mirror-deletion preview.
+            truncated |= slice!.ScanTruncated;
             yield return new DryRunChunkResponse
             {
-                SourceFiles = slice!.SourceFiles,
+                SourceFiles = slice.SourceFiles,
                 DestinationFiles = slice.DestinationFiles,
                 SourceOperations = slice.SourceOperations,
                 DestinationOperations = slice.DestinationOperations,
@@ -103,7 +106,17 @@ public sealed class DryRunStreamHandler(
         // reference their own files 0-based; offset both the file positions and the ops' SubjectIndex
         // by the file-phase destination count so indices stay global. Chunked so each frame stays
         // under the cap.
-        DestinationSweepResult sweep = destinationProjector.Sweep(profile, survivors, truncated, ct);
+        // Bound the sweep by the same overall file budget the source phase uses, so a target root
+        // with millions of pre-existing files can't buffer an unbounded op-per-file set service-side.
+        int sweepBudget = Math.Max(0, MaxStreamedFiles - destinationCount);
+        DestinationSweepResult sweep = destinationProjector.Sweep(profile, survivors, truncated, ct, sweepBudget);
+        if (sweep.Truncated)
+        {
+            logger.LogWarning(
+                "Dry-run (stream) destination sweep for profile {ProfileId} hit the {Cap:N0}-entry bound; report truncated",
+                typed.ProfileId, MaxStreamedFiles);
+            truncated = true;
+        }
         for (int start = 0; start < sweep.Files.Count; start += DestinationChunkSize)
         {
             int count = Math.Min(DestinationChunkSize, sweep.Files.Count - start);

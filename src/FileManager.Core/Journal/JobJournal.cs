@@ -51,8 +51,20 @@ public sealed class JobJournal : IJobJournal, IDisposable
                 _active.Flush(flushToDisk: true);
                 _nextSeq++;
 
+                // The record is now durable (written + fsync'd). Auto-rotation is best-effort
+                // compaction — a rotation failure must NOT turn a persisted append into a Result
+                // the caller would translate to JournalWriteFailed and roll back a live job over.
                 if (_active.Length > _config.JournalRotateAtBytes)
-                    RotateLocked();
+                {
+                    try
+                    {
+                        RotateLocked();
+                    }
+                    catch (Exception rotateEx)
+                    {
+                        _logger.LogWarning(rotateEx, "Journal auto-rotation failed after a durable append; segment left un-rotated");
+                    }
+                }
                 return Result.Success();
             }
             catch (Exception ex)
@@ -131,6 +143,19 @@ public sealed class JobJournal : IJobJournal, IDisposable
     {
         // Copy every still-OPEN job's records forward into a fresh segment, then delete the old
         // ones (I-APPEND — nothing is ever edited in place).
+        //
+        // Crash-atomicity contract: rotation is write-new-then-delete-old and is NOT atomic. A crash
+        // between the two steps leaves both the new segment and one or more old segments on disk, so
+        // ReadAll returns DUPLICATE records for the still-open jobs. Recovery tolerates this by design
+        // — it groups records by JobId, takes the FIRST job-opened, and Promote() only ever advances
+        // target state monotonically, so replaying a record twice is idempotent. (Covered by the
+        // duplicate-across-segments replay test.) Do not "optimise" recovery in a way that breaks this.
+        //
+        // Durability limitation (v1, accepted): Flush(flushToDisk:true) makes each segment's DATA
+        // durable, but the directory ENTRY for a freshly created segment is not separately fsync'd —
+        // Windows/.NET has no portable directory-fsync, so a power loss immediately after creating the
+        // very first segment could in principle lose that segment. The duplicate-tolerant recovery
+        // above bounds the blast radius; a full directory fsync is deferred to the platform layer.
         List<(int Number, string Path)> segments = OrderedSegments();
         var all = new List<JournalRecord>();
         foreach ((int _, string path) in segments)
@@ -272,7 +297,10 @@ public sealed class JobJournal : IJobJournal, IDisposable
     private void TryDelete(string path)
     {
         try { File.Delete(path); }
-        catch (IOException ex) { _logger.LogWarning(ex, "Could not delete old journal segment {Path}", path); }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            _logger.LogWarning(ex, "Could not delete old journal segment {Path}", path);
+        }
     }
 
     public void Dispose()

@@ -134,6 +134,77 @@ public sealed class RollbackExecutorTests : IDisposable
         Assert.Contains(ReadJournal(), x => x is JobClosedRecord { Outcome: JobOutcome.Failed });
     }
 
+    // A rollback executor with the inter-attempt backoff disabled so retry paths don't Thread.Sleep.
+    private RollbackExecutor ZeroDelay() =>
+        new(_journal, new FakeTimeProvider(), NullLogger<RollbackExecutor>.Instance) { RetryDelay = TimeSpan.Zero };
+
+    [Fact]
+    public void Staged_two_step_restore_restores_the_prior_file()
+    {
+        // Staged: the prior was moved out to staging, the rename to final never happened (final absent).
+        // Rollback moves staging -> final and drops the temp.
+        string final = Path.Combine(_root, "doc.txt");   // absent
+        string staged = Path.Combine(_root, "staging", "doc.txt");
+        Directory.CreateDirectory(Path.GetDirectoryName(staged)!);
+        File.WriteAllText(staged, "PRIOR (good)");
+        string temp = Path.Combine(_root, "doc.fmtmp");
+        File.WriteAllText(temp, "new bytes");
+
+        var result = ZeroDelay().Rollback(Context(OverwriteHandling.StageOverwrites, new TargetRollbackItem
+        {
+            TargetIndex = 0, State = TargetState.Staged, TempPath = temp, FinalPath = final, StagedPath = staged, FinalExistedBeforeJob = true,
+        }));
+
+        Assert.True(result.TryGetValue(out RollbackResult? r) && r.Complete);
+        Assert.True(File.Exists(final));
+        Assert.Equal("PRIOR (good)", File.ReadAllText(final));   // prior restored
+        Assert.False(File.Exists(temp));                          // temp removed
+        Assert.Contains(ReadJournal(), x => x is TargetRolledBackRecord { Action: RollbackAction.RestoredStagedBeforePlacement });
+    }
+
+    [Fact]
+    public void A_residual_yields_incomplete_and_a_rollback_failed_close()
+    {
+        // Placed + StageOverwrites + a prior existed, but the staged path is missing: the restore
+        // cannot run, so this target becomes a residual and the job closes RollbackFailed.
+        string final = Path.Combine(_root, "doc.txt");
+        File.WriteAllText(final, "NEW (bad)");
+
+        var result = ZeroDelay().Rollback(Context(OverwriteHandling.StageOverwrites, new TargetRollbackItem
+        {
+            TargetIndex = 0, State = TargetState.Placed, TempPath = null, FinalPath = final, StagedPath = null, FinalExistedBeforeJob = true,
+        }));
+
+        Assert.True(result.TryGetValue(out RollbackResult? r));
+        Assert.False(r.Complete);
+        Assert.Contains(final, r.ResidualPaths);
+        Assert.Contains(ReadJournal(), x => x is JobClosedRecord { Outcome: JobOutcome.RollbackFailed });
+        Assert.Contains(ReadJournal(), x => x is TargetRolledBackRecord { Error: not null });
+    }
+
+    [Fact]
+    public void Staging_dir_with_an_unrestored_file_is_kept()
+    {
+        // I-STAGING-KEEP: the restore fails (final is a directory, so replace/move cannot land the
+        // staged file), leaving an unrestored file in the staging dir — which must NOT be deleted.
+        string stagingDir = Path.Combine(_root, "staging", "job");
+        Directory.CreateDirectory(stagingDir);
+        string staged = Path.Combine(stagingDir, "doc.txt");
+        File.WriteAllText(staged, "PRIOR (unrestored)");
+        string final = Path.Combine(_root, "doc.txt");
+        Directory.CreateDirectory(final);   // final is a directory => the restore I/O fails
+
+        var result = ZeroDelay().Rollback(Context(OverwriteHandling.StageOverwrites, new TargetRollbackItem
+        {
+            TargetIndex = 0, State = TargetState.Placed, TempPath = null, FinalPath = final, StagedPath = staged, FinalExistedBeforeJob = true,
+        }));
+
+        Assert.True(result.TryGetValue(out RollbackResult? r));
+        Assert.False(r.Complete);
+        Assert.True(Directory.Exists(stagingDir));   // kept: it still holds an unrestored file
+        Assert.True(File.Exists(staged));            // the unrestored file survives for later quarantine
+    }
+
     private IReadOnlyList<JournalRecord> ReadJournal()
     {
         _journal.ReadAll().TryGetValue(out IReadOnlyList<JournalRecord>? records);

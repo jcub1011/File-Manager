@@ -25,12 +25,15 @@ public interface IDryRunEngine
 
 /// <summary>One streamed slice of a dry-run report. Indices in the operations are already global
 /// (positions into the fully assembled report lists), so the client simply concatenates chunks in
-/// receive order.</summary>
+/// receive order. <paramref name="ScanTruncated"/> is set once the source scan hit its candidate
+/// safety bound — the handler must OR it into its own truncation flag before running the destination
+/// sweep, since a truncated (prefix-only) survivor set would make every orphan judgement unsound.</summary>
 public sealed record DryRunChunk(
     IReadOnlyList<PhysicalFile> SourceFiles,
     IReadOnlyList<PhysicalFile> DestinationFiles,
     IReadOnlyList<VirtualFileOperation> SourceOperations,
-    IReadOnlyList<VirtualFileOperation> DestinationOperations);
+    IReadOnlyList<VirtualFileOperation> DestinationOperations,
+    bool ScanTruncated = false);
 
 /// <summary>The destination sweep's output: pre-existing files under the target roots that no source
 /// writes to, each paired with its operation. <see cref="Ops"/>[i] references <see cref="Files"/>[i]
@@ -38,4 +41,5 @@ public sealed record DryRunChunk(
 /// indices by the count of destination files already collected.</summary>
 public readonly record struct DestinationSweepResult(
     IReadOnlyList<PhysicalFile> Files,
-    IReadOnlyList<VirtualFileOperation> Ops);
+    IReadOnlyList<VirtualFileOperation> Ops,
+    bool Truncated = false);

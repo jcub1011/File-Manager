@@ -589,4 +589,114 @@ public sealed class DryRunViewModelTests
             DstOp(OperationKind.New, @"C:\t\three.txt", @"C:\t", sourceIndex: 2),
             DstOp(OperationKind.New, @"C:\t\four.txt", @"C:\t", sourceIndex: 3),
         ]);
+
+    // Sources nested two directory levels under a single root, so the tree has an interior folder
+    // ("deep") below the auto-expanded top level — a node whose expansion the user can toggle.
+    private static DryRunReport DeepSourcesReport(Guid profileId) => Report(profileId,
+        sourceFiles:
+        [
+            Pf(@"C:\proj\sub\deep\one.txt", @"C:\proj"),
+            Pf(@"C:\proj\sub\deep\two.txt", @"C:\proj"),
+            Pf(@"C:\proj\sub\other\three.txt", @"C:\proj"),
+        ],
+        sourceOps:
+        [
+            SrcOp(0, @"C:\proj\sub\deep\one.txt", @"C:\proj", OperationKind.Processed, OnSuccessAction.KeepSource),
+            SrcOp(1, @"C:\proj\sub\deep\two.txt", @"C:\proj", OperationKind.Processed, OnSuccessAction.KeepSource),
+            SrcOp(2, @"C:\proj\sub\other\three.txt", @"C:\proj", OperationKind.Processed, OnSuccessAction.KeepSource),
+        ],
+        destinationFiles: [],
+        destinationOps: []);
+
+    [Fact]
+    public async Task Duplicate_source_index_degrades_gracefully_instead_of_wiping_the_report()
+    {
+        // A service-side bug can emit two source ops with the same SourceIndex. The VM now groups and
+        // keeps the first rather than throwing on a duplicate dictionary key (which would blank the
+        // whole preview behind an error banner).
+        var (viewModel, gateway) = NewViewModel();
+        Guid pid = viewModel.ProfileId!.Value;
+        gateway.DryRunResult = Report(pid,
+            sourceFiles:
+            [
+                Pf(@"C:\s\a.txt", @"C:\s"),
+                Pf(@"C:\s\b.txt", @"C:\s"),
+            ],
+            sourceOps:
+            [
+                SrcOp(0, @"C:\s\a.txt", @"C:\s", OperationKind.Processed, OnSuccessAction.KeepSource),
+                SrcOp(0, @"C:\s\a.txt", @"C:\s", OperationKind.SkippedByFilter),   // duplicate SourceIndex 0
+                SrcOp(1, @"C:\s\b.txt", @"C:\s", OperationKind.Processed, OnSuccessAction.KeepSource),
+            ],
+            destinationFiles: [],
+            destinationOps:
+            [
+                DstOp(OperationKind.New, @"C:\t\a.txt", @"C:\t", sourceIndex: 0),
+                DstOp(OperationKind.New, @"C:\t\b.txt", @"C:\t", sourceIndex: 1),
+            ]);
+
+        await viewModel.RunAsync(CancellationToken.None);
+
+        Assert.True(viewModel.HasReport);
+        Assert.Null(viewModel.ErrorMessage);
+        Assert.Equal(2, viewModel.Sources.VisibleRows.Count);
+    }
+
+    [Fact]
+    public async Task Tree_expansion_persists_across_a_search_driven_rebuild()
+    {
+        var (viewModel, gateway) = NewViewModel();   // searchDebounce == Zero → rebuilds are synchronous
+        gateway.DryRunResult = DeepSourcesReport(viewModel.ProfileId!.Value);
+        await viewModel.RunAsync(CancellationToken.None);
+
+        viewModel.Sources.ShowTree = true;
+
+        DryRunTreeNode sub = Assert.Single(viewModel.Sources.Tree);   // top-level "sub", auto-expanded
+        DryRunTreeNode deep = sub.Children.Single(n => n.Name == "deep");
+        Assert.False(deep.IsExpanded);   // interior nodes start collapsed
+        deep.IsExpanded = true;
+
+        // A search term that still matches the deep node's files forces a rebuild of the forest.
+        viewModel.Sources.SearchText = "txt";
+
+        DryRunTreeNode subAfter = Assert.Single(viewModel.Sources.Tree);
+        DryRunTreeNode deepAfter = subAfter.Children.Single(n => n.Name == "deep");
+        Assert.True(deepAfter.IsExpanded);   // expansion (keyed by FullPath) survived the rebuild
+    }
+
+    [Fact]
+    public async Task Nonzero_debounce_coalesces_rapid_search_changes_to_the_final_term()
+    {
+        var tab = new DryRunSourcesTab(TimeSpan.FromMilliseconds(60));
+        List<DryRunFileRow> rows =
+        [
+            new(@"C:\s\alpha.txt", @"C:\s", OperationKind.Processed, null, "KeepSource", []),
+            new(@"C:\s\beta.txt", @"C:\s", OperationKind.Processed, null, "KeepSource", []),
+            new(@"C:\s\gamma.txt", @"C:\s", OperationKind.Processed, null, "KeepSource", []),
+        ];
+        tab.Load(rows, @"C:\s");
+        Assert.Equal(3, tab.VisibleRows.Count);
+
+        tab.SearchText = "alpha";
+        tab.SearchText = "beta";
+        tab.SearchText = "gamma";
+
+        // The debounce delays the rebuild, so the intermediate terms have not been applied yet.
+        Assert.Equal(3, tab.VisibleRows.Count);
+
+        // After the window lapses exactly one rebuild lands, reflecting only the final term.
+        await WaitUntilAsync(() =>
+            tab.VisibleRows.Count == 1 && tab.VisibleRows[0].SourcePath.EndsWith("gamma.txt"));
+
+        DryRunFileRow only = Assert.Single(tab.VisibleRows);
+        Assert.EndsWith("gamma.txt", only.SourcePath);
+    }
+
+    private static async Task WaitUntilAsync(Func<bool> condition, int timeoutMs = 2000)
+    {
+        System.Diagnostics.Stopwatch sw = System.Diagnostics.Stopwatch.StartNew();
+        while (!condition() && sw.ElapsedMilliseconds < timeoutMs)
+            await Task.Delay(10);
+        Assert.True(condition(), "condition was not met within the timeout");
+    }
 }

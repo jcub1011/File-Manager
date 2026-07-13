@@ -188,4 +188,160 @@ public sealed class CrashRecoveryTests : IDisposable
         Assert.True(result.TryGetValue(out RecoveryReport? report));
         Assert.Equal(0, report.JobsRecovered);
     }
+
+    // A two-target variant of Open(...) for the multi-target forward-completion test.
+    private JobOpenedRecord Open2(Guid job, string sourcePath, string final0, string final1, string targetRoot, string workspace, VerificationMethod verification, OnSuccessAction onSuccess)
+        => new()
+        {
+            JobId = job, Seq = 0, AtUtc = DateTimeOffset.UnixEpoch,
+            ProfileId = Guid.NewGuid(),
+            Source = new SourceSnapshot { Path = sourcePath, SizeBytes = 0, LastWriteUtc = DateTimeOffset.UnixEpoch },
+            Policies = new PolicySnapshot
+            {
+                Verification = verification, OverwriteHandling = OverwriteHandling.StageOverwrites,
+                ConflictResolution = ConflictResolution.Overwrite, OnSuccess = onSuccess,
+                MetadataOnConflict = MetadataOnConflict.WarnAndContinue,
+            },
+            WorkspaceDir = workspace,
+            Targets =
+            [
+                new TargetPlan { TargetIndex = 0, TargetRoot = targetRoot, ProspectiveFinalPath = final0 },
+                new TargetPlan { TargetIndex = 1, TargetRoot = targetRoot, ProspectiveFinalPath = final1 },
+            ],
+        };
+
+    [Fact]
+    public void Lost_target_write_begin_refuses_forward_completion_and_preserves_the_source()
+    {
+        // OutputSealed (Sha256) is present and a staged record promotes the target to Staged, but the
+        // target-write-begin was lost to a torn journal write — FinalPath/TempPath are null. The
+        // forward gate must refuse (else it would commit + dispose over a silently skipped target).
+        var job = Guid.NewGuid();
+        string source = Path.Combine(_root, "src.dat");
+        File.WriteAllText(source, "the irreplaceable source");
+        const string content = "sealed payload";
+        string workspace = Path.Combine(_root, "work", ".pipeline_tmp", job.ToString("N"));
+        Directory.CreateDirectory(workspace);
+        string output = Path.Combine(workspace, "output");
+        File.WriteAllText(output, content);
+        string targetRoot = Path.Combine(_root, "target");
+        Directory.CreateDirectory(targetRoot);
+        string final = Path.Combine(targetRoot, "out.dat");
+        string staged = Path.Combine(targetRoot, ".fm_staging", job.ToString("N"), "out.dat");
+        Directory.CreateDirectory(Path.GetDirectoryName(staged)!);
+        File.WriteAllText(staged, "PRIOR");
+
+        _journal.Append(Open(job, source, final, targetRoot, workspace, VerificationMethod.Sha256, OnSuccessAction.MoveToTrash));
+        _journal.Append(new OutputSealedRecord { JobId = job, Seq = 0, AtUtc = DateTimeOffset.UnixEpoch, OutputPath = output, SizeBytes = content.Length, ContentHash = Sha(content) });
+        // No TargetWriteBeginRecord — the lost record leaves FinalPath/TempPath null on the target.
+        _journal.Append(new TargetStagedRecord { JobId = job, Seq = 0, AtUtc = DateTimeOffset.UnixEpoch, TargetIndex = 0, FinalPath = final, StagedPath = staged });
+
+        Result<RecoveryReport, JobError> result = _recovery.Recover();
+
+        Assert.True(result.TryGetValue(out RecoveryReport? report));
+        Assert.Equal(1, report.RolledBack);
+        Assert.Equal(0, report.CompletedForward);
+        Assert.True(File.Exists(source));                 // source never disposed
+        Assert.DoesNotContain(source, _trash.Trashed);    // and never trashed
+    }
+
+    [Fact]
+    public void Placed_target_missing_after_crash_refuses_forward_completion()
+    {
+        // A Placed target whose final file is gone (mid-placement, JobCommitted NOT present) must not
+        // complete forward — the source must never be disposed over a target we cannot honour.
+        var job = Guid.NewGuid();
+        var jobId = new JobId(job);
+        string source = Path.Combine(_root, "src.dat");
+        File.WriteAllText(source, "source");
+        const string content = "sealed payload";
+        string workspace = Path.Combine(_root, "work", ".pipeline_tmp", job.ToString("N"));
+        Directory.CreateDirectory(workspace);
+        string output = Path.Combine(workspace, "output");
+        File.WriteAllText(output, content);
+        string targetRoot = Path.Combine(_root, "target");
+        Directory.CreateDirectory(targetRoot);
+        string final = Path.Combine(targetRoot, "out.dat");   // journal says Placed, but it is MISSING on disk
+        string temp = final + ".fmtmp-" + jobId.Short;
+
+        _journal.Append(Open(job, source, final, targetRoot, workspace, VerificationMethod.Sha256, OnSuccessAction.MoveToTrash));
+        _journal.Append(new OutputSealedRecord { JobId = job, Seq = 0, AtUtc = DateTimeOffset.UnixEpoch, OutputPath = output, SizeBytes = content.Length, ContentHash = Sha(content) });
+        _journal.Append(new TargetWriteBeginRecord { JobId = job, Seq = 0, AtUtc = DateTimeOffset.UnixEpoch, TargetIndex = 0, TempPath = temp, FinalPath = final, FinalExisted = false });
+        _journal.Append(new TargetPlacedRecord { JobId = job, Seq = 0, AtUtc = DateTimeOffset.UnixEpoch, TargetIndex = 0 });
+        // No JobCommittedRecord — pre-commit, placed-but-missing.
+
+        Result<RecoveryReport, JobError> result = _recovery.Recover();
+
+        Assert.True(result.TryGetValue(out RecoveryReport? report));
+        Assert.Equal(1, report.RolledBack);
+        Assert.Equal(0, report.CompletedForward);
+        Assert.True(File.Exists(source));                 // not disposed over a missing placed target
+        Assert.DoesNotContain(source, _trash.Trashed);
+    }
+
+    [Fact]
+    public void Multi_target_all_placed_and_verified_completes_forward()
+    {
+        var job = Guid.NewGuid();
+        var jobId = new JobId(job);
+        const string content = "shared verified payload";
+        string workspace = Path.Combine(_root, "work", ".pipeline_tmp", job.ToString("N"));
+        Directory.CreateDirectory(workspace);
+        string output = Path.Combine(workspace, "output");
+        File.WriteAllText(output, content);
+        string targetRoot = Path.Combine(_root, "target");
+        Directory.CreateDirectory(targetRoot);
+        string final0 = Path.Combine(targetRoot, "out0.dat");
+        string final1 = Path.Combine(targetRoot, "out1.dat");
+        File.WriteAllText(final0, content);
+        File.WriteAllText(final1, content);
+        string temp0 = final0 + ".fmtmp-" + jobId.Short;
+        string temp1 = final1 + ".fmtmp-" + jobId.Short;
+
+        _journal.Append(Open2(job, Path.Combine(_root, "src.dat"), final0, final1, targetRoot, workspace, VerificationMethod.Sha256, OnSuccessAction.KeepSource));
+        _journal.Append(new OutputSealedRecord { JobId = job, Seq = 0, AtUtc = DateTimeOffset.UnixEpoch, OutputPath = output, SizeBytes = content.Length, ContentHash = Sha(content) });
+        _journal.Append(new TargetWriteBeginRecord { JobId = job, Seq = 0, AtUtc = DateTimeOffset.UnixEpoch, TargetIndex = 0, TempPath = temp0, FinalPath = final0, FinalExisted = false });
+        _journal.Append(new TargetPlacedRecord { JobId = job, Seq = 0, AtUtc = DateTimeOffset.UnixEpoch, TargetIndex = 0 });
+        _journal.Append(new TargetWriteBeginRecord { JobId = job, Seq = 0, AtUtc = DateTimeOffset.UnixEpoch, TargetIndex = 1, TempPath = temp1, FinalPath = final1, FinalExisted = false });
+        _journal.Append(new TargetPlacedRecord { JobId = job, Seq = 0, AtUtc = DateTimeOffset.UnixEpoch, TargetIndex = 1 });
+
+        Result<RecoveryReport, JobError> result = _recovery.Recover();
+
+        Assert.True(result.TryGetValue(out RecoveryReport? report));
+        Assert.Equal(1, report.CompletedForward);
+        Assert.Equal(0, report.RolledBack);
+        Assert.True(File.Exists(final0));
+        Assert.True(File.Exists(final1));
+        Assert.Equal(content, File.ReadAllText(final0));
+        Assert.Equal(content, File.ReadAllText(final1));
+    }
+
+    [Fact]
+    public void Row_J_resumes_a_crashed_rollback()
+    {
+        // A rollback-begin is journalled but one target has no target-rolledback record: recovery
+        // resumes the sweep for the un-reverted target.
+        var job = Guid.NewGuid();
+        var jobId = new JobId(job);
+        string targetRoot = Path.Combine(_root, "target");
+        Directory.CreateDirectory(targetRoot);
+        string final = Path.Combine(targetRoot, "out.dat");
+        string temp = final + ".fmtmp-" + jobId.Short;
+        File.WriteAllText(temp, "unfinished temp");
+        string workspace = Path.Combine(_root, "work", ".pipeline_tmp", job.ToString("N"));
+        Directory.CreateDirectory(workspace);
+
+        _journal.Append(Open(job, Path.Combine(_root, "src.dat"), final, targetRoot, workspace, VerificationMethod.Sha256, OnSuccessAction.KeepSource));
+        _journal.Append(new TargetWriteBeginRecord { JobId = job, Seq = 0, AtUtc = DateTimeOffset.UnixEpoch, TargetIndex = 0, TempPath = temp, FinalPath = final, FinalExisted = false });
+        _journal.Append(new TargetVerifiedRecord { JobId = job, Seq = 0, AtUtc = DateTimeOffset.UnixEpoch, TargetIndex = 0 });
+        _journal.Append(new RollbackBeginRecord { JobId = job, Seq = 0, AtUtc = DateTimeOffset.UnixEpoch, Reason = "verification mismatch", FailedTargetIndex = 0 });
+        // No TargetRolledBackRecord — the rollback crashed before sweeping the target.
+
+        Result<RecoveryReport, JobError> result = _recovery.Recover();
+
+        Assert.True(result.TryGetValue(out RecoveryReport? report));
+        Assert.Equal(1, report.RolledBack);
+        Assert.False(File.Exists(temp));            // resumed sweep removed the leftover temp
+        Assert.False(Directory.Exists(workspace));  // and deleted the workspace
+    }
 }

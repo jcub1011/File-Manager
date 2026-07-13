@@ -57,7 +57,7 @@ public sealed class DestinationProjector(ILogger<DestinationProjector> logger, I
     /// Untouched) may well be written by an un-evaluated source. In that case we emit NOTHING rather
     /// than fabricate deletions/untouched entries.</param>
     public DestinationSweepResult Sweep(
-        Profile profile, ISet<NormalizedPath> survivors, bool truncated, CancellationToken ct)
+        Profile profile, ISet<NormalizedPath> survivors, bool truncated, CancellationToken ct, int maxEntries = int.MaxValue)
     {
         ArgumentNullException.ThrowIfNull(profile);
         ArgumentNullException.ThrowIfNull(survivors);
@@ -80,15 +80,21 @@ public sealed class DestinationProjector(ILogger<DestinationProjector> logger, I
         // Dedup across target roots that overlap (one nested under another) so a file enumerated
         // twice is reported once.
         HashSet<NormalizedPath> reported = [];
+        bool capped = false;
         foreach (TargetConfig target in profile.Targets)
         {
             if (ct.IsCancellationRequested)
                 break;
+            if (files.Count >= maxEntries) { capped = true; break; }
             if (!NormalizedPath.Create(target.Path).TryGetValue(out NormalizedPath targetRoot))
                 continue;
-            SweepRoot(targetRoot, survivors, sourceRoots, mirror, files, ops, reported, ct);
+            if (SweepRoot(targetRoot, survivors, sourceRoots, mirror, files, ops, reported, maxEntries, ct))
+            {
+                capped = true;
+                break;
+            }
         }
-        return new DestinationSweepResult(files, ops);
+        return new DestinationSweepResult(files, ops, capped);
     }
 
     /// <summary>Explicit-stack DFS over a single target root, mirroring the source scanner's walk but
@@ -96,7 +102,9 @@ public sealed class DestinationProjector(ILogger<DestinationProjector> logger, I
     /// regardless of the source's depth filter; (2) reparse-point directories are not descended
     /// (junctions can loop or escape the tree) and reparse-point files are classified Unknown, never
     /// Deleted.</summary>
-    private void SweepRoot(
+    /// <summary>Returns true if the entry cap was hit (the caller should stop sweeping further roots
+    /// and mark the result truncated).</summary>
+    private bool SweepRoot(
         NormalizedPath targetRoot,
         ISet<NormalizedPath> survivors,
         List<NormalizedPath> sourceRoots,
@@ -104,6 +112,7 @@ public sealed class DestinationProjector(ILogger<DestinationProjector> logger, I
         List<PhysicalFile> files,
         List<VirtualFileOperation> ops,
         HashSet<NormalizedPath> reported,
+        int maxEntries,
         CancellationToken ct)
     {
         Stack<string> pending = new();
@@ -112,7 +121,7 @@ public sealed class DestinationProjector(ILogger<DestinationProjector> logger, I
         while (pending.Count > 0)
         {
             if (ct.IsCancellationRequested)
-                return;
+                return false;
             string directory = pending.Pop();
 
             foreach (Result<FileSystemEntry, EnumerationFault> entry in fileSystem.EnumerateEntries(directory))
@@ -158,6 +167,9 @@ public sealed class DestinationProjector(ILogger<DestinationProjector> logger, I
                 if (!reported.Add(filePath))
                     continue;   // already reported via an overlapping target root
 
+                if (files.Count >= maxEntries)
+                    return true;   // hit the entry cap — caller marks the sweep truncated
+
                 OperationKind kind = isReparse
                     ? OperationKind.Unknown              // can't judge a reparse point
                     : mirror
@@ -184,6 +196,7 @@ public sealed class DestinationProjector(ILogger<DestinationProjector> logger, I
                 });
             }
         }
+        return false;
     }
 
     private static void AddNormalized(ISet<NormalizedPath> set, string path)

@@ -20,9 +20,16 @@ public sealed class SelfWriteSuppressionRegistry : IDisposable
 
     private const long ActiveSentinel = long.MaxValue;   // expiresAtTicks while the registration is live
 
+    /// <summary>Ceiling on how long an <c>Active</c> registration may suppress a path. A job that
+    /// faults on a path bypassing its <c>Release</c>/<c>Dispose</c> would otherwise suppress that path
+    /// for the process lifetime, so the watcher would silently drop real events for it forever. Well
+    /// above any legitimate single-file operation.</summary>
+    private static readonly TimeSpan MaxActiveTtl = TimeSpan.FromHours(1);
+
     private sealed class Entry
     {
         public required JobId Owner { get; init; }
+        public long RegisteredAtTicks { get; init; }
         public long ExpiresAtTicks;
     }
 
@@ -42,7 +49,7 @@ public sealed class SelfWriteSuppressionRegistry : IDisposable
 
     public SuppressionToken Register(NormalizedPath path, JobId owner)
     {
-        _entries[path] = new Entry { Owner = owner, ExpiresAtTicks = ActiveSentinel };
+        _entries[path] = new Entry { Owner = owner, RegisteredAtTicks = _time.GetUtcNow().UtcTicks, ExpiresAtTicks = ActiveSentinel };
         return new SuppressionToken(this, path, owner);
     }
 
@@ -51,10 +58,18 @@ public sealed class SelfWriteSuppressionRegistry : IDisposable
     {
         if (!_entries.TryGetValue(path, out Entry? entry))
             return false;
+        long now = _time.GetUtcNow().UtcTicks;
         long expires = Interlocked.Read(ref entry.ExpiresAtTicks);
         if (expires == ActiveSentinel)
-            return true;
-        if (_time.GetUtcNow().UtcTicks < expires)
+        {
+            // Active — but bounded: past the max-active TTL a never-released registration is treated
+            // as expired so a faulted job cannot suppress the path forever.
+            if (now - entry.RegisteredAtTicks <= MaxActiveTtl.Ticks)
+                return true;
+            _entries.TryRemove(new KeyValuePair<NormalizedPath, Entry>(path, entry));
+            return false;
+        }
+        if (now < expires)
             return true;
         // Expired: prune lazily (only removes this exact entry, so a concurrent re-Register wins).
         _entries.TryRemove(new KeyValuePair<NormalizedPath, Entry>(path, entry));
@@ -75,7 +90,9 @@ public sealed class SelfWriteSuppressionRegistry : IDisposable
         foreach (KeyValuePair<NormalizedPath, Entry> kvp in _entries)
         {
             long expires = Interlocked.Read(ref kvp.Value.ExpiresAtTicks);
-            if (expires != ActiveSentinel && now >= expires)
+            bool lingerExpired = expires != ActiveSentinel && now >= expires;
+            bool activeExpired = expires == ActiveSentinel && now - kvp.Value.RegisteredAtTicks > MaxActiveTtl.Ticks;
+            if (lingerExpired || activeExpired)
                 _entries.TryRemove(kvp);
         }
     }

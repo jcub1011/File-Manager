@@ -52,6 +52,10 @@ public sealed class PathLockRegistry
 
     private async Task AcquireOneAsync(NormalizedPath path, JobId owner, CancellationToken ct)
     {
+        // Honour cancellation even for an uncontended path — otherwise a cancelled caller could still
+        // be handed a fully-acquired set when no path happened to be contended.
+        ct.ThrowIfCancellationRequested();
+
         Waiter waiter;
         lock (_gate)
         {

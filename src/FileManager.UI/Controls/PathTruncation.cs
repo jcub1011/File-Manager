@@ -39,9 +39,9 @@ public static class PathTruncation
             return Ellipsis.ToString();
 
         int budget = maxChars - 1;          // one column is spent on the ellipsis
-        int head = budget / 2;
-        int tail = budget - head;
-        return string.Concat(text.AsSpan(0, head), Ellipsis.ToString(), text.AsSpan(text.Length - tail, tail));
+        int head = TrimHead(text, budget / 2);
+        int tailStart = TrimTailStart(text, text.Length - (budget - budget / 2));
+        return string.Concat(text.AsSpan(0, head), Ellipsis.ToString(), text.AsSpan(tailStart));
     }
 
     /// <summary>Shortens a file name to at most <paramref name="maxChars"/> characters, truncating the
@@ -61,14 +61,14 @@ public static class PathTruncation
         int dot = fileName.LastIndexOf('.');
         bool hasExtension = dot > 0 && dot < fileName.Length - 1;
         if (!hasExtension)
-            return string.Concat(fileName.AsSpan(0, maxChars - 1), Ellipsis.ToString());
+            return string.Concat(fileName.AsSpan(0, TrimHead(fileName, maxChars - 1)), Ellipsis.ToString());
 
         string extNoDot = fileName[(dot + 1)..];
         int keep = maxChars - 1 - extNoDot.Length;   // ellipsis + extension consume the rest
         if (keep < 1)
             return TruncateMiddle(fileName, maxChars);
 
-        return string.Concat(fileName.AsSpan(0, Math.Min(keep, dot)), Ellipsis.ToString(), extNoDot);
+        return string.Concat(fileName.AsSpan(0, TrimHead(fileName, Math.Min(keep, dot))), Ellipsis.ToString(), extNoDot);
     }
 
     /// <summary>Shortens a directory path to at most <paramref name="maxChars"/> characters at folder
@@ -125,7 +125,7 @@ public static class PathTruncation
                 continue;
             for (int stem = segments[idx].Length - 2; stem >= 1; stem--)
             {
-                display[idx] = segments[idx][..stem] + Ellipsis;
+                display[idx] = segments[idx][..TrimHead(segments[idx], stem)] + Ellipsis;
                 built = Build(leadingSep, display, sepAfter, kept);
                 if (built.Length <= maxChars)
                     return built;
@@ -207,4 +207,18 @@ public static class PathTruncation
     }
 
     private static bool IsSep(char c) => c is '\\' or '/';
+
+    /// <summary>Trims a head length so the kept prefix <c>text[0..len]</c> never ends on the high half
+    /// of a surrogate pair — cutting there would emit a lone surrogate that renders as <c>�</c>.</summary>
+    private static int TrimHead(string text, int len) =>
+        len > 0 && len < text.Length && char.IsHighSurrogate(text[len - 1]) && char.IsLowSurrogate(text[len])
+            ? len - 1
+            : len;
+
+    /// <summary>Advances a tail start so <c>text[start..]</c> never begins on the low half of a
+    /// surrogate pair (whose high half would be left stranded in the elided middle).</summary>
+    private static int TrimTailStart(string text, int start) =>
+        start > 0 && start < text.Length && char.IsLowSurrogate(text[start]) && char.IsHighSurrogate(text[start - 1])
+            ? start + 1
+            : start;
 }

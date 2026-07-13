@@ -70,4 +70,42 @@ public sealed class TransientRetryPolicyTests
         Assert.Equal(42, value);
         Assert.Equal(2, calls);
     }
+
+    [Fact]
+    public async Task Non_transient_verification_mismatch_returns_after_one_call_without_delay()
+    {
+        // A VerificationMismatch is deterministic (data corruption) — the policy must return it at
+        // once, on the first call, with no delay, so the FakeTimeProvider need never advance.
+        var time = new FakeTimeProvider();
+        var policy = new TransientRetryPolicy(time, NullLogger<TransientRetryPolicy>.Instance);
+        int calls = 0;
+
+        Result<int, JobError> result = await policy.ExecuteAsync<int>("op", _ =>
+        {
+            calls++;
+            return Task.FromResult<Result<int, JobError>>(new JobError { Code = JobErrorCode.VerificationMismatch, Message = "corrupt" });
+        });
+
+        Assert.True(result.TryGetError(out JobError? error));
+        Assert.Equal(JobErrorCode.VerificationMismatch, error.Code);
+        Assert.Equal(1, calls);
+    }
+
+    [Fact]
+    public async Task Non_transient_metadata_conflict_returns_after_one_call_without_delay()
+    {
+        var time = new FakeTimeProvider();
+        var policy = new TransientRetryPolicy(time, NullLogger<TransientRetryPolicy>.Instance);
+        int calls = 0;
+
+        Result<int, JobError> result = await policy.ExecuteAsync<int>("op", _ =>
+        {
+            calls++;
+            return Task.FromResult<Result<int, JobError>>(new JobError { Code = JobErrorCode.MetadataConflict, Message = "acl loss" });
+        });
+
+        Assert.True(result.TryGetError(out JobError? error));
+        Assert.Equal(JobErrorCode.MetadataConflict, error.Code);
+        Assert.Equal(1, calls);
+    }
 }

@@ -148,6 +148,41 @@ public sealed class CrashRecovery(
         if (seal is null || method is VerificationMethod.None or VerificationMethod.SizeTimestamp)
             return false;
 
+        // Decide BEFORE CompleteForward mutates anything: every not-yet-terminal target must be
+        // safely completable, or we roll back the whole job (source preserved, re-delivery idempotent
+        // per §3.4.1) rather than commit + dispose over a target we cannot honour.
+        foreach (TargetRecovery t in targets)
+        {
+            if (t.State is TargetState.SatisfiedUnchanged or TargetState.SkippedConflict)
+                continue;
+
+            if (t.State == TargetState.Placed)
+            {
+                // I-DISPOSE: a placed target whose file is now missing or hash-mismatched cannot be
+                // trusted; refuse forward completion so the source is never disposed over it.
+                if (t.FinalPath is null
+                    || !File.Exists(t.FinalPath)
+                    || !HashEquals(t.FinalPath, seal.ContentHash, method))
+                {
+                    logger.LogError(
+                        "Recovery: placed target {Index} (\"{Final}\") missing or hash-mismatched after crash; refusing forward completion",
+                        t.TargetIndex, t.FinalPath);
+                    return false;
+                }
+                continue;
+            }
+
+            // A lost target-write-begin (e.g. mid-journal corruption) leaves these null. Completing
+            // forward would silently skip the target, then commit and dispose the source — total loss.
+            if (t.FinalPath is null || t.TempPath is null)
+            {
+                logger.LogError(
+                    "Recovery: target {Index} has no target-write-begin paths; refusing forward completion",
+                    t.TargetIndex);
+                return false;
+            }
+        }
+
         if (File.Exists(seal.OutputPath)
             && new FileInfo(seal.OutputPath).Length == seal.SizeBytes
             && HashEquals(seal.OutputPath, seal.ContentHash, method))
@@ -158,7 +193,7 @@ public sealed class CrashRecovery(
         {
             if (t.State is TargetState.Placed or TargetState.SatisfiedUnchanged or TargetState.SkippedConflict)
                 continue;
-            if (t.TempPath is null || !File.Exists(t.TempPath) || !HashEquals(t.TempPath, seal.ContentHash, method))
+            if (!File.Exists(t.TempPath!) || !HashEquals(t.TempPath!, seal.ContentHash, method))
                 return false;
         }
         return true;
@@ -166,18 +201,13 @@ public sealed class CrashRecovery(
 
     private void CompleteForward(Guid jobId, JobOpenedRecord opened, OutputSealedRecord seal, TargetRecovery[] targets)
     {
+        // The forward gate (ForwardCompletionAllowed) has already verified that every placed target
+        // is intact and every not-yet-placed target has resolvable paths, so placement below cannot
+        // silently skip a target.
         foreach (TargetRecovery t in targets)
         {
-            if (t.State is TargetState.SatisfiedUnchanged or TargetState.SkippedConflict)
+            if (t.State is TargetState.Placed or TargetState.SatisfiedUnchanged or TargetState.SkippedConflict)
                 continue;
-
-            if (t.State == TargetState.Placed)
-            {
-                // H1/H2: trust the placed record; probe only for an integrity alert.
-                if (t.FinalPath is not null && (!File.Exists(t.FinalPath) || !HashEquals(t.FinalPath, seal.ContentHash, opened.Policies.Verification)))
-                    logger.LogError("Integrity: placed target \"{Final}\" missing or mismatched after crash (job {JobId})", t.FinalPath, jobId);
-                continue;
-            }
 
             ForwardPlaceTarget(jobId, opened, seal, t);
         }
@@ -190,10 +220,11 @@ public sealed class CrashRecovery(
     private void ForwardPlaceTarget(Guid jobId, JobOpenedRecord opened, OutputSealedRecord seal, TargetRecovery t)
     {
         if (t.FinalPath is null || t.TempPath is null)
-        {
-            logger.LogWarning("Cannot forward target {Index} of job {JobId}: no target-write-begin paths", t.TargetIndex, jobId);
-            return;
-        }
+            // Unreachable: the forward-completion gate rejects any job with such a target. Throwing
+            // (rather than silently returning) guarantees a target is never skipped on the way to a
+            // commit+dispose — the RecoverJob catch leaves the job for the next startup, source intact.
+            throw new InvalidOperationException(
+                $"forward-place target {t.TargetIndex} of job {jobId} has no target-write-begin paths");
 
         // Ensure a verified temp exists (rows C1/C2/D3): re-copy from the workspace if the temp is
         // absent or its hash does not match the reference.
@@ -326,22 +357,32 @@ public sealed class CrashRecovery(
         if (!Directory.Exists(pipelineTmp))
             return;
 
-        DateTimeOffset cutoff = time.GetUtcNow() - OrphanAge;
-        foreach (string dir in Directory.EnumerateDirectories(pipelineTmp))
+        try
         {
-            string name = Path.GetFileName(dir);
-            bool tracked = Guid.TryParseExact(name, "N", out Guid id) && knownJobs.Contains(id);
-            if (tracked)
-                continue;
-            // No journal trace + older than 24h → safe to delete (no user data lives in a workspace).
-            if (Directory.GetLastWriteTimeUtc(dir) < cutoff.UtcDateTime)
+            DateTimeOffset cutoff = time.GetUtcNow() - OrphanAge;
+            foreach (string dir in Directory.EnumerateDirectories(pipelineTmp))
             {
-                try { Directory.Delete(dir, recursive: true); }
-                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                string name = Path.GetFileName(dir);
+                bool tracked = Guid.TryParseExact(name, "N", out Guid id) && knownJobs.Contains(id);
+                if (tracked)
+                    continue;
+                // No journal trace + older than 24h → safe to delete (no user data lives in a workspace).
+                if (Directory.GetLastWriteTimeUtc(dir) < cutoff.UtcDateTime)
                 {
-                    logger.LogWarning(ex, "Could not delete orphaned workspace {Dir}", dir);
+                    try { Directory.Delete(dir, recursive: true); }
+                    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                    {
+                        logger.LogWarning(ex, "Could not delete orphaned workspace {Dir}", dir);
+                    }
                 }
             }
+        }
+        catch (Exception ex)
+        {
+            // Catch-all (directive): the enumeration itself (or GetLastWriteTimeUtc) can throw, and
+            // orphan sweeping is best-effort cleanup — a failure here must not abort a recovery pass
+            // whose jobs were already resolved above.
+            logger.LogWarning(ex, "Orphan workspace sweep failed; skipping (best-effort)");
         }
         // Note (v1 substrate): .fm_staging orphans live under arbitrary target roots that recovery
         // cannot enumerate without the profile catalog; a staging dir left by a failed rollback is

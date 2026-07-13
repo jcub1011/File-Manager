@@ -58,6 +58,13 @@ public sealed class WindowsMetadataPreserver(ILogger<WindowsMetadataPreserver> l
         {
             logger.LogDebug(ex, "Could not copy timestamps {From} → {To}", fromPath, toPath);
         }
+        catch (Exception ex)
+        {
+            // Last-resort catch-all (directive): the timestamp copy is best-effort and never fatal,
+            // so an unexpected fault (e.g. ArgumentException on a malformed path) is logged, not thrown
+            // out of Apply — the caller invokes this synchronously with no surrounding guard.
+            logger.LogWarning(ex, "Unexpected error copying timestamps {From} → {To}", fromPath, toPath);
+        }
 
         // ACLs: best-effort. A failure is a genuine metadata loss — fail the job under FailJob,
         // otherwise warn and continue (the temp keeps the target directory's inherited ACL).

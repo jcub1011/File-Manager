@@ -93,4 +93,77 @@ public sealed class JobJournalTests : IDisposable
         Assert.All(records!, r => Assert.Equal(openJob, r.JobId));   // only the OPEN job survives
         Assert.Single(Directory.GetFiles(_paths.JournalDirectory, "journal-*.ndjsonl"));
     }
+
+    [Fact]
+    public void Size_triggered_auto_rotation_compacts_and_keeps_open_job_records_once()
+    {
+        Guid openJob = Guid.NewGuid();
+        Guid closedJob = Guid.NewGuid();
+        // Tiny threshold: every durable append trips the auto-rotation path.
+        using JobJournal journal = New(rotateAt: 64);
+        journal.Append(Opened(openJob));
+        journal.Append(Opened(closedJob));
+        journal.Append(new JobClosedRecord { JobId = closedJob, Seq = 0, AtUtc = DateTimeOffset.UnixEpoch, Outcome = JobOutcome.Succeeded });
+        journal.Append(new JobCommittedRecord { JobId = openJob, Seq = 0, AtUtc = DateTimeOffset.UnixEpoch });
+
+        Result<IReadOnlyList<JournalRecord>, JobError> read = journal.ReadAll();
+        Assert.True(read.TryGetValue(out IReadOnlyList<JournalRecord>? records));
+        // The open job's records survive every rotation exactly once; the closed job is compacted away.
+        Assert.All(records!, r => Assert.Equal(openJob, r.JobId));
+        Assert.Equal(2, records!.Count(r => r.JobId == openJob));   // Opened + Committed, no duplicates
+        Assert.Contains(records!, r => r is JobOpenedRecord);
+        Assert.Contains(records!, r => r is JobCommittedRecord);
+        Assert.Single(Directory.GetFiles(_paths.JournalDirectory, "journal-*.ndjsonl"));   // compacted to one segment
+    }
+
+    [Fact]
+    public void Mid_segment_crc_corruption_is_skipped_while_good_records_still_load()
+    {
+        Guid job = Guid.NewGuid();
+        using (JobJournal journal = New())
+        {
+            journal.Append(Opened(job));                                                                            // line 0 — we corrupt this (non-tail)
+            journal.Append(new JobCommittedRecord { JobId = job, Seq = 0, AtUtc = DateTimeOffset.UnixEpoch });        // line 1
+            journal.Append(new JobClosedRecord { JobId = job, Seq = 0, AtUtc = DateTimeOffset.UnixEpoch, Outcome = JobOutcome.Succeeded }); // line 2
+        }
+
+        string segment = Directory.GetFiles(_paths.JournalDirectory, "journal-*.ndjsonl").Single();
+        byte[] bytes = File.ReadAllBytes(segment);
+        int firstNewline = Array.IndexOf(bytes, (byte)'\n');
+        Assert.True(firstNewline > 21);   // line 0 is longer than the "J1 <8hex> " frame header
+        bytes[20] ^= 0xFF;                // corrupt a payload byte in the first (non-tail) line => CRC mismatch
+        File.WriteAllBytes(segment, bytes);
+
+        using JobJournal reader = New();
+        Result<IReadOnlyList<JournalRecord>, JobError> read = reader.ReadAll();
+        Assert.True(read.TryGetValue(out IReadOnlyList<JournalRecord>? records));
+        Assert.Equal(2, records!.Count);                              // the corrupt line is logged-and-skipped
+        Assert.DoesNotContain(records!, r => r is JobOpenedRecord);   // the corrupted record did not load
+        Assert.Contains(records!, r => r is JobCommittedRecord);
+        Assert.Contains(records!, r => r is JobClosedRecord);
+    }
+
+    [Fact]
+    public void Duplicate_records_across_segments_are_tolerated_on_read()
+    {
+        Guid job = Guid.NewGuid();
+        using (JobJournal journal = New())
+        {
+            journal.Append(Opened(job));
+            journal.Append(new JobCommittedRecord { JobId = job, Seq = 0, AtUtc = DateTimeOffset.UnixEpoch });
+        }
+
+        // Simulate a crash mid-rotation: the new segment was written but the old one was not yet
+        // deleted, so both segments carry the same still-open-job records.
+        string first = Directory.GetFiles(_paths.JournalDirectory, "journal-*.ndjsonl").Single();
+        string second = Path.Combine(_paths.JournalDirectory, "journal-000002.ndjsonl");
+        File.Copy(first, second);
+
+        using JobJournal reader = New();
+        Result<IReadOnlyList<JournalRecord>, JobError> read = reader.ReadAll();
+        Assert.True(read.TryGetValue(out IReadOnlyList<JournalRecord>? records));   // no crash on duplicates
+        Assert.Equal(4, records!.Count);                                            // duplicated across both segments
+        Assert.Single(records!.Select(r => r.JobId).Distinct());                    // grouped by job => one job
+        Assert.Equal(2, records!.Count(r => r is JobOpenedRecord));                 // duplicate open tolerated
+    }
 }

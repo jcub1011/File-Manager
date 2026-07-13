@@ -117,4 +117,68 @@ public sealed class PathTruncationTests
         string result = PathTruncation.TruncateFolders(@"Alpha\Bravo\Charlie\Delta\Echo\file.txt", maxChars);
         Assert.True(result.Length <= maxChars);
     }
+
+    // ── Surrogate-pair safety ───────────────────────────────────────────────────────────────────
+    // Non-BMP characters (emoji, CJK ext-B) are two UTF-16 code units. A naive character cut can land
+    // between the two halves, emitting a lone surrogate that renders as the replacement char (�).
+
+    /// <summary>Fails if <paramref name="s"/> contains U+FFFD or any surrogate code unit without its
+    /// pair — the exact corruption the TrimHead/TrimTailStart helpers exist to prevent.</summary>
+    private static void AssertNoLoneSurrogates(string s)
+    {
+        Assert.DoesNotContain('�', s);
+        for (int i = 0; i < s.Length; i++)
+        {
+            if (char.IsHighSurrogate(s[i]))
+            {
+                Assert.True(i + 1 < s.Length && char.IsLowSurrogate(s[i + 1]),
+                    $"lone high surrogate at index {i} in \"{s}\"");
+                i++;   // the low half is accounted for
+            }
+            else
+            {
+                Assert.False(char.IsLowSurrogate(s[i]), $"lone low surrogate at index {i} in \"{s}\"");
+            }
+        }
+    }
+
+    private static string Emoji(int count) => string.Concat(System.Linq.Enumerable.Repeat("\U0001F600", count));
+
+    [Fact]
+    public void Middle_truncation_never_splits_a_surrogate_pair()
+    {
+        string dir = Emoji(12);   // 12 emoji = 24 UTF-16 code units, every char part of a pair
+        string result = PathTruncation.TruncateMiddle(dir, 11);
+
+        Assert.True(result.Length <= 11);
+        Assert.Contains('…', result);
+        AssertNoLoneSurrogates(result);
+    }
+
+    [Fact]
+    public void End_truncation_of_an_emoji_stem_keeps_the_extension_without_splitting_a_pair()
+    {
+        // Emoji stem + a plain extension; a small budget forces the stem cut to land mid-pair, where
+        // TrimHead must back off to the pair boundary.
+        string fileName = Emoji(5) + ".txt";
+        string result = PathTruncation.TruncateEndPreservingExtension(fileName, 7);
+
+        Assert.True(result.Length <= 7);
+        Assert.EndsWith("txt", result);
+        Assert.Contains('…', result);
+        AssertNoLoneSurrogates(result);
+    }
+
+    [Fact]
+    public void Folder_truncation_abbreviates_emoji_folder_names_without_splitting_a_pair()
+    {
+        // Two long emoji folder names must be abbreviated (no middle folders to elide with n == 2),
+        // exercising the phase-2 TrimHead abbreviation on non-BMP segments.
+        string path = Emoji(8) + @"\" + Emoji(8);
+        string result = PathTruncation.TruncateFolders(path, 14);
+
+        Assert.True(result.Length <= 14);
+        Assert.Contains('…', result);
+        AssertNoLoneSurrogates(result);
+    }
 }

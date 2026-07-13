@@ -5,6 +5,7 @@ using FileManager.Core.Jobs;
 using FileManager.Core.Journal;
 using FileManager.Core.Locking;
 using FileManager.Core.Placement;
+using FileManager.Core.Platform;
 using FileManager.Core.Tests.TestSupport;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Time.Testing;
@@ -139,6 +140,106 @@ public sealed class AtomicPlacerTests : IDisposable
         Result<UnchangedCheckResult, JobError> result = await _placer.CheckUnchangedAsync(execution, 0, finalPath);
         result.TryGetValue(out UnchangedCheckResult verdict);
         Assert.Equal(UnchangedCheckResult.ExistsDifferent, verdict);
+    }
+
+    [Fact]
+    public async Task Read_back_mismatch_returns_VerificationMismatch_and_does_not_place_the_final()
+    {
+        (JobExecution execution, string finalPath) = Setup("hello world", "out.dat");
+
+        // Tamper the sealed content hash: the temp is copied faithfully from the source, so its
+        // read-back hash cannot match this bogus reference — forcing a VerificationMismatch.
+        var tampered = new SealedOutput
+        {
+            Path = execution.Output!.Path,
+            SizeBytes = execution.Output.SizeBytes,
+            ContentHash = "0000000000000000000000000000000000000000000000000000000000000000",
+            SourceLastWriteUtc = execution.Output.SourceLastWriteUtc,
+        };
+        var request = new PlacementRequest
+        {
+            Execution = execution,
+            TargetIndex = 0,
+            Output = tampered,
+            FinalPath = finalPath,
+            FinalExists = false,
+            OverwriteHandling = execution.Plan.Policies.OverwriteHandling,
+            Verification = execution.Plan.Policies.Verification,   // Sha256 → content is hashed
+        };
+
+        Result<PlacementResult, JobError> result = await _placer.PlaceTargetAsync(request);
+
+        Assert.True(result.TryGetError(out JobError? error));
+        Assert.Equal(JobErrorCode.VerificationMismatch, error.Code);
+        Assert.False(File.Exists(finalPath));   // the final was never placed
+    }
+
+    [Fact]
+    public async Task StageOverwrites_journals_exactly_one_target_staged_row_for_the_job()
+    {
+        (JobExecution execution, string finalPath) = Setup("new content", "out.dat");
+        Directory.CreateDirectory(Path.GetDirectoryName(finalPath)!);
+        File.WriteAllText(finalPath, "PRIOR VERSION");
+
+        Result<PlacementResult, JobError> result = await _placer.PlaceTargetAsync(Request(execution, finalPath, finalExists: true));
+
+        Assert.True(result.TryGetValue(out PlacementResult? placement));
+
+        Guid jobId = execution.Plan.JobId.Value;
+        int stagedRows = ReadJournal().OfType<TargetStagedRecord>().Count(r => r.JobId == jobId);
+        Assert.Equal(1, stagedRows);   // journaled once, before the retried replace — never duplicated
+
+        Assert.NotNull(placement.StagedPath);
+        Assert.Equal("PRIOR VERSION", File.ReadAllText(placement.StagedPath!));   // prior file at staged path
+        Assert.Equal("new content", File.ReadAllText(finalPath));                 // new content at final
+    }
+
+    [Fact]
+    public async Task MetadataApply_failure_returns_MetadataConflict()
+    {
+        // Under MetadataOnConflict.FailJob a preserver failure must fail the placement. The fake
+        // preserver fails unconditionally, so the placer maps it to a MetadataConflict JobError.
+        PolicySnapshot policy = JobFixtures.Policy() with { MetadataOnConflict = MetadataOnConflict.FailJob };
+        (JobExecution execution, string finalPath) = Setup("payload", "meta.dat", policy);
+        AtomicPlacer placer = PlacerWith(new FakeMetadataPreserver { FailApply = true });
+
+        Result<PlacementResult, JobError> result = await placer.PlaceTargetAsync(Request(execution, finalPath, finalExists: false));
+
+        Assert.True(result.TryGetError(out JobError? error));
+        Assert.Equal(JobErrorCode.MetadataConflict, error.Code);
+        Assert.False(File.Exists(finalPath));   // metadata is applied before the rename, so no final
+    }
+
+    [Fact]
+    public async Task Fresh_place_into_a_new_directory_moves_temp_to_final()
+    {
+        // A plain fresh place (FinalExists=false) into a not-yet-existing target directory exercises
+        // the PlaceAsync fresh-file branch (File.Move without overwrite).
+        (JobExecution execution, string finalPath) = Setup("brand new", "nested.dat");
+        string tempPath = finalPath + ".fmtmp-" + execution.Plan.JobId.Short;
+
+        Result<PlacementResult, JobError> result = await _placer.PlaceTargetAsync(Request(execution, finalPath, finalExists: false));
+
+        Assert.True(result.TryGetValue(out PlacementResult? placement));
+        Assert.Equal(TargetState.Placed, placement.FinalState);
+        Assert.Null(placement.StagedPath);
+        Assert.Equal("brand new", File.ReadAllText(finalPath));
+        Assert.False(File.Exists(tempPath));   // temp moved away, not left behind
+    }
+
+    /// <summary>Builds a placer sharing this fixture's journal but with a custom metadata preserver.</summary>
+    private AtomicPlacer PlacerWith(IMetadataPreserver metadata)
+    {
+        var time = new FakeTimeProvider();
+        return new AtomicPlacer(
+            new FileHasher(NullLogger<FileHasher>.Instance),
+            _journal,
+            new SelfWriteSuppressionRegistry(time),
+            new TransientRetryPolicy(time, NullLogger<TransientRetryPolicy>.Instance),
+            metadata,
+            new SourcePriorityRegistry(),
+            time,
+            NullLogger<AtomicPlacer>.Instance);
     }
 
     private IReadOnlyList<JournalRecord> ReadJournal()

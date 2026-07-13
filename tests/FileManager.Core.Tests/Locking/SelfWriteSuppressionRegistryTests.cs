@@ -54,4 +54,20 @@ public sealed class SelfWriteSuppressionRegistryTests
         time.Advance(TimeSpan.FromSeconds(5));
         Assert.True(registry.IsSuppressed(path));            // still actively suppressed by the second job
     }
+
+    [Fact]
+    public void A_never_released_active_registration_expires_after_the_max_ttl()
+    {
+        var time = new FakeTimeProvider();
+        using var registry = new SelfWriteSuppressionRegistry(time);
+        NormalizedPath path = P(@"C:\a\stuck.tmp");
+
+        registry.Register(path, JobId.New());                // a faulted job never Releases/Disposes it
+        Assert.True(registry.IsSuppressed(path));
+
+        // Past the one-hour active ceiling the never-released registration is treated as expired, so a
+        // faulted job can't suppress the path for the process lifetime.
+        time.Advance(TimeSpan.FromHours(1) + TimeSpan.FromMinutes(1));
+        Assert.False(registry.IsSuppressed(path));
+    }
 }

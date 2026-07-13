@@ -94,6 +94,14 @@ public sealed class SourceDispositionService(
             logger.LogWarning(ex, "Disposition {Action} failed for {Path}", action, sourcePath);
             return Failure(sourcePath, $"{action} failed: {ex.Message}");
         }
+        catch (Exception ex)
+        {
+            // Last-resort catch-all (directive): File.Move/Delete can throw ArgumentException,
+            // NotSupportedException, PathTooLongException, etc. This runs at a disposition (task)
+            // boundary — an unhandled throw here is exactly the silent-failure class to guard against.
+            logger.LogError(ex, "Disposition {Action} failed unexpectedly for {Path}", action, sourcePath);
+            return Failure(sourcePath, $"{action} failed unexpectedly: {ex.Message}");
+        }
     }
 
     private DispositionAuditRecord Record(Guid jobId, string sourcePath, OnSuccessAction action, string? destination, DateTimeOffset now, bool append)

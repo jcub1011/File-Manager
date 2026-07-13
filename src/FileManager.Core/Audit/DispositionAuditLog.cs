@@ -73,9 +73,33 @@ public sealed class DispositionAuditLog(EnginePaths paths, ILogger<DispositionAu
 
     private IEnumerable<DispositionAuditRecord> ReadFile(string path)
     {
-        byte[] bytes = File.ReadAllBytes(path);
-        int start = 0;
-        for (int i = 0; i <= bytes.Length; i++)
+        // Bound memory: a monthly audit file is never auto-deleted and can grow large, but ReadRecent
+        // only ever needs the newest records — so read at most the tail and start on a line boundary.
+        const long MaxTailBytes = 1 << 20;   // 1 MiB
+
+        byte[] bytes;
+        int start;
+        using (FileStream stream = new(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+        {
+            long length = stream.Length;
+            if (length <= MaxTailBytes)
+            {
+                bytes = new byte[(int)length];
+                stream.ReadExactly(bytes);
+                start = 0;
+            }
+            else
+            {
+                stream.Seek(length - MaxTailBytes, SeekOrigin.Begin);
+                bytes = new byte[(int)MaxTailBytes];
+                stream.ReadExactly(bytes);
+                // Drop the (likely partial) first line so parsing begins at a complete record.
+                int nl = Array.IndexOf(bytes, (byte)'\n');
+                start = nl >= 0 ? nl + 1 : bytes.Length;
+            }
+        }
+
+        for (int i = start; i <= bytes.Length; i++)
         {
             bool end = i == bytes.Length;
             if (!end && bytes[i] != (byte)'\n')

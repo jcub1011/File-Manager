@@ -122,6 +122,39 @@ public sealed class ConflictResolverProbeTests : IDisposable
         Assert.Equal(ConflictAction.SkipExistingKept, outcome.Action);
     }
 
+    [Fact]
+    public async Task Resolve_overwrite_higher_priority_source_overwrites_a_lower_priority_placement()
+    {
+        Guid profileId = Guid.NewGuid();
+        string path = Existing("shared.txt");
+        var priorities = new SourcePriorityRegistry();
+        NormalizedPath.Create(path).TryGetValue(out NormalizedPath key);
+        priorities.RecordPlacement(profileId, key, sourceIndex: 5);   // placed this session by a lower-priority source
+        var resolver = new ConflictResolver(_locks, priorities, NullLogger<ConflictResolver>.Instance);
+        await using PathLockSet held = await _locks.AcquireAsync([], JobId.New());
+
+        // A higher-priority (lower-index) incoming source must overwrite the existing placement.
+        var resolved = resolver.Resolve(path, ConflictResolution.Overwrite, Sealed(), sourceIndex: 0, profileId, held);
+        Assert.True(resolved.TryGetValue(out ConflictOutcome? outcome));
+        Assert.Equal(ConflictAction.Write, outcome.Action);
+    }
+
+    [Fact]
+    public async Task Resolve_rename_suffix_skips_taken_candidates_and_reserves_the_next_free_name()
+    {
+        Existing("song.flac");
+        Existing("song (1).flac");
+        await using PathLockSet held = await _locks.AcquireAsync([], JobId.New());
+
+        var resolved = _resolver.Resolve(Path.Combine(_dir, "song.flac"), ConflictResolution.RenameSuffix, Sealed(), 0, Guid.NewGuid(), held);
+
+        Assert.True(resolved.TryGetValue(out ConflictOutcome? outcome));
+        Assert.Equal(ConflictAction.Write, outcome.Action);
+        Assert.Equal(Path.Combine(_dir, "song (2).flac"), outcome.FinalPath);   // (1) is taken → next free is (2)
+        // The chosen candidate is reserved in this job's lock set (held against sibling jobs).
+        Assert.Contains(held.Paths, p => p.Value.EndsWith("song (2).flac", StringComparison.OrdinalIgnoreCase));
+    }
+
     private static SealedOutput Sealed(DateTimeOffset? sourceLastWrite = null) => new()
     {
         Path = "unused",

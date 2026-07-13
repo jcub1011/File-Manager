@@ -265,6 +265,7 @@ public sealed class DryRunEngine(
         // Phase 1: drain the scan into a candidate list bounded by MaxScannedCandidates. A fatal fault
         // ends the stream with a failure; warnings are logged and skipped.
         List<Payload> candidates = [];
+        bool scanTruncated = false;
         foreach (var scanned in scanner.Scan(profile, TriggerKind.Cli, scopePath))
         {
             ct.ThrowIfCancellationRequested();
@@ -287,6 +288,7 @@ public sealed class DryRunEngine(
                     "Dry-run (stream) for profile {ProfileId} hit the {Cap:N0}-candidate safety bound; " +
                     "report truncated — the scan found more",
                     profileId, MaxScannedCandidates);
+                scanTruncated = true;
                 break;
             }
 
@@ -302,6 +304,7 @@ public sealed class DryRunEngine(
 
         int maxConcurrency = ResolveWorkers(profile);
         StreamAccumulator accumulator = new();
+        bool anyEmitted = false;
         for (int start = 0; start < candidates.Count; start += EvaluationBatchSize)
         {
             int count = Math.Min(EvaluationBatchSize, candidates.Count - start);
@@ -322,11 +325,23 @@ public sealed class DryRunEngine(
                     continue;
                 accumulator.Add(evaluation);
                 if (accumulator.Bytes >= ChunkByteBudget)
-                    yield return Result<DryRunChunk, string>.Success(accumulator.Flush());
+                {
+                    yield return Result<DryRunChunk, string>.Success(accumulator.Flush() with { ScanTruncated = scanTruncated });
+                    anyEmitted = true;
+                }
             }
         }
         if (accumulator.HasData)
-            yield return Result<DryRunChunk, string>.Success(accumulator.Flush());
+        {
+            yield return Result<DryRunChunk, string>.Success(accumulator.Flush() with { ScanTruncated = scanTruncated });
+            anyEmitted = true;
+        }
+
+        // Guarantee the truncation signal reaches the handler even when no data chunk carried it
+        // (e.g. every candidate was filtered out) — otherwise the handler would sweep an incomplete
+        // survivor set and could preview bogus Mirror deletions.
+        if (scanTruncated && !anyEmitted)
+            yield return Result<DryRunChunk, string>.Success(new DryRunChunk([], [], [], [], ScanTruncated: true));
 
         DateTimeOffset completedAt = time.GetUtcNow();
         if (logger.IsEnabled(LogLevel.Information))

@@ -24,20 +24,37 @@ public sealed class DiskPreflight(IVolumeInfoProvider volumes, EngineConfig conf
         // volumeKey → (display root, representative path, required bytes)
         var required = new Dictionary<string, (string Root, string SamplePath, long Bytes)>(StringComparer.Ordinal);
 
-        void Add(string path, long bytes)
+        // Fail closed: a path whose volume we cannot resolve is an error, not a silent skip — skipping
+        // it would let a write pass preflight with zero free-space checked on that volume.
+        JobError? Add(string path, long bytes)
         {
             Result<string, string> key = volumes.GetVolumeKey(path);
             if (!key.TryGetValue(out string? volumeKey))
-                return;   // unresolvable volume → skipped; the query below will fail closed if it matters
+            {
+                key.TryGetError(out string? keyError);
+                return new JobError
+                {
+                    Code = JobErrorCode.InsufficientDiskSpace,
+                    Message = $"could not resolve the volume for \"{path}\": {keyError}",
+                    Path = path,
+                };
+            }
             if (required.TryGetValue(volumeKey, out (string Root, string SamplePath, long Bytes) v))
                 required[volumeKey] = (v.Root, v.SamplePath, v.Bytes + bytes);
             else
                 required[volumeKey] = (volumeKey, path, bytes);
+            return null;
         }
 
-        Add(plan.WorkspaceDir, WorkspaceNeed(plan, sourceSize));
+        JobError? addError = Add(plan.WorkspaceDir, WorkspaceNeed(plan, sourceSize));
+        if (addError is not null)
+            return addError;
         foreach (TargetPlan target in plan.Targets)
-            Add(target.ProspectiveFinalPath, sourceSize);
+        {
+            addError = Add(target.ProspectiveFinalPath, sourceSize);
+            if (addError is not null)
+                return addError;
+        }
 
         var estimates = new List<VolumeEstimate>(required.Count);
         var shortfalls = new List<string>();

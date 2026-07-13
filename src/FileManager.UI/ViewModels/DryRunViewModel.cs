@@ -229,7 +229,8 @@ public sealed partial class DryRunTreeNode : ObservableObject
         Func<T, string> pathSelector,
         Func<T, IReadOnlyList<(string Kind, int Increment)>> categorizer,
         IReadOnlyList<TreePillSpec> specs,
-        string? commonRoot = null)
+        string? commonRoot = null,
+        IReadOnlySet<string>? expandedPaths = null)
     {
         List<DryRunTreeNode> roots = [];
         Dictionary<string, DryRunTreeNode> rootIndex = new(StringComparer.OrdinalIgnoreCase);
@@ -259,7 +260,10 @@ public sealed partial class DryRunTreeNode : ObservableObject
 
                 if (!index.TryGetValue(segment, out DryRunTreeNode? node))
                 {
-                    node = new DryRunTreeNode(segment, prefix, isDirectory, i) { IsExpanded = i == 0 };
+                    // Restore the user's prior expand/collapse state (keyed by absolute path) across
+                    // rebuilds; on the first build (no prior state) top-level nodes open by default.
+                    bool expanded = expandedPaths is null ? i == 0 : expandedPaths.Contains(prefix);
+                    node = new DryRunTreeNode(segment, prefix, isDirectory, i) { IsExpanded = expanded };
                     level.Add(node);
                     index[segment] = node;
                 }
@@ -277,6 +281,25 @@ public sealed partial class DryRunTreeNode : ObservableObject
         SortRecursive(roots);
         BuildPillsRecursive(roots, specs);
         return roots;
+    }
+
+    /// <summary>Collects the absolute path of every expanded node in a forest so a rebuild can restore
+    /// the user's expand/collapse state instead of snapping back to defaults on every keystroke.</summary>
+    public static IReadOnlySet<string> CollectExpanded(IEnumerable<DryRunTreeNode> nodes)
+    {
+        HashSet<string> into = new(StringComparer.OrdinalIgnoreCase);
+        Walk(nodes);
+        return into;
+
+        void Walk(IEnumerable<DryRunTreeNode> level)
+        {
+            foreach (DryRunTreeNode n in level)
+            {
+                if (n.IsExpanded)
+                    into.Add(n.FullPath);
+                Walk(n.Children);
+            }
+        }
     }
 
     private static void BuildPillsRecursive(List<DryRunTreeNode> nodes, IReadOnlyList<TreePillSpec> specs)
@@ -514,7 +537,9 @@ public sealed partial class DryRunSourcesTab : ViewModelBase
             if (r.IsProcessed) cats.Add(("processed", 1));
             if (r.IsDeleted) cats.Add(("deleted", 1));
             return cats;
-        }, TreeSpecs, CommonRoot);
+            // A prior forest (Tree non-empty) → restore its expansion; the very first build → null so
+            // the BuildForest default (top level expanded) applies.
+        }, TreeSpecs, CommonRoot, Tree.Count > 0 ? DryRunTreeNode.CollectExpanded(Tree) : null);
 
     private static Dictionary<string, int> CountBy<T>(IEnumerable<T> items, Func<T, string> key)
     {
@@ -714,7 +739,7 @@ public sealed partial class DryRunDestinationsTab : ViewModelBase
                 _ => "unknown",
             };
             return new[] { (kind, 1) };
-        }, TreeSpecs, CommonRoot);
+        }, TreeSpecs, CommonRoot, Tree.Count > 0 ? DryRunTreeNode.CollectExpanded(Tree) : null);
 
     private static Dictionary<string, int> CountBy<T>(IEnumerable<T> items, Func<T, string> key)
     {
@@ -753,7 +778,9 @@ public sealed partial class DryRunViewModel : ViewModelBase
     public DryRunSourcesTab Sources { get; }
     public DryRunDestinationsTab Destinations { get; }
 
-    [ObservableProperty] public partial Guid? ProfileId { get; set; }
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(CanRun))]
+    public partial Guid? ProfileId { get; set; }
     [ObservableProperty] public partial string ProfileName { get; set; } = "";
     [ObservableProperty] public partial bool HasReport { get; set; }
     [ObservableProperty] public partial string? ErrorMessage { get; set; }
@@ -775,7 +802,7 @@ public sealed partial class DryRunViewModel : ViewModelBase
         ProfileId = profileId;
         ProfileName = profileName;
         ClearReport();
-        OnPropertyChanged(nameof(CanRun));
+        // CanRun re-raises via [NotifyPropertyChangedFor] on ProfileId — no manual notify needed.
     }
 
     [RelayCommand(IncludeCancelCommand = true)]
@@ -824,9 +851,13 @@ public sealed partial class DryRunViewModel : ViewModelBase
         // rename-around Untouched and swept orphans have SourceIndex == -1 and so attach to no source.
         ILookup<int, VirtualFileOperation> destOpsBySource =
             report.DestinationOperations.ToLookup(o => o.SourceIndex);
-        // One source op per source file, addressable by the file's index.
+        // One source op per source file, addressable by the file's index. Guard against a duplicate
+        // SourceIndex (a service-side bug) degrading gracefully to the first op rather than throwing
+        // and wiping the entire preview — mirrors the ToLookup used for destination ops above.
         Dictionary<int, VirtualFileOperation> sourceOpByIndex =
-            report.SourceOperations.ToDictionary(o => o.SourceIndex);
+            report.SourceOperations
+                .GroupBy(o => o.SourceIndex)
+                .ToDictionary(g => g.Key, g => g.First());
 
         // The folder every displayed path is shown relative to, per panel: the single source/target
         // dir, else the common parent, else null (spanning drives → full paths). Distinct first so a

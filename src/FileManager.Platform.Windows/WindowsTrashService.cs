@@ -45,20 +45,22 @@ public sealed partial class WindowsTrashService(ILogger<WindowsTrashService> log
         {
             nint operationPtr = 0;
             nint shellItemPtr = 0;
+            IFileOperation? operation = null;
+            IShellItem? shellItem = null;
             try
             {
                 int hr = CoCreateInstance(in ClsidFileOperation, IntPtr.Zero, ClsctxInprocServer, in IidIUnknown, out operationPtr);
                 if (hr < 0 || operationPtr == 0)
                     return $"could not create IFileOperation (hr 0x{hr:X8})";
 
-                var operation = (IFileOperation)ComWrappers.GetOrCreateObjectForComInstance(operationPtr, CreateObjectFlags.None);
+                operation = (IFileOperation)ComWrappers.GetOrCreateObjectForComInstance(operationPtr, CreateObjectFlags.None);
 
                 Guid shellItemIid = IidIShellItem;
                 hr = SHCreateItemFromParsingName(absolutePath, IntPtr.Zero, in shellItemIid, out shellItemPtr);
                 if (hr < 0 || shellItemPtr == 0)
                     return $"could not resolve shell item for \"{absolutePath}\" (hr 0x{hr:X8})";
 
-                var shellItem = (IShellItem)ComWrappers.GetOrCreateObjectForComInstance(shellItemPtr, CreateObjectFlags.None);
+                shellItem = (IShellItem)ComWrappers.GetOrCreateObjectForComInstance(shellItemPtr, CreateObjectFlags.None);
 
                 operation.SetOperationFlags(OperationFlags);
                 operation.DeleteItem(shellItem, IntPtr.Zero);
@@ -67,6 +69,10 @@ public sealed partial class WindowsTrashService(ILogger<WindowsTrashService> log
             }
             finally
             {
+                // Dispose the RCW wrappers so their COM ref is released promptly on this short-lived STA
+                // thread rather than lingering until finalization; then release our raw AddRef'd ptrs.
+                (operation as IDisposable)?.Dispose();
+                (shellItem as IDisposable)?.Dispose();
                 if (shellItemPtr != 0) Marshal.Release(shellItemPtr);
                 if (operationPtr != 0) Marshal.Release(operationPtr);
             }
