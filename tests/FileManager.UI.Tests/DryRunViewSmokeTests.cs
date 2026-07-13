@@ -126,7 +126,40 @@ public sealed class DryRunViewSmokeTests(HeadlessSessionFixture headless)
             try
             {
                 Assert.NotEmpty(vm.Destinations.VisibleRows);
-                Assert.Contains(vm.Destinations.VisibleRows, r => r.IsDeleted);
+                Assert.Contains(vm.Destinations.VisibleRows, r => r.Destinations.Any(d => d.IsDeleted));
+            }
+            finally { window.Close(); }
+        }, CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task Destinations_tab_lays_out_a_replicated_files_wrapping_chip_list()
+    {
+        await headless.Session.Dispatch(async () =>
+        {
+            FakeIpcGateway gateway = new();
+            DryRunViewModel vm = new(gateway, searchDebounce: TimeSpan.Zero);
+            vm.SetProfile(Guid.NewGuid(), "P");
+            // One source fanned out to several nested targets → one grouped row of wrapping chips.
+            var srcOps = new List<VirtualFileOperation>
+                { SrcOp(0, @"C:\src\reports\annual-summary.docx", @"C:\src", OperationKind.Processed, OnSuccessAction.KeepSource) };
+            var dstOps = new List<VirtualFileOperation>
+            {
+                DstOp(OperationKind.New, @"D:\backup\2026\reports\annual-summary.docx", @"D:\backup", sourceIndex: 0),
+                DstOp(OperationKind.Overwrite, @"E:\archive\deep\nested\path\reports\annual-summary.docx", @"E:\archive", sourceIndex: 0),
+                DstOp(OperationKind.New, @"F:\mirror\reports\annual-summary.docx", @"F:\mirror", sourceIndex: 0),
+            };
+            gateway.DryRunResult = Report(vm.ProfileId!.Value,
+                [Pf(@"C:\src\reports\annual-summary.docx", @"C:\src")], srcOps, [], dstOps);
+            await vm.RunAsync(CancellationToken.None);
+
+            var (window, _) = ShowView(vm);
+            try
+            {
+                DryRunDestinationRow row = Assert.Single(vm.Destinations.VisibleRows);
+                Assert.True(row.HasSource);
+                Assert.Equal(3, row.Destinations.Count);
+                Assert.NotNull(window.Content);
             }
             finally { window.Close(); }
         }, CancellationToken.None);

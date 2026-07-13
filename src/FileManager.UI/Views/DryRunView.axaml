@@ -229,26 +229,28 @@
                         <Border IsVisible="{Binding Sources.ShowSourceFacet}"
                                 Background="{DynamicResource SystemControlBackgroundListLowBrush}"
                                 CornerRadius="6" Padding="10,6">
-                            <StackPanel Orientation="Horizontal" Spacing="8">
-                                <TextBlock Text="Sources:" FontWeight="SemiBold" VerticalAlignment="Center" />
+                            <DockPanel LastChildFill="True">
+                                <TextBlock Text="Sources:" FontWeight="SemiBold" VerticalAlignment="Center"
+                                           DockPanel.Dock="Left" Margin="0,0,8,0" />
                                 <ItemsControl ItemsSource="{Binding Sources.SourceFacets}" ItemTemplate="{StaticResource FacetTemplate}">
                                     <ItemsControl.ItemsPanel>
                                         <ItemsPanelTemplate><WrapPanel /></ItemsPanelTemplate>
                                     </ItemsControl.ItemsPanel>
                                 </ItemsControl>
-                            </StackPanel>
+                            </DockPanel>
                         </Border>
                         <Border IsVisible="{Binding Sources.ShowDestinationFacet}"
                                 Background="{DynamicResource SystemControlBackgroundListLowBrush}"
                                 CornerRadius="6" Padding="10,6">
-                            <StackPanel Orientation="Horizontal" Spacing="8">
-                                <TextBlock Text="Destinations:" FontWeight="SemiBold" VerticalAlignment="Center" />
+                            <DockPanel LastChildFill="True">
+                                <TextBlock Text="Destinations:" FontWeight="SemiBold" VerticalAlignment="Center"
+                                           DockPanel.Dock="Left" Margin="0,0,8,0" />
                                 <ItemsControl ItemsSource="{Binding Sources.DestinationFacets}" ItemTemplate="{StaticResource FacetTemplate}">
                                     <ItemsControl.ItemsPanel>
                                         <ItemsPanelTemplate><WrapPanel /></ItemsPanelTemplate>
                                     </ItemsControl.ItemsPanel>
                                 </ItemsControl>
-                            </StackPanel>
+                            </DockPanel>
                         </Border>
                     </StackPanel>
 
@@ -298,9 +300,9 @@
                                             </Border>
                                         </StackPanel>
 
-                                        <!-- line 2: parent directory, relative to the common root (middle-truncated) -->
+                                        <!-- line 2: parent directory, relative to the common root (folder-boundary truncated) -->
                                         <ctrl:PathText Grid.Row="1" Grid.Column="0" Grid.ColumnSpan="2" Text="{Binding ParentDisplay}"
-                                                       Mode="MiddleEllipsis" FontFamily="{StaticResource MonoFontFamily}"
+                                                       Mode="FolderMiddleEllipsis" FontFamily="{StaticResource MonoFontFamily}"
                                                        FontSize="11" Margin="0,2,0,0" Opacity="0.6" />
                                     </Grid>
                                 </Border>
@@ -344,26 +346,28 @@
                         <Border IsVisible="{Binding Destinations.ShowSourceFacet}"
                                 Background="{DynamicResource SystemControlBackgroundListLowBrush}"
                                 CornerRadius="6" Padding="10,6">
-                            <StackPanel Orientation="Horizontal" Spacing="8">
-                                <TextBlock Text="Sources:" FontWeight="SemiBold" VerticalAlignment="Center" />
+                            <DockPanel LastChildFill="True">
+                                <TextBlock Text="Sources:" FontWeight="SemiBold" VerticalAlignment="Center"
+                                           DockPanel.Dock="Left" Margin="0,0,8,0" />
                                 <ItemsControl ItemsSource="{Binding Destinations.SourceFacets}" ItemTemplate="{StaticResource FacetTemplate}">
                                     <ItemsControl.ItemsPanel>
                                         <ItemsPanelTemplate><WrapPanel /></ItemsPanelTemplate>
                                     </ItemsControl.ItemsPanel>
                                 </ItemsControl>
-                            </StackPanel>
+                            </DockPanel>
                         </Border>
                         <Border IsVisible="{Binding Destinations.ShowDestinationFacet}"
                                 Background="{DynamicResource SystemControlBackgroundListLowBrush}"
                                 CornerRadius="6" Padding="10,6">
-                            <StackPanel Orientation="Horizontal" Spacing="8">
-                                <TextBlock Text="Destinations:" FontWeight="SemiBold" VerticalAlignment="Center" />
+                            <DockPanel LastChildFill="True">
+                                <TextBlock Text="Destinations:" FontWeight="SemiBold" VerticalAlignment="Center"
+                                           DockPanel.Dock="Left" Margin="0,0,8,0" />
                                 <ItemsControl ItemsSource="{Binding Destinations.DestinationFacets}" ItemTemplate="{StaticResource FacetTemplate}">
                                     <ItemsControl.ItemsPanel>
                                         <ItemsPanelTemplate><WrapPanel /></ItemsPanelTemplate>
                                     </ItemsControl.ItemsPanel>
                                 </ItemsControl>
-                            </StackPanel>
+                            </DockPanel>
                         </Border>
                     </StackPanel>
 
@@ -384,25 +388,64 @@
                         <ListBox.ItemTemplate>
                             <DataTemplate x:DataType="vm:DryRunDestinationRow">
                                 <Border BorderThickness="0,0,0,1" BorderBrush="{DynamicResource SystemControlBackgroundListLowBrush}"
-                                        Padding="4,6" ToolTip.Tip="{Binding TargetPath}">
-                                    <Grid RowDefinitions="Auto,Auto" ColumnDefinitions="*,Auto">
-                                        <ctrl:PathText Grid.Row="0" Grid.Column="0" Text="{Binding FileName}"
-                                                       Mode="EndPreservingExtension" FontFamily="{StaticResource MonoFontFamily}"
-                                                       FontSize="13" VerticalAlignment="Center" />
+                                        Padding="4,6">
+                                    <Panel>
+                                        <!-- No-source row (a Mirror deletion, a kept-around conflict original, a
+                                             pre-existing untouched file): the classic filename + status + folder layout. -->
+                                        <Grid IsVisible="{Binding IsSingle}" RowDefinitions="Auto,Auto" ColumnDefinitions="*,Auto"
+                                              ToolTip.Tip="{Binding Primary.TargetPath}">
+                                            <ctrl:PathText Grid.Row="0" Grid.Column="0" Text="{Binding FileName}"
+                                                           Mode="EndPreservingExtension" FontFamily="{StaticResource MonoFontFamily}"
+                                                           FontSize="13" VerticalAlignment="Center" />
+                                            <Border Grid.Row="0" Grid.Column="1" Classes="chip" Margin="8,0,0,0" VerticalAlignment="Center"
+                                                    Classes.chipInfo="{Binding Primary.IsUntouched}"
+                                                    Classes.chipSafe="{Binding Primary.IsNew}"
+                                                    Classes.chipAmber="{Binding Primary.IsOverwritten}"
+                                                    Classes.chipDanger="{Binding Primary.IsDeleted}"
+                                                    Classes.chipMuted="{Binding Primary.IsUnknown}">
+                                                <TextBlock Text="{Binding Primary.StatusText}" FontSize="11" />
+                                            </Border>
+                                            <ctrl:PathText Grid.Row="1" Grid.Column="0" Grid.ColumnSpan="2" Text="{Binding Primary.ParentDisplay}"
+                                                           Mode="FolderMiddleEllipsis" FontFamily="{StaticResource MonoFontFamily}"
+                                                           FontSize="11" Margin="0,2,0,0" Opacity="0.6" />
+                                        </Grid>
 
-                                        <Border Grid.Row="0" Grid.Column="1" Classes="chip" Margin="8,0,0,0" VerticalAlignment="Center"
-                                                Classes.chipInfo="{Binding IsUntouched}"
-                                                Classes.chipSafe="{Binding IsNew}"
-                                                Classes.chipAmber="{Binding IsOverwritten}"
-                                                Classes.chipDanger="{Binding IsDeleted}"
-                                                Classes.chipMuted="{Binding IsUnknown}">
-                                            <TextBlock Text="{Binding StatusText}" FontSize="11" />
-                                        </Border>
-
-                                        <ctrl:PathText Grid.Row="1" Grid.Column="0" Grid.ColumnSpan="2" Text="{Binding ParentDisplay}"
-                                                       Mode="MiddleEllipsis" FontFamily="{StaticResource MonoFontFamily}"
-                                                       FontSize="11" Margin="0,2,0,0" Opacity="0.6" />
-                                    </Grid>
+                                        <!-- Source-backed row: the source file on top, then every destination it fans
+                                             out to as a wrapping list of chips, each coloured by its own status. -->
+                                        <StackPanel IsVisible="{Binding HasSource}" Spacing="4" ToolTip.Tip="{Binding SourcePath}">
+                                            <ctrl:PathText Text="{Binding FileName}" Mode="EndPreservingExtension"
+                                                           FontFamily="{StaticResource MonoFontFamily}" FontSize="13" />
+                                            <DockPanel LastChildFill="True">
+                                                <TextBlock Text="from" DockPanel.Dock="Left" FontSize="11" Opacity="0.5"
+                                                           VerticalAlignment="Center" Margin="0,0,6,0" />
+                                                <ctrl:PathText Text="{Binding SourceDisplay}" Mode="FolderMiddleEllipsis"
+                                                               FontFamily="{StaticResource MonoFontFamily}" FontSize="11" Opacity="0.6" />
+                                            </DockPanel>
+                                            <ItemsControl ItemsSource="{Binding Destinations}" Margin="0,2,0,0">
+                                                <ItemsControl.ItemsPanel>
+                                                    <ItemsPanelTemplate><WrapPanel /></ItemsPanelTemplate>
+                                                </ItemsControl.ItemsPanel>
+                                                <ItemsControl.ItemTemplate>
+                                                    <DataTemplate x:DataType="vm:DryRunDestinationEntry">
+                                                        <Border Classes="chip" Margin="0,0,6,4" ToolTip.Tip="{Binding TargetPath}"
+                                                                Classes.chipInfo="{Binding IsUntouched}"
+                                                                Classes.chipSafe="{Binding IsNew}"
+                                                                Classes.chipAmber="{Binding IsOverwritten}"
+                                                                Classes.chipDanger="{Binding IsDeleted}"
+                                                                Classes.chipMuted="{Binding IsUnknown}">
+                                                            <StackPanel Orientation="Horizontal" Spacing="6">
+                                                                <TextBlock Text="{Binding RelativeDisplay}" FontFamily="{StaticResource MonoFontFamily}"
+                                                                           FontSize="11" MaxWidth="320" TextTrimming="CharacterEllipsis"
+                                                                           VerticalAlignment="Center" />
+                                                                <TextBlock Text="{Binding StatusText}" FontSize="10" FontWeight="SemiBold"
+                                                                           Opacity="0.85" VerticalAlignment="Center" />
+                                                            </StackPanel>
+                                                        </Border>
+                                                    </DataTemplate>
+                                                </ItemsControl.ItemTemplate>
+                                            </ItemsControl>
+                                        </StackPanel>
+                                    </Panel>
                                 </Border>
                             </DataTemplate>
                         </ListBox.ItemTemplate>

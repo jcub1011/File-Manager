@@ -102,16 +102,18 @@ public sealed record DryRunFileRow(
 /// present as <see cref="New"/>; the several skip/keep kinds collapse to <see cref="Untouched"/>).</summary>
 public enum DestinationRowKind { Untouched, New, Overwritten, Deleted, Unknown }
 
-/// <summary>A resulting destination file in the Destinations tab.</summary>
-public sealed record DryRunDestinationRow(
+/// <summary>One resulting destination path within a <see cref="DryRunDestinationRow"/> — a single
+/// target a source file lands at (a grouped row can have several), or the sole entry of a row that
+/// has no originating source (a Mirror deletion, a kept-around conflict original, a pre-existing
+/// untouched file).</summary>
+public sealed record DryRunDestinationEntry(
     string TargetPath,
     string TargetRoot,
-    string? SourceRoot,
     DestinationRowKind Kind,
     string? Detail,
-    string ParentDisplay = "")
+    string ParentDisplay,
+    string RelativeDisplay)
 {
-    /// <summary>The file name alone (line 1 of the row); the directory sits on line 2.</summary>
     public string FileName => System.IO.Path.GetFileName(TargetPath);
 
     public bool IsUntouched => Kind == DestinationRowKind.Untouched;
@@ -119,8 +121,6 @@ public sealed record DryRunDestinationRow(
     public bool IsOverwritten => Kind == DestinationRowKind.Overwritten;
     public bool IsDeleted => Kind == DestinationRowKind.Deleted;
     public bool IsUnknown => Kind == DestinationRowKind.Unknown;
-
-    public bool HasSource => SourceRoot is not null;
 
     public string StatusText => Kind switch
     {
@@ -131,9 +131,33 @@ public sealed record DryRunDestinationRow(
         _ => "Unknown",
     };
 
+    public bool Matches(string term) => TargetPath.Contains(term, StringComparison.OrdinalIgnoreCase);
+}
+
+/// <summary>A row in the Destinations tab: a source file and every destination it fans out to
+/// (replication collapses to one row with a list of destinations instead of one row per target).
+/// Rows with no originating source (<see cref="HasSource"/> false) carry a single
+/// <see cref="DryRunDestinationEntry"/> and render as a plain single-status row.</summary>
+public sealed record DryRunDestinationRow(
+    string FileName,
+    string? SourcePath,
+    string? SourceRoot,
+    string SourceDisplay,
+    IReadOnlyList<DryRunDestinationEntry> Destinations)
+{
+    public bool HasSource => SourcePath is not null;
+
+    /// <summary>True for rows with no source — rendered with the simple filename + status + folder
+    /// layout (their single entry is <see cref="Primary"/>).</summary>
+    public bool IsSingle => !HasSource;
+
+    /// <summary>The sole entry of a no-source row (also the first entry generally); the simple
+    /// template binds its status and folder off this.</summary>
+    public DryRunDestinationEntry Primary => Destinations[0];
+
     public bool Matches(string term) =>
-        TargetPath.Contains(term, StringComparison.OrdinalIgnoreCase)
-        || (SourceRoot?.Contains(term, StringComparison.OrdinalIgnoreCase) ?? false);
+        (SourcePath?.Contains(term, StringComparison.OrdinalIgnoreCase) ?? false)
+        || Destinations.Any(d => d.Matches(term));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────
@@ -562,14 +586,19 @@ public sealed partial class DryRunDestinationsTab : ViewModelBase
         _applying = true;
         _all = rows.ToList();
         CommonRoot = commonRoot;
-        UntouchedCount = _all.Count(r => r.IsUntouched);
-        NewCount = _all.Count(r => r.IsNew);
-        OverwrittenCount = _all.Count(r => r.IsOverwritten);
-        DeletedCount = _all.Count(r => r.IsDeleted);
+        // Counts are over the individual destination entries (one per resulting path), not the grouped
+        // rows, so replicating one file to N targets still counts as N destinations.
+        List<DryRunDestinationEntry> entries = _all.SelectMany(r => r.Destinations).ToList();
+        UntouchedCount = entries.Count(e => e.IsUntouched);
+        NewCount = entries.Count(e => e.IsNew);
+        OverwrittenCount = entries.Count(e => e.IsOverwritten);
+        DeletedCount = entries.Count(e => e.IsDeleted);
 
         SourceFacets = DryRunFacets.Build(CountBy(_all, r => r.SourceRoot ?? NoSourceKey), OnFacetChanged);
         ShowSourceFacet = SourceFacets.Count > 0;
-        DestinationFacets = DryRunFacets.Build(CountBy(_all, r => r.TargetRoot), OnFacetChanged);
+        DestinationFacets = DryRunFacets.Build(
+            CountByMany(_all, r => r.Destinations.Select(d => d.TargetRoot).Distinct(StringComparer.OrdinalIgnoreCase)),
+            OnFacetChanged);
         ShowDestinationFacet = DestinationFacets.Count > 0;
 
         SearchText = "";
@@ -638,16 +667,34 @@ public sealed partial class DryRunDestinationsTab : ViewModelBase
         HashSet<string>? sources = DryRunFacets.SelectedKeys(SourceFacets);
         HashSet<string>? destinations = DryRunFacets.SelectedKeys(DestinationFacets);
 
-        IEnumerable<DryRunDestinationRow> rows = _all;
-        if (sources is not null) rows = rows.Where(r => sources.Contains(r.SourceRoot ?? NoSourceKey));
-        if (destinations is not null) rows = rows.Where(r => destinations.Contains(r.TargetRoot));
-        if (term is not null) rows = rows.Where(r => r.Matches(term));
+        // Filter at the destination-entry level and drop rows left with nothing, so a grouped row
+        // shows only the destinations that survived the destination-facet / search filters. The source
+        // facet applies to the whole row; a search hit on the source path keeps all of its entries.
+        List<DryRunDestinationRow> visible = [];
+        foreach (DryRunDestinationRow row in _all)
+        {
+            if (sources is not null && !sources.Contains(row.SourceRoot ?? NoSourceKey))
+                continue;
 
-        // Same relative-to-root ordering as the Sources tab so the two previews line up row-for-row.
-        _visible = rows
-            .Select(r => (Row: r, Key: DryRunSort.RelativeKey(r.TargetPath, r.TargetRoot)))
+            IEnumerable<DryRunDestinationEntry> entries = row.Destinations;
+            if (destinations is not null) entries = entries.Where(e => destinations.Contains(e.TargetRoot));
+            if (term is not null && !(row.SourcePath?.Contains(term, StringComparison.OrdinalIgnoreCase) ?? false))
+                entries = entries.Where(e => e.Matches(term));
+
+            List<DryRunDestinationEntry> kept = entries.ToList();
+            if (kept.Count == 0)
+                continue;
+            visible.Add(kept.Count == row.Destinations.Count ? row : row with { Destinations = kept });
+        }
+
+        // Order by the source file's relative path (grouped rows) or the destination's (no-source rows)
+        // so the preview stays comparable to the Sources tab.
+        _visible = visible
+            .Select(r => (Row: r, Key: r.HasSource
+                ? DryRunSort.RelativeKey(r.SourcePath!, r.SourceRoot)
+                : DryRunSort.RelativeKey(r.Primary.TargetPath, r.Primary.TargetRoot)))
             .OrderBy(x => x.Key, StringComparer.OrdinalIgnoreCase)
-            .ThenBy(x => x.Row.TargetRoot, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(x => x.Row.SourceRoot ?? x.Row.Primary.TargetRoot, StringComparer.OrdinalIgnoreCase)
             .Select(x => x.Row)
             .ToList();
         VisibleRows = _visible;
@@ -655,9 +702,10 @@ public sealed partial class DryRunDestinationsTab : ViewModelBase
     }
 
     private IReadOnlyList<DryRunTreeNode> BuildTree(IReadOnlyList<DryRunDestinationRow> rows) =>
-        DryRunTreeNode.BuildForest(rows, static r => r.TargetPath, static r =>
+        // Flatten grouped rows back to one leaf per resulting path — the tree is per-file, unchanged.
+        DryRunTreeNode.BuildForest(rows.SelectMany(r => r.Destinations).ToList(), static e => e.TargetPath, static e =>
         {
-            string kind = r.Kind switch
+            string kind = e.Kind switch
             {
                 DestinationRowKind.Untouched => "untouched",
                 DestinationRowKind.New => "new",
@@ -673,6 +721,15 @@ public sealed partial class DryRunDestinationsTab : ViewModelBase
         Dictionary<string, int> counts = new(StringComparer.OrdinalIgnoreCase);
         foreach (T item in items)
             counts[key(item)] = counts.GetValueOrDefault(key(item)) + 1;
+        return counts;
+    }
+
+    private static Dictionary<string, int> CountByMany<T>(IEnumerable<T> items, Func<T, IEnumerable<string>> keys)
+    {
+        Dictionary<string, int> counts = new(StringComparer.OrdinalIgnoreCase);
+        foreach (T item in items)
+            foreach (string k in keys(item))
+                counts[k] = counts.GetValueOrDefault(k) + 1;
         return counts;
     }
 }
@@ -797,18 +854,36 @@ public sealed partial class DryRunViewModel : ViewModelBase
                 DryRunPaths.SplitForDisplay(file.Path, sourceCommonRoot).ParentDisplay));
         }
 
-        // The destination "after" view maps 1:1 from the server's destination operations — no
-        // client-side reconstruction. A New/Rename op's content comes from a source file, so its
-        // SourceRoot resolves via SourceIndex; a pre-existing/orphan op has SourceIndex == -1 (→ null,
-        // HasSource == false).
-        List<DryRunDestinationRow> destRows = report.DestinationOperations.Select(o => new DryRunDestinationRow(
-            o.Path,
-            o.Root,
-            o.SourceIndex >= 0 ? report.SourceFiles[o.SourceIndex].Root : null,
-            MapDestinationKind(o.Kind),
-            o.Detail,
-            DryRunPaths.SplitForDisplay(o.Path, destCommonRoot).ParentDisplay))
-            .ToList();
+        // The destination "after" view groups the server's destination operations by the source file
+        // they carry content from: a file replicated to N targets is one row listing N destinations
+        // (each keeping its own status), instead of N near-identical rows. Ops with SourceIndex == -1
+        // (a pre-existing untouched file, a kept-around conflict original, a Mirror orphan) have no
+        // originating source and become their own single-entry rows.
+        static DryRunDestinationEntry Entry(VirtualFileOperation o, string? destCommonRoot)
+        {
+            (string file, string parent) = DryRunPaths.SplitForDisplay(o.Path, destCommonRoot);
+            return new DryRunDestinationEntry(
+                o.Path, o.Root, MapDestinationKind(o.Kind), o.Detail, parent, parent + file);
+        }
+
+        List<DryRunDestinationRow> destRows = [];
+        for (int i = 0; i < report.SourceFiles.Count; i++)
+        {
+            List<DryRunDestinationEntry> entries = destOpsBySource[i].Select(o => Entry(o, destCommonRoot)).ToList();
+            if (entries.Count == 0)
+                continue;   // a filtered/unchanged source that produced no destination op
+            PhysicalFile file = report.SourceFiles[i];
+            (string _, string srcParent) = DryRunPaths.SplitForDisplay(file.Path, sourceCommonRoot);
+            destRows.Add(new DryRunDestinationRow(
+                System.IO.Path.GetFileName(file.Path),
+                file.Path,
+                file.Root,
+                srcParent + System.IO.Path.GetFileName(file.Path),
+                entries));
+        }
+        foreach (VirtualFileOperation o in report.DestinationOperations.Where(o => o.SourceIndex < 0))
+            destRows.Add(new DryRunDestinationRow(
+                System.IO.Path.GetFileName(o.Path), null, null, "", [Entry(o, destCommonRoot)]));
 
         TotalFiles = report.SourceFiles.Count;
         OverwriteCount = report.DestinationOperations.Count(static o => o.Kind == OperationKind.Overwrite);

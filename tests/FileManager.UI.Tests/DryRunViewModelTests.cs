@@ -22,9 +22,10 @@ public sealed class DryRunViewModelTests
     // ── New-model fixture helpers ──────────────────────────────────────────────────────────────
     // A dry-run report is now a bipartite graph: PhysicalFile nodes (SourceFiles / DestinationFiles)
     // plus VirtualFileOperation edges (SourceOperations / DestinationOperations) that reference files
-    // by integer index. The VM pairs SourceFiles[i] with the source op whose SourceIndex == i, groups
-    // destination ops by SourceIndex for that file's target rows, and maps every destination op 1:1 to
-    // a destination row (SourceRoot resolved via SourceIndex).
+    // by integer index. The VM pairs SourceFiles[i] with the source op whose SourceIndex == i, and
+    // groups destination ops by SourceIndex: each source file becomes ONE destination row listing its
+    // fan-out of DryRunDestinationEntry targets. Ops with SourceIndex == -1 (kept-around originals,
+    // Mirror orphans, pre-existing untouched files) become their own single-entry, no-source rows.
 
     private static PhysicalFile Pf(string path, string root) =>
         new() { Path = path, Root = root, Length = 0, LastWritten = DateTimeOffset.UnixEpoch, IsReparsePoint = false };
@@ -149,8 +150,9 @@ public sealed class DryRunViewModelTests
         Assert.Contains(clobber.Targets, t => t.IsRename);
         Assert.DoesNotContain(clobber.Targets, t => t.Path == @"C:\t2\clobber.txt");   // the kept original is not a target
 
-        DryRunDestinationRow kept = viewModel.Destinations.VisibleRows.Single(r => r.TargetPath == @"C:\t2\clobber.txt");
-        Assert.True(kept.IsUntouched);
+        DryRunDestinationRow kept = viewModel.Destinations.VisibleRows
+            .Single(r => !r.HasSource && r.Primary.TargetPath == @"C:\t2\clobber.txt");
+        Assert.True(kept.Primary.IsUntouched);
         Assert.False(kept.HasSource);   // SourceIndex == -1
     }
 
@@ -181,7 +183,7 @@ public sealed class DryRunViewModelTests
         var sourceRel = viewModel.Sources.VisibleRows
             .Select(r => System.IO.Path.GetRelativePath(r.SourceRoot!, r.SourcePath)).ToList();
         var destRel = viewModel.Destinations.VisibleRows
-            .Select(r => System.IO.Path.GetRelativePath(r.TargetRoot, r.TargetPath)).ToList();
+            .Select(r => System.IO.Path.GetRelativePath(r.Primary.TargetRoot, r.Primary.TargetPath)).ToList();
 
         Assert.Equal(sourceRel, destRel);   // identical relative-path ordering in both tabs
     }
@@ -216,8 +218,37 @@ public sealed class DryRunViewModelTests
         Assert.Equal(2, viewModel.Destinations.UntouchedCount);
         Assert.Equal(0, viewModel.Destinations.DeletedCount);
 
-        Assert.Contains(viewModel.Destinations.VisibleRows, r => r.TargetPath == @"C:\t2\clobber (1).txt" && r.IsNew);
-        Assert.Contains(viewModel.Destinations.VisibleRows, r => r.TargetPath == @"C:\t2\clobber.txt" && r.IsUntouched);
+        var entries = viewModel.Destinations.VisibleRows.SelectMany(r => r.Destinations).ToList();
+        Assert.Contains(entries, e => e.TargetPath == @"C:\t2\clobber (1).txt" && e.IsNew);
+        Assert.Contains(entries, e => e.TargetPath == @"C:\t2\clobber.txt" && e.IsUntouched);
+    }
+
+    [Fact]
+    public async Task Replicated_file_collapses_to_one_row_listing_each_destination()
+    {
+        // One source fanned out to three targets → a single grouped row, not three rows.
+        var (viewModel, gateway) = NewViewModel();
+        gateway.DryRunResult = Report(viewModel.ProfileId!.Value,
+            sourceFiles: [Pf(@"C:\s\report.docx", @"C:\s")],
+            sourceOps: [SrcOp(0, @"C:\s\report.docx", @"C:\s", OperationKind.Processed, OnSuccessAction.KeepSource)],
+            destinationFiles: [],
+            destinationOps:
+            [
+                DstOp(OperationKind.New, @"C:\a\report.docx", @"C:\a", sourceIndex: 0),
+                DstOp(OperationKind.New, @"C:\b\report.docx", @"C:\b", sourceIndex: 0),
+                DstOp(OperationKind.Overwrite, @"C:\c\report.docx", @"C:\c", sourceIndex: 0),
+            ]);
+        await viewModel.RunAsync(CancellationToken.None);
+
+        DryRunDestinationRow row = Assert.Single(viewModel.Destinations.VisibleRows);
+        Assert.True(row.HasSource);
+        Assert.Equal(@"C:\s\report.docx", row.SourcePath);
+        Assert.Equal(3, row.Destinations.Count);
+        Assert.Equal(2, row.Destinations.Count(d => d.IsNew));
+        Assert.Equal(1, row.Destinations.Count(d => d.IsOverwritten));
+        // Counts remain over the individual destinations, not the collapsed row.
+        Assert.Equal(2, viewModel.Destinations.NewCount);
+        Assert.Equal(1, viewModel.Destinations.OverwrittenCount);
     }
 
     [Fact]
@@ -245,7 +276,7 @@ public sealed class DryRunViewModelTests
         Assert.Equal(1, viewModel.Destinations.DeletedCount);
         Assert.Equal(1, viewModel.Destinations.UntouchedCount);
         Assert.True(viewModel.HasDestructiveActions);
-        DryRunDestinationRow orphan = viewModel.Destinations.VisibleRows.Single(r => r.IsDeleted);
+        DryRunDestinationRow orphan = viewModel.Destinations.VisibleRows.Single(r => r.Destinations.Any(d => d.IsDeleted));
         Assert.False(orphan.HasSource);                     // extras have no originating source
     }
 
@@ -275,7 +306,8 @@ public sealed class DryRunViewModelTests
 
         Assert.True(viewModel.Destinations.ShowDestinationFacet);
         viewModel.Destinations.DestinationFacets.Single(f => f.Key == @"C:\t").IsSelected = false;
-        Assert.All(viewModel.Destinations.VisibleRows, r => Assert.Equal(@"C:\t2", r.TargetRoot));
+        Assert.All(viewModel.Destinations.VisibleRows.SelectMany(r => r.Destinations),
+            e => Assert.Equal(@"C:\t2", e.TargetRoot));
     }
 
     [Fact]

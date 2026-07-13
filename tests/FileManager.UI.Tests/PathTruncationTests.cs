@@ -70,4 +70,51 @@ public sealed class PathTruncationTests
         Assert.True(a.Length <= (maxChars <= 0 ? 0 : 1));
         Assert.True(b.Length <= (maxChars <= 0 ? 0 : 1));
     }
+
+    [Fact]
+    public void Folder_truncation_elides_whole_middle_folders_keeping_root_and_parent()
+    {
+        // Long\Path\To\The\File\ (22) → drop the middle folders into one ellipsis, keeping root+parent
+        // and every separator intact.
+        Assert.Equal(@"Long\…\File\", PathTruncation.TruncateFolders(@"Long\Path\To\The\File\", 12));
+    }
+
+    [Fact]
+    public void Folder_truncation_preserves_the_root_and_parent_names_and_drops_the_middle()
+    {
+        string result = PathTruncation.TruncateFolders(@"LongRoot\middleAlpha\middleBeta\ParentDir\file", 24);
+        Assert.True(result.Length <= 24);
+        Assert.StartsWith("LongRoot", result);
+        Assert.Contains('…', result);
+        Assert.DoesNotContain("middle", result);   // middle folders are the first to go
+    }
+
+    [Fact]
+    public void Folder_truncation_never_partially_cuts_a_short_folder_name()
+    {
+        // Parent "ab" (≤ 3 chars) must survive whole; only the middle folders are elided to fit.
+        string result = PathTruncation.TruncateFolders(@"LongRoot\mid1\mid2\ab", 14);
+        Assert.True(result.Length <= 14);
+        Assert.EndsWith("ab", result);
+        Assert.DoesNotContain("mid", result);
+        Assert.Contains('…', result);
+    }
+
+    [Fact]
+    public void Folder_truncation_leaves_a_fitting_path_unchanged()
+    {
+        Assert.Equal(@"a\bb\ccc\", PathTruncation.TruncateFolders(@"a\bb\ccc\", 20));
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(4)]
+    [InlineData(9)]
+    [InlineData(15)]
+    public void Folder_truncation_never_exceeds_the_budget(int maxChars)
+    {
+        string result = PathTruncation.TruncateFolders(@"Alpha\Bravo\Charlie\Delta\Echo\file.txt", maxChars);
+        Assert.True(result.Length <= maxChars);
+    }
 }

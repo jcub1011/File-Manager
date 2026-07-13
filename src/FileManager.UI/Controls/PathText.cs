@@ -104,9 +104,12 @@ public sealed class PathText : Control
 
             string display = maxChars >= text.Length
                 ? text
-                : Mode == PathTruncationMode.EndPreservingExtension
-                    ? PathTruncation.TruncateEndPreservingExtension(text, maxChars)
-                    : PathTruncation.TruncateMiddle(text, maxChars);
+                : Mode switch
+                {
+                    PathTruncationMode.EndPreservingExtension => PathTruncation.TruncateEndPreservingExtension(text, maxChars),
+                    PathTruncationMode.FolderMiddleEllipsis => PathTruncation.TruncateFolders(text, maxChars),
+                    _ => PathTruncation.TruncateMiddle(text, maxChars),
+                };
 
             context.DrawText(Build(display), new Point(0, 0));
         }
