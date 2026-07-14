@@ -680,14 +680,15 @@ public sealed class DryRunEngine(
         if (metadata is null)
         {
             var metadataResult = FileMetadataReader.Read(payload.SourcePath);
-            if (metadataResult.TryGetError(out string? statError))
+            if (!metadataResult.TryGetValue(out metadata) || metadata is null)
             {
                 // The file vanished or turned unreadable between enumeration and stat — a race,
                 // not a reportable plan item.
-                logger.LogWarning("Dry-run skipping {Path}: {Error}", payload.SourcePath, statError);
+                metadataResult.TryGetError(out string? statError);
+                logger.LogWarning("Dry-run skipping {Path}: {Error}", payload.SourcePath,
+                    statError ?? $"file not found: {payload.SourcePath}");
                 return null;
             }
-            metadataResult.TryGetValue(out metadata);
         }
 
         PhysicalFile sourceFile = new()
@@ -828,18 +829,14 @@ public sealed class DryRunEngine(
         RunCounters counters,
         CancellationToken ct)
     {
+        // One stat serves as both the existence probe and the metadata read: a null value means
+        // the target does not exist; a failed read means it exists (or is unknowable) but is
+        // unreadable — kept on the conflict-probe path so the preview stays Overwrite, never a
+        // silently reclassified New.
         counters.CountExistenceProbe();
-        bool finalExists = File.Exists(prospectivePath);
-
-        // Read the existing file's metadata once (up front) and reuse it for both the unchanged-check
-        // and the PhysicalFile node — no second stat, no File.GetLastWriteTimeUtc.
-        FileMetadata? existingMeta = null;
-        if (finalExists)
-        {
-            counters.CountExistingStat();
-            var existing = FileMetadataReader.Read(prospectivePath);
-            existing.TryGetValue(out existingMeta);   // null if the read raced/failed
-        }
+        var existing = FileMetadataReader.Read(prospectivePath);
+        existing.TryGetValue(out FileMetadata? existingMeta);
+        bool finalExists = existingMeta is not null || existing.IsFailure;
         PhysicalFile? existingFile = existingMeta is null ? null : new PhysicalFile
         {
             Path = prospectivePath,
@@ -902,7 +899,8 @@ public sealed class DryRunEngine(
             }
         }
 
-        var probe = conflictResolver.Probe(prospectivePath, policies.ConflictResolution, metadata.LastWritten);
+        var probe = conflictResolver.Probe(prospectivePath, policies.ConflictResolution, metadata.LastWritten,
+            finalExists, existingMeta?.LastWritten ?? default);
         if (probe.TryGetError(out JobError? probeError))
             return Single(Op(OperationKind.Unknown, prospectivePath, 0, subject, probeError.Message), cachedSourceHash);
         probe.TryGetValue(out ConflictOutcome? outcome);

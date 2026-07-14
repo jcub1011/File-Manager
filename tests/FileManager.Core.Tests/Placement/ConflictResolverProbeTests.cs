@@ -30,7 +30,10 @@ public sealed class ConflictResolverProbeTests : IDisposable
 
     private ConflictOutcome Probe(string path, ConflictResolution policy, DateTimeOffset? incoming = null)
     {
-        var probed = _resolver.Probe(path, policy, incoming ?? DateTimeOffset.UtcNow);
+        // Mirror the production caller's contract: hand Probe the existence + mtime already stat'd.
+        bool exists = File.Exists(path);
+        DateTimeOffset existingMtime = exists ? File.GetLastWriteTimeUtc(path) : default;
+        var probed = _resolver.Probe(path, policy, incoming ?? DateTimeOffset.UtcNow, exists, existingMtime);
         Assert.True(probed.TryGetValue(out ConflictOutcome? outcome));
         return outcome;
     }
@@ -66,6 +69,34 @@ public sealed class ConflictResolverProbeTests : IDisposable
             Probe(path, ConflictResolution.OverwriteIfNewer, existingMtime.AddMinutes(5)).Action);
         Assert.Equal(ConflictAction.SkipExistingKept,
             Probe(path, ConflictResolution.OverwriteIfNewer, existingMtime.AddMinutes(-5)).Action);
+    }
+
+    [Fact]
+    public void OverwriteIfNewer_is_driven_by_the_caller_supplied_mtime_not_the_disk()
+    {
+        string path = Existing("stale.txt");
+        DateTimeOffset diskMtime = File.GetLastWriteTimeUtc(path);
+
+        // The caller claims the existing file is an hour newer than the disk says; the incoming
+        // file is only five minutes newer than the disk. If Probe re-stat'd the disk it would
+        // Write — trusting the parameter it must keep the existing file.
+        var probed = _resolver.Probe(path, ConflictResolution.OverwriteIfNewer, diskMtime.AddMinutes(5),
+            desiredFinalExists: true, existingLastWriteUtc: diskMtime.AddHours(1));
+
+        Assert.True(probed.TryGetValue(out ConflictOutcome? outcome));
+        Assert.Equal(ConflictAction.SkipExistingKept, outcome.Action);
+    }
+
+    [Fact]
+    public void Probe_trusts_the_caller_supplied_existence_over_the_disk()
+    {
+        // The file exists on disk, but the caller says it doesn't — Probe must not re-stat.
+        string path = Existing("present.txt");
+        var probed = _resolver.Probe(path, ConflictResolution.Skip, DateTimeOffset.UtcNow,
+            desiredFinalExists: false, existingLastWriteUtc: default);
+
+        Assert.True(probed.TryGetValue(out ConflictOutcome? outcome));
+        Assert.Equal(ConflictAction.Write, outcome.Action);
     }
 
     [Fact]

@@ -9,13 +9,17 @@ namespace FileManager.Core.Files;
 /// future job planner both need the full <see cref="FileMetadata"/>.</summary>
 internal static class FileMetadataReader
 {
-    public static Result<FileMetadata, string> Read(string path)
+    /// <summary>A <c>null</c> success value means the file does not exist (mirroring
+    /// <see cref="File.Exists"/>, including "a directory sits at that path"); a failure means the
+    /// path could not be stat'd at all — callers that knew the file existed should treat that as
+    /// exists-but-unreadable, not as absent.</summary>
+    public static Result<FileMetadata?, string> Read(string path)
     {
         try
         {
             FileInfo info = new(path);
             if (!info.Exists)
-                return $"file not found: {path}";
+                return Result<FileMetadata?, string>.Success(null);
             return new FileMetadata
             {
                 Length = info.Length,

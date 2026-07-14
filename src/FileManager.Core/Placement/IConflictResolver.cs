@@ -21,7 +21,11 @@ public interface IConflictResolver
         PathLockSet heldLocks);
 
     /// <summary>Read-only variant for dry-run (I-DRYRUN-RO): computes the outcome that Resolve
-    /// would choose, without acquiring locks or consulting the priority registry's write side.</summary>
+    /// would choose, without acquiring locks or consulting the priority registry's write side.
+    /// The caller supplies the target's existence and last-write time from the stat it already
+    /// performed, so the probe never re-stats <paramref name="desiredFinalPath"/> (RenameSuffix
+    /// still probes its suffixed candidates — paths the caller has never stat'd).</summary>
     Result<ConflictOutcome, JobError> Probe(
-        string desiredFinalPath, ConflictResolution policy, DateTimeOffset incomingLastWriteUtc);
+        string desiredFinalPath, ConflictResolution policy, DateTimeOffset incomingLastWriteUtc,
+        bool desiredFinalExists, DateTimeOffset existingLastWriteUtc);
 }

@@ -136,11 +136,12 @@ public sealed class ConflictResolver(
     }
 
     public Result<ConflictOutcome, JobError> Probe(
-        string desiredFinalPath, ConflictResolution policy, DateTimeOffset incomingLastWriteUtc)
+        string desiredFinalPath, ConflictResolution policy, DateTimeOffset incomingLastWriteUtc,
+        bool desiredFinalExists, DateTimeOffset existingLastWriteUtc)
     {
         try
         {
-            if (!File.Exists(desiredFinalPath))
+            if (!desiredFinalExists)
                 return new ConflictOutcome(ConflictAction.Write, desiredFinalPath);
 
             switch (policy)
@@ -149,8 +150,7 @@ public sealed class ConflictResolver(
                     return new ConflictOutcome(ConflictAction.Write, desiredFinalPath);
 
                 case ConflictResolution.OverwriteIfNewer:
-                    DateTimeOffset existingLastWrite = File.GetLastWriteTimeUtc(desiredFinalPath);
-                    return incomingLastWriteUtc > existingLastWrite
+                    return incomingLastWriteUtc > existingLastWriteUtc
                         ? new ConflictOutcome(ConflictAction.Write, desiredFinalPath)
                         : new ConflictOutcome(ConflictAction.SkipExistingKept, desiredFinalPath);
 

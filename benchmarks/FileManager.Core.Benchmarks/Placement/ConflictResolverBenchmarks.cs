@@ -55,7 +55,8 @@ public class ConflictResolverBenchmarks
     [Benchmark]
     public ConflictOutcome? ProbeSaturated()
     {
-        var result = _resolver.Probe(_desiredFinalPath, ConflictResolution.RenameSuffix, _incomingLastWrite);
+        var result = _resolver.Probe(_desiredFinalPath, ConflictResolution.RenameSuffix, _incomingLastWrite,
+            desiredFinalExists: true, existingLastWriteUtc: _incomingLastWrite);
         result.TryGetValue(out ConflictOutcome? outcome);
         return outcome;   // free slot is "file (SaturationCount + 1).dat"
     }
