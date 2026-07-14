@@ -310,7 +310,9 @@ public sealed class DryRunEngineTests : IDisposable
             SourceFile($"{i:D3}.txt", $"content {i}");
         Profile profile = ProfileUnderTest();
 
-        var simulated = await NewEngine(1500, profile).SimulateAsync(profile.Id, null);
+        // The tight estimator sits close to the true serialized size, so this budget keeps a
+        // couple of ~110-char-path bundles (~1.6 KB each) before truncating.
+        var simulated = await NewEngine(4000, profile).SimulateAsync(profile.Id, null);
         Assert.True(simulated.TryGetValue(out DryRunReport? report));
 
         Assert.True(report!.Truncated);
@@ -422,6 +424,26 @@ public sealed class DryRunEngineTests : IDisposable
         Assert.Equal(Path.Combine(_target, "nested", "deep", "file.txt"), action.Path);
     }
 
+    /// <summary>The frame-fit guarantee rests on the estimate being a TRUE upper bound of what the
+    /// serializer emits, for any string content — ASCII paths, escape-heavy names, non-ASCII,
+    /// control chars, surrogate pairs. The serializer here uses the same default encoder as
+    /// <c>FileManagerJsonContext</c> (no custom encoder configured).</summary>
+    [Theory]
+    [InlineData(@"C:\Users\Jacob McCormack\source\repos\File-Manager\file.txt")]
+    [InlineData("plain-ascii_name.txt (1)")]
+    [InlineData("quotes \" and \\ backslashes \\\\ everywhere \"\"")]
+    [InlineData("résumé ✓ naïve Größe 日本語")]
+    [InlineData("emoji 🎉🚀 surrogate pairs 𝔘𝔫𝔦")]
+    [InlineData("controlchars\ttabs\nnewlines\r")]
+    [InlineData("html-sensitive <tag> & 'quote' + `tick`")]
+    [InlineData("")]
+    public void String_upper_bound_never_underestimates_the_serialized_size(string value)
+    {
+        long bound = DryRunEngine.StringUpperBound(value);
+        int actual = System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(value).Length;
+        Assert.True(bound >= actual, $"estimate {bound} < serialized {actual} for \"{value}\"");
+    }
+
     [Fact]
     public async Task Unknown_profile_fails()
     {
@@ -528,10 +550,11 @@ public sealed class DryRunEngineTests : IDisposable
             SourceFile($"{i:D3}.txt", $"content {i}");
         Profile profile = ProfileUnderTest();
 
-        var simulated = await NewEngine(1500, profile).SimulateAsync(profile.Id, null);
+        var simulated = await NewEngine(4000, profile).SimulateAsync(profile.Id, null);
         Assert.True(simulated.TryGetValue(out DryRunReport? report));
 
         Assert.True(report!.Truncated);
+        Assert.NotEmpty(report.SourceFiles);   // a vacuously empty report would prove nothing
         AssertIndicesValid(report);   // bundle-boundary truncation ⇒ no retained op references a dropped file
     }
 
@@ -582,14 +605,14 @@ public sealed class DryRunEngineTests : IDisposable
             SourceFile($"{i:D3}.txt", $"content {i}");
         Profile profile = ProfileUnderTest();
 
-        var batched = await NewEngine(1500, profile).SimulateAsync(profile.Id, null);
+        var batched = await NewEngine(4000, profile).SimulateAsync(profile.Id, null);
         Assert.True(batched.TryGetValue(out DryRunReport? truncatedReport));
         Assert.True(truncatedReport!.Truncated);
         Assert.InRange(truncatedReport.SourceFiles.Count, 1, 39);
 
         // Same tiny budget as the *chunk* budget — still every file comes back.
         List<(string SourcePath, OperationKind Kind)> streamed =
-            await CollectStream(NewEngine(1500, 1500, GlobalSettings.Default, profile), profile.Id);
+            await CollectStream(NewEngine(4000, 4000, GlobalSettings.Default, profile), profile.Id);
         Assert.Equal(40, streamed.Count);
         Assert.Equal(
             Enumerable.Range(0, 40).Select(i => $"{i:D3}.txt").OrderBy(n => n, StringComparer.OrdinalIgnoreCase).ToList(),

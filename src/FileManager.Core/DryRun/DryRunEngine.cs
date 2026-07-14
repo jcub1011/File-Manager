@@ -12,7 +12,6 @@ using Microsoft.Extensions.Logging;
 using FileManager.Contracts;
 using FileManager.Contracts.Settings;
 using System;
-using System.Buffers;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -20,7 +19,7 @@ using System.IO;
 using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Runtime.ExceptionServices;
-using System.Text.Json;
+using System.Text.Encodings.Web;
 using System.Threading;
 using System.Threading.Channels;
 using System.Threading.Tasks;
@@ -151,7 +150,7 @@ public sealed class DryRunEngine(
         evaluations.Sort(static (a, b) =>
             string.Compare(a.SourceFile.Path, b.SourceFile.Path, StringComparison.OrdinalIgnoreCase));
 
-        using ReportBuilder builder = new(ReportByteBudget);
+        ReportBuilder builder = new(ReportByteBudget);
         foreach (FileEvaluation evaluation in evaluations)
         {
             if (!builder.TryAddBundle(evaluation))
@@ -563,12 +562,12 @@ public sealed class DryRunEngine(
     }
 
     /// <summary>Batched-report accumulator with truncation to the serialized byte budget, fed bundles
-    /// in final (source-path) order. Serialization is not free, so it is skipped while a conservative
-    /// upper-bound estimate proves the report still fits — the common case. Only once the upper bound
-    /// could cross the budget does it fall back to exact measurement (re-establishing the running total
-    /// from what's already kept). A bundle is added atomically, so a retained operation never
-    /// references a dropped file.</summary>
-    private sealed class ReportBuilder(long budget) : IDisposable
+    /// in final (source-path) order. Sizing uses the tight upper-bound estimate only (see
+    /// <see cref="StringUpperBound"/>) — a true bound, so the serialized report always fits the
+    /// budget; near the cap it may truncate a handful of records earlier than exact measurement
+    /// would, never later. A bundle is added atomically, so a retained operation never references
+    /// a dropped file.</summary>
+    private sealed class ReportBuilder(long budget)
     {
         public List<PhysicalFile> SourceFiles { get; } = [];
         public List<PhysicalFile> DestinationFiles { get; } = [];
@@ -578,19 +577,16 @@ public sealed class DryRunEngine(
         /// <summary>True once a unit was rejected because keeping it would cross the budget.</summary>
         public bool Truncated { get; private set; }
 
-        /// <summary>Exact once measuring, otherwise the running upper-bound estimate.</summary>
+        /// <summary>The running upper-bound estimate.</summary>
         public long ReportBytes => _total;
 
         private long _total;
-        private bool _exact;
-        private ArrayBufferWriter<byte>? _buffer;
-        private Utf8JsonWriter? _writer;
 
         /// <summary>Adds a whole per-file bundle atomically. Returns false (and sets
         /// <see cref="Truncated"/>) without keeping it if it would cross the budget.</summary>
         public bool TryAddBundle(FileEvaluation bundle)
         {
-            if (!TryReserve(BundleUpperBound(bundle), () => BundleExactBytes(bundle)))
+            if (!TryReserve(BundleUpperBound(bundle)))
                 return false;
             AppendGlobalized(bundle, SourceFiles.Count, DestinationFiles.Count,
                 SourceFiles, DestinationFiles, SourceOperations, DestinationOperations);
@@ -601,8 +597,7 @@ public sealed class DryRunEngine(
         /// file's new position.</summary>
         public bool TryAddSweepEntry(PhysicalFile file, VirtualFileOperation op)
         {
-            if (!TryReserve(UpperBoundBytes(file) + UpperBoundBytes(op),
-                    () => ExactBytes(file) + ExactBytes(op)))
+            if (!TryReserve(UpperBoundBytes(file) + UpperBoundBytes(op)))
                 return false;
             int subjectIndex = DestinationFiles.Count;
             DestinationFiles.Add(file);
@@ -610,68 +605,16 @@ public sealed class DryRunEngine(
             return true;
         }
 
-        private bool TryReserve(long upperBound, Func<long> exactBytes)
+        private bool TryReserve(long upperBound)
         {
-            if (!_exact)
-            {
-                if (_total + upperBound <= budget)
-                {
-                    _total += upperBound;
-                    return true;
-                }
-                // The upper bound could exceed the budget — switch to exact measurement and
-                // re-establish the running total as the exact size of what's already kept.
-                _exact = true;
-                _buffer = new ArrayBufferWriter<byte>();
-                _writer = new Utf8JsonWriter(_buffer);
-                _total = ExactTotalOfKept();
-            }
-
-            long exact = exactBytes();
-            if (_total + exact > budget)
+            if (_total + upperBound > budget)
             {
                 Truncated = true;
                 return false;
             }
-            _total += exact;
+            _total += upperBound;
             return true;
         }
-
-        private long ExactTotalOfKept()
-        {
-            long total = 0;
-            foreach (PhysicalFile f in SourceFiles) total += ExactBytes(f);
-            foreach (PhysicalFile f in DestinationFiles) total += ExactBytes(f);
-            foreach (VirtualFileOperation o in SourceOperations) total += ExactBytes(o);
-            foreach (VirtualFileOperation o in DestinationOperations) total += ExactBytes(o);
-            return total;
-        }
-
-        private long BundleExactBytes(FileEvaluation bundle)
-        {
-            long total = ExactBytes(bundle.SourceFile) + ExactBytes(bundle.SourceOp);
-            foreach (PhysicalFile f in bundle.DestinationFiles) total += ExactBytes(f);
-            foreach (VirtualFileOperation o in bundle.DestinationOps) total += ExactBytes(o);
-            return total;
-        }
-
-        private int ExactBytes(PhysicalFile file)
-        {
-            _buffer!.ResetWrittenCount();
-            _writer!.Reset(_buffer);
-            JsonSerializer.Serialize(_writer, file, FileManagerJsonContext.Default.PhysicalFile);
-            return _buffer.WrittenCount;
-        }
-
-        private int ExactBytes(VirtualFileOperation op)
-        {
-            _buffer!.ResetWrittenCount();
-            _writer!.Reset(_buffer);
-            JsonSerializer.Serialize(_writer, op, FileManagerJsonContext.Default.VirtualFileOperation);
-            return _buffer.WrittenCount;
-        }
-
-        public void Dispose() => _writer?.Dispose();
     }
 
     /// <summary>Streaming accumulator: buffers one chunk's records while tracking global source/dest
@@ -731,9 +674,34 @@ public sealed class DryRunEngine(
     private static long UpperBoundBytes(VirtualFileOperation op) =>
         OperationStructuralBytes + StringUpperBound(op.Path) + StringUpperBound(op.Root) + StringUpperBound(op.Detail);
 
-    // JSON's absolute worst case is 6 UTF-8 bytes per UTF-16 code unit (\uXXXX, incl. surrogates),
-    // plus the surrounding quotes — a true upper bound regardless of escaping or non-ASCII content.
-    private static long StringUpperBound(string? value) => value is null ? 0 : (long)value.Length * 6 + 2;
+    // Which ASCII chars the serializer's encoder (JavaScriptEncoder.Default — the JSON context
+    // sets no custom encoder) writes through verbatim, built from the encoder itself so the table
+    // can never disagree with the actual escaping behavior.
+    private static readonly bool[] UnescapedAscii = BuildUnescapedAscii();
+
+    private static bool[] BuildUnescapedAscii()
+    {
+        bool[] table = new bool[128];
+        for (int i = 0x20; i < 0x7F; i++)
+            table[i] = !JavaScriptEncoder.Default.WillEncode(i);
+        return table;
+    }
+
+    // A tight true upper bound on the serialized size of a JSON string literal: 1 byte per
+    // untouched ASCII char, 6 per anything else (the \uXXXX worst case — every escape form and
+    // every UTF-8/surrogate encoding is ≤ 6 bytes per UTF-16 code unit), plus the quotes. For the
+    // path-dominated strings in a report this sits within a few percent of the exact size, versus
+    // the flat 6-bytes-per-char bound it replaces (which forced an exact-serialization fallback
+    // near the budget — records were serialized twice, once to measure and once for the wire).
+    internal static long StringUpperBound(string? value)
+    {
+        if (value is null)
+            return 0;
+        long bytes = 2;   // the surrounding quotes
+        foreach (char c in value)
+            bytes += c < 128 && UnescapedAscii[c] ? 1 : 6;
+        return bytes;
+    }
 
     private async Task<FileEvaluation?> EvaluateFileAsync(
         Profile profile,
