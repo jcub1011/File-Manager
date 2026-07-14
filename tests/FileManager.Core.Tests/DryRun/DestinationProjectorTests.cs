@@ -1,6 +1,7 @@
 using FileManager.Contracts.DryRun;
 using FileManager.Contracts.Profiles;
 using FileManager.Core.DryRun;
+using FileManager.Core.Jobs;
 using FileManager.Core.Files;
 using FileManager.Core.Tests.TestSupport;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -27,7 +28,9 @@ public sealed class DestinationProjectorTests : IDisposable
     public void Dispose() => Directory.Delete(_root, recursive: true);
 
     private static DestinationProjector NewProjector() =>
-        new(NullLogger<DestinationProjector>.Instance, new FileSystemService(NullLogger<FileSystemService>.Instance));
+        new(NullLogger<DestinationProjector>.Instance,
+            new FileSystemService(NullLogger<FileSystemService>.Instance),
+            new FakeVolumeInfoProvider());   // local temp dirs → not a network path
 
     private Profile Mirror() => TestProfiles.Valid(_source, _target) with { SyncMode = SyncMode.Mirror };
     private Profile Additive() => TestProfiles.Valid(_source, _target);
@@ -50,8 +53,11 @@ public sealed class DestinationProjectorTests : IDisposable
         SourceIndex = 0,
     };
 
+    // A pinned worker count > 1 so the sweep exercises its concurrent work-stealing walk in every case.
+    private const int Workers = 4;
+
     private DestinationSweepResult Project(Profile profile, params VirtualFileOperation[] destinationOps) =>
-        NewProjector().Project(profile, destinationOps, truncated: false, CancellationToken.None);
+        NewProjector().Project(profile, destinationOps, truncated: false, manualWorkers: Workers, CancellationToken.None);
 
     [Fact]
     public void Mirror_orphan_is_deleted()
@@ -139,7 +145,7 @@ public sealed class DestinationProjectorTests : IDisposable
     {
         TargetFile("orphan.txt");
 
-        Assert.Empty(NewProjector().Project(Mirror(), [], truncated: true, CancellationToken.None).Ops);
+        Assert.Empty(NewProjector().Project(Mirror(), [], truncated: true, manualWorkers: Workers, CancellationToken.None).Ops);
     }
 
     [Fact]
@@ -161,4 +167,61 @@ public sealed class DestinationProjectorTests : IDisposable
         Profile profile = Mirror() with { Targets = [new TargetConfig { Path = Path.Combine(_root, "does-not-exist") }] };
         Assert.Empty(Project(profile).Ops);
     }
+
+    [Fact]
+    public void Every_orphan_is_found_with_a_valid_index_pairing_regardless_of_tree_shape()
+    {
+        var expected = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        for (int i = 0; i < 20; i++)                                                  // wide: many shallow subtrees
+            expected.Add(TargetFile(Path.Combine($"w{i}", $"f{i}.txt")));
+        expected.Add(TargetFile(Path.Combine("a", "b", "c", "d", "e", "deep.txt")));  // deep/narrow chain
+
+        DestinationSweepResult result = Project(Mirror());
+
+        Assert.Equal(expected.Count, result.Files.Count);
+        Assert.Equal(result.Files.Count, result.Ops.Count);
+        for (int i = 0; i < result.Ops.Count; i++)
+        {
+            Assert.Equal(i, result.Ops[i].SubjectIndex);              // Ops[i] references Files[i]
+            Assert.Equal(result.Files[i].Path, result.Ops[i].Path);
+            Assert.Equal(OperationKind.Deleted, result.Ops[i].Kind);
+        }
+        Assert.Equal(expected, result.Ops.Select(o => o.Path).ToHashSet(StringComparer.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public void Result_is_identical_across_worker_counts()
+    {
+        for (int i = 0; i < 25; i++)
+            TargetFile(Path.Combine($"d{i % 5}", $"f{i}.txt"));
+
+        DestinationProjector projector = NewProjector();
+        DestinationSweepResult one = projector.Project(Mirror(), [], truncated: false, manualWorkers: 1, CancellationToken.None);
+        DestinationSweepResult many = projector.Project(Mirror(), [], truncated: false, manualWorkers: 8, CancellationToken.None);
+        DestinationSweepResult auto = projector.Project(Mirror(), [], truncated: false, manualWorkers: null, CancellationToken.None);
+
+        // The sorted merge makes the output order-stable regardless of how the concurrent walk raced
+        // or how many threads the auto (medium-aware) degree of parallelism chose.
+        var expected = one.Ops.Select(o => (o.Path, o.Kind)).ToList();
+        Assert.Equal(expected, many.Ops.Select(o => (o.Path, o.Kind)));
+        Assert.Equal(expected, auto.Ops.Select(o => (o.Path, o.Kind)));
+        Assert.Equal(one.Files.Select(f => f.Path), many.Files.Select(f => f.Path));
+    }
+
+    [Fact]
+    public void The_entry_budget_is_respected_under_parallelism()
+    {
+        for (int i = 0; i < 50; i++)
+            TargetFile(Path.Combine($"d{i % 5}", $"f{i}.txt"));
+
+        const int budget = 10;
+        DestinationSweepResult result = Sweep(Mirror(), manualWorkers: 8, maxEntries: budget);
+
+        Assert.True(result.Files.Count <= budget);
+        Assert.Equal(result.Files.Count, result.Ops.Count);
+        Assert.True(result.Truncated);
+    }
+
+    private DestinationSweepResult Sweep(Profile profile, int manualWorkers, int maxEntries) =>
+        NewProjector().Sweep(profile, new HashSet<NormalizedPath>(), truncated: false, manualWorkers, CancellationToken.None, maxEntries);
 }

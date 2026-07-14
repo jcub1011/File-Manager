@@ -1,9 +1,20 @@
 using System.Collections.Concurrent;
 using FileManager.Contracts.Primitives;
 using FileManager.Contracts.Profiles;
+using FileManager.Contracts.Settings;
 using FileManager.Core.Platform;
+using FileManager.Core.Settings;
 
 namespace FileManager.Core.Tests.TestSupport;
+
+/// <summary>Serves a fixed <see cref="GlobalSettings"/> snapshot (default unless one is supplied);
+/// <see cref="Update"/> echoes the input.</summary>
+internal sealed class FakeSettingsProvider(GlobalSettings? current = null) : ISettingsProvider
+{
+    public GlobalSettings Current { get; } = current ?? GlobalSettings.Default;
+    public Result<GlobalSettings, string> Update(GlobalSettings settings) =>
+        Result<GlobalSettings, string>.Success(settings);
+}
 
 /// <summary>Reports abundant free space and a per-drive-root volume key; lets a test force a
 /// shortfall via <see cref="Free"/>.</summary>

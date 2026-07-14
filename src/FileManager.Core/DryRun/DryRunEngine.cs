@@ -199,8 +199,9 @@ public sealed class DryRunEngine(
         // entirely when the source pass truncated (the survivor set would be incomplete, so any
         // orphan classification is untrustworthy). Appended only while their size keeps the report
         // under budget; an overflow drops the rest and marks the report truncated.
-        DestinationSweepResult sweep =
-            destinationProjector.Project(profile, builder.DestinationOperations, truncated, ct);
+        DestinationSweepResult sweep = destinationProjector.Project(
+            profile, builder.DestinationOperations, truncated,
+            DryRunConcurrency.ResolveManualWorkers(profile, settings.Current), ct);
         for (int i = 0; i < sweep.Files.Count; i++)
         {
             if (!builder.TryAddSweepEntry(sweep.Files[i], sweep.Ops[i]))
@@ -414,10 +415,8 @@ public sealed class DryRunEngine(
             : AutoWorkers();
     }
 
-    // Reserve one core for the system and keep an 8-worker ceiling — per-file evaluation is
-    // I/O-bound (stat + existence probe + up to two SHA-256 hashes), so beyond ~8 concurrent
-    // hashers the disk, not the CPU, is the bottleneck. Floor of 1 covers single-core machines.
-    private static int AutoWorkers() => Math.Max(1, Math.Min(8, Environment.ProcessorCount - 1));
+    // Evaluation-phase default worker count; see DryRunConcurrency.AutoWorkers for the rationale.
+    private static int AutoWorkers() => DryRunConcurrency.AutoWorkers();
 
     /// <summary>One source file's contribution to the report: the source file node, its source-side
     /// operation (Processed / Skipped + disposition), and the destination files/operations its targets

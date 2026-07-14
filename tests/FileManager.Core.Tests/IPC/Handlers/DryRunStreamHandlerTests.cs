@@ -67,8 +67,8 @@ public sealed class DryRunStreamHandlerTests
     {
         FileSystemService fileSystem = new(NullLogger<FileSystemService>.Instance);
         return new(NullLogger<DryRunStreamHandler>.Instance, engine, new FakeCatalog(profile), TimeProvider.System,
-            new DestinationProjector(NullLogger<DestinationProjector>.Instance, fileSystem),
-            new FakeVolumeInfoProvider(), new EngineConfig())
+            new DestinationProjector(NullLogger<DestinationProjector>.Instance, fileSystem, new FakeVolumeInfoProvider()),
+            new FakeVolumeInfoProvider(), new EngineConfig(), new FakeSettingsProvider())
         { MaxStreamedFiles = maxStreamedFiles };
     }
 

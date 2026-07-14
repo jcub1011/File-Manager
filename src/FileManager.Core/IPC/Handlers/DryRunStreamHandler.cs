@@ -6,6 +6,7 @@ using FileManager.Core.DryRun;
 using FileManager.Core.Jobs;
 using FileManager.Core.Platform;
 using FileManager.Core.Profiles;
+using FileManager.Core.Settings;
 using Microsoft.Extensions.Logging;
 using System;
 using System.Collections.Generic;
@@ -24,7 +25,8 @@ namespace FileManager.Core.IPC.Handlers;
 /// frame (matching DryRunHandler's error codes).</summary>
 public sealed class DryRunStreamHandler(
     ILogger<DryRunStreamHandler> logger, IDryRunEngine engine, IProfileCatalog catalog, TimeProvider time,
-    DestinationProjector destinationProjector, IVolumeInfoProvider volumes, EngineConfig config)
+    DestinationProjector destinationProjector, IVolumeInfoProvider volumes, EngineConfig config,
+    ISettingsProvider settings)
     : IIpcStreamingRequestHandler
 {
     /// <summary>Destination sweep entries per streamed frame. Each entry is small (a physical file +
@@ -129,7 +131,11 @@ public sealed class DryRunStreamHandler(
         long engineMs = totalWatch.ElapsedMilliseconds;
         int sweepBudget = Math.Max(0, MaxStreamedFiles - destinationCount);
         Stopwatch sweepWatch = Stopwatch.StartNew();
-        DestinationSweepResult sweep = destinationProjector.Sweep(profile, survivors, truncated, ct, sweepBudget);
+        // Resolve a Manual worker pin (profile, or Inherit → global) exactly as the batched engine
+        // does; Automatic leaves it null so the projector auto-scales to the target medium.
+        int? manualWorkers = DryRunConcurrency.ResolveManualWorkers(profile, settings.Current);
+        DestinationSweepResult sweep =
+            destinationProjector.Sweep(profile, survivors, truncated, manualWorkers, ct, sweepBudget);
         sweepWatch.Stop();
         if (sweep.Truncated)
         {

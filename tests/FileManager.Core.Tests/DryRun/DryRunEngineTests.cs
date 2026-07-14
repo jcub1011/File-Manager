@@ -110,7 +110,7 @@ public sealed class DryRunEngineTests : IDisposable
             new ConflictResolver(new(), new(), NullLogger<ConflictResolver>.Instance),
             new FakeSettings(global),
             TimeProvider.System,
-            new DestinationProjector(NullLogger<DestinationProjector>.Instance, fileSystem))
+            new DestinationProjector(NullLogger<DestinationProjector>.Instance, fileSystem, new FakeVolumeInfoProvider()))
         { ReportByteBudget = reportByteBudget, ChunkByteBudget = chunkByteBudget, MaxScannedCandidates = maxScannedCandidates };
     }
 

@@ -6,6 +6,7 @@ using FileManager.Core.DryRun;
 using FileManager.Core.Files;
 using FileManager.Core.Filtering;
 using FileManager.Core.Placement;
+using FileManager.Core.Platform;
 using FileManager.Core.Profiles;
 using FileManager.Core.Settings;
 using FileManager.Core.Watching;
@@ -82,7 +83,17 @@ public class DryRunEngineBenchmarks
             new ConflictResolver(new(), new(), NullLogger<ConflictResolver>.Instance),
             new FixedSettings(),
             TimeProvider.System,
-            new DestinationProjector(NullLogger<DestinationProjector>.Instance, fileSystem));
+            new DestinationProjector(NullLogger<DestinationProjector>.Instance, fileSystem, new LocalVolumes()));
+    }
+
+    /// <summary>The benchmark trees live in the local temp dir; the projector only consults
+    /// <see cref="IVolumeInfoProvider.IsNetworkPath"/>, so the rest is never reached here.</summary>
+    private sealed class LocalVolumes : IVolumeInfoProvider
+    {
+        public bool IsNetworkPath(string path) => false;
+        public Result<long, string> GetAvailableFreeBytes(string path) => throw new NotSupportedException();
+        public Result<string, string> GetVolumeKey(string path) => throw new NotSupportedException();
+        public Result<VolumeCapacity, string> GetVolumeCapacity(string path) => throw new NotSupportedException();
     }
 
     /// <summary>Automatic concurrency (the default) so the benchmark measures the engine's own

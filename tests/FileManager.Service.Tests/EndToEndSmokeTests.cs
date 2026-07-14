@@ -50,7 +50,8 @@ public sealed class EndToEndSmokeTests : IAsyncLifetime
         FileHasher hasher = new(NullLogger<FileHasher>.Instance);
         ConflictResolver resolver = new(new(), new(), NullLogger<ConflictResolver>.Instance);
         SettingsService settings = new(NullLogger<SettingsService>.Instance, paths);
-        DestinationProjector destinationProjector = new(NullLogger<DestinationProjector>.Instance, fileSystem);
+        WindowsVolumeInfoProvider volumes = new(NullLogger<WindowsVolumeInfoProvider>.Instance);
+        DestinationProjector destinationProjector = new(NullLogger<DestinationProjector>.Instance, fileSystem, volumes);
         DryRunEngine dryRun = new(NullLogger<DryRunEngine>.Instance, catalog, scanner, filterCompiler, hasher, resolver, settings, TimeProvider.System, destinationProjector);
 
         IIpcRequestHandler[] handlers =
