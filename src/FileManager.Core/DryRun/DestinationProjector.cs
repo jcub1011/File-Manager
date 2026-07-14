@@ -8,6 +8,7 @@ using Microsoft.Extensions.Logging;
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
@@ -109,11 +110,19 @@ public sealed class DestinationProjector(
         // want. A Manual concurrency setting is honoured as-is; Automatic scales to the target medium.
         int dop = Math.Max(1, manualWorkers ?? AutoSweepWorkers(profile));
 
+        // Each worker classifies into its OWN list — no shared sink, so no per-file contention (a
+        // ConcurrentBag add costs a CAS + thread-local bookkeeping on every one of potentially
+        // hundreds of thousands of survivors). The lists are concatenated by the serial merge, whose
+        // sort already makes the output order independent of which worker found what.
+        var sinks = new List<Candidate>[dop];
+        for (int i = 0; i < dop; i++)
+            sinks[i] = [];
+
         // Each thread drains the shared queue: enumerate a directory (the blocking I/O), classify its
-        // files into the shared sink, push its subdirectories back. Cancellation stays cooperative (no
+        // files into its own sink, push its subdirectories back. Cancellation stays cooperative (no
         // token wired to the threads → no throw): a cancelled/capped item is drained without
         // processing, so `outstanding` still reaches zero and every thread exits.
-        void Drain()
+        void Drain(List<Candidate> sink)
         {
             SpinWait spin = default;
             while (true)
@@ -123,7 +132,7 @@ public sealed class DestinationProjector(
                     try
                     {
                         if (!ct.IsCancellationRequested && !state.Capped)
-                            Walk(item, state, survivors, sourceRoots, mirror, maxEntries);
+                            Walk(item, state, sink, survivors, sourceRoots, mirror, maxEntries);
                     }
                     finally
                     {
@@ -139,13 +148,22 @@ public sealed class DestinationProjector(
             }
         }
 
+        Stopwatch walkWatch = Stopwatch.StartNew();
         Task[] threads = new Task[dop];
         for (int i = 0; i < dop; i++)
+        {
+            List<Candidate> sink = sinks[i];   // capture a distinct list per thread
             threads[i] = Task.Factory.StartNew(
-                Drain, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+                () => Drain(sink), CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+        }
         Task.WaitAll(threads);
+        walkWatch.Stop();
 
-        return Merge(state, maxEntries);
+        Stopwatch mergeWatch = Stopwatch.StartNew();
+        DestinationSweepResult merged = Merge(sinks, state.Capped, maxEntries);
+        mergeWatch.Stop();
+
+        return merged with { WalkMs = walkWatch.ElapsedMilliseconds, MergeMs = mergeWatch.ElapsedMilliseconds };
     }
 
     /// <summary>Enumerates one directory (single level): pushes descendable subdirectories back onto
@@ -157,6 +175,7 @@ public sealed class DestinationProjector(
     private void Walk(
         WorkItem item,
         SweepState state,
+        List<Candidate> sink,
         ISet<NormalizedPath> survivors,
         List<NormalizedPath> sourceRoots,
         bool mirror,
@@ -196,8 +215,11 @@ public sealed class DestinationProjector(
             // Files only — directory/empty-dir deletion is not modeled.
             if (InfrastructurePaths.IsTempFileName(fsEntry.FileName))
                 continue;
-            if (!NormalizedPath.Create(fsEntry.FullPath).TryGetValue(out NormalizedPath filePath))
-                continue;
+            // The enumerated path descends from a target root that was already GetFullPath-canonicalized
+            // (see the seeding above), so it is itself canonical — wrap it WITHOUT paying Create's
+            // per-file Path.GetFullPath re-canonicalization. Survivor paths are canonicalized the same
+            // way (via Create on the destination-op paths), so OrdinalIgnoreCase matching is preserved.
+            NormalizedPath filePath = NormalizedPath.FromCanonical(fsEntry.FullPath);
             if (survivors.Contains(filePath))
                 continue;   // a source writes here — already an operation from the file phase
             if (IsUnderAnySource(filePath, sourceRoots))
@@ -214,7 +236,7 @@ public sealed class DestinationProjector(
                     ? OperationKind.Deleted          // orphan a mirror would remove
                     : OperationKind.Untouched;       // pre-existing, left in place
 
-            state.Results.Add(new Candidate(
+            sink.Add(new Candidate(
                 filePath,
                 new PhysicalFile
                 {
@@ -229,13 +251,19 @@ public sealed class DestinationProjector(
         }
     }
 
-    /// <summary>Serial merge of the concurrently-collected candidates into the index-paired result:
-    /// sorts by path for deterministic output, dedups overlapping roots, and assigns each op's
-    /// <see cref="VirtualFileOperation.SubjectIndex"/> so <c>Ops[i]</c> references <c>Files[i]</c>.
-    /// Applies the authoritative <paramref name="maxEntries"/> cap.</summary>
-    private static DestinationSweepResult Merge(SweepState state, int maxEntries)
+    /// <summary>Serial merge of the per-worker candidate lists into the index-paired result:
+    /// concatenates the lists, sorts by path for deterministic output, dedups overlapping roots, and
+    /// assigns each op's <see cref="VirtualFileOperation.SubjectIndex"/> so <c>Ops[i]</c> references
+    /// <c>Files[i]</c>. Applies the authoritative <paramref name="maxEntries"/> cap.</summary>
+    private static DestinationSweepResult Merge(List<Candidate>[] sinks, bool cappedDuringWalk, int maxEntries)
     {
-        List<Candidate> collected = new(state.Results);
+        int total = 0;
+        foreach (List<Candidate> sink in sinks)
+            total += sink.Count;
+
+        List<Candidate> collected = new(total);
+        foreach (List<Candidate> sink in sinks)
+            collected.AddRange(sink);
         collected.Sort(static (a, b) =>
             string.Compare(a.Path.Value, b.Path.Value, StringComparison.OrdinalIgnoreCase));
 
@@ -243,8 +271,8 @@ public sealed class DestinationProjector(
         List<VirtualFileOperation> ops = new(collected.Count);
         // Dedup across target roots that overlap (one nested under another) so a file enumerated
         // twice is reported once.
-        HashSet<NormalizedPath> reported = [];
-        bool capped = state.Capped;
+        HashSet<NormalizedPath> reported = new(collected.Count);
+        bool capped = cappedDuringWalk;
         foreach (Candidate candidate in collected)
         {
             if (!reported.Add(candidate.Path))
@@ -313,7 +341,6 @@ public sealed class DestinationProjector(
     /// mutated concurrently, so every mutation is interlocked (mirrors the engine's RunCounters).</summary>
     private sealed class SweepState
     {
-        public readonly ConcurrentBag<Candidate> Results = new();
         private readonly ConcurrentStack<WorkItem> _pending = new();
         // Directories queued OR being processed. Seeded/incremented on Enqueue, decremented on Done;
         // a worker exits only when it sees an empty stack AND this at zero (no peer can still push).

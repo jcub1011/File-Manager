@@ -67,6 +67,15 @@ public readonly record struct NormalizedPath : IComparable<NormalizedPath>
         }
     }
 
+    /// <summary>Wraps an already-absolute, already-canonical full path (e.g. one produced by a
+    /// directory enumeration that descended from a NormalizedPath root) WITHOUT re-running
+    /// Path.GetFullPath — the expensive re-canonicalization <see cref="Create"/> performs. The caller
+    /// guarantees the path is fully-qualified and canonical; only a trailing separator is trimmed
+    /// (a no-op — hence allocation-free — for enumerated file/dir names, which never carry one). Use
+    /// <see cref="Create"/> for any path from an untrusted or external source.</summary>
+    public static NormalizedPath FromCanonical(string canonicalFullPath) =>
+        new(System.IO.Path.TrimEndingDirectorySeparator(canonicalFullPath));
+
     public bool Equals(NormalizedPath other) => string.Equals(Value, other.Value, Comparison);
 
     public override int GetHashCode() =>

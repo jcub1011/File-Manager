@@ -38,8 +38,12 @@ public sealed record DryRunChunk(
 /// <summary>The destination sweep's output: pre-existing files under the target roots that no source
 /// writes to, each paired with its operation. <see cref="Ops"/>[i] references <see cref="Files"/>[i]
 /// (its <c>SubjectIndex</c> is <c>i</c>); a caller merging this into a larger report offsets those
-/// indices by the count of destination files already collected.</summary>
+/// indices by the count of destination files already collected. <see cref="WalkMs"/>/<see cref="MergeMs"/>
+/// split the sweep's own wall time (parallel directory walk vs. the serial sort/dedup merge) for the
+/// timing audit; both are 0 on the early-return (truncated / no target) paths.</summary>
 public readonly record struct DestinationSweepResult(
     IReadOnlyList<PhysicalFile> Files,
     IReadOnlyList<VirtualFileOperation> Ops,
-    bool Truncated = false);
+    bool Truncated = false,
+    long WalkMs = 0,
+    long MergeMs = 0);

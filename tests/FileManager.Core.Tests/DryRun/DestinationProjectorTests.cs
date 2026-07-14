@@ -1,4 +1,5 @@
 using FileManager.Contracts.DryRun;
+using FileManager.Contracts.Primitives;
 using FileManager.Contracts.Profiles;
 using FileManager.Core.DryRun;
 using FileManager.Core.Jobs;
@@ -224,4 +225,42 @@ public sealed class DestinationProjectorTests : IDisposable
 
     private DestinationSweepResult Sweep(Profile profile, int manualWorkers, int maxEntries) =>
         NewProjector().Sweep(profile, new HashSet<NormalizedPath>(), truncated: false, manualWorkers, CancellationToken.None, maxEntries);
+
+    // The sweep's per-file hot path wraps each enumerated path with NormalizedPath.FromCanonical
+    // (skipping Create's Path.GetFullPath) on the guarantee that a path enumerated beneath an
+    // already-canonical root is itself canonical. This locks that guarantee in: for every entry the
+    // walk would see — seeded exactly as the projector seeds it, from a Create-canonicalized root —
+    // the trusted wrap must produce the identical value the full Create would. A divergence here would
+    // silently break survivor matching (a source's own target re-reported as an orphan deletion).
+    [Fact]
+    public void FromCanonical_matches_Create_for_every_enumerated_path()
+    {
+        TargetFile(Path.Combine("a", "b", "c", "deep.txt"));
+        TargetFile("top.txt");
+        for (int i = 0; i < 10; i++)
+            TargetFile(Path.Combine($"w{i}", $"f{i}.txt"));
+
+        var fs = new FileSystemService(NullLogger<FileSystemService>.Instance);
+        // Seed from the canonical target root, mirroring DestinationProjector.Sweep.
+        Assert.True(NormalizedPath.Create(_target).TryGetValue(out NormalizedPath root));
+
+        int checkedEntries = 0;
+        void Recurse(string dir)
+        {
+            foreach (Result<FileSystemEntry, EnumerationFault> entry in fs.EnumerateEntries(dir))
+            {
+                Assert.True(entry.TryGetValue(out FileSystemEntry? e));
+                Assert.True(NormalizedPath.Create(e!.FullPath).TryGetValue(out NormalizedPath viaCreate));
+                NormalizedPath viaTrusted = NormalizedPath.FromCanonical(e.FullPath);
+                Assert.Equal(viaCreate.Value, viaTrusted.Value);   // Ordinal: byte-for-byte identical
+                Assert.Equal(viaCreate, viaTrusted);               // and equal under the path comparer
+                checkedEntries++;
+                if (e.IsDirectory)
+                    Recurse(e.FullPath);
+            }
+        }
+        Recurse(root.Value);
+
+        Assert.True(checkedEntries >= 12);   // sanity: the tree was actually walked
+    }
 }

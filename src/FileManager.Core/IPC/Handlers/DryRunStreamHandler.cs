@@ -169,10 +169,12 @@ public sealed class DryRunStreamHandler(
         if (logger.IsEnabled(LogLevel.Information))
             logger.LogInformation(
                 "Dry-run stream timings for profile {ProfileId}: total {TotalMs}ms " +
-                "(engine stream {EngineMs}ms, destination sweep {SweepMs}ms, space estimator {EstimatorMs}ms), " +
+                "(engine stream {EngineMs}ms, destination sweep {SweepMs}ms [walk {WalkMs}ms, merge {MergeMs}ms], " +
+                "space estimator {EstimatorMs}ms), " +
                 "{SourceCount} source files, {DestCount} destination files (+{SweepCount} swept)",
                 typed.ProfileId, totalWatch.ElapsedMilliseconds, engineMs, sweepWatch.ElapsedMilliseconds,
-                estimatorWatch.ElapsedMilliseconds, emitted, destinationCount, sweep.Files.Count);
+                sweep.WalkMs, sweep.MergeMs, estimatorWatch.ElapsedMilliseconds, emitted, destinationCount,
+                sweep.Files.Count);
         yield return new DryRunCompleteResponse { GeneratedAt = time.GetUtcNow(), Truncated = truncated, Space = space };
     }
 }
