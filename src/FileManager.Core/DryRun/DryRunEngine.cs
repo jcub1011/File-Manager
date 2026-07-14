@@ -132,6 +132,11 @@ public sealed class DryRunEngine(
 
                 if (candidates.Count >= MaxReportedFiles)
                 {
+                    // Accepted with the parallel scan: emission order is non-deterministic, so a fatal
+                    // walk-root fault produced after this cap is reached goes unobserved and the run
+                    // resolves as truncated-success rather than failed. That is deliberate — the cap
+                    // already means "we stopped looking", and the truncated flag communicates the
+                    // incompleteness (see ISourceScanner.Scan remarks).
                     truncated = true;
                     break;
                 }
@@ -305,6 +310,9 @@ public sealed class DryRunEngine(
 
             if (candidates.Count >= MaxScannedCandidates)
             {
+                // As in the batched path: with the parallel scan a fatal walk-root fault produced after
+                // this cap is reached goes unobserved and the stream truncates rather than fails. The
+                // truncated flag carries the incompleteness (see ISourceScanner.Scan remarks).
                 logger.LogWarning(
                     "Dry-run (stream) for profile {ProfileId} hit the {Cap:N0}-candidate safety bound; " +
                     "report truncated — the scan found more",

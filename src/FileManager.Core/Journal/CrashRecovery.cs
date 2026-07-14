@@ -48,10 +48,19 @@ public sealed class CrashRecovery(
         int recovered = 0, forward = 0, rolledBack = 0, cleaned = 0;
         var quarantined = new ConcurrentBag<string>();
 
-        // Each job is independent — distinct workspace/targets/source, and journal.Append is thread-safe
-        // (its own lock) — so the per-job work (which blocks on hashing and copies) runs concurrently.
-        // Counters are interlocked and quarantined is a concurrent bag; journal.Rotate + SweepOrphans
-        // stay in the serial tail after the barrier. Cancellation propagates as before (OCE out of Recover).
+        // Recover jobs concurrently — the one axis that is genuinely independent: each job owns a
+        // distinct WorkspaceDir (job-scoped temp), and journal.Append is thread-safe (its own lock), so
+        // the per-job work (which blocks on hashing and copies) overlaps safely. Shared state is
+        // confined: counters are interlocked, quarantined is a concurrent bag, and journal.Rotate +
+        // SweepOrphans run in the serial tail after the barrier. Cancellation propagates as before (OCE
+        // out of Recover).
+        //   Caveat: final *target* paths are NOT proven disjoint across jobs — two crashed jobs could in
+        // principle have targeted the same destination. Parallel recovery assumes they did not; the
+        // serial version made no ordering guarantee there either, so this is not a regression.
+        //   Nesting: RecoverJob → rollback fans out per-target, but RollbackExecutor caps that fan-out
+        // (MaxTargetParallelism) so the nested thread-pool demand stays O(cores × 8), not O(cores²).
+        // Recovery also runs before the IPC server starts (I-RECOVER-FIRST), so it contends with nothing
+        // for pool threads while it borrows them for this blocking work.
         Parallel.ForEach(
             byJob,
             new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, Environment.ProcessorCount), CancellationToken = ct },

@@ -20,6 +20,14 @@ public sealed class RollbackExecutor(IJobJournal journal, TimeProvider time, ILo
 {
     private const int MaxAttempts = 3;
 
+    /// <summary>Ceiling on concurrent per-target reverts. Each revert is blocking I/O (move/replace/
+    /// delete), so beyond a handful the disk — not the CPU — is the bottleneck (the same rationale as
+    /// <see cref="DryRun.DryRunConcurrency.AutoWorkers"/>). A small constant, rather than
+    /// <see cref="Environment.ProcessorCount"/>, deliberately bounds the total when this runs nested
+    /// under crash recovery's per-job <c>Parallel.ForEach</c>: the product stays O(cores × 8) instead
+    /// of O(cores²) blocking thread-pool work items.</summary>
+    private const int MaxTargetParallelism = 8;
+
     /// <summary>Backoff between rollback I/O attempts so a transient lock (AV / indexer / another
     /// handle) can clear before the retry. Test seam: unit tests set this to zero.</summary>
     internal TimeSpan RetryDelay { get; init; } = TimeSpan.FromMilliseconds(150);
@@ -72,7 +80,7 @@ public sealed class RollbackExecutor(IJobJournal journal, TimeProvider time, ILo
         else if (targets.Count > 1)
         {
             Parallel.For(0, targets.Count,
-                new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, Environment.ProcessorCount) },
+                new ParallelOptions { MaxDegreeOfParallelism = Math.Min(MaxTargetParallelism, targets.Count) },
                 i => reverts[i] = RevertTarget(targets[i], context.OverwriteHandling));
         }
 
