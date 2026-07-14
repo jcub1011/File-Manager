@@ -210,6 +210,27 @@ public sealed class DestinationProjectorTests : IDisposable
     }
 
     [Fact]
+    public void Overlapping_target_roots_report_a_shared_file_once()
+    {
+        // Two target roots where one is nested under the other, so the parent's walk and the child's
+        // walk both enumerate the files beneath the child. The merge must dedup them to a single entry.
+        string child = Path.Combine(_target, "shared");
+        Directory.CreateDirectory(child);
+        string overlap = Path.Combine(child, "both.txt");
+        File.WriteAllText(overlap, "x");
+
+        Profile profile = Mirror() with
+        {
+            Targets = [new TargetConfig { Path = _target }, new TargetConfig { Path = child }],
+        };
+
+        DestinationSweepResult result = Project(profile);
+
+        Assert.Single(result.Ops, o => string.Equals(o.Path, overlap, StringComparison.OrdinalIgnoreCase));
+        Assert.Equal(result.Files.Count, result.Ops.Count);   // still index-paired after dedup
+    }
+
+    [Fact]
     public void The_entry_budget_is_respected_under_parallelism()
     {
         for (int i = 0; i < 50; i++)

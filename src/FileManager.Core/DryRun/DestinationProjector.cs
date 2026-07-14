@@ -96,11 +96,16 @@ public sealed class DestinationProjector(
 
         // Seed the shared work queue with each valid target root (paired with itself so every file
         // enumerated beneath it records that root). Overlapping roots (one nested under another) may
-        // enqueue a subtree twice; the merge dedups by path.
+        // enqueue a subtree twice; the merge dedups by path — but only needs to when there is more
+        // than one root, since a single root never enumerates the same path twice.
         SweepState state = new();
+        int rootCount = 0;
         foreach (TargetConfig target in profile.Targets)
             if (NormalizedPath.Create(target.Path).TryGetValue(out NormalizedPath targetRoot))
+            {
                 state.Enqueue(new WorkItem(targetRoot.Value, targetRoot));
+                rootCount++;
+            }
 
         if (state.IsEmpty)
             return new DestinationSweepResult([], []);
@@ -160,7 +165,7 @@ public sealed class DestinationProjector(
         walkWatch.Stop();
 
         Stopwatch mergeWatch = Stopwatch.StartNew();
-        DestinationSweepResult merged = Merge(sinks, state.Capped, maxEntries);
+        DestinationSweepResult merged = Merge(sinks, state.Capped, maxEntries, dedup: rootCount > 1);
         mergeWatch.Stop();
 
         return merged with { WalkMs = walkWatch.ElapsedMilliseconds, MergeMs = mergeWatch.ElapsedMilliseconds };
@@ -255,7 +260,10 @@ public sealed class DestinationProjector(
     /// concatenates the lists, sorts by path for deterministic output, dedups overlapping roots, and
     /// assigns each op's <see cref="VirtualFileOperation.SubjectIndex"/> so <c>Ops[i]</c> references
     /// <c>Files[i]</c>. Applies the authoritative <paramref name="maxEntries"/> cap.</summary>
-    private static DestinationSweepResult Merge(List<Candidate>[] sinks, bool cappedDuringWalk, int maxEntries)
+    /// <param name="dedup">Whether paths can repeat across the walk (only when target roots overlap).
+    /// With a single root no path is ever enumerated twice, so the per-path dedup set — a full extra
+    /// hash of every survivor — is skipped.</param>
+    private static DestinationSweepResult Merge(List<Candidate>[] sinks, bool cappedDuringWalk, int maxEntries, bool dedup)
     {
         int total = 0;
         foreach (List<Candidate> sink in sinks)
@@ -270,12 +278,12 @@ public sealed class DestinationProjector(
         List<PhysicalFile> files = new(collected.Count);
         List<VirtualFileOperation> ops = new(collected.Count);
         // Dedup across target roots that overlap (one nested under another) so a file enumerated
-        // twice is reported once.
-        HashSet<NormalizedPath> reported = new(collected.Count);
+        // twice is reported once. Only allocated/consulted when more than one root was swept.
+        HashSet<NormalizedPath>? reported = dedup ? new(collected.Count) : null;
         bool capped = cappedDuringWalk;
         foreach (Candidate candidate in collected)
         {
-            if (!reported.Add(candidate.Path))
+            if (reported is not null && !reported.Add(candidate.Path))
                 continue;
             if (files.Count >= maxEntries)
             {
