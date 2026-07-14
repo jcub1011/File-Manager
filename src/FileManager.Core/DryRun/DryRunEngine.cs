@@ -864,10 +864,23 @@ public sealed class DryRunEngine(
         {
             if (policies.VerificationMethod is VerificationMethod.Sha256 or VerificationMethod.XxHash128)
             {
+                Result<byte[], JobError> targetHash;
                 if (cachedSourceHash is null)
                 {
+                    // First hashing target for this file: the source and target full-file reads are
+                    // independent, so run them concurrently — max(src, tgt) instead of src + tgt.
+                    // HashFileToBytesAsync never throws (cancellation and errors come back as Result
+                    // states), so WhenAll cannot fault and neither task is abandoned.
                     counters.CountHash(metadata.Length);
-                    var sourceHash = await hasher.HashFileToBytesAsync(sourcePath, policies.VerificationMethod, ct).ConfigureAwait(false);
+                    counters.CountHash(existingMeta.Length);
+                    Task<Result<byte[], JobError>> sourceTask =
+                        hasher.HashFileToBytesAsync(sourcePath, policies.VerificationMethod, ct);
+                    Task<Result<byte[], JobError>> targetTask =
+                        hasher.HashFileToBytesAsync(prospectivePath, policies.VerificationMethod, ct);
+                    await Task.WhenAll(sourceTask, targetTask).ConfigureAwait(false);
+
+                    Result<byte[], JobError> sourceHash = sourceTask.Result;
+                    targetHash = targetTask.Result;
                     if (sourceHash.IsCanceled)
                         // Placeholder — discarded by SimulateAsync's cancellation catch.
                         return Single(Op(OperationKind.Unknown, prospectivePath, 0, subject, "canceled"), cachedSourceHash);
@@ -876,9 +889,12 @@ public sealed class DryRunEngine(
                             $"could not hash the source: {hashError.Message}"), null);
                     sourceHash.TryGetValue(out cachedSourceHash);
                 }
+                else
+                {
+                    counters.CountHash(existingMeta.Length);
+                    targetHash = await hasher.HashFileToBytesAsync(prospectivePath, policies.VerificationMethod, ct).ConfigureAwait(false);
+                }
 
-                counters.CountHash(existingMeta.Length);
-                var targetHash = await hasher.HashFileToBytesAsync(prospectivePath, policies.VerificationMethod, ct).ConfigureAwait(false);
                 if (targetHash.IsCanceled)
                     return Single(Op(OperationKind.Unknown, prospectivePath, 0, subject, "canceled"), cachedSourceHash);
                 if (targetHash.TryGetError(out JobError? targetHashError))
