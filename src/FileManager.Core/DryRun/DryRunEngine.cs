@@ -109,34 +109,42 @@ public sealed class DryRunEngine(
 
         // Phase 1: drain the scan into a bounded candidate list. A fatal fault aborts the whole run;
         // warnings are logged and skipped. The file cap bounds both the buffered payloads and the
-        // parallel evaluation work below.
+        // parallel evaluation work below. The scan honours the same Manual concurrency pin as the
+        // evaluation and sweep (Automatic → the scanner auto-scales to the source medium).
+        int? scanWorkers = DryRunConcurrency.ResolveManualWorkers(profile, settings.Current);
         Stopwatch scanWatch = Stopwatch.StartNew();
         List<Payload> candidates = [];
-        foreach (var scanned in scanner.Scan(profile, TriggerKind.Cli, scopePath))
+        try
         {
-            if (ct.IsCancellationRequested)
-                return Result<DryRunReport, string>.Canceled();
-
-            if (scanned.TryGetError(out EnumerationFault fault))
+            foreach (var scanned in scanner.Scan(profile, TriggerKind.Cli, scopePath, scanWorkers, ct))
             {
-                if (fault.Severity == EnumerationSeverity.Fatal)
+                if (scanned.TryGetError(out EnumerationFault fault))
                 {
-                    logger.LogError("Dry-run for profile {ProfileId} failed: scan error: {Message}",
-                        profileId, fault.Message);
-                    return $"scan failed: {fault.Message}";
+                    if (fault.Severity == EnumerationSeverity.Fatal)
+                    {
+                        logger.LogError("Dry-run for profile {ProfileId} failed: scan error: {Message}",
+                            profileId, fault.Message);
+                        return $"scan failed: {fault.Message}";
+                    }
+                    logger.LogWarning("Dry-run enumeration warning: {Message}", fault.Message);
+                    continue;
                 }
-                logger.LogWarning("Dry-run enumeration warning: {Message}", fault.Message);
-                continue;
-            }
 
-            if (candidates.Count >= MaxReportedFiles)
-            {
-                truncated = true;
-                break;
-            }
+                if (candidates.Count >= MaxReportedFiles)
+                {
+                    truncated = true;
+                    break;
+                }
 
-            scanned.TryGetValue(out Payload? payload);
-            candidates.Add(payload!);
+                scanned.TryGetValue(out Payload? payload);
+                candidates.Add(payload!);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // The parallel scan throws when the token trips (even before any payload); a cancelled
+            // run resolves to Canceled, matching the evaluation phase below.
+            return Result<DryRunReport, string>.Canceled();
         }
 
         // Phase 2: fix the output order up front by sorting candidates by source path, then evaluate
@@ -273,11 +281,13 @@ public sealed class DryRunEngine(
         bool hasTransformers = profile.Transformers is { Count: > 0 };
 
         // Phase 1: drain the scan into a candidate list bounded by MaxScannedCandidates. A fatal fault
-        // ends the stream with a failure; warnings are logged and skipped.
+        // ends the stream with a failure; warnings are logged and skipped. The scan honours the same
+        // Manual concurrency pin as the evaluation and sweep (Automatic → auto-scale to the medium).
+        int? scanWorkers = DryRunConcurrency.ResolveManualWorkers(profile, settings.Current);
         Stopwatch scanWatch = Stopwatch.StartNew();
         List<Payload> candidates = [];
         bool scanTruncated = false;
-        foreach (var scanned in scanner.Scan(profile, TriggerKind.Cli, scopePath))
+        foreach (var scanned in scanner.Scan(profile, TriggerKind.Cli, scopePath, scanWorkers, ct))
         {
             ct.ThrowIfCancellationRequested();
             if (scanned.TryGetError(out EnumerationFault fault))

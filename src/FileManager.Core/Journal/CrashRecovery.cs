@@ -6,10 +6,12 @@ using FileManager.Core.Jobs;
 using FileManager.Core.Placement;
 using Microsoft.Extensions.Logging;
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Threading;
+using System.Threading.Tasks;
 
 namespace FileManager.Core.Journal;
 
@@ -44,38 +46,47 @@ public sealed class CrashRecovery(
         var knownJobs = new HashSet<Guid>(byJob.Keys);
 
         int recovered = 0, forward = 0, rolledBack = 0, cleaned = 0;
-        var quarantined = new List<string>();
+        var quarantined = new ConcurrentBag<string>();
 
-        foreach ((Guid jobId, List<JournalRecord> records) in byJob)
-        {
-            if (records.OfType<JobClosedRecord>().Any())
-                continue;                                   // already CLOSED
-            if (records.OfType<JobOpenedRecord>().FirstOrDefault() is not { } opened)
-                continue;                                   // records with no open (shouldn't happen)
-
-            recovered++;
-            ct.ThrowIfCancellationRequested();
-            try
+        // Each job is independent — distinct workspace/targets/source, and journal.Append is thread-safe
+        // (its own lock) — so the per-job work (which blocks on hashing and copies) runs concurrently.
+        // Counters are interlocked and quarantined is a concurrent bag; journal.Rotate + SweepOrphans
+        // stay in the serial tail after the barrier. Cancellation propagates as before (OCE out of Recover).
+        Parallel.ForEach(
+            byJob,
+            new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, Environment.ProcessorCount), CancellationToken = ct },
+            entry =>
             {
-                RecoveryOutcome outcome = RecoverJob(jobId, opened, records, quarantined);
-                switch (outcome)
+                Guid jobId = entry.Key;
+                List<JournalRecord> records = entry.Value;
+                if (records.OfType<JobClosedRecord>().Any())
+                    return;                                     // already CLOSED
+                if (records.OfType<JobOpenedRecord>().FirstOrDefault() is not { } opened)
+                    return;                                     // records with no open (shouldn't happen)
+
+                Interlocked.Increment(ref recovered);
+                try
                 {
-                    case RecoveryOutcome.CompletedForward: forward++; break;
-                    case RecoveryOutcome.RolledBack: rolledBack++; break;
-                    case RecoveryOutcome.CleanedPrePlacement: cleaned++; break;
+                    RecoveryOutcome outcome = RecoverJob(jobId, opened, records, quarantined);
+                    switch (outcome)
+                    {
+                        case RecoveryOutcome.CompletedForward: Interlocked.Increment(ref forward); break;
+                        case RecoveryOutcome.RolledBack: Interlocked.Increment(ref rolledBack); break;
+                        case RecoveryOutcome.CleanedPrePlacement: Interlocked.Increment(ref cleaned); break;
+                    }
                 }
-            }
-            catch (Exception ex)
-            {
-                logger.LogError(ex, "Recovery of job {JobId} failed; leaving it for the next startup", jobId);
-                recovered--;   // not resolved
-            }
-        }
+                catch (Exception ex)
+                {
+                    logger.LogError(ex, "Recovery of job {JobId} failed; leaving it for the next startup", jobId);
+                    Interlocked.Decrement(ref recovered);   // not resolved
+                }
+            });
 
         // Compact: startup recovery closes every job, so this collapses to one fresh segment.
         journal.Rotate();
 
-        SweepOrphans(knownJobs, quarantined);
+        var quarantinedPaths = quarantined.ToList();
+        SweepOrphans(knownJobs, quarantinedPaths);
 
         var report = new RecoveryReport
         {
@@ -83,17 +94,17 @@ public sealed class CrashRecovery(
             CompletedForward = forward,
             RolledBack = rolledBack,
             CleanedPrePlacement = cleaned,
-            QuarantinedPaths = quarantined,
+            QuarantinedPaths = quarantinedPaths,
         };
-        if (recovered > 0 || quarantined.Count > 0)
+        if (recovered > 0 || quarantinedPaths.Count > 0)
             logger.LogInformation("Crash recovery: {Recovered} recovered ({Forward} forward, {Back} rolled back, {Clean} pre-placement), {Quarantined} quarantined",
-                recovered, forward, rolledBack, cleaned, quarantined.Count);
+                recovered, forward, rolledBack, cleaned, quarantinedPaths.Count);
         return report;
     }
 
     private enum RecoveryOutcome { CompletedForward, RolledBack, CleanedPrePlacement }
 
-    private RecoveryOutcome RecoverJob(Guid jobId, JobOpenedRecord opened, List<JournalRecord> records, List<string> quarantined)
+    private RecoveryOutcome RecoverJob(Guid jobId, JobOpenedRecord opened, List<JournalRecord> records, ConcurrentBag<string> quarantined)
     {
         bool sealedPresent = records.OfType<OutputSealedRecord>().Any();
         bool committed = records.OfType<JobCommittedRecord>().Any();

@@ -6,6 +6,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Threading;
+using System.Threading.Tasks;
 
 namespace FileManager.Core.Journal;
 
@@ -56,10 +57,29 @@ public sealed class RollbackExecutor(IJobJournal journal, TimeProvider time, ILo
         var residuals = new List<string>();
         var keepStagingDirs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-        // 2. Per target, by state.
-        foreach (TargetRollbackItem target in context.Targets)
+        // 2. Per target, by state. Each RevertTarget touches only its own target's temp/final/staged
+        //    paths (independent and already error-isolated), so the blocking I/O — moves/replaces/
+        //    deletes, each with its own retry backoff — is run concurrently, then journaled serially
+        //    in target order below so the record sequence stays deterministic and a journal-write
+        //    failure still aborts. Cancellation is deliberately not wired here (as before): recovery
+        //    calls in with no live tasks, so a rollback always runs to completion.
+        IReadOnlyList<TargetRollbackItem> targets = context.Targets;
+        var reverts = new (RollbackAction Action, string? Error)[targets.Count];
+        if (targets.Count == 1)
         {
-            (RollbackAction action, string? error) = RevertTarget(target, context.OverwriteHandling);
+            reverts[0] = RevertTarget(targets[0], context.OverwriteHandling);
+        }
+        else if (targets.Count > 1)
+        {
+            Parallel.For(0, targets.Count,
+                new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, Environment.ProcessorCount) },
+                i => reverts[i] = RevertTarget(targets[i], context.OverwriteHandling));
+        }
+
+        for (int i = 0; i < targets.Count; i++)
+        {
+            TargetRollbackItem target = targets[i];
+            (RollbackAction action, string? error) = reverts[i];
 
             if (error is not null)
             {
