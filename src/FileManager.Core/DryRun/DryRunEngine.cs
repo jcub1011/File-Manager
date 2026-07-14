@@ -13,13 +13,16 @@ using FileManager.Contracts;
 using FileManager.Contracts.Settings;
 using System;
 using System.Buffers;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Runtime.CompilerServices;
+using System.Runtime.ExceptionServices;
 using System.Text.Json;
 using System.Threading;
+using System.Threading.Channels;
 using System.Threading.Tasks;
 
 namespace FileManager.Core.DryRun;
@@ -58,17 +61,18 @@ public sealed class DryRunEngine(
     internal const int ChunkByteThreshold = 1 * 1024 * 1024;
 
     /// <summary>Streaming lifts the frame-cap ceiling, but not the good sense of an upper limit. The
-    /// candidate buffer (<see cref="SimulateStreamAsync"/> phase 1) has to be fully materialized to
-    /// sort by source path, so a pathological scan of millions of files would otherwise buffer — and
-    /// then hash — all of them before the first chunk. This bound caps the buffered candidates
-    /// (and therefore the evaluation work), the same way <see cref="MaxReportedFiles"/> bounds the
+    /// evaluated results (<see cref="ScanAndEvaluateAsync"/>) have to be fully materialized to sort
+    /// by source path before the first chunk, so a pathological scan of millions of files would
+    /// otherwise buffer — and hash — all of them. This bound caps the accepted candidates (and
+    /// therefore the evaluation work), the same way <see cref="MaxReportedFiles"/> bounds the
     /// batched path. Hitting it marks the report truncated.</summary>
     internal const int MaxStreamedFiles = 500_000;
 
-    /// <summary>Candidates are evaluated in batches so the byte budget can halt evaluation early
-    /// (see phase 2). Sized well above the resolved worker count so every worker stays busy, while
-    /// capping the evaluation wasted past the truncation point to at most one batch.</summary>
-    private const int EvaluationBatchSize = 512;
+    /// <summary>Bound on the scan → evaluation hand-off buffer (see
+    /// <see cref="ScanAndEvaluateAsync"/>): big enough that a bursty scan never starves the
+    /// evaluation workers, small enough that a huge tree cannot balloon memory ahead of them
+    /// (the scanner's own output buffer is 4096).</summary>
+    private const int PipelineBufferCapacity = 1024;
 
     /// <summary>Test seam: production uses <see cref="MaxReportBytes"/>; tests shrink it so
     /// truncation is reachable without tens of thousands of real files.</summary>
@@ -81,6 +85,10 @@ public sealed class DryRunEngine(
     /// <summary>Test seam: production uses <see cref="MaxStreamedFiles"/>; tests shrink it so the
     /// candidate cap is reachable without generating half a million files.</summary>
     internal int MaxScannedCandidates { get; init; } = MaxStreamedFiles;
+
+    /// <summary>Test seam: production uses <see cref="MaxReportedFiles"/>; tests shrink it so the
+    /// batched file cap is reachable without generating tens of thousands of files.</summary>
+    internal int MaxBatchCandidates { get; init; } = MaxReportedFiles;
 
     public async Task<Result<DryRunReport, string>> SimulateAsync(
         Guid profileId, string? scopePath, CancellationToken ct = default)
@@ -105,100 +113,50 @@ public sealed class DryRunEngine(
         filtersResult.TryGetValue(out Dictionary<string, CompiledFilterSet>? filtersBySourceRoot);
 
         bool hasTransformers = profile.Transformers is { Count: > 0 };
-        bool truncated = false;
 
-        // Phase 1: drain the scan into a bounded candidate list. A fatal fault aborts the whole run;
-        // warnings are logged and skipped. The file cap bounds both the buffered payloads and the
-        // parallel evaluation work below. The scan honours the same Manual concurrency pin as the
-        // evaluation and sweep (Automatic → the scanner auto-scales to the source medium).
-        int? scanWorkers = DryRunConcurrency.ResolveManualWorkers(profile, settings.Current);
-        Stopwatch scanWatch = Stopwatch.StartNew();
-        List<Payload> candidates = [];
-        try
-        {
-            foreach (var scanned in scanner.Scan(profile, TriggerKind.Cli, scopePath, scanWorkers, ct))
-            {
-                if (scanned.TryGetError(out EnumerationFault fault))
-                {
-                    if (fault.Severity == EnumerationSeverity.Fatal)
-                    {
-                        logger.LogError("Dry-run for profile {ProfileId} failed: scan error: {Message}",
-                            profileId, fault.Message);
-                        return $"scan failed: {fault.Message}";
-                    }
-                    logger.LogWarning("Dry-run enumeration warning: {Message}", fault.Message);
-                    continue;
-                }
-
-                if (candidates.Count >= MaxReportedFiles)
-                {
-                    // Accepted with the parallel scan: emission order is non-deterministic, so a fatal
-                    // walk-root fault produced after this cap is reached goes unobserved and the run
-                    // resolves as truncated-success rather than failed. That is deliberate — the cap
-                    // already means "we stopped looking", and the truncated flag communicates the
-                    // incompleteness (see ISourceScanner.Scan remarks).
-                    truncated = true;
-                    break;
-                }
-
-                scanned.TryGetValue(out Payload? payload);
-                candidates.Add(payload!);
-            }
-        }
-        catch (OperationCanceledException)
-        {
-            // The parallel scan throws when the token trips (even before any payload); a cancelled
-            // run resolves to Canceled, matching the evaluation phase below.
-            return Result<DryRunReport, string>.Canceled();
-        }
-
-        // Phase 2: fix the output order up front by sorting candidates by source path, then evaluate
-        // them in that order. A source file's index is its sorted position, so truncation keeps a
-        // path-ordered *prefix* and no retained operation references a dropped file. Evaluating in
-        // bounded batches keeps the concurrency of an all-at-once pass while capping the work wasted
-        // past the truncation point to at most one batch. Every collaborator is read-only
-        // (I-DRYRUN-RO) and stateless, so the parallel evaluation is race-free; positional writes into
-        // the batch array make the append order deterministic regardless of completion order.
-        scanWatch.Stop();
-        candidates.Sort(static (a, b) =>
-            string.Compare(a.SourcePath, b.SourcePath, StringComparison.OrdinalIgnoreCase));
-
-        int maxConcurrency = ResolveWorkers(profile);
+        // Phases 1+2 are fused (see ScanAndEvaluateAsync): the scan streams payloads into a bounded
+        // buffer while a worker pool evaluates them as they arrive, so the two dominant I/O costs
+        // overlap instead of running back-to-back. A fatal fault aborts the whole run; warnings are
+        // logged and skipped; the file cap bounds the accepted payloads and therefore the evaluation
+        // work. A hash or target loop cut short by cancellation returns a partial/placeholder result;
+        // cancellation turns the whole run into Canceled rather than a misleading partial report.
         RunCounters counters = new();
-        Stopwatch evalWatch = Stopwatch.StartNew();
-        using ReportBuilder builder = new(ReportByteBudget);
+        PipelineOutcome outcome;
         try
         {
-            for (int start = 0; start < candidates.Count && !builder.Truncated; start += EvaluationBatchSize)
-            {
-                int count = Math.Min(EvaluationBatchSize, candidates.Count - start);
-                FileEvaluation?[] batch = new FileEvaluation?[count];
-                await Parallel.ForEachAsync(
-                    Enumerable.Range(0, count),
-                    new ParallelOptions { MaxDegreeOfParallelism = maxConcurrency, CancellationToken = ct },
-                    async (j, token) =>
-                    {
-                        batch[j] = await EvaluateFileAsync(
-                            profile, candidates[start + j], filtersBySourceRoot!, hasTransformers, counters, token)
-                            .ConfigureAwait(false);
-                    }).ConfigureAwait(false);
-
-                foreach (FileEvaluation? evaluation in batch)
-                {
-                    if (evaluation is null)
-                        continue;
-                    if (!builder.TryAddBundle(evaluation))
-                        break;      // budget full — Truncated is set, so the outer loop also stops
-                }
-            }
+            outcome = await ScanAndEvaluateAsync(
+                profile, scopePath, filtersBySourceRoot!, hasTransformers, MaxBatchCandidates, counters, ct)
+                .ConfigureAwait(false);
         }
         catch (OperationCanceledException)
         {
-            // A hash or target loop cut short by cancellation returns a partial/placeholder result;
-            // cancellation turns the whole run into Canceled rather than a misleading partial report.
             return Result<DryRunReport, string>.Canceled();
         }
-        evalWatch.Stop();
+
+        if (outcome.FatalScanError is not null)
+        {
+            logger.LogError("Dry-run for profile {ProfileId} failed: scan error: {Message}",
+                profileId, outcome.FatalScanError);
+            return $"scan failed: {outcome.FatalScanError}";
+        }
+
+        bool truncated = outcome.ScanTruncated;
+
+        // Fix the output order by sorting the evaluations by source path. A source file's index is
+        // its sorted position, so truncation keeps a path-ordered *prefix* and no retained operation
+        // references a dropped file. The byte budget can only be applied here (assembly needs the
+        // sorted order), so a byte-truncated report has over-evaluated its dropped tail — bounded by
+        // the file cap, and accepted as the price of the scan/eval overlap.
+        List<FileEvaluation> evaluations = outcome.Evaluations;
+        evaluations.Sort(static (a, b) =>
+            string.Compare(a.SourceFile.Path, b.SourceFile.Path, StringComparison.OrdinalIgnoreCase));
+
+        using ReportBuilder builder = new(ReportByteBudget);
+        foreach (FileEvaluation evaluation in evaluations)
+        {
+            if (!builder.TryAddBundle(evaluation))
+                break;      // budget full — Truncated is set
+        }
 
         truncated |= builder.Truncated;
 
@@ -206,7 +164,7 @@ public sealed class DryRunEngine(
             logger.LogWarning(
                 "Dry-run report for profile {ProfileId} truncated at {FileCount} source files / ~{Bytes:N0} bytes " +
                 "(caps: {ByteCap:N0} bytes, {FileCap} files) — the scan found more",
-                profileId, builder.SourceFiles.Count, builder.ReportBytes, ReportByteBudget, MaxReportedFiles);
+                profileId, builder.SourceFiles.Count, builder.ReportBytes, ReportByteBudget, MaxBatchCandidates);
 
         // Phase 3: destination-only entries (pre-existing Untouched + Mirror orphans). Suppressed
         // entirely when the source pass truncated (the survivor set would be incomplete, so any
@@ -231,11 +189,11 @@ public sealed class DryRunEngine(
         DateTimeOffset completedAt = time.GetUtcNow();
         logger.LogInformation(
             "Dry-run completed for profile {ProfileId}: {SourceCount} source files, {DestCount} destination files " +
-            "in {ElapsedMs}ms{Truncated} (scan {ScanMs}ms, evaluation {EvalMs}ms; {Probes} existence probes, " +
-            "{Stats} existing-target stats, {HashCount} files hashed / {HashBytes:N0} bytes)",
+            "in {ElapsedMs}ms{Truncated} (scan {ScanMs}ms within pipeline {EvalMs}ms — the phases overlap; " +
+            "{Probes} existence probes, {Stats} existing-target stats, {HashCount} files hashed / {HashBytes:N0} bytes)",
             profileId, builder.SourceFiles.Count, builder.DestinationFiles.Count,
             (completedAt - startedAt).TotalMilliseconds, truncated ? " (report truncated)" : "",
-            scanWatch.ElapsedMilliseconds, evalWatch.ElapsedMilliseconds,
+            outcome.ScanMs, outcome.EvalMs,
             counters.ExistenceProbes, counters.ExistingStats, counters.FilesHashed, counters.BytesHashed);
 
         return new DryRunReport
@@ -285,83 +243,48 @@ public sealed class DryRunEngine(
 
         bool hasTransformers = profile.Transformers is { Count: > 0 };
 
-        // Phase 1: drain the scan into a candidate list bounded by MaxScannedCandidates. A fatal fault
-        // ends the stream with a failure; warnings are logged and skipped. The scan honours the same
-        // Manual concurrency pin as the evaluation and sweep (Automatic → auto-scale to the medium).
-        int? scanWorkers = DryRunConcurrency.ResolveManualWorkers(profile, settings.Current);
-        Stopwatch scanWatch = Stopwatch.StartNew();
-        List<Payload> candidates = [];
-        bool scanTruncated = false;
-        foreach (var scanned in scanner.Scan(profile, TriggerKind.Cli, scopePath, scanWorkers, ct))
+        // Phases 1+2 are fused (see ScanAndEvaluateAsync): the scan streams payloads into a bounded
+        // buffer while a worker pool evaluates them as they arrive. Chunks cannot be yielded before
+        // the pipeline completes — output order is fixed by the sort below, so the first chunk needs
+        // the full evaluated set regardless; the win is the scan/eval overlap, not first-chunk
+        // latency. A fatal fault ends the stream with a failure; cancellation propagates as an
+        // OperationCanceledException from the enumerator, exactly as before.
+        RunCounters counters = new();
+        PipelineOutcome outcome = await ScanAndEvaluateAsync(
+            profile, scopePath, filtersBySourceRoot!, hasTransformers, MaxScannedCandidates, counters, ct)
+            .ConfigureAwait(false);
+
+        if (outcome.FatalScanError is not null)
         {
-            ct.ThrowIfCancellationRequested();
-            if (scanned.TryGetError(out EnumerationFault fault))
-            {
-                if (fault.Severity == EnumerationSeverity.Fatal)
-                {
-                    logger.LogError("Dry-run (stream) for profile {ProfileId} failed: scan error: {Message}",
-                        profileId, fault.Message);
-                    yield return $"scan failed: {fault.Message}";
-                    yield break;
-                }
-                logger.LogWarning("Dry-run enumeration warning: {Message}", fault.Message);
-                continue;
-            }
-
-            if (candidates.Count >= MaxScannedCandidates)
-            {
-                // As in the batched path: with the parallel scan a fatal walk-root fault produced after
-                // this cap is reached goes unobserved and the stream truncates rather than fails. The
-                // truncated flag carries the incompleteness (see ISourceScanner.Scan remarks).
-                logger.LogWarning(
-                    "Dry-run (stream) for profile {ProfileId} hit the {Cap:N0}-candidate safety bound; " +
-                    "report truncated — the scan found more",
-                    profileId, MaxScannedCandidates);
-                scanTruncated = true;
-                break;
-            }
-
-            scanned.TryGetValue(out Payload? payload);
-            candidates.Add(payload!);
+            logger.LogError("Dry-run (stream) for profile {ProfileId} failed: scan error: {Message}",
+                profileId, outcome.FatalScanError);
+            yield return $"scan failed: {outcome.FatalScanError}";
+            yield break;
         }
 
-        scanWatch.Stop();
+        bool scanTruncated = outcome.ScanTruncated;
+        if (scanTruncated)
+            logger.LogWarning(
+                "Dry-run (stream) for profile {ProfileId} hit the {Cap:N0}-candidate safety bound; " +
+                "report truncated — the scan found more",
+                profileId, MaxScannedCandidates);
 
-        // Phase 2: fix the output order (source path), evaluate in bounded batches, and flush a chunk
-        // whenever the buffer's upper-bound size crosses the threshold. Indices are global across
-        // chunks (tracked by the accumulator) so the client simply concatenates.
-        candidates.Sort(static (a, b) =>
-            string.Compare(a.SourcePath, b.SourcePath, StringComparison.OrdinalIgnoreCase));
+        // Fix the output order (source path) and flush a chunk whenever the buffer's upper-bound
+        // size crosses the threshold. Indices are global across chunks (tracked by the accumulator)
+        // so the client simply concatenates.
+        List<FileEvaluation> evaluations = outcome.Evaluations;
+        evaluations.Sort(static (a, b) =>
+            string.Compare(a.SourceFile.Path, b.SourceFile.Path, StringComparison.OrdinalIgnoreCase));
 
-        int maxConcurrency = ResolveWorkers(profile);
-        RunCounters counters = new();
-        Stopwatch evalWatch = Stopwatch.StartNew();
         StreamAccumulator accumulator = new();
         bool anyEmitted = false;
-        for (int start = 0; start < candidates.Count; start += EvaluationBatchSize)
+        foreach (FileEvaluation evaluation in evaluations)
         {
-            int count = Math.Min(EvaluationBatchSize, candidates.Count - start);
-            FileEvaluation?[] batch = new FileEvaluation?[count];
-            await Parallel.ForEachAsync(
-                Enumerable.Range(0, count),
-                new ParallelOptions { MaxDegreeOfParallelism = maxConcurrency, CancellationToken = ct },
-                async (j, token) =>
-                {
-                    batch[j] = await EvaluateFileAsync(
-                        profile, candidates[start + j], filtersBySourceRoot!, hasTransformers, counters, token)
-                        .ConfigureAwait(false);
-                }).ConfigureAwait(false);
-
-            foreach (FileEvaluation? evaluation in batch)
+            accumulator.Add(evaluation);
+            if (accumulator.Bytes >= ChunkByteBudget)
             {
-                if (evaluation is null)
-                    continue;
-                accumulator.Add(evaluation);
-                if (accumulator.Bytes >= ChunkByteBudget)
-                {
-                    yield return Result<DryRunChunk, string>.Success(accumulator.Flush() with { ScanTruncated = scanTruncated });
-                    anyEmitted = true;
-                }
+                yield return Result<DryRunChunk, string>.Success(accumulator.Flush() with { ScanTruncated = scanTruncated });
+                anyEmitted = true;
             }
         }
         if (accumulator.HasData)
@@ -376,16 +299,162 @@ public sealed class DryRunEngine(
         if (scanTruncated && !anyEmitted)
             yield return Result<DryRunChunk, string>.Success(new DryRunChunk([], [], [], [], ScanTruncated: true));
 
-        evalWatch.Stop();
         DateTimeOffset completedAt = time.GetUtcNow();
         if (logger.IsEnabled(LogLevel.Information))
             logger.LogInformation(
                 "Dry-run (stream) completed for profile {ProfileId}: {SourceCount} source files in {ElapsedMs}ms " +
-                "(scan {ScanMs}ms, evaluation {EvalMs}ms; {Probes} existence probes, {Stats} existing-target stats, " +
-                "{HashCount} files hashed / {HashBytes:N0} bytes)",
+                "(scan {ScanMs}ms within pipeline {EvalMs}ms — the phases overlap; {Probes} existence probes, " +
+                "{Stats} existing-target stats, {HashCount} files hashed / {HashBytes:N0} bytes)",
                 profileId, accumulator.TotalSourceFiles, (completedAt - startedAt).TotalMilliseconds,
-                scanWatch.ElapsedMilliseconds, evalWatch.ElapsedMilliseconds,
+                outcome.ScanMs, outcome.EvalMs,
                 counters.ExistenceProbes, counters.ExistingStats, counters.FilesHashed, counters.BytesHashed);
+    }
+
+    /// <summary>The fused scan+evaluation pipeline's result. <see cref="Evaluations"/> is UNSORTED
+    /// (completion order — the parallel scan's emission order is already non-deterministic); the
+    /// caller sorts by source path before assembly, which is where index assignment happens. A
+    /// fatal scan fault is carried as a value in <see cref="FatalScanError"/>, never thrown.
+    /// <see cref="ScanMs"/> is the pump's span within the <see cref="EvalMs"/> pipeline wall time —
+    /// the two overlap by design.</summary>
+    private sealed record PipelineOutcome(
+        List<FileEvaluation> Evaluations,
+        bool ScanTruncated,
+        string? FatalScanError,
+        long ScanMs,
+        long EvalMs);
+
+    /// <summary>Fused scan → evaluation pipeline shared by the batched and streamed simulations
+    /// (spec §8; all collaborators read-only, I-DRYRUN-RO). A single pump task drains the scanner —
+    /// its returned iterator is not safe for concurrent MoveNext — into a bounded channel while
+    /// <see cref="ResolveWorkers"/> consumers evaluate payloads as they arrive, so enumeration and
+    /// evaluation I/O overlap instead of running back-to-back. Responsibilities and semantics,
+    /// unchanged from the pre-pipeline phases:
+    /// <list type="bullet">
+    /// <item>Warning fault → logged and skipped (in the pump).</item>
+    /// <item>Fatal fault → the pump cancels the linked token (consumers tear down promptly, the
+    /// buffered tail is dropped unevaluated) and the fault comes back as a value. Checked before
+    /// cancellation on the way out, so a fault that raced a cancel still wins deterministically.</item>
+    /// <item>File cap (<paramref name="candidateCap"/>) → stop accepting, mark truncated. As before,
+    /// a fatal walk-root fault produced after the cap goes unobserved and the run resolves as
+    /// truncated-success (see ISourceScanner.Scan remarks).</item>
+    /// <item>Cancellation (the caller's token) → OperationCanceledException after both sides have
+    /// torn down; the scan iterator's disposal runs the scanner's own cancel → drain → dispose.</item>
+    /// <item>An unexpected evaluation exception → cancels the pump (it must not stay blocked on a
+    /// full buffer), then rethrows once both sides have joined.</item>
+    /// </list></summary>
+    private async Task<PipelineOutcome> ScanAndEvaluateAsync(
+        Profile profile,
+        string? scopePath,
+        Dictionary<string, CompiledFilterSet> filtersBySourceRoot,
+        bool hasTransformers,
+        int candidateCap,
+        RunCounters counters,
+        CancellationToken ct)
+    {
+        using CancellationTokenSource linked = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        Channel<Payload> channel = Channel.CreateBounded<Payload>(new BoundedChannelOptions(PipelineBufferCapacity)
+        {
+            SingleWriter = true,
+            SingleReader = false,
+            FullMode = BoundedChannelFullMode.Wait,
+        });
+
+        // Written by the pump before it completes or cancels; read only after the pump is awaited
+        // (the task join is the memory fence).
+        string? fatalError = null;
+        bool scanTruncated = false;
+
+        // The scan honours the same Manual concurrency pin as the evaluation and sweep
+        // (Automatic → the scanner auto-scales to the source medium).
+        int? scanWorkers = DryRunConcurrency.ResolveManualWorkers(profile, settings.Current);
+        Stopwatch scanWatch = Stopwatch.StartNew();
+
+        Task pump = Task.Run(async () =>
+        {
+            try
+            {
+                int accepted = 0;
+                foreach (var scanned in scanner.Scan(profile, TriggerKind.Cli, scopePath, scanWorkers, linked.Token))
+                {
+                    if (scanned.TryGetError(out EnumerationFault fault))
+                    {
+                        if (fault.Severity == EnumerationSeverity.Fatal)
+                        {
+                            fatalError = fault.Message;
+                            linked.Cancel();
+                            return;
+                        }
+                        logger.LogWarning("Dry-run enumeration warning: {Message}", fault.Message);
+                        continue;
+                    }
+
+                    if (accepted >= candidateCap)
+                    {
+                        scanTruncated = true;
+                        return;
+                    }
+
+                    scanned.TryGetValue(out Payload? payload);
+                    await channel.Writer.WriteAsync(payload!, linked.Token).ConfigureAwait(false);
+                    accepted++;
+                }
+            }
+            finally
+            {
+                // Unconditional, so consumers never wait on a writer that is already gone. Leaving
+                // the foreach on any path disposes the scan iterator, which runs the scanner's own
+                // teardown (cancel producers → drain → dispose).
+                channel.Writer.TryComplete();
+                scanWatch.Stop();
+            }
+        });
+
+        ConcurrentQueue<FileEvaluation> results = new();
+        Stopwatch evalWatch = Stopwatch.StartNew();
+        Exception? consumerError = null;
+        try
+        {
+            await Parallel.ForEachAsync(
+                channel.Reader.ReadAllAsync(linked.Token),
+                new ParallelOptions { MaxDegreeOfParallelism = ResolveWorkers(profile), CancellationToken = linked.Token },
+                async (payload, token) =>
+                {
+                    FileEvaluation? evaluation = await EvaluateFileAsync(
+                        profile, payload, filtersBySourceRoot, hasTransformers, counters, token)
+                        .ConfigureAwait(false);
+                    if (evaluation is not null)
+                        results.Enqueue(evaluation);
+                }).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            // Fatal-fault teardown or user cancellation — disambiguated after the pump joins.
+        }
+        catch (Exception ex)
+        {
+            consumerError = ex;
+            linked.Cancel();   // unblock a pump stuck writing into a full buffer
+        }
+        evalWatch.Stop();
+
+        try
+        {
+            await pump.ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            // Expected on every teardown path: the user's token tripping the scan, or a fault above
+            // cancelling the linked source while the pump was blocked in MoveNext/WriteAsync.
+        }
+
+        if (fatalError is not null)
+            return new PipelineOutcome([], false, fatalError, scanWatch.ElapsedMilliseconds, evalWatch.ElapsedMilliseconds);
+        if (consumerError is not null)
+            ExceptionDispatchInfo.Capture(consumerError).Throw();
+        ct.ThrowIfCancellationRequested();
+
+        return new PipelineOutcome(
+            [.. results], scanTruncated, null, scanWatch.ElapsedMilliseconds, evalWatch.ElapsedMilliseconds);
     }
 
     /// <summary>Compiles one filter set per source, keyed by the source root the scanner stamps on

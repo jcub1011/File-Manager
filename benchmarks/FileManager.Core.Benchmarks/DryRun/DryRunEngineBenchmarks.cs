@@ -28,6 +28,18 @@ public enum DryRunScenario
     AllUnchanged,
 }
 
+/// <summary>The source-medium dimension: local temp-dir enumeration, or the same tree behind a
+/// per-directory round-trip delay approximating a network share. Only the scanner's filesystem is
+/// slowed — evaluation stats/hashes bypass <see cref="IFileSystemService"/> — so this isolates
+/// enumeration latency, the cost the scan→evaluation pipeline overlap targets.</summary>
+public enum SourceLatency
+{
+    Local,
+
+    /// <summary>~2 ms per directory open, the order of a LAN SMB metadata round-trip.</summary>
+    Slow,
+}
+
 /// <summary>Measures <see cref="DryRunEngine.SimulateAsync"/> end-to-end over the real collaborators
 /// (scanner, filter compiler, hasher, conflict resolver). This is the top-level per-file loop: for
 /// every scanned file it evaluates filters, stats, optionally hashes source + existing target twice,
@@ -52,6 +64,9 @@ public class DryRunEngineBenchmarks
     [Params(DryRunScenario.AllNew, DryRunScenario.AllUnchanged)]
     public DryRunScenario Scenario { get; set; }
 
+    [Params(SourceLatency.Local, SourceLatency.Slow)]
+    public SourceLatency Latency { get; set; }
+
     [GlobalSetup]
     public void Setup()
     {
@@ -72,7 +87,10 @@ public class DryRunEngineBenchmarks
         _profileId = profile.Id;
 
         var fileSystem = new FileSystemService(NullLogger<FileSystemService>.Instance);
-        var scanner = new SourceScanner(NullLogger<SourceScanner>.Instance, fileSystem, TimeProvider.System);
+        IFileSystemService scanFileSystem = Latency == SourceLatency.Slow
+            ? new SlowFileSystem(fileSystem, TimeSpan.FromMilliseconds(2))
+            : fileSystem;
+        var scanner = new SourceScanner(NullLogger<SourceScanner>.Instance, scanFileSystem, TimeProvider.System);
 
         _engine = new DryRunEngine(
             NullLogger<DryRunEngine>.Instance,
@@ -84,6 +102,22 @@ public class DryRunEngineBenchmarks
             new FixedSettings(),
             TimeProvider.System,
             new DestinationProjector(NullLogger<DestinationProjector>.Instance, fileSystem, new LocalVolumes()));
+    }
+
+    /// <summary>Injects a per-directory round-trip delay into enumeration only (the delay runs
+    /// eagerly at the open, like a network directory handle; the entries themselves then stream
+    /// from the local tree). Everything else delegates untouched.</summary>
+    private sealed class SlowFileSystem(IFileSystemService inner, TimeSpan perDirectory) : IFileSystemService
+    {
+        public IEnumerable<Result<FileSystemEntry, EnumerationFault>> EnumerateEntries(string path)
+        {
+            Thread.Sleep(perDirectory);
+            return inner.EnumerateEntries(path);
+        }
+
+        public IEnumerable<Result<FileSystemEntry, EnumerationFault>> EnumerateRoots() => inner.EnumerateRoots();
+        public Result<string, string> GetHomeDirectory() => inner.GetHomeDirectory();
+        public Result<string?, string> GetParent(string path) => inner.GetParent(path);
     }
 
     /// <summary>The benchmark trees live in the local temp dir; the projector only consults
