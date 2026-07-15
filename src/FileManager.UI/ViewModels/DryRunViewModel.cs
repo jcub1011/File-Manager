@@ -371,8 +371,17 @@ public sealed partial class DryRunTreeNode : ObservableObject
                 return null;
 
             // FullPath stays absolute: seed the running prefix with the common root when the path
-            // was taken relative to it; otherwise (fallback to the full path) start empty.
-            string prefix = ReferenceEquals(relative, dirPath) ? "" : rootPrefix ?? "";
+            // was taken relative to it; otherwise (fallback to the full path) start empty — EXCEPT a
+            // UNC path, whose leading "\\" is a separator that Split(RemoveEmptyEntries) drops, so seed
+            // a single backslash and let the loop's first append ($"{prefix}\\{segment}") add the second,
+            // reconstructing "\\server\share\…" instead of "server\share\…".
+            string prefix;
+            if (!ReferenceEquals(relative, dirPath))
+                prefix = rootPrefix ?? "";
+            else if (dirPath.StartsWith(@"\\", StringComparison.Ordinal) || dirPath.StartsWith("//", StringComparison.Ordinal))
+                prefix = @"\";
+            else
+                prefix = "";
             List<DryRunTreeNode> level = roots;
             Dictionary<string, DryRunTreeNode> index = rootIndex;
             DryRunTreeNode? node = null;
@@ -682,6 +691,8 @@ public sealed partial class DryRunSourcesTab : ViewModelBase
 
         SearchText = "";
         ShowTree = false;
+        Tree = [];   // mirror Clear(): the _applying guard stops the ShowTree setter from clearing a
+                     // previously-built forest, which would otherwise stay retained until the next toggle.
         _applying = false;
         Rebuild();
     }
@@ -871,6 +882,8 @@ public sealed partial class DryRunDestinationsTab : ViewModelBase
 
         SearchText = "";
         ShowTree = false;
+        Tree = [];   // mirror Clear(): the _applying guard stops the ShowTree setter from clearing a
+                     // previously-built forest, which would otherwise stay retained until the next toggle.
         _applying = false;
         Rebuild();
     }

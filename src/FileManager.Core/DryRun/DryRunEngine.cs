@@ -45,10 +45,12 @@ public sealed class DryRunEngine(
     DestinationProjector destinationProjector) : IDryRunEngine
 {
     /// <summary>Report size guards: a serialized report must fit an IPC frame (16 MiB cap, §3.1).
-    /// The byte budget is the guarantee — each record is measured as serialized and the report
-    /// truncates when the running total would exceed it (16 MiB minus the response envelope and
-    /// headroom for future additive fields). The file-count cap is a secondary bound on UI
-    /// row-building work.</summary>
+    /// The byte budget is the guarantee — each record's size is a cheap tight upper-bound estimate
+    /// (<see cref="UpperBoundBytes(PhysicalFile)"/> / <see cref="StringUpperBound"/>, never actual
+    /// serialization) and the report truncates when the running total would exceed it (16 MiB minus
+    /// the response envelope and headroom for future additive fields). Because the estimate is an
+    /// upper bound, the true serialized report is always smaller than the budget. The file-count cap
+    /// is a secondary bound on UI row-building work.</summary>
     internal const int MaxReportBytes = 12 * 1024 * 1024;
     internal const int MaxReportedFiles = 50_000;
 

@@ -12,6 +12,10 @@ namespace FileManager.UI.Tests;
 /// preview holds for its lifetime. BenchmarkDotNet's Allocated column is per-op allocation, not
 /// retention, so this probe is the gauge for the memory-optimization work. Filter with
 /// <c>dotnet test --filter Category=Memory</c>; it builds a 500k-file report and is slow.</summary>
+/// <remarks>Pinned to a non-parallel collection: <see cref="GC.GetTotalMemory(bool)"/> measures the
+/// whole process heap, so letting other collections allocate concurrently during a full-suite run
+/// would contaminate the before/after delta and flake the budget asserts.</remarks>
+[Collection("Memory")]
 public sealed class DryRunViewModelMemoryTests(ITestOutputHelper output)
 {
     private const int FileCount = 500_000;

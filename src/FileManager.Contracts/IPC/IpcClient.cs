@@ -193,6 +193,17 @@ public sealed class IpcClient : IAsyncDisposable
                                     $"the service sent a directory entry ('{dir.Name}') whose ParentIndex {dir.ParentIndex} does not precede it in the table");
                             directories.Add(dir);
                         }
+                        // Every file/op index must resolve against the table assembled so far
+                        // (directories precede the records that reference them). Reject an
+                        // out-of-range index here rather than letting a consumer crash on it.
+                        if (DryRunDirectoryTable.FindInvalidReference(
+                                directories.Count, chunk.SourceFiles, chunk.SourceOperations) is { } badSource)
+                            return new IpcError("IPC_MALFORMED",
+                                $"the service sent a record with an out-of-range directory index: {badSource}");
+                        if (DryRunDirectoryTable.FindInvalidReference(
+                                directories.Count, chunk.DestinationFiles, chunk.DestinationOperations) is { } badDest)
+                            return new IpcError("IPC_MALFORMED",
+                                $"the service sent a record with an out-of-range directory index: {badDest}");
                         sourceFiles.AddRange(chunk.SourceFiles);
                         destinationFiles.AddRange(chunk.DestinationFiles);
                         sourceOperations.AddRange(chunk.SourceOperations);

@@ -32,6 +32,14 @@
     <ProjectReference Include="..\FileManager.Service\FileManager.Service.csproj" ReferenceOutputAssembly="false" OutputItemType="ServiceHostAssembly" Private="false" />
   </ItemGroup>
 
+  <!-- Fail fast with an actionable message when the TreeDataGrid submodule wasn't checked out
+       (a plain `git clone` that omits the recurse-submodules flag leaves third_party/TreeDataGrid
+       empty, so the ProjectReference above would otherwise fail with an opaque "project not found"). -->
+  <Target Name="EnsureTreeDataGridSubmodule" BeforeTargets="PrepareForBuild">
+    <Error Condition="!Exists('$(MSBuildThisFileDirectory)..\..\third_party\TreeDataGrid\src\Avalonia.Controls.TreeDataGrid\Avalonia.Controls.TreeDataGrid.csproj')"
+           Text="The TreeDataGrid submodule is missing. Run: git submodule update --init --recursive" />
+  </Target>
+
   <!-- Copies the Service host's entire output (exe, dlls, runtimeconfig) into the UI's output
        directory so ServiceLauncher's side-by-side probe works under F5 without env overrides. -->
   <Target Name="CopyServiceHostOutput" AfterTargets="Build" Condition="'@(ServiceHostAssembly)' != ''">

@@ -235,7 +235,43 @@ public sealed class DryRunPipelineTests : IDisposable
         Assert.Equal(one, eight);
     }
 
+    [Fact]
+    public async Task Concurrent_hashing_yields_the_expected_operation_kinds()
+    {
+        // Byte-identity (above) proves the workers agree; this pins the *correct* outcome so a
+        // wrong-but-deterministic evaluation bug (which would agree at both worker counts and pass
+        // the identity test) is still caught. Run at 8 workers so the concurrent source+target hash
+        // path in the unchanged/conflict check is genuinely exercised.
+        string[] emissionOrder = ["j.txt", "c.txt", "a.txt", "h.txt", "e.txt", "b.txt", "l.txt",
+            "d.txt", "k.txt", "f.txt", "i.txt", "g.txt"];
+        foreach (string name in emissionOrder)
+            SourceFile(name, $"content of {name}");
+        TargetFile("c.txt", "content of c.txt");    // byte-identical target → SkipUnchanged
+        TargetFile("e.txt", "DIFFERENT of e.txt");  // same length, different content, Skip → SkipConflict
+        Profile profile = ProfileUnderTest();
+
+        DryRunReport report = await BuildReport(profile, manualWorkers: 8, emissionOrder);
+
+        AssertIndicesValid(report);
+        string[] dirPaths = DryRunDirectoryTable.Materialize(report.Directories);
+        Dictionary<string, OperationKind> destKind = report.DestinationOperations
+            .ToDictionary(o => o.FileName, o => o.Kind);
+
+        Assert.Equal(12, report.SourceFiles.Count);
+        Assert.Equal(OperationKind.SkipUnchanged, destKind["c.txt"]);   // hashes matched
+        Assert.Equal(OperationKind.SkipConflict, destKind["e.txt"]);    // same size, hashes differ
+        foreach (string name in emissionOrder.Where(n => n is not ("c.txt" or "e.txt")))
+            Assert.Equal(OperationKind.New, destKind[name]);
+    }
+
     private async Task<byte[]> SerializedReport(Profile profile, int manualWorkers, string[] emissionOrder)
+    {
+        DryRunReport report = await BuildReport(profile, manualWorkers, emissionOrder);
+        return JsonSerializer.SerializeToUtf8Bytes(
+            report with { GeneratedAt = default }, FileManagerJsonContext.Default.DryRunReport);
+    }
+
+    private async Task<DryRunReport> BuildReport(Profile profile, int manualWorkers, string[] emissionOrder)
     {
         Profile pinned = profile with
         {
@@ -246,8 +282,7 @@ public sealed class DryRunPipelineTests : IDisposable
 
         var simulated = await NewEngine(scanner, pinned).SimulateAsync(pinned.Id, null);
         Assert.True(simulated.TryGetValue(out DryRunReport? report));
-        return JsonSerializer.SerializeToUtf8Bytes(
-            report! with { GeneratedAt = default }, FileManagerJsonContext.Default.DryRunReport);
+        return report!;
     }
 
     // ----- scripted collaborators -----

@@ -193,4 +193,71 @@ public sealed class DryRunDirectoryTableTests
         Assert.Throws<InvalidOperationException>(() =>
             DryRunDirectoryTable.Materialize([new DryRunDirectory(@"C:\", -1), new DryRunDirectory("a", 2)]));
     }
+
+    [Fact]
+    public void Materialize_throws_on_an_invalid_negative_parent_reference()
+    {
+        // Any negative ParentIndex other than -1 (the "root" sentinel) is malformed.
+        Assert.Throws<InvalidOperationException>(() =>
+            DryRunDirectoryTable.Materialize([new DryRunDirectory("a", -2)]));
+    }
+
+    [Fact]
+    public void FindInvalidReference_returns_null_when_every_reference_is_in_range()
+    {
+        // Two directories (indices 0, 1); every file/op index sits within [0, 2).
+        Assert.Null(DryRunDirectoryTable.FindInvalidReference(
+            directoryCount: 2,
+            files: [File(dirIndex: 0, rootDirIndex: 1)],
+            operations: [Op(dirIndex: 1, rootDirIndex: 0)]));
+    }
+
+    [Theory]
+    [InlineData(2, 0)]   // DirIndex == count (one past the end)
+    [InlineData(99, 0)]  // DirIndex well past the end
+    [InlineData(-1, 0)]  // negative DirIndex
+    [InlineData(0, 2)]   // RootDirIndex out of range
+    [InlineData(0, -1)]  // negative RootDirIndex
+    public void FindInvalidReference_flags_an_out_of_range_file_index(int dirIndex, int rootDirIndex)
+    {
+        string? bad = DryRunDirectoryTable.FindInvalidReference(
+            directoryCount: 2,
+            files: [File(dirIndex, rootDirIndex)],
+            operations: []);
+
+        Assert.NotNull(bad);
+        Assert.Contains("file", bad);
+    }
+
+    [Theory]
+    [InlineData(2, 0)]
+    [InlineData(-1, 0)]
+    [InlineData(0, 5)]
+    public void FindInvalidReference_flags_an_out_of_range_operation_index(int dirIndex, int rootDirIndex)
+    {
+        string? bad = DryRunDirectoryTable.FindInvalidReference(
+            directoryCount: 2,
+            files: [],
+            operations: [Op(dirIndex, rootDirIndex)]);
+
+        Assert.NotNull(bad);
+        Assert.Contains("operation", bad);
+    }
+
+    private static DryRunFile File(int dirIndex, int rootDirIndex) => new()
+    {
+        DirIndex = dirIndex,
+        FileName = "f.txt",
+        RootDirIndex = rootDirIndex,
+        Length = 0,
+        LastWritten = default,
+    };
+
+    private static DryRunOperation Op(int dirIndex, int rootDirIndex) => new()
+    {
+        DirIndex = dirIndex,
+        FileName = "f.txt",
+        RootDirIndex = rootDirIndex,
+        Kind = OperationKind.New,
+    };
 }

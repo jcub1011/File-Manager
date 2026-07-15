@@ -440,6 +440,27 @@ public sealed class DryRunViewModelTests
     }
 
     [Fact]
+    public async Task Tree_reconstructs_UNC_paths_when_roots_span_shares()
+    {
+        // Two unrelated UNC shares → no common root, so the tree falls back to splitting the raw
+        // absolute path. The leading "\\" must survive that split/rejoin (regression: it was dropped,
+        // yielding "srv1\share" tooltips instead of "\\srv1\share").
+        var (viewModel, gateway) = NewViewModel();
+        gateway.DryRunResult = WritesReport(viewModel.ProfileId!.Value,
+            (@"\\srv1\share\a.txt", @"\\srv1\share", @"\\dst\out\a.txt", @"\\dst\out"),
+            (@"\\srv2\other\b.txt", @"\\srv2\other", @"\\dst\out\b.txt", @"\\dst\out"));
+        await viewModel.RunAsync(CancellationToken.None);
+
+        Assert.Null(viewModel.Sources.CommonRoot);   // unrelated shares span no shared prefix
+        viewModel.Sources.ShowTree = true;
+
+        DryRunTreeNode srv1 = viewModel.Sources.Tree.Single(n => n.Name == "srv1");
+        Assert.Equal(@"\\srv1", srv1.FullPath);
+        DryRunTreeNode share = srv1.Children.Single(n => n.Name == "share");
+        Assert.Equal(@"\\srv1\share", share.FullPath);
+    }
+
+    [Fact]
     public async Task Common_root_is_the_single_source_directory()
     {
         var (viewModel, gateway) = NewViewModel();
@@ -490,6 +511,30 @@ public sealed class DryRunViewModelTests
         Assert.Empty(viewModel.Sources.Tree);
         Assert.False(viewModel.Destinations.ShowTree);
         Assert.Empty(viewModel.Destinations.Tree);
+    }
+
+    [Fact]
+    public async Task Re_running_a_dry_run_releases_the_previous_tree_forest()
+    {
+        // Regression: Load() forces ShowTree=false under the _applying guard, so the ShowTree setter
+        // won't clear a forest built by a prior run. Without an explicit Tree reset the previous
+        // report's entire forest (up to the streamed cap) would stay retained until the next manual
+        // toggle — the exact retained memory the optimization work set out to eliminate.
+        var (viewModel, gateway) = NewViewModel();
+        gateway.DryRunResult = NestedSourcesReport(viewModel.ProfileId!.Value);
+        await viewModel.RunAsync(CancellationToken.None);
+
+        viewModel.Sources.ShowTree = true;
+        Assert.NotEmpty(viewModel.Sources.Tree);
+        Assert.NotNull(viewModel.Sources.TreeSource);
+
+        // A second run applies a fresh report without the user toggling the tree off first.
+        gateway.DryRunResult = NestedSourcesReport(viewModel.ProfileId!.Value);
+        await viewModel.RunAsync(CancellationToken.None);
+
+        Assert.False(viewModel.Sources.ShowTree);
+        Assert.Empty(viewModel.Sources.Tree);
+        Assert.Null(viewModel.Sources.TreeSource);
     }
 
     [Fact]

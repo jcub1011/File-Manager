@@ -141,4 +141,35 @@ public static class DryRunDirectoryTable
         }
         return paths;
     }
+
+    /// <summary>Returns a description of the first file/op record whose <c>DirIndex</c> or
+    /// <c>RootDirIndex</c> falls outside a directory table of <paramref name="directoryCount"/>
+    /// entries, or <c>null</c> when every reference is in range. Consumers index the materialized
+    /// path array by these values, so an out-of-range reference from a corrupt or buggy producer
+    /// must be rejected at the trust boundary rather than crashing deep in a consumer (e.g.
+    /// <c>DryRunViewModel.ApplyReport</c>). The <c>(uint)</c> casts fold the negative and
+    /// too-large checks into one comparison.</summary>
+    public static string? FindInvalidReference(
+        int directoryCount,
+        IReadOnlyList<DryRunFile> files,
+        IReadOnlyList<DryRunOperation> operations)
+    {
+        ArgumentNullException.ThrowIfNull(files);
+        ArgumentNullException.ThrowIfNull(operations);
+        foreach (DryRunFile f in files)
+        {
+            if ((uint)f.DirIndex >= (uint)directoryCount)
+                return $"file '{f.FileName}' DirIndex {f.DirIndex}";
+            if ((uint)f.RootDirIndex >= (uint)directoryCount)
+                return $"file '{f.FileName}' RootDirIndex {f.RootDirIndex}";
+        }
+        foreach (DryRunOperation o in operations)
+        {
+            if ((uint)o.DirIndex >= (uint)directoryCount)
+                return $"operation '{o.FileName}' DirIndex {o.DirIndex}";
+            if ((uint)o.RootDirIndex >= (uint)directoryCount)
+                return $"operation '{o.FileName}' RootDirIndex {o.RootDirIndex}";
+        }
+        return null;
+    }
 }
