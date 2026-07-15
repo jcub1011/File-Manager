@@ -14,6 +14,22 @@
         Title="Settings">
 
     <StackPanel Margin="16" Spacing="4">
+        <Border Classes="sectionHeader" Margin="0,0,0,8"><TextBlock Text="Appearance" /></Border>
+        <TextBlock TextWrapping="Wrap" Classes="secondary" Margin="0,0,0,8"
+                   Text="The application theme. System follows the Windows light/dark preference; Light and Dark force a fixed theme." />
+
+        <Grid ColumnDefinitions="140,*" RowDefinitions="Auto" Margin="0,0,0,4">
+            <TextBlock Grid.Row="0" Grid.Column="0" Classes="fieldLabel" Text="Theme" />
+            <ComboBox Grid.Row="0" Grid.Column="1" ItemsSource="{Binding ThemeModeOptions}"
+                      SelectedItem="{Binding ThemeMode}" Margin="0,2" MinWidth="220">
+                <ComboBox.ItemTemplate>
+                    <DataTemplate x:DataType="settings:ThemeMode">
+                        <TextBlock Text="{Binding Converter={x:Static conv:EnumTitleConverters.ThemeMode}}" />
+                    </DataTemplate>
+                </ComboBox.ItemTemplate>
+            </ComboBox>
+        </Grid>
+
         <Border Classes="sectionHeader" Margin="0,0,0,8"><TextBlock Text="Service startup" /></Border>
         <TextBlock TextWrapping="Wrap" Classes="secondary" Margin="0,0,0,8"
                    Text="When the background service runs. RunOnStartup launches it at Windows login. StartOnProgramOpen starts it when this app opens and leaves it running. StartAndStopWithProgram starts it on open and stops it when the app closes (warning first if jobs are running)." />

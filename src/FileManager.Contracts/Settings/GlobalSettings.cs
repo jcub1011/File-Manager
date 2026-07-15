@@ -22,5 +22,9 @@ public sealed record GlobalSettings
     /// service. Null / ignored when Automatic.</summary>
     public int? DryRunManualWorkers { get; init; }
 
+    /// <summary>The UI theme. Defaults to <see cref="Settings.ThemeMode.System"/> so the app follows the
+    /// OS light/dark preference unless the user picks a fixed theme.</summary>
+    public ThemeMode ThemeMode { get; init; } = ThemeMode.System;
+
     public static GlobalSettings Default { get; } = new();
 }

@@ -17,7 +17,11 @@ public sealed class SettingsWindowSmokeTests(HeadlessSessionFixture headless)
         {
             FakeIpcGateway gateway = new()
             {
-                GetSettingsResult = new GlobalSettings { ServiceStartupMode = ServiceStartupMode.RunOnStartup },
+                GetSettingsResult = new GlobalSettings
+                {
+                    ServiceStartupMode = ServiceStartupMode.RunOnStartup,
+                    ThemeMode = ThemeMode.Dark,
+                },
             };
             SettingsViewModel vm = new(gateway);
             await vm.LoadAsync();
@@ -27,6 +31,8 @@ public sealed class SettingsWindowSmokeTests(HeadlessSessionFixture headless)
 
             Assert.Equal(ServiceStartupMode.RunOnStartup, vm.StartupMode);
             Assert.Contains(ServiceStartupMode.StartAndStopWithProgram, vm.ServiceStartupModeOptions);
+            Assert.Equal(ThemeMode.Dark, vm.ThemeMode);
+            Assert.Contains(ThemeMode.System, vm.ThemeModeOptions);
         }, CancellationToken.None);
     }
 

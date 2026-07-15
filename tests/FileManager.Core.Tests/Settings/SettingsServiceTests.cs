@@ -68,4 +68,17 @@ public sealed class SettingsServiceTests : IDisposable
         NewService().Update(new GlobalSettings { ServiceStartupMode = ServiceStartupMode.RunOnStartup });
         Assert.Equal(ServiceStartupMode.RunOnStartup, NewService().Current.ServiceStartupMode);
     }
+
+    [Fact]
+    public void Default_theme_mode_is_system()
+    {
+        Assert.Equal(ThemeMode.System, NewService().Current.ThemeMode);
+    }
+
+    [Fact]
+    public void Update_persists_and_reloads_the_theme_mode()
+    {
+        NewService().Update(new GlobalSettings { ThemeMode = ThemeMode.Dark });
+        Assert.Equal(ThemeMode.Dark, NewService().Current.ThemeMode);
+    }
 }

@@ -66,6 +66,25 @@ public sealed class SettingsViewModelTests
     }
 
     [Fact]
+    public async Task Load_and_save_round_trip_the_theme_mode()
+    {
+        FakeIpcGateway gateway = new()
+        {
+            GetSettingsResult = new GlobalSettings { ThemeMode = ThemeMode.Dark },
+        };
+        SettingsViewModel vm = new(gateway);
+
+        await vm.LoadAsync();
+        Assert.Equal(ThemeMode.Dark, vm.ThemeMode);
+
+        vm.ThemeMode = ThemeMode.Light;
+        await vm.SaveCommand.ExecuteAsync(null);
+
+        GlobalSettings sent = Assert.Single(gateway.SaveSettingsCalls);
+        Assert.Equal(ThemeMode.Light, sent.ThemeMode);
+    }
+
+    [Fact]
     public async Task Load_and_save_round_trip_the_startup_mode()
     {
         FakeIpcGateway gateway = new()

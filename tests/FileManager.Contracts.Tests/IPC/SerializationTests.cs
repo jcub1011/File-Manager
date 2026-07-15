@@ -346,6 +346,7 @@ public sealed class SerializationTests
                 ServiceStartupMode = ServiceStartupMode.RunOnStartup,
                 DryRunConcurrencyMode = ConcurrencyMode.Manual,
                 DryRunManualWorkers = 6,
+                ThemeMode = ThemeMode.Dark,
             },
         });
         Assert.True(IpcSerializer.DeserializeResponse(wire).TryGetValue(out IpcResponse? reparsed));
@@ -353,6 +354,7 @@ public sealed class SerializationTests
         Assert.Equal(ServiceStartupMode.RunOnStartup, roundTripped.Settings.ServiceStartupMode);
         Assert.Equal(ConcurrencyMode.Manual, roundTripped.Settings.DryRunConcurrencyMode);
         Assert.Equal(6, roundTripped.Settings.DryRunManualWorkers);
+        Assert.Equal(ThemeMode.Dark, roundTripped.Settings.ThemeMode);
 
         // Enums serialize as strings, consistent with the rest of the wire format.
         using JsonDocument document = JsonDocument.Parse(wire);
@@ -360,6 +362,8 @@ public sealed class SerializationTests
             document.RootElement.GetProperty("Settings").GetProperty("DryRunConcurrencyMode").GetString());
         Assert.Equal("RunOnStartup",
             document.RootElement.GetProperty("Settings").GetProperty("ServiceStartupMode").GetString());
+        Assert.Equal("Dark",
+            document.RootElement.GetProperty("Settings").GetProperty("ThemeMode").GetString());
     }
 
     [Fact]

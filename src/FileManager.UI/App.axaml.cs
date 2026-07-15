@@ -45,6 +45,12 @@ namespace FileManager.UI
                     try
                     {
                         await viewModel.InitializeAsync();
+                        // Apply the persisted theme once settings can be read. Left until now (rather
+                        // than App.axaml) because it comes from the service over IPC; App.axaml's
+                        // "Default" variant is the correct pre-connect value for ThemeMode.System.
+                        var settingsResult = await _gateway.GetSettingsAsync();
+                        if (settingsResult.TryGetValue(out FileManager.Contracts.Settings.GlobalSettings? settings))
+                            ThemeApplier.Apply(settings.ThemeMode);
                     }
                     catch (Exception ex)
                     {

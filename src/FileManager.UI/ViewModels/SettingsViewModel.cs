@@ -26,6 +26,10 @@ public sealed partial class SettingsViewModel : ViewModelBase
     public IReadOnlyList<ServiceStartupMode> ServiceStartupModeOptions { get; } =
         [ServiceStartupMode.RunOnStartup, ServiceStartupMode.StartOnProgramOpen, ServiceStartupMode.StartAndStopWithProgram];
 
+    public IReadOnlyList<ThemeMode> ThemeModeOptions { get; } =
+        [ThemeMode.System, ThemeMode.Light, ThemeMode.Dark];
+
+    [ObservableProperty] public partial ThemeMode ThemeMode { get; set; } = ThemeMode.System;
     [ObservableProperty] public partial ServiceStartupMode StartupMode { get; set; } = ServiceStartupMode.StartAndStopWithProgram;
     [ObservableProperty] public partial ConcurrencyMode Mode { get; set; } = ConcurrencyMode.Automatic;
     [ObservableProperty] public partial int ManualWorkers { get; set; } = 1;
@@ -55,7 +59,8 @@ public sealed partial class SettingsViewModel : ViewModelBase
                 return;
             }
             result.TryGetValue(out GlobalSettings? settings);
-            StartupMode = settings!.ServiceStartupMode;
+            ThemeMode = settings!.ThemeMode;
+            StartupMode = settings.ServiceStartupMode;
             Mode = settings.DryRunConcurrencyMode == ConcurrencyMode.Manual
                 ? ConcurrencyMode.Manual
                 : ConcurrencyMode.Automatic;
@@ -83,6 +88,7 @@ public sealed partial class SettingsViewModel : ViewModelBase
         {
             GlobalSettings settings = new()
             {
+                ThemeMode = ThemeMode,
                 ServiceStartupMode = StartupMode,
                 DryRunConcurrencyMode = Mode,
                 DryRunManualWorkers = Mode == ConcurrencyMode.Manual ? Math.Max(1, ManualWorkers) : null,
@@ -94,6 +100,7 @@ public sealed partial class SettingsViewModel : ViewModelBase
                 return;
             }
             StatusMessage = "Saved.";
+            ThemeApplier.Apply(ThemeMode);      // apply the selected theme app-wide on save
             RequestClose?.Invoke();
         }
         catch (Exception ex)
