@@ -48,6 +48,56 @@ public sealed record DryRunReport
     public SpaceProjection? Space { get; init; }
 }
 
+/// <summary>One directory in a report's shared table. A root entry (<see cref="ParentIndex"/> == -1)
+/// stores the path root in full (<c>C:\</c>, <c>\\server\share</c>); every other entry stores a
+/// single segment name. <see cref="ParentIndex"/> always refers to an earlier entry (parents precede
+/// children), so a single forward pass can materialize absolute paths. The table exists because
+/// sibling files repeat their entire directory chain — sharing the chain structurally is what keeps
+/// a 500k-file report's paths from costing hundreds of MB as flat strings.</summary>
+public sealed record DryRunDirectory(string Name, int ParentIndex);
+
+/// <summary>The wire form of a discovered file: its directory as an index into the report's shared
+/// <see cref="DryRunReport.Directories"/> table plus the file name — never a flat absolute path.
+/// Otherwise mirrors <see cref="PhysicalFile"/>, which remains the engine's in-memory currency
+/// (evaluation and hashing need absolute paths) but no longer crosses the IPC boundary.</summary>
+public sealed record DryRunFile
+{
+    /// <summary>Index of the containing directory in <see cref="DryRunReport.Directories"/>.</summary>
+    public required int DirIndex { get; init; }
+    public required string FileName { get; init; }
+    /// <summary>Index of the source/target root this file was discovered under — the group/facet key.</summary>
+    public required int RootDirIndex { get; init; }
+    public required long Length { get; init; }
+    public required DateTimeOffset LastWritten { get; init; }
+    public bool IsReparsePoint { get; init; }
+}
+
+/// <summary>The wire form of <see cref="VirtualFileOperation"/>: the op's path as a directory-table
+/// index plus file name. Index semantics (<see cref="SourceIndex"/>/<see cref="SubjectIndex"/>) are
+/// unchanged — positions into the report's file lists.</summary>
+public sealed record DryRunOperation
+{
+    /// <summary>Index of the resulting path's directory in <see cref="DryRunReport.Directories"/>.</summary>
+    public required int DirIndex { get; init; }
+    public required string FileName { get; init; }
+    /// <summary>Index of the source/target root this op's path sits under — facet key and cross-tab
+    /// relative-path alignment.</summary>
+    public required int RootDirIndex { get; init; }
+    public required OperationKind Kind { get; init; }
+    /// <summary>Index into <see cref="DryRunReport.SourceFiles"/> for the content origin. <c>-1</c>
+    /// when there is none.</summary>
+    public int SourceIndex { get; init; } = -1;
+    /// <summary>Index into <see cref="DryRunReport.DestinationFiles"/> for the pre-existing file this
+    /// destination op touches. <c>-1</c> when there is none (New/Rename, and all source ops).</summary>
+    public int SubjectIndex { get; init; } = -1;
+    /// <summary>Source ops only: what happens to the original after a successful copy. Null when the
+    /// file does not process.</summary>
+    public OnSuccessAction? SourceDisposition { get; init; }
+    /// <summary>Display string: e.g. the existing file's mtime, the suffixed rename name, the
+    /// deciding filter rule, or the unchanged reason.</summary>
+    public string? Detail { get; init; }
+}
+
 /// <summary>An actual file discovered on disk — pure ground truth, no verdict. <see cref="Length"/>
 /// and <see cref="LastWritten"/> come free from the enumeration/stat snapshot (no extra I/O).</summary>
 public sealed record PhysicalFile
