@@ -31,12 +31,39 @@ public sealed class DryRunViewModelMemoryTests(ITestOutputHelper output)
         output.WriteLine($"Retained after ApplyReport({FileCount:N0} files): {retained:N0} bytes ({retained / (1024.0 * 1024.0):F1} MB)");
 
         // Budget guard. History at this shape/count: 372 MB before any optimization; 250 MB after
-        // lazy display strings + root interning. The margin catches regressions back toward eager
-        // per-row strings without flaking on GC noise.
-        Assert.True(retained < 300L * 1024 * 1024,
-            $"ApplyReport retained {retained / (1024.0 * 1024.0):F1} MB — over the 300 MB budget");
+        // lazy display strings + root interning; 238 MB after the directory-table report (this
+        // shallow shape's ~28-char paths understate that step — see the deep-path probe below).
+        // The margin catches regressions back toward eager per-row strings without flaking on GC noise.
+        Assert.True(retained < 280L * 1024 * 1024,
+            $"ApplyReport retained {retained / (1024.0 * 1024.0):F1} MB — over the 280 MB budget");
 
         GC.KeepAlive(vm);   // rows must outlive the second measurement
+    }
+
+    /// <summary>The benchmark shape above is unrealistically shallow (64 directories, ~28-char
+    /// paths), which understates what the directory-table report buys: there a filename is nearly
+    /// as long as the whole path. This variant uses a realistic tree — ~25k directories, ~100-char
+    /// paths — where per-row path bytes dominated the old flat-string model. History at this shape:
+    /// 519 MB before any optimization, 307 MB after lazy display strings + interned roots, 219 MB
+    /// with the directory-table report — whose property this budget pins: retained heap no longer
+    /// scales with path depth.</summary>
+    [Fact]
+    [Trait("Category", "Memory")]
+    public void ApplyReport_retained_heap_at_streamed_cap_with_realistic_deep_paths()
+    {
+        long before = GC.GetTotalMemory(forceFullCollection: true);
+        (DryRunViewModel vm, WeakReference report) = BuildAndApplyDeep();
+        long after = GC.GetTotalMemory(forceFullCollection: true);
+
+        Assert.False(report.IsAlive);
+
+        long retained = after - before;
+        output.WriteLine($"Retained after ApplyReport({FileCount:N0} deep-path files): {retained:N0} bytes ({retained / (1024.0 * 1024.0):F1} MB)");
+
+        Assert.True(retained < 260L * 1024 * 1024,
+            $"ApplyReport retained {retained / (1024.0 * 1024.0):F1} MB — over the 260 MB budget");
+
+        GC.KeepAlive(vm);
     }
 
     /// <summary>NoInlining so the report reference provably dies with this frame — nulling a local
@@ -48,6 +75,96 @@ public sealed class DryRunViewModelMemoryTests(ITestOutputHelper output)
         DryRunViewModel vm = new(gateway: null!);
         vm.ApplyReport(report);
         return (vm, new WeakReference(report));
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static (DryRunViewModel Vm, WeakReference Report) BuildAndApplyDeep()
+    {
+        DryRunReport report = BuildDeepReport(FileCount);
+        DryRunViewModel vm = new(gateway: null!);
+        vm.ApplyReport(report);
+        return (vm, new WeakReference(report));
+    }
+
+    /// <summary>A realistic 500k-file tree: 20 files per leaf directory, leaves nested four levels
+    /// under the root (project/assets/renders/batch), absolute paths ~100 chars. Ops mirror the
+    /// benchmark shape's disposition mix (processed with two targets / filtered / unchanged).</summary>
+    private static DryRunReport BuildDeepReport(int fileCount)
+    {
+        DryRunDirectoryTableBuilder dirs = new();
+        var sourceFiles = new List<DryRunFile>(fileCount);
+        var sourceOps = new List<DryRunOperation>(fileCount);
+        var destinationFiles = new List<DryRunFile>();
+        var destinationOps = new List<DryRunOperation>();
+
+        for (int i = 0; i < fileCount; i++)
+        {
+            int leaf = i / 20;                    // 20 files per directory → 25k leaf dirs at 500k
+            string sourceDir = $@"C:\media-archive\projects\project-{leaf % 500:D3}\assets\renders\batch-{leaf / 500:D4}";
+            string source = $@"{sourceDir}\render-output-{i:D7}.png";
+            sourceFiles.Add(dirs.Convert(new PhysicalFile
+            {
+                Path = source,
+                Root = @"C:\media-archive\projects",
+                Length = i,
+                LastWritten = DateTimeOffset.UnixEpoch,
+            }));
+
+            switch (i % 3)
+            {
+                case 0:
+                    sourceOps.Add(dirs.Convert(new VirtualFileOperation
+                    {
+                        Path = source,
+                        Root = @"C:\media-archive\projects",
+                        Kind = OperationKind.Processed,
+                        SourceIndex = i,
+                        SourceDisposition = i % 6 == 0 ? OnSuccessAction.MoveToTrash : OnSuccessAction.KeepSource,
+                    }));
+                    string target = $@"D:\backup\media-archive\projects\project-{leaf % 500:D3}\assets\renders\batch-{leaf / 500:D4}\render-output-{i:D7}.png";
+                    destinationOps.Add(dirs.Convert(new VirtualFileOperation
+                    {
+                        Path = target, Root = @"D:\backup\media-archive\projects", Kind = OperationKind.New, SourceIndex = i,
+                    }));
+                    break;
+
+                case 1:
+                    sourceOps.Add(dirs.Convert(new VirtualFileOperation
+                    {
+                        Path = source,
+                        Root = @"C:\media-archive\projects",
+                        Kind = OperationKind.SkippedByFilter,
+                        SourceIndex = i,
+                        Detail = "exclude *.tmp",
+                    }));
+                    break;
+
+                default:
+                    sourceOps.Add(dirs.Convert(new VirtualFileOperation
+                    {
+                        Path = source,
+                        Root = @"C:\media-archive\projects",
+                        Kind = OperationKind.SkippedUnchanged,
+                        SourceIndex = i,
+                    }));
+                    string unchanged = $@"D:\backup\media-archive\projects\project-{leaf % 500:D3}\assets\renders\batch-{leaf / 500:D4}\render-output-{i:D7}.png";
+                    int unchangedSubject = destinationFiles.Count;
+                    destinationFiles.Add(dirs.Convert(new PhysicalFile { Path = unchanged, Root = @"D:\backup\media-archive\projects", Length = i, LastWritten = DateTimeOffset.UnixEpoch }));
+                    destinationOps.Add(dirs.Convert(new VirtualFileOperation { Path = unchanged, Root = @"D:\backup\media-archive\projects", Kind = OperationKind.SkipUnchanged, SourceIndex = i, SubjectIndex = unchangedSubject, Detail = "identical content (SHA-256)" }));
+                    break;
+            }
+        }
+
+        return new DryRunReport
+        {
+            ProfileId = Guid.NewGuid(),
+            GeneratedAt = DateTimeOffset.UtcNow,
+            Directories = dirs.Entries.ToList(),
+            SourceFiles = sourceFiles,
+            DestinationFiles = destinationFiles,
+            SourceOperations = sourceOps,
+            DestinationOperations = destinationOps,
+        };
     }
 
     /// <summary>Same report shape as <c>DryRunViewModelBenchmarks.BuildReport</c> so the two gauges

@@ -1,7 +1,15 @@
 # Dry-run preview: memory optimization plan
 
-**Audience:** a coding agent picking this up cold. Everything needed is below; file
-references use `path:line` against the current tree.
+> **Status: IMPLEMENTED (2026-07-15).** All three optimizations landed (lazy display
+> strings; root interning, later subsumed by #3; the directory-table wire contract with
+> IPC protocol v2). Measured at the 500k-file cap via the retained-heap probes in
+> `tests/FileManager.UI.Tests/DryRunViewModelMemoryTests.cs`:
+> benchmark (shallow) shape 372 MB → 238 MB; realistic deep-path shape
+> **519 MB → 219 MB (−58%)**. `ApplyReport` allocations and time also dropped
+> (1151 MB / 3.83 s → see `DryRunViewModelBenchmarks`). One deliberate design deviation:
+> normalization lives in `DryRunStreamHandler` (which also emits the sweep chunks), not
+> on the engine's `DryRunChunk` — the engine, space estimator, and destination projector
+> stayed stringy and untouched. Line references below describe the pre-change tree.
 
 ## Context
 
