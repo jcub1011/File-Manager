@@ -1,45 +1,58 @@
-using BenchmarkDotNet.Attributes;
+using System.Runtime.CompilerServices;
 using FileManager.Contracts.DryRun;
 using FileManager.Contracts.Profiles;
 using FileManager.UI.ViewModels;
+using Xunit.Abstractions;
 
-namespace FileManager.UI.Benchmarks.ViewModels;
+namespace FileManager.UI.Tests;
 
-/// <summary>Measures <see cref="DryRunViewModel.ApplyReport"/> — the UI-thread aggregation that runs
-/// once per dry run under the physical-files + operations model: it builds a <c>SourceIndex</c> lookup
-/// over the destination operations, projects every source file into a row (pairing it with its source
-/// operation and gathering its target rows from that lookup), projects every destination operation 1:1
-/// into a destination row, runs a handful of O(n) count passes for the blast-radius banner, then hands
-/// both row lists to the two tabs' <c>Load</c>. The report is built once in setup; the measured call is
-/// pure aggregation. The gateway/folder-picker are never touched by ApplyReport, so null suffices —
-/// this isolates the aggregation from IPC.</summary>
-[MemoryDiagnoser]
-public class DryRunViewModelBenchmarks
+/// <summary>Measures what <see cref="DryRunViewModel.ApplyReport"/> leaves on the retained heap at
+/// the engine's <c>MaxStreamedFiles</c> cap (500k source files) — the number a populated dry-run
+/// preview holds for its lifetime. BenchmarkDotNet's Allocated column is per-op allocation, not
+/// retention, so this probe is the gauge for the memory-optimization work. Filter with
+/// <c>dotnet test --filter Category=Memory</c>; it builds a 500k-file report and is slow.</summary>
+public sealed class DryRunViewModelMemoryTests(ITestOutputHelper output)
 {
-    private DryRunViewModel _viewModel = null!;
-    private DryRunReport _report = null!;
+    private const int FileCount = 500_000;
 
-    /// <summary>Source files to aggregate; 500k is the engine's <c>MaxStreamedFiles</c> cap — the
-    /// bound on the streamed path the UI actually uses (<c>MaxReportedFiles</c> only guards the
-    /// legacy single-frame batched path).</summary>
-    [Params(1_000, 10_000, 50_000, 500_000)]
-    public int FileCount { get; set; }
-
-    [GlobalSetup]
-    public void Setup()
+    [Fact]
+    [Trait("Category", "Memory")]
+    public void ApplyReport_retained_heap_at_streamed_cap()
     {
-        _viewModel = new DryRunViewModel(gateway: null!);
-        _report = BuildReport(FileCount);
+        long before = GC.GetTotalMemory(forceFullCollection: true);
+        (DryRunViewModel vm, WeakReference report) = BuildAndApply();
+        long after = GC.GetTotalMemory(forceFullCollection: true);
+
+        // The delta is meaningless unless the report itself was collected — otherwise it counts
+        // report + rows instead of the rows the preview actually retains.
+        Assert.False(report.IsAlive);
+
+        long retained = after - before;
+        output.WriteLine($"Retained after ApplyReport({FileCount:N0} files): {retained:N0} bytes ({retained / (1024.0 * 1024.0):F1} MB)");
+
+        // Budget guard. History at this shape/count: 372 MB before any optimization; 250 MB after
+        // lazy display strings + root interning. The margin catches regressions back toward eager
+        // per-row strings without flaking on GC noise.
+        Assert.True(retained < 300L * 1024 * 1024,
+            $"ApplyReport retained {retained / (1024.0 * 1024.0):F1} MB — over the 300 MB budget");
+
+        GC.KeepAlive(vm);   // rows must outlive the second measurement
     }
 
-    [Benchmark]
-    public void ApplyReport() => _viewModel.ApplyReport(_report);
+    /// <summary>NoInlining so the report reference provably dies with this frame — nulling a local
+    /// in the caller would not guarantee the JIT treats it as unreachable.</summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static (DryRunViewModel Vm, WeakReference Report) BuildAndApply()
+    {
+        DryRunReport report = BuildReport(FileCount);
+        DryRunViewModel vm = new(gateway: null!);
+        vm.ApplyReport(report);
+        return (vm, new WeakReference(report));
+    }
 
-    /// <summary>Spreads files across the three source dispositions with a mix of destination operation
-    /// kinds so every projection and count pass in ApplyReport does real work: processed rows fan out to
-    /// two targets (one an overwrite/rename every few rows) and carry a destructive source disposition,
-    /// so the Overwrite/Rename/Disposal counts and the SourceIndex lookup are all non-trivial. Every
-    /// destination operation references its source file by index, exactly as the engine emits it.</summary>
+    /// <summary>Same report shape as <c>DryRunViewModelBenchmarks.BuildReport</c> so the two gauges
+    /// measure the same workload: files spread across the three source dispositions, processed rows
+    /// fanning out to two targets with a mix of operation kinds.</summary>
     private static DryRunReport BuildReport(int fileCount)
     {
         var sourceFiles = new List<PhysicalFile>(fileCount);
@@ -60,7 +73,7 @@ public class DryRunViewModelBenchmarks
 
             switch (i % 3)
             {
-                case 0:   // Processed with two targets — the rows the count passes iterate.
+                case 0:
                     sourceOps.Add(new VirtualFileOperation
                     {
                         Path = source,
@@ -84,7 +97,6 @@ public class DryRunViewModelBenchmarks
 
                     if (i % 5 == 0)
                     {
-                        // A conflict rename: the suffixed new file plus the kept-original Untouched op.
                         string original = $@"C:\dst2\file-{i}.dat";
                         int subject = destinationFiles.Count;
                         destinationFiles.Add(new PhysicalFile { Path = original, Root = @"C:\dst2", Length = i, LastWritten = DateTimeOffset.UnixEpoch });

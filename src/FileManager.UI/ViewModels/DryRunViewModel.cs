@@ -45,10 +45,15 @@ public sealed record DryRunFileRow(
     string? SourceDisposition,
     IReadOnlyList<DryRunTargetRow> Targets,
     long SizeBytes = 0,
-    string ParentDisplay = "")
+    string? SourceCommonRoot = null)
 {
     /// <summary>The file name alone (line 1 of the row); the directory sits on line 2.</summary>
     public string FileName => System.IO.Path.GetFileName(SourcePath);
+
+    /// <summary>The directory shown under the file name, relative to the tab's common root. Computed
+    /// on demand: the list is virtualized, so only realized rows ever pay for it — storing it per row
+    /// costs tens of MB at the streamed-report cap.</summary>
+    public string ParentDisplay => DryRunPaths.SplitForDisplay(SourcePath, SourceCommonRoot).ParentDisplay;
 
     /// <summary>The source file's size, human-readable (right-aligned on the row).</summary>
     public string SizeText => ByteSize.Format(SizeBytes);
@@ -119,11 +124,16 @@ public sealed record DryRunDestinationEntry(
     string TargetRoot,
     DestinationRowKind Kind,
     string? Detail,
-    string ParentDisplay,
-    string RelativeDisplay,
+    string? CommonRoot,
     long SizeBytes = 0)
 {
     public string FileName => System.IO.Path.GetFileName(TargetPath);
+
+    /// <summary>Directory relative to the tab's common root; computed on demand — only realized
+    /// (visible) rows ever run this.</summary>
+    public string ParentDisplay => DryRunPaths.SplitForDisplay(TargetPath, CommonRoot).ParentDisplay;
+
+    public string RelativeDisplay => ParentDisplay + FileName;
 
     /// <summary>The resulting file's size, human-readable: the incoming content for a write, or the
     /// existing file for an untouched/deleted entry.</summary>
@@ -152,12 +162,22 @@ public sealed record DryRunDestinationEntry(
 /// Rows with no originating source (<see cref="HasSource"/> false) carry a single
 /// <see cref="DryRunDestinationEntry"/> and render as a plain single-status row.</summary>
 public sealed record DryRunDestinationRow(
-    string FileName,
     string? SourcePath,
     string? SourceRoot,
-    string SourceDisplay,
+    string? SourceCommonRoot,
     IReadOnlyList<DryRunDestinationEntry> Destinations)
 {
+    /// <summary>The source file's name, or the sole entry's name for a no-source row (its
+    /// <see cref="Primary"/> target path IS the row's identity).</summary>
+    public string FileName =>
+        SourcePath is null ? Primary.FileName : System.IO.Path.GetFileName(SourcePath);
+
+    /// <summary>"parent-dir\name" of the originating source, relative to the Sources tab's common
+    /// root; "" for no-source rows. Computed on demand — only realized rows run this.</summary>
+    public string SourceDisplay =>
+        SourcePath is null ? "" :
+        DryRunPaths.SplitForDisplay(SourcePath, SourceCommonRoot).ParentDisplay + System.IO.Path.GetFileName(SourcePath);
+
     public bool HasSource => SourcePath is not null;
 
     /// <summary>True for rows with no source — rendered with the simple filename + status + folder
@@ -1055,6 +1075,10 @@ public sealed partial class DryRunViewModel : ViewModelBase
         }
     }
 
+    /// <summary>Shared by every source row with no destination ops (skipped files, ~2/3 of a typical
+    /// report) — a fresh empty list per row is ~10 MB at the streamed cap.</summary>
+    private static readonly IReadOnlyList<DryRunTargetRow> EmptyTargets = [];
+
     internal void ApplyReport(DryRunReport report)
     {
         // Destination ops grouped by the source file they carry content from (SourceIndex); the
@@ -1077,23 +1101,33 @@ public sealed partial class DryRunViewModel : ViewModelBase
         string? destCommonRoot = DryRunPaths.CommonRoot(
             report.DestinationOperations.Select(o => o.Root).Distinct(StringComparer.OrdinalIgnoreCase));
 
+        // Roots repeat across nearly every contract record, but JSON deserialization does not intern —
+        // each record carries its own instance. Canonicalize through a local pool so the retained rows
+        // share one string per distinct root (~1.3M duplicates at the streamed cap). Full paths are
+        // unique — pooling them would only add dictionary overhead.
+        Dictionary<string, string> rootPool = new(StringComparer.Ordinal);
+        string? Intern(string? s) => s is null ? null : rootPool.TryGetValue(s, out string? v) ? v : rootPool[s] = s;
+        // Seed with the common roots so a root that equals the common root shares its instance too.
+        sourceCommonRoot = Intern(sourceCommonRoot);
+        destCommonRoot = Intern(destCommonRoot);
+
         List<DryRunFileRow> fileRows = new(report.SourceFiles.Count);
         for (int i = 0; i < report.SourceFiles.Count; i++)
         {
             PhysicalFile file = report.SourceFiles[i];
             sourceOpByIndex.TryGetValue(i, out VirtualFileOperation? op);
             List<DryRunTargetRow> targets = destOpsBySource[i]
-                .Select(t => new DryRunTargetRow(t.Path, t.Root, t.Kind, t.Detail))
+                .Select(t => new DryRunTargetRow(t.Path, Intern(t.Root), t.Kind, t.Detail))
                 .ToList();
             fileRows.Add(new DryRunFileRow(
                 file.Path,
-                file.Root,
+                Intern(file.Root),
                 op?.Kind ?? OperationKind.Processed,
                 op?.Detail,
                 op?.SourceDisposition?.ToString(),
-                targets,
+                targets.Count == 0 ? EmptyTargets : targets,
                 file.Length,
-                DryRunPaths.SplitForDisplay(file.Path, sourceCommonRoot).ParentDisplay));
+                sourceCommonRoot));
         }
 
         // The byte size behind a destination op: the incoming content (its source file) for a write,
@@ -1108,31 +1142,20 @@ public sealed partial class DryRunViewModel : ViewModelBase
         // (each keeping its own status), instead of N near-identical rows. Ops with SourceIndex == -1
         // (a pre-existing untouched file, a kept-around conflict original, a Mirror orphan) have no
         // originating source and become their own single-entry rows.
-        static DryRunDestinationEntry Entry(VirtualFileOperation o, string? destCommonRoot, long sizeBytes)
-        {
-            (string file, string parent) = DryRunPaths.SplitForDisplay(o.Path, destCommonRoot);
-            return new DryRunDestinationEntry(
-                o.Path, o.Root, MapDestinationKind(o.Kind), o.Detail, parent, parent + file, sizeBytes);
-        }
+        DryRunDestinationEntry Entry(VirtualFileOperation o, long sizeBytes) =>
+            new(o.Path, Intern(o.Root)!, MapDestinationKind(o.Kind), o.Detail, destCommonRoot, sizeBytes);
 
         List<DryRunDestinationRow> destRows = [];
         for (int i = 0; i < report.SourceFiles.Count; i++)
         {
-            List<DryRunDestinationEntry> entries = destOpsBySource[i].Select(o => Entry(o, destCommonRoot, OpSize(o))).ToList();
+            List<DryRunDestinationEntry> entries = destOpsBySource[i].Select(o => Entry(o, OpSize(o))).ToList();
             if (entries.Count == 0)
                 continue;   // a filtered/unchanged source that produced no destination op
             PhysicalFile file = report.SourceFiles[i];
-            (string _, string srcParent) = DryRunPaths.SplitForDisplay(file.Path, sourceCommonRoot);
-            destRows.Add(new DryRunDestinationRow(
-                System.IO.Path.GetFileName(file.Path),
-                file.Path,
-                file.Root,
-                srcParent + System.IO.Path.GetFileName(file.Path),
-                entries));
+            destRows.Add(new DryRunDestinationRow(file.Path, Intern(file.Root), sourceCommonRoot, entries));
         }
         foreach (VirtualFileOperation o in report.DestinationOperations.Where(o => o.SourceIndex < 0))
-            destRows.Add(new DryRunDestinationRow(
-                System.IO.Path.GetFileName(o.Path), null, null, "", [Entry(o, destCommonRoot, OpSize(o))]));
+            destRows.Add(new DryRunDestinationRow(null, null, null, [Entry(o, OpSize(o))]));
 
         TotalFiles = report.SourceFiles.Count;
         OverwriteCount = report.DestinationOperations.Count(static o => o.Kind == OperationKind.Overwrite);
