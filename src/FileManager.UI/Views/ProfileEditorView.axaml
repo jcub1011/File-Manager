@@ -7,28 +7,20 @@
              x:Class="FileManager.UI.Views.ProfileEditorView"
              x:DataType="vm:ProfileEditorViewModel">
 
-    <UserControl.Styles>
-        <Style Selector="TextBlock.sectionHeader">
-            <Setter Property="FontWeight" Value="Bold" />
-            <Setter Property="FontSize" Value="15" />
-            <Setter Property="Margin" Value="0,14,0,6" />
-        </Style>
-        <Style Selector="TextBlock.fieldLabel">
-            <Setter Property="VerticalAlignment" Value="Center" />
-            <Setter Property="Margin" Value="0,0,8,0" />
-        </Style>
-    </UserControl.Styles>
-
     <DockPanel>
         <!-- action bar -->
-        <Border DockPanel.Dock="Bottom" Padding="0,8,0,0">
-            <StackPanel Spacing="6">
-                <TextBlock Text="{Binding LocalError}" Foreground="#E53935" TextWrapping="Wrap"
-                           IsVisible="{Binding LocalError, Converter={x:Static ObjectConverters.IsNotNull}}" />
-                <TextBlock Text="{Binding StatusMessage}" Foreground="#4CAF50"
-                           IsVisible="{Binding StatusMessage, Converter={x:Static ObjectConverters.IsNotNull}}" />
-                <Border Background="#33FFA000" CornerRadius="4" Padding="8"
-                        IsVisible="{Binding ShowUnsavedWarning}">
+        <Border DockPanel.Dock="Bottom" Padding="0,10,0,0" Margin="0,8,0,0"
+                BorderBrush="{DynamicResource Brush.Panel.Border}" BorderThickness="0,1,0,0">
+            <StackPanel Spacing="8">
+                <Border Classes="infoBar danger"
+                        IsVisible="{Binding LocalError, Converter={x:Static ObjectConverters.IsNotNull}}">
+                    <TextBlock Text="{Binding LocalError}" TextWrapping="Wrap" />
+                </Border>
+                <Border Classes="infoBar success"
+                        IsVisible="{Binding StatusMessage, Converter={x:Static ObjectConverters.IsNotNull}}">
+                    <TextBlock Text="{Binding StatusMessage}" TextWrapping="Wrap" />
+                </Border>
+                <Border Classes="infoBar warning" IsVisible="{Binding ShowUnsavedWarning}">
                     <TextBlock Text="You have unsaved changes — save or discard them before switching profiles."
                                TextWrapping="Wrap" />
                 </Border>
@@ -36,7 +28,7 @@
                     <Button Content="Save" Command="{Binding SaveCommand}" Classes="accent" />
                     <Button Content="I understand the risk — save anyway"
                             Command="{Binding AcknowledgeAndSaveCommand}"
-                            Background="#E53935" Foreground="White"
+                            Classes="danger"
                             IsVisible="{Binding CanAcknowledgeAndSave}" />
                     <Button Content="Discard changes" Command="{Binding DiscardCommand}"
                             IsVisible="{Binding IsDirty}" />
@@ -48,11 +40,10 @@
             <StackPanel Margin="4,0,16,0" Spacing="2">
 
                 <!-- validation issues -->
-                <Border Background="{DynamicResource SystemControlBackgroundListLowBrush}"
-                        CornerRadius="4" Padding="8" Margin="0,4,0,4"
+                <Border Classes="card" Margin="0,4,0,4"
                         IsVisible="{Binding !!Issues.Count}">
                     <StackPanel Spacing="4">
-                        <TextBlock Text="Validation results" FontWeight="Bold" />
+                        <TextBlock Text="Validation results" FontWeight="SemiBold" />
                         <ItemsControl ItemsSource="{Binding Issues}">
                             <ItemsControl.ItemTemplate>
                                 <DataTemplate x:DataType="ed:ValidationIssueItem">
@@ -69,7 +60,7 @@
                 </Border>
 
                 <!-- general -->
-                <TextBlock Classes="sectionHeader" Text="General" />
+                <Border Classes="sectionHeader"><TextBlock Text="General" /></Border>
                 <Grid ColumnDefinitions="140,*" RowDefinitions="Auto,Auto,Auto,Auto" Margin="0,0,0,4">
                     <TextBlock Grid.Row="0" Grid.Column="0" Classes="fieldLabel" Text="Name" />
                     <TextBox Grid.Row="0" Grid.Column="1" Text="{Binding ProfileName}" Margin="0,2" />
@@ -96,7 +87,7 @@
                 </Grid>
 
                 <!-- sources -->
-                <TextBlock Classes="sectionHeader" Text="Sources" />
+                <Border Classes="sectionHeader"><TextBlock Text="Sources" /></Border>
                 <ItemsControl ItemsSource="{Binding Sources}">
                     <ItemsControl.ItemTemplate>
                         <DataTemplate x:DataType="ed:SourceRowViewModel">
@@ -119,7 +110,7 @@
                 <Button Content="Add source" Command="{Binding AddSourceCommand}" Margin="0,4,0,0" HorizontalAlignment="Left" />
 
                 <!-- targets -->
-                <TextBlock Classes="sectionHeader" Text="Targets" />
+                <Border Classes="sectionHeader"><TextBlock Text="Targets" /></Border>
                 <ItemsControl ItemsSource="{Binding Targets}">
                     <ItemsControl.ItemTemplate>
                         <DataTemplate x:DataType="ed:TargetRowViewModel">
@@ -136,7 +127,7 @@
                 <Button Content="Add target" Command="{Binding AddTargetCommand}" Margin="0,4,0,0" HorizontalAlignment="Left" />
 
                 <!-- policies -->
-                <TextBlock Classes="sectionHeader" Text="Policies" />
+                <Border Classes="sectionHeader"><TextBlock Text="Policies" /></Border>
                 <Grid ColumnDefinitions="140,*" RowDefinitions="Auto,Auto,Auto,Auto,Auto,Auto" Margin="0,0,0,4">
                     <TextBlock Grid.Row="0" Grid.Column="0" Classes="fieldLabel" Text="On conflict" />
                     <ComboBox Grid.Row="0" Grid.Column="1" ItemsSource="{Binding ConflictResolutionOptions}"
@@ -191,7 +182,7 @@
                 </Grid>
 
                 <!-- filters -->
-                <TextBlock Classes="sectionHeader" Text="Filters" />
+                <Border Classes="sectionHeader"><TextBlock Text="Filters" /></Border>
                 <Grid ColumnDefinitions="140,*" RowDefinitions="Auto,Auto,Auto,Auto,Auto" Margin="0,0,0,4">
                     <TextBlock Grid.Row="0" Grid.Column="0" Classes="fieldLabel" Text="Include globs" VerticalAlignment="Top" Margin="0,6,8,0" />
                     <TextBox Grid.Row="0" Grid.Column="1" Text="{Binding IncludeGlobsText}" AcceptsReturn="True"
@@ -208,7 +199,7 @@
                 </Grid>
 
                 <!-- logging -->
-                <TextBlock Classes="sectionHeader" Text="Logging" />
+                <Border Classes="sectionHeader"><TextBlock Text="Logging" /></Border>
                 <Grid ColumnDefinitions="140,*" RowDefinitions="Auto,Auto" Margin="0,0,0,8">
                     <TextBlock Grid.Row="0" Grid.Column="0" Classes="fieldLabel" Text="Verbosity" />
                     <ComboBox Grid.Row="0" Grid.Column="1" ItemsSource="{Binding VerbosityOptions}"
@@ -224,7 +215,7 @@
                 </Grid>
 
                 <!-- concurrency -->
-                <TextBlock Classes="sectionHeader" Text="Concurrency" />
+                <Border Classes="sectionHeader"><TextBlock Text="Concurrency" /></Border>
                 <Grid ColumnDefinitions="140,*" RowDefinitions="Auto,Auto" Margin="0,0,0,8">
                     <TextBlock Grid.Row="0" Grid.Column="0" Classes="fieldLabel" Text="Dry-run workers" />
                     <ComboBox Grid.Row="0" Grid.Column="1" ItemsSource="{Binding ConcurrencyModeOptions}"

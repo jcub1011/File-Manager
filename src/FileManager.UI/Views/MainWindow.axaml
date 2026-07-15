@@ -8,47 +8,13 @@
         Icon="/Assets/avalonia-logo.ico"
         Width="1200" Height="760"
         Title="File Manager"
+        FontFamily="{StaticResource AppFontFamily}"
+        FontSize="{StaticResource Font.Body}"
+        Background="{DynamicResource Brush.Window.Background}"
         ExtendClientAreaToDecorationsHint="True"
         WindowDecorations="BorderOnly">
 
-    <Window.Styles>
-        <!-- Flat, transparent icon buttons used in the title bar and profile toolbar. -->
-        <Style Selector="Button.iconButton">
-            <Setter Property="Background" Value="Transparent" />
-            <Setter Property="BorderThickness" Value="0" />
-            <Setter Property="Padding" Value="8,4" />
-            <Setter Property="VerticalAlignment" Value="Center" />
-        </Style>
-
-        <!-- Caption buttons (minimize/maximize/close). WindowDecorations="BorderOnly" keeps the OS
-             resize border but draws no system title bar/buttons, so we draw and size our own; standard
-             46x32 caption metrics. -->
-        <Style Selector="Button.caption">
-            <Setter Property="Background" Value="Transparent" />
-            <Setter Property="BorderThickness" Value="0" />
-            <Setter Property="CornerRadius" Value="0" />
-            <Setter Property="Width" Value="46" />
-            <Setter Property="Height" Value="32" />
-            <Setter Property="Padding" Value="0" />
-            <Setter Property="VerticalAlignment" Value="Stretch" />
-        </Style>
-        <Style Selector="Button.caption:pointerover /template/ ContentPresenter">
-            <Setter Property="Background" Value="#19808080" />
-        </Style>
-        <Style Selector="Button.caption:pressed /template/ ContentPresenter">
-            <Setter Property="Background" Value="#0F808080" />
-        </Style>
-        <!-- Close gets the conventional Windows 11 red hover with a light glyph. -->
-        <Style Selector="Button.caption.close:pointerover /template/ ContentPresenter">
-            <Setter Property="Background" Value="#C42B1C" />
-        </Style>
-        <Style Selector="Button.caption.close:pressed /template/ ContentPresenter">
-            <Setter Property="Background" Value="#B4271C" />
-        </Style>
-        <Style Selector="Button.caption.close:pointerover PathIcon">
-            <Setter Property="Foreground" Value="White" />
-        </Style>
-    </Window.Styles>
+    <!-- Caption- and icon-button styles now live in Themes/Controls.axaml (app-wide). -->
 
     <DockPanel>
         <!-- Custom title bar (Avalonia 12 WindowDecorations="BorderOnly" + ElementRole markers). The
@@ -57,11 +23,17 @@
              double-click-maximize region. CRITICAL: every interactive child must carry its own role
              (User for app buttons, {Min,Max,Close}Button for the caption buttons) or the drag region
              swallows its clicks. The role only routes input — the Click handlers still do the work. -->
-        <Grid DockPanel.Dock="Top" Height="32" Background="Transparent"
+        <Grid DockPanel.Dock="Top" Height="32" Background="{DynamicResource Brush.Chrome.Background}"
               ColumnDefinitions="Auto,*,Auto"
               chrome:WindowDecorationProperties.ElementRole="TitleBar">
-            <TextBlock Grid.Column="0" Text="File Manager" VerticalAlignment="Center"
-                       Margin="12,0,0,0" FontSize="12" Opacity="0.8" />
+            <StackPanel Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Center" Margin="10,0,0,0">
+                <Border Width="18" Height="18" CornerRadius="4" Background="{DynamicResource Brush.Accent}">
+                    <PathIcon Data="{StaticResource IconFolder}" Width="11" Height="11" Foreground="White" />
+                </Border>
+                <TextBlock Text="File Manager" VerticalAlignment="Center"
+                           Margin="8,0,0,0" FontSize="{StaticResource Font.Title}"
+                           Foreground="{DynamicResource Brush.Text.Primary}" />
+            </StackPanel>
 
             <StackPanel Grid.Column="2" Orientation="Horizontal">
                 <Button Classes="iconButton" chrome:WindowDecorationProperties.ElementRole="User"
@@ -92,28 +64,35 @@
         <v:StatusBarView DockPanel.Dock="Bottom" DataContext="{Binding StatusBar}" />
 
         <Grid ColumnDefinitions="280,4,*">
-            <DockPanel Grid.Column="0" Margin="8">
-                <Grid DockPanel.Dock="Top" ColumnDefinitions="Auto,*,Auto" Margin="0,0,0,8">
-                    <Button Grid.Column="0" Classes="iconButton" Command="{Binding List.RefreshCommand}" ToolTip.Tip="Refresh">
-                        <PathIcon Data="{StaticResource IconRefresh}" Width="16" Height="16" />
-                    </Button>
-                    <TextBox Grid.Column="1" Text="{Binding List.SearchText}"
-                             PlaceholderText="Search profiles…" Margin="6,0">
+            <!-- Left tool-window: PROFILES. Its own panel surface + a divider border against the
+                 document area on the right. -->
+            <Border Grid.Column="0" Background="{DynamicResource Brush.Panel.Background}"
+                    BorderBrush="{DynamicResource Brush.Panel.Border}" BorderThickness="0,0,1,0">
+                <DockPanel Margin="8,10,8,8">
+                    <Grid DockPanel.Dock="Top" ColumnDefinitions="*,Auto,Auto" Margin="4,0,0,8">
+                        <TextBlock Grid.Column="0" Classes="panelHeader" Text="PROFILES" />
+                        <Button Grid.Column="1" Classes="iconButton" Command="{Binding List.RefreshCommand}" ToolTip.Tip="Refresh">
+                            <PathIcon Data="{StaticResource IconRefresh}" Width="16" Height="16" />
+                        </Button>
+                        <Button Grid.Column="2" Classes="iconButton" Command="{Binding NewProfileCommand}" ToolTip.Tip="New profile">
+                            <PathIcon Data="{StaticResource IconAdd}" Width="16" Height="16" />
+                        </Button>
+                    </Grid>
+                    <TextBox DockPanel.Dock="Top" Text="{Binding List.SearchText}"
+                             PlaceholderText="Search profiles…" Margin="0,0,0,8">
                         <TextBox.InnerLeftContent>
                             <PathIcon Data="{StaticResource IconSearch}" Width="14" Height="14"
-                                      Margin="6,0,0,0" Opacity="0.6" />
+                                      Margin="8,0,0,0" Foreground="{DynamicResource Brush.Text.Secondary}" />
                         </TextBox.InnerLeftContent>
                     </TextBox>
-                    <Button Grid.Column="2" Classes="iconButton" Command="{Binding NewProfileCommand}" ToolTip.Tip="New profile">
-                        <PathIcon Data="{StaticResource IconAdd}" Width="16" Height="16" />
-                    </Button>
-                </Grid>
-                <v:ProfileListView DataContext="{Binding List}" />
-            </DockPanel>
+                    <v:ProfileListView DataContext="{Binding List}" />
+                </DockPanel>
+            </Border>
 
             <GridSplitter Grid.Column="1" Background="Transparent" ResizeDirection="Columns" />
 
-            <TabControl Grid.Column="2" Margin="4,8,8,8" IsVisible="{Binding Editor.HasProfile}">
+            <TabControl Grid.Column="2" Classes="documents" Margin="8,6,10,8"
+                        IsVisible="{Binding Editor.HasProfile}">
                 <TabItem Header="Profile">
                     <v:ProfileEditorView DataContext="{Binding Editor}" />
                 </TabItem>

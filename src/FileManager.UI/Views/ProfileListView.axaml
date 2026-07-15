@@ -5,38 +5,41 @@
              x:DataType="vm:ProfileListViewModel">
 
     <DockPanel>
-        <TextBlock DockPanel.Dock="Top" Text="{Binding ErrorMessage}" Foreground="#E53935"
-                   TextWrapping="Wrap" Margin="0,0,0,6"
-                   IsVisible="{Binding ErrorMessage, Converter={x:Static ObjectConverters.IsNotNull}}" />
+        <Border DockPanel.Dock="Top" Classes="infoBar danger" Margin="0,0,0,6"
+                IsVisible="{Binding ErrorMessage, Converter={x:Static ObjectConverters.IsNotNull}}">
+            <TextBlock Text="{Binding ErrorMessage}" TextWrapping="Wrap" />
+        </Border>
 
-        <Border DockPanel.Dock="Bottom" Margin="0,6,0,0" Padding="8"
-                Background="#33E53935" CornerRadius="4"
+        <Border DockPanel.Dock="Bottom" Classes="infoBar danger" Margin="0,8,0,0"
                 IsVisible="{Binding PendingDelete, Converter={x:Static ObjectConverters.IsNotNull}}">
-            <StackPanel Spacing="6">
+            <StackPanel Spacing="8">
                 <TextBlock TextWrapping="Wrap">
                     <Run Text="Delete profile " /><Run Text="{Binding PendingDelete.Name}" FontWeight="Bold" /><Run Text="?" />
                 </TextBlock>
-                <StackPanel Orientation="Horizontal" Spacing="6">
-                    <Button Content="Delete" Command="{Binding ConfirmDeleteCommand}" Background="#E53935" Foreground="White" />
+                <StackPanel Orientation="Horizontal" Spacing="8">
+                    <Button Content="Delete" Command="{Binding ConfirmDeleteCommand}" Classes="danger" />
                     <Button Content="Cancel" Command="{Binding CancelDeleteCommand}" />
                 </StackPanel>
             </StackPanel>
         </Border>
 
-        <ListBox ItemsSource="{Binding FilteredProfiles}" SelectedItem="{Binding SelectedProfile}">
+        <ListBox Classes="profiles" ItemsSource="{Binding FilteredProfiles}" SelectedItem="{Binding SelectedProfile}">
             <ListBox.ItemTemplate>
                 <DataTemplate x:DataType="vm:ProfileListItem">
                     <Grid ColumnDefinitions="*,Auto">
-                        <StackPanel Grid.Column="0" Spacing="2">
+                        <StackPanel Grid.Column="0" Spacing="2" VerticalAlignment="Center">
                             <TextBlock Text="{Binding Name}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" />
                             <StackPanel Orientation="Horizontal" Spacing="6">
-                                <TextBlock Text="{Binding ActiveText}" FontSize="11" Opacity="0.7" />
-                                <TextBlock Text="{Binding TriggerSummary}" FontSize="11" Opacity="0.7" TextTrimming="CharacterEllipsis" />
+                                <TextBlock Classes="caption" Text="{Binding ActiveText}" />
+                                <TextBlock Classes="caption" Text="{Binding TriggerSummary}" TextTrimming="CharacterEllipsis" />
                             </StackPanel>
                         </StackPanel>
-                        <Button Grid.Column="1" Content="✕" FontSize="11" Padding="6,2" VerticalAlignment="Center"
+                        <Button Grid.Column="1" Classes="iconButton" Padding="6,4" VerticalAlignment="Center"
+                                ToolTip.Tip="Delete profile"
                                 Command="{Binding $parent[ListBox].((vm:ProfileListViewModel)DataContext).RequestDeleteCommand}"
-                                CommandParameter="{Binding}" />
+                                CommandParameter="{Binding}">
+                            <PathIcon Data="{StaticResource IconTrash}" Width="14" Height="14" />
+                        </Button>
                     </Grid>
                 </DataTemplate>
             </ListBox.ItemTemplate>

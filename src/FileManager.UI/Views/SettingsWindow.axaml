@@ -8,23 +8,14 @@
         x:DataType="vm:SettingsViewModel"
         Width="520" SizeToContent="Height"
         WindowStartupLocation="CenterOwner"
+        FontFamily="{StaticResource AppFontFamily}"
+        FontSize="{StaticResource Font.Body}"
+        Background="{DynamicResource Brush.Window.Background}"
         Title="Settings">
 
-    <Window.Styles>
-        <Style Selector="TextBlock.sectionHeader">
-            <Setter Property="FontWeight" Value="Bold" />
-            <Setter Property="FontSize" Value="15" />
-            <Setter Property="Margin" Value="0,0,0,6" />
-        </Style>
-        <Style Selector="TextBlock.fieldLabel">
-            <Setter Property="VerticalAlignment" Value="Center" />
-            <Setter Property="Margin" Value="0,0,8,0" />
-        </Style>
-    </Window.Styles>
-
     <StackPanel Margin="16" Spacing="4">
-        <TextBlock Classes="sectionHeader" Text="Service startup" />
-        <TextBlock TextWrapping="Wrap" Opacity="0.8" Margin="0,0,0,8"
+        <Border Classes="sectionHeader" Margin="0,0,0,8"><TextBlock Text="Service startup" /></Border>
+        <TextBlock TextWrapping="Wrap" Classes="secondary" Margin="0,0,0,8"
                    Text="When the background service runs. RunOnStartup launches it at Windows login. StartOnProgramOpen starts it when this app opens and leaves it running. StartAndStopWithProgram starts it on open and stops it when the app closes (warning first if jobs are running)." />
 
         <Grid ColumnDefinitions="140,*" RowDefinitions="Auto" Margin="0,0,0,4">
@@ -39,8 +30,8 @@
             </ComboBox>
         </Grid>
 
-        <TextBlock Classes="sectionHeader" Text="Dry-run performance" Margin="0,12,0,6" />
-        <TextBlock TextWrapping="Wrap" Opacity="0.8" Margin="0,0,0,8"
+        <Border Classes="sectionHeader"><TextBlock Text="Dry-run performance" /></Border>
+        <TextBlock TextWrapping="Wrap" Classes="secondary" Margin="0,0,0,8"
                    Text="How many files a dry run evaluates in parallel. Automatic reserves one core for the system (capped at 8). Individual profiles can override this." />
 
         <Grid ColumnDefinitions="140,*" RowDefinitions="Auto,Auto" Margin="0,0,0,4">
@@ -60,10 +51,14 @@
                            IsVisible="{Binding ShowManualWorkers}" />
         </Grid>
 
-        <TextBlock Text="{Binding ErrorMessage}" Foreground="#E53935" TextWrapping="Wrap"
-                   IsVisible="{Binding ErrorMessage, Converter={x:Static ObjectConverters.IsNotNull}}" />
-        <TextBlock Text="{Binding StatusMessage}" Foreground="#4CAF50"
-                   IsVisible="{Binding StatusMessage, Converter={x:Static ObjectConverters.IsNotNull}}" />
+        <Border Classes="infoBar danger" Margin="0,8,0,0"
+                IsVisible="{Binding ErrorMessage, Converter={x:Static ObjectConverters.IsNotNull}}">
+            <TextBlock Text="{Binding ErrorMessage}" TextWrapping="Wrap" />
+        </Border>
+        <Border Classes="infoBar success" Margin="0,8,0,0"
+                IsVisible="{Binding StatusMessage, Converter={x:Static ObjectConverters.IsNotNull}}">
+            <TextBlock Text="{Binding StatusMessage}" TextWrapping="Wrap" />
+        </Border>
 
         <StackPanel Orientation="Horizontal" Spacing="8" HorizontalAlignment="Right" Margin="0,12,0,0">
             <Button Content="Save" Command="{Binding SaveCommand}" Classes="accent" IsEnabled="{Binding !IsBusy}" />

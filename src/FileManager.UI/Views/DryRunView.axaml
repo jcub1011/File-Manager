@@ -108,64 +108,7 @@
     </UserControl.Resources>
 
     <UserControl.Styles>
-        <Style Selector="Border.chip">
-            <Setter Property="CornerRadius" Value="10" />
-            <Setter Property="Padding" Value="10,3" />
-            <Setter Property="Background" Value="{DynamicResource SystemControlBackgroundListLowBrush}" />
-        </Style>
-        <Style Selector="Border.chipDanger">
-            <Setter Property="Background" Value="#E53935" />
-        </Style>
-        <Style Selector="Border.chipDanger TextBlock">
-            <Setter Property="Foreground" Value="White" />
-        </Style>
-        <Style Selector="Border.chipAmber">
-            <Setter Property="Background" Value="#FFA000" />
-        </Style>
-        <Style Selector="Border.chipAmber TextBlock">
-            <Setter Property="Foreground" Value="Black" />
-        </Style>
-        <Style Selector="Border.chipSafe">
-            <Setter Property="Background" Value="#2E7D32" />
-        </Style>
-        <Style Selector="Border.chipSafe TextBlock">
-            <Setter Property="Foreground" Value="White" />
-        </Style>
-        <Style Selector="Border.chipMuted">
-            <Setter Property="Background" Value="#757575" />
-        </Style>
-        <Style Selector="Border.chipMuted TextBlock">
-            <Setter Property="Foreground" Value="White" />
-        </Style>
-        <!-- Untouched pill: blue, distinct from the green "will change" pills. -->
-        <Style Selector="Border.chipInfo">
-            <Setter Property="Background" Value="#1E88E5" />
-        </Style>
-        <Style Selector="Border.chipInfo TextBlock">
-            <Setter Property="Foreground" Value="White" />
-        </Style>
-
-        <!-- per-target kind tags (Sources list nested targets) -->
-        <Style Selector="TextBlock.kind">
-            <Setter Property="FontSize" Value="11" />
-            <Setter Property="FontWeight" Value="SemiBold" />
-            <Setter Property="VerticalAlignment" Value="Center" />
-        </Style>
-        <Style Selector="TextBlock.kind.overwrite">
-            <Setter Property="Foreground" Value="#E53935" />
-        </Style>
-        <Style Selector="TextBlock.kind.rename">
-            <Setter Property="Foreground" Value="#FFA000" />
-        </Style>
-        <Style Selector="TextBlock.kind.write">
-            <Setter Property="Foreground" Value="#2E7D32" />
-        </Style>
-        <Style Selector="TextBlock.kind.skip">
-            <Setter Property="Foreground" Value="#9E9E9E" />
-        </Style>
-        <Style Selector="TextBlock.kind.unknown">
-            <Setter Property="Foreground" Value="#8E24AA" />
-        </Style>
+        <!-- chip* and kind* classes are shared app-wide in Themes/Controls.axaml (token-backed). -->
 
         <!-- Virtualized row lists: strip default ListBoxItem chrome so rows render like plain rows. -->
         <Style Selector="ListBox.rows">
@@ -208,7 +151,7 @@
                         IsVisible="{Binding RunCommand.IsRunning}" />
             </Grid>
             <ProgressBar IsIndeterminate="True" IsVisible="{Binding RunCommand.IsRunning}" />
-            <TextBlock Text="{Binding ErrorMessage}" Foreground="#E53935" TextWrapping="Wrap"
+            <TextBlock Text="{Binding ErrorMessage}" Foreground="{DynamicResource Brush.Danger}" TextWrapping="Wrap"
                        IsVisible="{Binding ErrorMessage, Converter={x:Static ObjectConverters.IsNotNull}}" />
         </StackPanel>
 

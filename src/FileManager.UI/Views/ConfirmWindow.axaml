@@ -4,12 +4,15 @@
         Width="420" SizeToContent="Height"
         WindowStartupLocation="CenterOwner"
         CanResize="False"
+        FontFamily="{StaticResource AppFontFamily}"
+        FontSize="{StaticResource Font.Body}"
+        Background="{DynamicResource Brush.Window.Background}"
         Title="Confirm">
 
     <StackPanel Margin="16" Spacing="16">
         <TextBlock x:Name="MessageText" TextWrapping="Wrap" />
         <StackPanel Orientation="Horizontal" Spacing="8" HorizontalAlignment="Right">
-            <Button Content="Close anyway" Click="OnYesClick" Classes="accent" />
+            <Button Content="Close anyway" Click="OnYesClick" Classes="danger" />
             <Button Content="Cancel" Click="OnNoClick" IsDefault="True" IsCancel="True" />
         </StackPanel>
     </StackPanel>
