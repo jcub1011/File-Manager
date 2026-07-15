@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using FileManager.Contracts.DryRun;
 using FileManager.Contracts.Profiles;
@@ -62,6 +63,42 @@ public sealed class DryRunViewModelMemoryTests(ITestOutputHelper output)
 
         Assert.True(retained < 260L * 1024 * 1024,
             $"ApplyReport retained {retained / (1024.0 * 1024.0):F1} MB — over the 260 MB budget");
+
+        GC.KeepAlive(vm);
+    }
+
+    /// <summary>What turning on tree view adds on top of the populated preview — the forest of
+    /// <see cref="DryRunTreeNode"/>s plus the TreeDataGrid sources — and how long the synchronous
+    /// build blocks for, at the streamed cap on the realistic deep-path shape. The build runs on
+    /// the UI thread, so the wall time here is the freeze the user feels.</summary>
+    [Fact]
+    [Trait("Category", "Memory")]
+    public void Tree_toggle_retained_heap_and_build_time_at_streamed_cap_with_realistic_deep_paths()
+    {
+        (DryRunViewModel vm, WeakReference report) = BuildAndApplyDeep();
+
+        long before = GC.GetTotalMemory(forceFullCollection: true);
+        Assert.False(report.IsAlive);
+
+        Stopwatch watch = Stopwatch.StartNew();
+        vm.Sources.ShowTree = true;
+        long sourcesMs = watch.ElapsedMilliseconds;
+        vm.Destinations.ShowTree = true;
+        watch.Stop();
+
+        long after = GC.GetTotalMemory(forceFullCollection: true);
+        long retained = after - before;
+        output.WriteLine(
+            $"Tree toggle (both tabs, {FileCount:N0} deep-path files): retained {retained:N0} bytes " +
+            $"({retained / (1024.0 * 1024.0):F1} MB); Sources build {sourcesMs:N0} ms, both tabs {watch.ElapsedMilliseconds:N0} ms");
+
+        // Budget guard. History at this shape/count: 681 MB / ~4.8 s when BuildForest split every
+        // row's absolute path (one node per file, each retaining its own full path, counts
+        // dictionary, and pill strings); 116 MB / ~1.6 s building from the shared directory
+        // structure (leaves reference their rows' strings; pills memoized). Time is reported but
+        // not asserted — wall clock flakes across machines.
+        Assert.True(retained < 150L * 1024 * 1024,
+            $"Tree toggle retained {retained / (1024.0 * 1024.0):F1} MB — over the 150 MB budget");
 
         GC.KeepAlive(vm);
     }

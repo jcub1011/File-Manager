@@ -52,8 +52,8 @@ public sealed record DryRunFileRow(
     long SizeBytes = 0,
     string? SourceCommonRoot = null)
 {
-    /// <summary>The absolute source path, reconstructed on demand (tooltips, tree building) — rows
-    /// share their directory string instead of each retaining a full path.</summary>
+    /// <summary>The absolute source path, reconstructed on demand (tooltips) — rows share their
+    /// directory string instead of each retaining a full path.</summary>
     public string SourcePath => System.IO.Path.Join(DirPath, FileName);
 
     /// <summary>The directory shown under the file name, relative to the tab's common root. Computed
@@ -134,8 +134,8 @@ public sealed record DryRunDestinationEntry(
     string? CommonRoot,
     long SizeBytes = 0)
 {
-    /// <summary>The absolute resulting path, reconstructed on demand (tooltips, tree building) —
-    /// entries share their directory string instead of each retaining a full path.</summary>
+    /// <summary>The absolute resulting path, reconstructed on demand (tooltips) — entries share
+    /// their directory string instead of each retaining a full path.</summary>
     public string TargetPath => System.IO.Path.Join(DirPath, FileName);
 
     /// <summary>Directory relative to the tab's common root; computed on demand — only realized
@@ -232,35 +232,48 @@ public sealed record TreePill(string Text, IBrush Background, IBrush Foreground)
 public sealed record TreePillSpec(string Kind, string Label, IBrush Background, IBrush Foreground);
 
 /// <summary>A node in a path tree whose counts are the rolled-up totals of everything beneath it,
-/// rendered as coloured summary pills. Building the forest over tens of thousands of paths is cheap
-/// data work; TreeDataGrid flattens the forest into a single virtualized row list and only realizes
-/// the rows currently in view, however deep or expanded the tree is.</summary>
+/// rendered as coloured summary pills. The forest is derived from the directory structure the rows
+/// already share (their directory strings reference the report's materialized directory table), so
+/// building it is cheap even at the streamed cap; TreeDataGrid flattens the forest into a single
+/// virtualized row list and only realizes the rows currently in view, however deep or expanded the
+/// tree is.</summary>
 public sealed partial class DryRunTreeNode : ObservableObject
 {
     private static readonly char[] Separators = ['\\', '/'];
 
-    private readonly Dictionary<string, int> _counts = new(StringComparer.Ordinal);
+    // Directory nodes store their absolute path; leaves hold a reference to their directory's
+    // shared string and reconstruct on demand — FullPath is only ever read by the tooltip and
+    // CollectExpanded, and per-leaf absolute paths alone are hundreds of MB at the streamed cap.
+    private readonly string? _dirFullPath;      // directory nodes only
+    private readonly string? _parentDirPath;    // leaves only — the row's shared directory string
+    private List<DryRunTreeNode>? _children;    // created on first child; leaves stay null
+    private int[]? _counts;                     // per-spec counts, released once the pills are built
     private long _sizeBytes;
 
-    private DryRunTreeNode(string name, string fullPath, bool isDirectory, int depth)
+    private DryRunTreeNode(string name, string? dirFullPath, string? parentDirPath, bool isDirectory, int depth)
     {
         Name = name;
-        FullPath = fullPath;
+        _dirFullPath = dirFullPath;
+        _parentDirPath = parentDirPath;
         IsDirectory = isDirectory;
         Depth = depth;
     }
 
     public string Name { get; }
-    public string FullPath { get; }
+
+    /// <summary>The absolute path (the tooltip, and the expand-state key across rebuilds) — stored
+    /// for directory nodes, reconstructed on demand for leaves.</summary>
+    public string FullPath => _dirFullPath ?? System.IO.Path.Join(_parentDirPath, Name);
+
     public bool IsDirectory { get; }
     public int Depth { get; }
-    public List<DryRunTreeNode> Children { get; } = [];
+    public IReadOnlyList<DryRunTreeNode> Children => (IReadOnlyList<DryRunTreeNode>?)_children ?? [];
 
     /// <summary>Expand/collapse state, bound two-way to the TreeDataGrid expander column's
     /// <c>IsExpandedBinding</c>, so a rebuild can restore what the user had open.</summary>
     [ObservableProperty] public partial bool IsExpanded { get; set; }
 
-    public bool HasChildren => Children.Count > 0;
+    public bool HasChildren => _children is { Count: > 0 };
 
     /// <summary>Rolled-up total byte size of everything beneath this node.</summary>
     public long SizeBytes => _sizeBytes;
@@ -272,16 +285,21 @@ public sealed partial class DryRunTreeNode : ObservableObject
     /// whole forest is assembled.</summary>
     public IReadOnlyList<TreePill> Pills { get; private set; } = [];
 
-    /// <summary>Builds the forest from arbitrary rows, with the path segments taken relative to
-    /// <paramref name="commonRoot"/> so the top level is the first folder the panel actually cares
-    /// about rather than the drive letter (<paramref name="commonRoot"/> null falls back to the full
-    /// path, e.g. when roots span drives). Each node's <see cref="FullPath"/> stays absolute for the
-    /// tooltip. Each leaf contributes (kind, count) increments that roll up the whole ancestor chain;
-    /// pills are rendered in <paramref name="specs"/> order for every kind with a non-zero count.
-    /// Top-level nodes start expanded so the tree opens on something to see.</summary>
+    /// <summary>Builds the forest from arbitrary (directory, file name) rows. Rows share their
+    /// directory string instances (references into the report's materialized directory table), so
+    /// the directory chain is split and its nodes created once per DISTINCT directory, with the
+    /// segments taken relative to <paramref name="commonRoot"/> so the top level is the first folder
+    /// the panel actually cares about rather than the drive letter (<paramref name="commonRoot"/>
+    /// null falls back to the full path, e.g. when roots span drives). Each row then costs two
+    /// dictionary lookups: its directory's node and its leaf (rows at duplicate paths merge). Every
+    /// node's <see cref="FullPath"/> stays absolute for the tooltip. Each leaf accumulates its
+    /// (kind, count) increments and size locally; one post-order pass rolls the totals up the
+    /// ancestor chain and renders pills in <paramref name="specs"/> order for every kind with a
+    /// non-zero count. Top-level nodes start expanded so the tree opens on something to see.</summary>
     public static IReadOnlyList<DryRunTreeNode> BuildForest<T>(
-        IReadOnlyList<T> rows,
-        Func<T, string> pathSelector,
+        IEnumerable<T> rows,
+        Func<T, string> dirSelector,
+        Func<T, string> nameSelector,
         Func<T, IReadOnlyList<(string Kind, int Increment)>> categorizer,
         IReadOnlyList<TreePillSpec> specs,
         string? commonRoot = null,
@@ -290,56 +308,97 @@ public sealed partial class DryRunTreeNode : ObservableObject
     {
         List<DryRunTreeNode> roots = [];
         Dictionary<string, DryRunTreeNode> rootIndex = new(StringComparer.OrdinalIgnoreCase);
-        Dictionary<DryRunTreeNode, Dictionary<string, DryRunTreeNode>> childIndex = new();
+        Dictionary<DryRunTreeNode, Dictionary<string, DryRunTreeNode>> childIndex = [];
+        // One entry per distinct directory string; a null value means the directory IS the common
+        // root, so its files sit at forest-root level.
+        Dictionary<string, DryRunTreeNode?> dirNodeByPath = new(StringComparer.OrdinalIgnoreCase);
         string? rootPrefix = string.IsNullOrEmpty(commonRoot) ? null : commonRoot.TrimEnd('\\', '/');
+
+        Dictionary<string, int> specIndex = new(specs.Count, StringComparer.Ordinal);
+        for (int k = 0; k < specs.Count; k++)
+            specIndex[specs[k].Kind] = k;
 
         foreach (T row in rows)
         {
-            IReadOnlyList<(string Kind, int Increment)> increments = categorizer(row);
-            long size = sizeSelector?.Invoke(row) ?? 0;
-            string full = pathSelector(row);
-            string relative = DryRunPaths.RelativeForTree(full, commonRoot);
+            string dirPath = dirSelector(row);
+            if (!dirNodeByPath.TryGetValue(dirPath, out DryRunTreeNode? dirNode))
+                dirNodeByPath[dirPath] = dirNode = ResolveDirectory(dirPath);
+
+            string fileName = nameSelector(row);
+            Dictionary<string, DryRunTreeNode> index = dirNode is null ? rootIndex : IndexOf(dirNode);
+            if (!index.TryGetValue(fileName, out DryRunTreeNode? leaf))
+            {
+                leaf = new DryRunTreeNode(fileName, dirFullPath: null, dirPath, isDirectory: false,
+                    depth: dirNode is null ? 0 : dirNode.Depth + 1);
+                (dirNode is null ? roots : dirNode._children ??= []).Add(leaf);
+                index[fileName] = leaf;
+            }
+
+            // Increments and size land on the leaf only; FinishRecursive rolls them up afterwards —
+            // O(rows + nodes) instead of per-row walks of the whole ancestor chain. Kinds absent
+            // from the specs are dropped, exactly as pills always rendered only spec kinds.
+            foreach ((string kind, int increment) in categorizer(row))
+            {
+                if (specIndex.TryGetValue(kind, out int k))
+                    (leaf._counts ??= new int[specs.Count])[k] += increment;
+            }
+            leaf._sizeBytes += sizeSelector?.Invoke(row) ?? 0;
+        }
+
+        SortRecursive(roots);
+        FinishRecursive(roots, specs, [], []);
+        foreach (DryRunTreeNode root in roots)
+            root._counts = null;
+        return roots;
+
+        Dictionary<string, DryRunTreeNode> IndexOf(DryRunTreeNode node)
+        {
+            if (!childIndex.TryGetValue(node, out Dictionary<string, DryRunTreeNode>? index))
+                childIndex[node] = index = new(StringComparer.OrdinalIgnoreCase);
+            return index;
+        }
+
+        // Splits and walks one directory chain, creating any missing nodes — runs once per distinct
+        // directory (~the directory-table size), not once per row; the absolute FullPath prefixes
+        // are built only here.
+        DryRunTreeNode? ResolveDirectory(string dirPath)
+        {
+            string relative = DryRunPaths.RelativeForTree(dirPath, commonRoot);
+            if (relative == ".")
+                return null;   // the directory IS the common root
             string[] segments = relative.Split(Separators, StringSplitOptions.RemoveEmptyEntries);
             if (segments.Length == 0)
-                continue;
+                return null;
 
-            // FullPath stays absolute: seed the running prefix with the common root when the path was
-            // taken relative to it; otherwise (fallback to the full path) start empty.
-            string prefix = ReferenceEquals(relative, full) ? "" : rootPrefix ?? "";
-
+            // FullPath stays absolute: seed the running prefix with the common root when the path
+            // was taken relative to it; otherwise (fallback to the full path) start empty.
+            string prefix = ReferenceEquals(relative, dirPath) ? "" : rootPrefix ?? "";
             List<DryRunTreeNode> level = roots;
             Dictionary<string, DryRunTreeNode> index = rootIndex;
+            DryRunTreeNode? node = null;
             for (int i = 0; i < segments.Length; i++)
             {
                 string segment = segments[i];
-                bool isDirectory = i < segments.Length - 1;
                 prefix = prefix.Length == 0 ? segment : $"{prefix}\\{segment}";
 
-                if (!index.TryGetValue(segment, out DryRunTreeNode? node))
+                if (!index.TryGetValue(segment, out node))
                 {
                     // Restore the user's prior expand/collapse state (keyed by absolute path) across
                     // rebuilds; on the first build (no prior state) top-level nodes open by default.
                     bool expanded = expandedPaths is null ? i == 0 : expandedPaths.Contains(prefix);
-                    node = new DryRunTreeNode(segment, prefix, isDirectory, i) { IsExpanded = expanded };
+                    node = new DryRunTreeNode(segment, prefix, parentDirPath: null, isDirectory: true, i)
+                    {
+                        IsExpanded = expanded,
+                    };
                     level.Add(node);
                     index[segment] = node;
                 }
 
-                // The leaf is one row; every ancestor contains it, so counts and sizes roll up the
-                // whole chain.
-                foreach ((string kind, int increment) in increments)
-                    node._counts[kind] = node._counts.GetValueOrDefault(kind) + increment;
-                node._sizeBytes += size;
-
-                level = node.Children;
-                if (!childIndex.TryGetValue(node, out index!))
-                    childIndex[node] = index = new(StringComparer.OrdinalIgnoreCase);
+                level = node._children ??= [];
+                index = IndexOf(node);
             }
+            return node;
         }
-
-        SortRecursive(roots);
-        BuildPillsRecursive(roots, specs);
-        return roots;
     }
 
     /// <summary>Collects the absolute path of every expanded node in a forest so a rebuild can restore
@@ -410,19 +469,63 @@ public sealed partial class DryRunTreeNode : ObservableObject
         return ascending ? byName : -byName;
     }
 
-    private static void BuildPillsRecursive(List<DryRunTreeNode> nodes, IReadOnlyList<TreePillSpec> specs)
+    /// <summary>One post-order pass: rolls every node's counts and size up from its children, then
+    /// renders its pills. Pills are memoized per (kind, count) — at the streamed cap the ~500k
+    /// leaves are overwhelmingly the same "1 &lt;label&gt;" pill — and each node's count buffer is
+    /// released as soon as its parent has consumed it.</summary>
+    private static void FinishRecursive(
+        List<DryRunTreeNode> nodes,
+        IReadOnlyList<TreePillSpec> specs,
+        Dictionary<(int Spec, int Count), TreePill> pillCache,
+        Dictionary<TreePill, IReadOnlyList<TreePill>> singlePillLists)
     {
         foreach (DryRunTreeNode node in nodes)
         {
-            List<TreePill> pills = [];
-            foreach (TreePillSpec spec in specs)
+            if (node._children is { Count: > 0 } children)
             {
-                int count = node._counts.GetValueOrDefault(spec.Kind);
-                if (count > 0)
-                    pills.Add(new TreePill($"{count:N0} {spec.Label}", spec.Background, spec.Foreground));
+                FinishRecursive(children, specs, pillCache, singlePillLists);
+                foreach (DryRunTreeNode child in children)
+                {
+                    if (child._counts is int[] childCounts)
+                    {
+                        int[] counts = node._counts ??= new int[specs.Count];
+                        for (int k = 0; k < childCounts.Length; k++)
+                            counts[k] += childCounts[k];
+                        child._counts = null;
+                    }
+                    node._sizeBytes += child._sizeBytes;
+                }
             }
-            node.Pills = pills;
-            BuildPillsRecursive(node.Children, specs);
+
+            if (node._counts is not int[] own)
+                continue;   // nothing categorized beneath — Pills stays empty
+            List<TreePill>? pills = null;
+            for (int k = 0; k < specs.Count; k++)
+            {
+                int count = own[k];
+                if (count == 0)
+                    continue;
+                if (!pillCache.TryGetValue((k, count), out TreePill? pill))
+                {
+                    TreePillSpec spec = specs[k];
+                    pillCache[(k, count)] = pill =
+                        new TreePill($"{count:N0} {spec.Label}", spec.Background, spec.Foreground);
+                }
+                (pills ??= []).Add(pill);
+            }
+            if (pills is null)
+                continue;
+            if (pills.Count == 1)
+            {
+                // The dominant case (a leaf's single pill) shares one list per distinct pill.
+                if (!singlePillLists.TryGetValue(pills[0], out IReadOnlyList<TreePill>? shared))
+                    singlePillLists[pills[0]] = shared = [pills[0]];
+                node.Pills = shared;
+            }
+            else
+            {
+                node.Pills = pills;
+            }
         }
     }
 
@@ -433,7 +536,10 @@ public sealed partial class DryRunTreeNode : ObservableObject
             ? (a.IsDirectory ? -1 : 1)
             : string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase));
         foreach (DryRunTreeNode node in nodes)
-            SortRecursive(node.Children);
+        {
+            if (node._children is { Count: > 0 } children)
+                SortRecursive(children);
+        }
     }
 }
 
@@ -659,7 +765,7 @@ public sealed partial class DryRunSourcesTab : ViewModelBase
     }
 
     private IReadOnlyList<DryRunTreeNode> BuildTree(IReadOnlyList<DryRunFileRow> rows) =>
-        DryRunTreeNode.BuildForest(rows, static r => r.SourcePath, static r =>
+        DryRunTreeNode.BuildForest(rows, static r => r.DirPath, static r => r.FileName, static r =>
         {
             List<(string, int)> cats = [];
             if (r.IsUntouched) cats.Add(("untouched", 1));
@@ -867,7 +973,7 @@ public sealed partial class DryRunDestinationsTab : ViewModelBase
 
     private IReadOnlyList<DryRunTreeNode> BuildTree(IReadOnlyList<DryRunDestinationRow> rows) =>
         // Flatten grouped rows back to one leaf per resulting path — the tree is per-file, unchanged.
-        DryRunTreeNode.BuildForest(rows.SelectMany(r => r.Destinations).ToList(), static e => e.TargetPath, static e =>
+        DryRunTreeNode.BuildForest(rows.SelectMany(static r => r.Destinations), static e => e.DirPath, static e => e.FileName, static e =>
         {
             string kind = e.Kind switch
             {

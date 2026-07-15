@@ -10,6 +10,18 @@
 > normalization lives in `DryRunStreamHandler` (which also emits the sweep chunks), not
 > on the engine's `DryRunChunk` — the engine, space estimator, and destination projector
 > stayed stringy and untouched. Line references below describe the pre-change tree.
+>
+> **Addendum (2026-07-15): the tree view needed the same treatment.** This plan left
+> `DryRunTreeNode.BuildForest` alone ("transient, only runs when the tree toggles on"),
+> but at the 500k cap that toggle split every row's absolute path back apart on the UI
+> thread and retained one node per file with its own full-path string, counts dictionary,
+> and pill strings — measured at **681 MB retained and a ~4.8 s freeze** (deep-path probe,
+> both tabs). `BuildForest` now derives the forest from the directory structure the rows
+> already share: the directory chain is resolved once per distinct directory string,
+> leaves reference their rows' strings and reconstruct `FullPath` on demand, counts roll
+> up in one post-order pass, and pills are memoized per (kind, count). Same probe after:
+> **116 MB / ~1.6 s**. The remaining follow-up, if the residual pause matters, is moving
+> the build off the UI thread.
 
 ## Context
 
