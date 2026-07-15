@@ -1,0 +1,3 @@
+[submodule "third_party/TreeDataGrid"]
+	path = third_party/TreeDataGrid
+	url = https://github.com/wieslawsoltes/TreeDataGrid.git

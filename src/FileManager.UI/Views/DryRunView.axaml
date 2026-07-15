@@ -6,36 +6,33 @@
              x:DataType="vm:DryRunViewModel">
 
     <UserControl.Resources>
-        <!-- Shared tree row for both the Sources and Destinations trees. The built-in TreeView draws
-             the expand chevron + indentation; we supply the node name (col 0) and a right-aligned strip
-             of rolled-up, colour-coded summary pills (col 1). ItemsSource="{Binding Children}" makes it
-             hierarchical. The pills are data-driven (each carries its own brushes) so one template
-             serves both tabs. -->
-        <TreeDataTemplate x:Key="DryRunNodeTemplate" x:DataType="vm:DryRunTreeNode"
-                          ItemsSource="{Binding Children}">
-            <Grid ColumnDefinitions="*,Auto,Auto" Height="24" ToolTip.Tip="{Binding FullPath}">
-                <TextBlock Grid.Column="0" Text="{Binding Name}" FontFamily="{StaticResource MonoFontFamily}"
-                           VerticalAlignment="Center" Classes.dir="{Binding IsDirectory}"
-                           TextTrimming="CharacterEllipsis" />
-                <TextBlock Grid.Column="1" Text="{Binding SizeText}" FontSize="11" Opacity="0.6"
-                           VerticalAlignment="Center" Margin="8,0,0,0" />
-                <ItemsControl Grid.Column="2" ItemsSource="{Binding Pills}" Margin="8,0,0,0">
-                    <ItemsControl.ItemsPanel>
-                        <ItemsPanelTemplate>
-                            <StackPanel Orientation="Horizontal" Spacing="6" />
-                        </ItemsPanelTemplate>
-                    </ItemsControl.ItemsPanel>
-                    <ItemsControl.ItemTemplate>
-                        <DataTemplate x:DataType="vm:TreePill">
-                            <Border CornerRadius="10" Padding="10,3" Background="{Binding Background}"
-                                    VerticalAlignment="Center">
-                                <TextBlock Text="{Binding Text}" FontSize="11" Foreground="{Binding Foreground}" />
-                            </Border>
-                        </DataTemplate>
-                    </ItemsControl.ItemTemplate>
-                </ItemsControl>
-            </Grid>
-        </TreeDataTemplate>
+        <!-- Shared cell templates for both the Sources and Destinations trees (rendered by
+             TreeDataGrid, which flattens the hierarchy into a single virtualized row list). The
+             expander column draws the chevron + indentation; these templates supply the node name and
+             a strip of rolled-up, colour-coded summary pills. The pills are data-driven (each carries
+             its own brushes) so one template serves both tabs. -->
+        <DataTemplate x:Key="DryRunNameCell" x:DataType="vm:DryRunTreeNode">
+            <TextBlock Text="{Binding Name}" FontFamily="{StaticResource MonoFontFamily}"
+                       VerticalAlignment="Center" Classes.dir="{Binding IsDirectory}"
+                       TextTrimming="CharacterEllipsis" ToolTip.Tip="{Binding FullPath}" />
+        </DataTemplate>
+        <DataTemplate x:Key="DryRunPillsCell" x:DataType="vm:DryRunTreeNode">
+            <ItemsControl ItemsSource="{Binding Pills}">
+                <ItemsControl.ItemsPanel>
+                    <ItemsPanelTemplate>
+                        <StackPanel Orientation="Horizontal" Spacing="6" />
+                    </ItemsPanelTemplate>
+                </ItemsControl.ItemsPanel>
+                <ItemsControl.ItemTemplate>
+                    <DataTemplate x:DataType="vm:TreePill">
+                        <Border CornerRadius="10" Padding="10,3" Background="{Binding Background}"
+                                VerticalAlignment="Center">
+                            <TextBlock Text="{Binding Text}" FontSize="11" Foreground="{Binding Foreground}" />
+                        </Border>
+                    </DataTemplate>
+                </ItemsControl.ItemTemplate>
+            </ItemsControl>
+        </DataTemplate>
 
         <!-- A tab's source + destination filter facets: two WrapPanels of checkboxes. -->
         <DataTemplate x:Key="FacetTemplate" x:DataType="vm:DryRunFacetRow">
@@ -186,24 +183,16 @@
             <Setter Property="FontWeight" Value="SemiBold" />
         </Style>
 
-        <!-- Virtualized tree lists (recycle containers per level so a large forest stays bounded). -->
-        <Style Selector="TreeView.rows">
+        <!-- The tree lists render with TreeDataGrid, which flattens the hierarchy into one virtualized
+             row list (only visible rows are realized, however deep or expanded the forest). Keep the
+             surface clean: transparent, borderless, compact rows to match the rest of the panel. -->
+        <Style Selector="TreeDataGrid.rows">
             <Setter Property="Background" Value="Transparent" />
-            <Setter Property="BorderThickness" Value="0" />
-            <Setter Property="Padding" Value="0" />
-            <Setter Property="ItemsPanel">
-                <ItemsPanelTemplate>
-                    <VirtualizingStackPanel />
-                </ItemsPanelTemplate>
-            </Setter>
+            <Setter Property="ShowColumnHeaders" Value="True" />
+            <Setter Property="CanUserSortColumns" Value="True" />
         </Style>
-        <Style Selector="TreeView.rows TreeViewItem" x:DataType="vm:DryRunTreeNode">
-            <Setter Property="IsExpanded" Value="{Binding IsExpanded, Mode=TwoWay}" />
-            <Setter Property="ItemsPanel">
-                <ItemsPanelTemplate>
-                    <VirtualizingStackPanel />
-                </ItemsPanelTemplate>
-            </Setter>
+        <Style Selector="TreeDataGrid.rows TreeDataGridRow">
+            <Setter Property="MinHeight" Value="24" />
         </Style>
     </UserControl.Styles>
 
@@ -401,9 +390,8 @@
                         </ListBox.ItemTemplate>
                     </ListBox>
 
-                    <TreeView Grid.Row="5" Classes="rows" ItemsSource="{Binding Sources.Tree}"
-                              IsVisible="{Binding Sources.ShowTree}"
-                              ItemTemplate="{StaticResource DryRunNodeTemplate}" />
+                    <TreeDataGrid Grid.Row="5" Classes="rows" Source="{Binding Sources.TreeSource}"
+                                  IsVisible="{Binding Sources.ShowTree}" />
                 </Grid>
 
                 <GridSplitter Grid.Column="1" Width="6" ResizeDirection="Columns"
@@ -547,9 +535,8 @@
                         </ListBox.ItemTemplate>
                     </ListBox>
 
-                    <TreeView Grid.Row="5" Classes="rows" ItemsSource="{Binding Destinations.Tree}"
-                              IsVisible="{Binding Destinations.ShowTree}"
-                              ItemTemplate="{StaticResource DryRunNodeTemplate}" />
+                    <TreeDataGrid Grid.Row="5" Classes="rows" Source="{Binding Destinations.TreeSource}"
+                                  IsVisible="{Binding Destinations.ShowTree}" />
                 </Grid>
             </Grid>
         </Grid>

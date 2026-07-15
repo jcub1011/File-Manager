@@ -11,10 +11,10 @@ using FileManager.UI.Views;
 namespace FileManager.UI.Tests;
 
 /// <summary>Loads the real DryRunView control against a populated view model and forces a layout pass,
-/// so runtime-only XAML failures (the shared TreeDataTemplate + data-driven pills, the TreeViewItem
-/// IsExpanded style binding, the VirtualizingStackPanel item panels, the tabbed list/tree templates,
-/// facet checkbox templates) surface as a failing test rather than in the app. Each test closes its
-/// window so the headless render loop stops and the shared session tears down cleanly.</summary>
+/// so runtime-only XAML failures (the TreeDataGrid columns + shared cell templates, the data-driven
+/// pills, the expander column's Children/HasChildren/IsExpanded bindings, the tabbed list/tree
+/// templates, facet checkbox templates) surface as a failing test rather than in the app. Each test
+/// closes its window so the headless render loop stops and the shared session tears down cleanly.</summary>
 [Collection(HeadlessCollection.Name)]
 public sealed class DryRunViewSmokeTests(HeadlessSessionFixture headless)
 {

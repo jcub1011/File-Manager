@@ -1,3 +1,6 @@
+using Avalonia;
+using Avalonia.Controls;
+using Avalonia.Controls.Models.TreeDataGrid;
 using Avalonia.Media;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
@@ -196,8 +199,8 @@ public sealed record TreePillSpec(string Kind, string Label, IBrush Background, 
 
 /// <summary>A node in a path tree whose counts are the rolled-up totals of everything beneath it,
 /// rendered as coloured summary pills. Building the forest over tens of thousands of paths is cheap
-/// data work; the built-in TreeView virtualizes the realized rows and only materializes a node's
-/// children once it is expanded.</summary>
+/// data work; TreeDataGrid flattens the forest into a single virtualized row list and only realizes
+/// the rows currently in view, however deep or expanded the tree is.</summary>
 public sealed partial class DryRunTreeNode : ObservableObject
 {
     private static readonly char[] Separators = ['\\', '/'];
@@ -219,7 +222,8 @@ public sealed partial class DryRunTreeNode : ObservableObject
     public int Depth { get; }
     public List<DryRunTreeNode> Children { get; } = [];
 
-    /// <summary>Expand/collapse state, bound two-way to the built-in <c>TreeViewItem.IsExpanded</c>.</summary>
+    /// <summary>Expand/collapse state, bound two-way to the TreeDataGrid expander column's
+    /// <c>IsExpandedBinding</c>, so a rebuild can restore what the user had open.</summary>
     [ObservableProperty] public partial bool IsExpanded { get; set; }
 
     public bool HasChildren => Children.Count > 0;
@@ -321,6 +325,55 @@ public sealed partial class DryRunTreeNode : ObservableObject
                 Walk(n.Children);
             }
         }
+    }
+
+    /// <summary>Wraps a built forest in the <see cref="HierarchicalTreeDataGridSource{TModel}"/> that the
+    /// view binds to. Columns use compiled lambda/expression selectors (no runtime model reflection, so
+    /// it stays AOT/trim-clean) and reference the Name/Status cell templates by resource key, resolved
+    /// from the view's resources at cell realization. The expander's <c>IsExpanded</c> selector is
+    /// two-way, so user expand/collapse writes back to the node and survives a rebuild via
+    /// <see cref="CollectExpanded"/>.</summary>
+    public static HierarchicalTreeDataGridSource<DryRunTreeNode> BuildSource(IReadOnlyList<DryRunTreeNode> roots)
+    {
+        // Header-click sort comparers (the default view keeps BuildForest's dirs-first order). Name keeps
+        // directories first in both directions; Size sorts on the raw byte count, not the formatted text;
+        // the pills column is not meaningfully sortable.
+        TemplateColumnOptions<DryRunTreeNode> nameOptions = new()
+        {
+            CompareAscending = (a, b) => CompareNodes(a, b, ascending: true),
+            CompareDescending = (a, b) => CompareNodes(a, b, ascending: false),
+        };
+        TextColumnOptions<DryRunTreeNode> sizeOptions = new()
+        {
+            CompareAscending = static (a, b) => (a?.SizeBytes ?? 0).CompareTo(b?.SizeBytes ?? 0),
+            CompareDescending = static (a, b) => (b?.SizeBytes ?? 0).CompareTo(a?.SizeBytes ?? 0),
+        };
+        TemplateColumnOptions<DryRunTreeNode> pillsOptions = new() { CanUserSortColumn = false };
+
+        HierarchicalTreeDataGridSource<DryRunTreeNode> source = new(roots)
+        {
+            Columns =
+            {
+                new HierarchicalExpanderColumn<DryRunTreeNode>(
+                    new TemplateColumn<DryRunTreeNode>("Name", "DryRunNameCell",
+                        width: new GridLength(1, GridUnitType.Star), options: nameOptions),
+                    x => x.Children,
+                    x => x.HasChildren,
+                    x => x.IsExpanded),
+                new TextColumn<DryRunTreeNode, string>("Size", x => x.SizeText, width: null, options: sizeOptions),
+                new TemplateColumn<DryRunTreeNode>("Status", "DryRunPillsCell", options: pillsOptions),
+            },
+        };
+        return source;
+    }
+
+    // Directories before files, then alphabetical — the same ordering BuildForest applies by default.
+    private static int CompareNodes(DryRunTreeNode? a, DryRunTreeNode? b, bool ascending)
+    {
+        if (a is null || b is null) return 0;
+        if (a.IsDirectory != b.IsDirectory) return a.IsDirectory ? -1 : 1;
+        int byName = string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase);
+        return ascending ? byName : -byName;
     }
 
     private static void BuildPillsRecursive(List<DryRunTreeNode> nodes, IReadOnlyList<TreePillSpec> specs)
@@ -431,6 +484,13 @@ public sealed partial class DryRunSourcesTab : ViewModelBase
 
     [ObservableProperty] public partial IReadOnlyList<DryRunFileRow> VisibleRows { get; private set; } = [];
     [ObservableProperty] public partial IReadOnlyList<DryRunTreeNode> Tree { get; private set; } = [];
+
+    /// <summary>The TreeDataGrid source the view binds to, rebuilt from <see cref="Tree"/> whenever the
+    /// forest changes (null while empty so the grid shows nothing).</summary>
+    [ObservableProperty] public partial HierarchicalTreeDataGridSource<DryRunTreeNode>? TreeSource { get; private set; }
+
+    partial void OnTreeChanged(IReadOnlyList<DryRunTreeNode> value) =>
+        TreeSource = value.Count == 0 ? null : DryRunTreeNode.BuildSource(value);
     [ObservableProperty] public partial IReadOnlyList<DryRunFacetRow> SourceFacets { get; private set; } = [];
     [ObservableProperty] public partial IReadOnlyList<DryRunFacetRow> DestinationFacets { get; private set; } = [];
     [ObservableProperty] public partial bool ShowSourceFacet { get; private set; }
@@ -607,6 +667,13 @@ public sealed partial class DryRunDestinationsTab : ViewModelBase
 
     [ObservableProperty] public partial IReadOnlyList<DryRunDestinationRow> VisibleRows { get; private set; } = [];
     [ObservableProperty] public partial IReadOnlyList<DryRunTreeNode> Tree { get; private set; } = [];
+
+    /// <summary>The TreeDataGrid source the view binds to, rebuilt from <see cref="Tree"/> whenever the
+    /// forest changes (null while empty so the grid shows nothing).</summary>
+    [ObservableProperty] public partial HierarchicalTreeDataGridSource<DryRunTreeNode>? TreeSource { get; private set; }
+
+    partial void OnTreeChanged(IReadOnlyList<DryRunTreeNode> value) =>
+        TreeSource = value.Count == 0 ? null : DryRunTreeNode.BuildSource(value);
     [ObservableProperty] public partial IReadOnlyList<DryRunFacetRow> SourceFacets { get; private set; } = [];
     [ObservableProperty] public partial IReadOnlyList<DryRunFacetRow> DestinationFacets { get; private set; } = [];
     [ObservableProperty] public partial bool ShowSourceFacet { get; private set; }

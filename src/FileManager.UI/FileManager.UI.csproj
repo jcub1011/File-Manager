@@ -20,6 +20,12 @@
 
   <ItemGroup>
     <ProjectReference Include="..\FileManager.Contracts\FileManager.Contracts.csproj" />
+    <!-- TreeDataGrid is built from its MIT source (vendored as a git submodule under third_party/)
+         rather than the official NuGet: the published package (11.2.0+) injects an Avalonia Pro
+         license-key gate, but the source itself is MIT with no such check. Assembly name stays
+         "Avalonia.Controls.TreeDataGrid", so the App.axaml theme include and control namespaces
+         match the NuGet exactly. -->
+    <ProjectReference Include="..\..\third_party\TreeDataGrid\src\Avalonia.Controls.TreeDataGrid\Avalonia.Controls.TreeDataGrid.csproj" />
     <!-- Build-order + copy-output only, NOT an assembly reference (§1 rule 3: the UI references
          Contracts only). ServiceLauncher resolves FileManager.Service.exe beside the UI exe —
          the publish layout — so the dev build must lay the files out the same way. -->
