@@ -40,13 +40,22 @@ public sealed record DryRunResponse : IpcResponse { public required DryRunReport
 /// collections; the client appends them <b>in receive order</b> so the file lists' indices stay
 /// global (an op's SourceIndex/SubjectIndex is a position into the fully assembled lists). Sweep
 /// frames leave the source collections empty; their <c>SubjectIndex</c> values are already offset
-/// by the running <see cref="DestinationFiles"/> count.</summary>
+/// by the running <see cref="DestinationFiles"/> count.
+/// <para>
+/// Paths are normalized against a shared directory table: <see cref="Directories"/> carries, in
+/// global index order, exactly the <see cref="DryRunDirectory"/> entries first referenced by this
+/// chunk — every <c>ParentIndex</c> refers to an earlier global index (possibly a prior chunk's),
+/// and every <c>DirIndex</c>/<c>RootDirIndex</c> in this chunk's files/ops is below the table count
+/// after this chunk's entries are appended. The consumer appends <see cref="Directories"/> before
+/// reading the files/ops, exactly as it already appends the file lists.
+/// </para></summary>
 public sealed record DryRunChunkResponse : IpcResponse
 {
-    public IReadOnlyList<PhysicalFile> SourceFiles { get; init; } = [];
-    public IReadOnlyList<PhysicalFile> DestinationFiles { get; init; } = [];
-    public IReadOnlyList<VirtualFileOperation> SourceOperations { get; init; } = [];
-    public IReadOnlyList<VirtualFileOperation> DestinationOperations { get; init; } = [];
+    public IReadOnlyList<DryRunDirectory> Directories { get; init; } = [];
+    public IReadOnlyList<DryRunFile> SourceFiles { get; init; } = [];
+    public IReadOnlyList<DryRunFile> DestinationFiles { get; init; } = [];
+    public IReadOnlyList<DryRunOperation> SourceOperations { get; init; } = [];
+    public IReadOnlyList<DryRunOperation> DestinationOperations { get; init; } = [];
 }
 /// <summary>Terminates a streamed dry-run report. GeneratedAt is stamped when the report finishes;
 /// Truncated is true only if a service-side safety bound cut the report short.</summary>

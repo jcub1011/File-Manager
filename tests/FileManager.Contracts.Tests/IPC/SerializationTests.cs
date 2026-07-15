@@ -59,7 +59,7 @@ public sealed class SerializationTests
         { new ValidationResponse { Issues = [new ValidationIssue(ValidationSeverity.BlockingWarning, "C", "m")] }, "validation" },
         { new MatchingProfilesResponse { Matches = [] }, "matching" },
         { new DryRunResponse { Report = SampleReport() }, "dry-run-report" },
-        { new DryRunChunkResponse { SourceFiles = [SampleSourceFile()], SourceOperations = [SampleSourceOp()] }, "dry-run-chunk" },
+        { new DryRunChunkResponse { Directories = SampleDirectories(), SourceFiles = [SampleWireFile()], SourceOperations = [SampleWireSourceOp()] }, "dry-run-chunk" },
         { new DryRunCompleteResponse { GeneratedAt = DateTimeOffset.UnixEpoch, Truncated = false }, "dry-run-complete" },
         { new RecentJobsResponse { Jobs = [] }, "recent-jobs" },
         { new JobLogResponse { Lines = ["a"] }, "job-log" },
@@ -215,27 +215,41 @@ public sealed class SerializationTests
     }
 
     [Fact]
-    public void DryRunChunkResponse_round_trips_its_four_collections()
+    public void DryRunChunkResponse_round_trips_its_directory_table_and_collections()
     {
+        // Normalized wire shape: a directory table plus (DirIndex, FileName) records, built the
+        // same way the service builds them.
+        DryRunDirectoryTableBuilder dirs = new();
+        DryRunFile sourceFile = dirs.Convert(SampleSourceFile());
+        DryRunFile destinationFile = dirs.Convert(SampleDestinationFile());
+        DryRunOperation sourceOp = dirs.Convert(SampleSourceOp());
+        DryRunOperation destOp = dirs.Convert(new VirtualFileOperation
+        {
+            Path = @"C:\t\one.txt", Root = @"C:\t", Kind = OperationKind.Overwrite, SourceIndex = 0, SubjectIndex = 0,
+        });
         byte[] wire = IpcSerializer.SerializeResponse(new DryRunChunkResponse
         {
-            SourceFiles = [SampleSourceFile()],
-            DestinationFiles = [SampleDestinationFile()],
-            SourceOperations = [SampleSourceOp()],
-            DestinationOperations =
-            [
-                new VirtualFileOperation { Path = @"C:\t\one.txt", Root = @"C:\t", Kind = OperationKind.Overwrite, SourceIndex = 0, SubjectIndex = 0 },
-            ],
+            Directories = dirs.FlushNew(),
+            SourceFiles = [sourceFile],
+            DestinationFiles = [destinationFile],
+            SourceOperations = [sourceOp],
+            DestinationOperations = [destOp],
         });
 
         Assert.True(IpcSerializer.DeserializeResponse(wire).TryGetValue(out IpcResponse? reparsed));
         DryRunChunkResponse chunk = Assert.IsType<DryRunChunkResponse>(reparsed);
-        Assert.Equal(@"C:\a\one.txt", Assert.Single(chunk.SourceFiles).Path);
-        Assert.Equal(@"C:\t\one.txt", Assert.Single(chunk.DestinationFiles).Path);
+
+        // The table survives the round-trip and resolves the records back to the original paths.
+        string[] paths = DryRunDirectoryTable.Materialize(chunk.Directories);
+        DryRunFile parsedSource = Assert.Single(chunk.SourceFiles);
+        Assert.Equal(@"C:\a\one.txt", System.IO.Path.Join(paths[parsedSource.DirIndex], parsedSource.FileName));
+        Assert.Equal(@"C:\a", paths[parsedSource.RootDirIndex]);
+        DryRunFile parsedDestination = Assert.Single(chunk.DestinationFiles);
+        Assert.Equal(@"C:\t\one.txt", System.IO.Path.Join(paths[parsedDestination.DirIndex], parsedDestination.FileName));
         Assert.Equal(OperationKind.Processed, Assert.Single(chunk.SourceOperations).Kind);
-        VirtualFileOperation destOp = Assert.Single(chunk.DestinationOperations);
-        Assert.Equal(0, destOp.SourceIndex);
-        Assert.Equal(0, destOp.SubjectIndex);
+        DryRunOperation parsedDestOp = Assert.Single(chunk.DestinationOperations);
+        Assert.Equal(0, parsedDestOp.SourceIndex);
+        Assert.Equal(0, parsedDestOp.SubjectIndex);
     }
 
     [Fact]
@@ -347,6 +361,30 @@ public sealed class SerializationTests
         Assert.True(IpcSerializer.DeserializeRequest("""{"type":"no-such-request"}"""u8.ToArray()).TryGetError(out string? unknown));
         Assert.Contains("malformed request", unknown);
     }
+
+    /// <summary>The table for <see cref="SampleWireFile"/>/<see cref="SampleWireSourceOp"/>:
+    /// <c>C:\</c> → <c>a</c>, so index 1 is <c>C:\a</c>.</summary>
+    private static List<DryRunDirectory> SampleDirectories() =>
+        [new DryRunDirectory(@"C:\", -1), new DryRunDirectory("a", 0)];
+
+    private static DryRunFile SampleWireFile() => new()
+    {
+        DirIndex = 1,
+        FileName = "one.txt",
+        RootDirIndex = 1,
+        Length = 10,
+        LastWritten = DateTimeOffset.UnixEpoch,
+    };
+
+    private static DryRunOperation SampleWireSourceOp() => new()
+    {
+        DirIndex = 1,
+        FileName = "one.txt",
+        RootDirIndex = 1,
+        Kind = OperationKind.Processed,
+        SourceIndex = 0,
+        SourceDisposition = OnSuccessAction.KeepSource,
+    };
 
     private static PhysicalFile SampleSourceFile() => new()
     {

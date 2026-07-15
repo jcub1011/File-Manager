@@ -190,11 +190,11 @@ public sealed class IpcServer(
         parsed.TryGetValue(out IpcRequest? request);
 
         string discriminator = IpcRequestTypes.DiscriminatorOf(request!);
-        if (request!.ProtocolVersion != 1)
+        if (request!.ProtocolVersion != IpcRequest.CurrentProtocolVersion)
             return new Resolution(discriminator, null, null, new ErrorResponse
             {
                 Code = "IPC_VERSION_MISMATCH",
-                Message = $"this service speaks protocol version 1, the client sent {request.ProtocolVersion}",
+                Message = $"this service speaks protocol version {IpcRequest.CurrentProtocolVersion}, the client sent {request.ProtocolVersion}",
             });
 
         if (!handlers.TryGetValue(discriminator, out IIpcRequestHandler? handler))

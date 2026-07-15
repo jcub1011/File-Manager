@@ -159,12 +159,14 @@ public sealed class IpcClient : IAsyncDisposable
             if (writeResult.TryGetError(out string? writeError))
                 return new IpcError("IPC_TRANSPORT", writeError);
 
-            // Appended in receive order so the file lists' indices stay global — an op's
-            // SourceIndex/SubjectIndex is a position into the fully assembled lists.
-            List<PhysicalFile> sourceFiles = [];
-            List<PhysicalFile> destinationFiles = [];
-            List<VirtualFileOperation> sourceOperations = [];
-            List<VirtualFileOperation> destinationOperations = [];
+            // Appended in receive order so the lists' indices stay global — an op's
+            // SourceIndex/SubjectIndex is a position into the fully assembled file lists, and a
+            // file/op's DirIndex/RootDirIndex is a position into the assembled directory table.
+            List<DryRunDirectory> directories = [];
+            List<DryRunFile> sourceFiles = [];
+            List<DryRunFile> destinationFiles = [];
+            List<DryRunOperation> sourceOperations = [];
+            List<DryRunOperation> destinationOperations = [];
             while (true)
             {
                 Result<byte[], string> frame = await IpcFrameCodec.ReadFrameAsync(_pipe, ct).ConfigureAwait(false);
@@ -182,20 +184,33 @@ public sealed class IpcClient : IAsyncDisposable
                 switch (response!)
                 {
                     case DryRunChunkResponse chunk:
+                        // Fail loud on a malformed table rather than mis-rooting paths: every parent
+                        // must already be in the assembled table (parents precede children globally).
+                        foreach (DryRunDirectory dir in chunk.Directories)
+                        {
+                            if (dir.ParentIndex < -1 || dir.ParentIndex >= directories.Count)
+                                return new IpcError("IPC_MALFORMED",
+                                    $"the service sent a directory entry ('{dir.Name}') whose ParentIndex {dir.ParentIndex} does not precede it in the table");
+                            directories.Add(dir);
+                        }
                         sourceFiles.AddRange(chunk.SourceFiles);
                         destinationFiles.AddRange(chunk.DestinationFiles);
                         sourceOperations.AddRange(chunk.SourceOperations);
                         destinationOperations.AddRange(chunk.DestinationOperations);
                         break;
                     case DryRunCompleteResponse complete:
+                        // TEMPORARY (directory-table migration, stage B): reconstruct the stringy
+                        // report until DryRunReport itself carries the normalized shape (stage C),
+                        // at which point the assembled lists return directly.
+                        string[] dirPaths = DryRunDirectoryTable.Materialize(directories);
                         return new DryRunReport
                         {
                             ProfileId = request.ProfileId,
                             GeneratedAt = complete.GeneratedAt,
-                            SourceFiles = sourceFiles,
-                            DestinationFiles = destinationFiles,
-                            SourceOperations = sourceOperations,
-                            DestinationOperations = destinationOperations,
+                            SourceFiles = sourceFiles.ConvertAll(f => ToPhysicalFile(f, dirPaths)),
+                            DestinationFiles = destinationFiles.ConvertAll(f => ToPhysicalFile(f, dirPaths)),
+                            SourceOperations = sourceOperations.ConvertAll(o => ToOperation(o, dirPaths)),
+                            DestinationOperations = destinationOperations.ConvertAll(o => ToOperation(o, dirPaths)),
                             Truncated = complete.Truncated,
                             Space = complete.Space,
                         };
@@ -226,6 +241,28 @@ public sealed class IpcClient : IAsyncDisposable
             _requestGate.Release();
         }
     }
+
+    // TEMPORARY (directory-table migration, stage B): the stringy bridge from the normalized wire
+    // shape back to the current DryRunReport. Deleted when the report itself goes normalized.
+    private static PhysicalFile ToPhysicalFile(DryRunFile file, string[] dirPaths) => new()
+    {
+        Path = System.IO.Path.Join(dirPaths[file.DirIndex], file.FileName),
+        Root = dirPaths[file.RootDirIndex],
+        Length = file.Length,
+        LastWritten = file.LastWritten,
+        IsReparsePoint = file.IsReparsePoint,
+    };
+
+    private static VirtualFileOperation ToOperation(DryRunOperation op, string[] dirPaths) => new()
+    {
+        Path = System.IO.Path.Join(dirPaths[op.DirIndex], op.FileName),
+        Root = dirPaths[op.RootDirIndex],
+        Kind = op.Kind,
+        SourceIndex = op.SourceIndex,
+        SubjectIndex = op.SubjectIndex,
+        SourceDisposition = op.SourceDisposition,
+        Detail = op.Detail,
+    };
 
     /// <summary>Sends SubscribeEventsRequest; after the acknowledgment the connection is a
     /// one-way EngineEvent stream until disconnect (§3.2). Throws InvalidOperationException if

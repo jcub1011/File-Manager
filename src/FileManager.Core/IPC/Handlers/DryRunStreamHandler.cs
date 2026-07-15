@@ -83,6 +83,10 @@ public sealed class DryRunStreamHandler(
         // operation's resulting path) as chunks stream by — NOT the file objects — so the destination
         // sweep below can identify orphans without retaining the whole report in memory.
         HashSet<NormalizedPath> survivors = [];
+        // One converter for the whole stream: it owns the report's directory-index space across the
+        // file phase AND the sweep, so each outgoing chunk carries exactly its first-referenced
+        // directory entries with globally valid indices.
+        WireChunkConverter converter = new();
         await foreach (Result<DryRunChunk, string> chunk in
             engine.SimulateStreamAsync(typed.ProfileId, typed.ScopePath, ct).ConfigureAwait(false))
         {
@@ -95,19 +99,15 @@ public sealed class DryRunStreamHandler(
             // The engine sets ScanTruncated once its candidate scan is cut short. OR it in BEFORE the
             // sweep so a prefix-only survivor set never drives a (bogus) Mirror-deletion preview.
             truncated |= slice!.ScanTruncated;
-            yield return new DryRunChunkResponse
-            {
-                SourceFiles = slice.SourceFiles,
-                DestinationFiles = slice.DestinationFiles,
-                SourceOperations = slice.SourceOperations,
-                DestinationOperations = slice.DestinationOperations,
-            };
+            // Fold the stringy slice into the estimator and survivor set BEFORE converting: both key
+            // on absolute path/root strings, so they consume the engine's shape, never the wire's.
             estimatorWatch.Start();
             estimator.Accumulate(
                 slice.SourceFiles, slice.DestinationFiles, slice.SourceOperations, slice.DestinationOperations,
                 emitted, destinationCount, stageOverwrites);
             estimatorWatch.Stop();
             DestinationProjector.AccumulateSurvivors(survivors, slice.DestinationOperations);
+            yield return converter.Convert(slice);
             destinationCount += slice.DestinationFiles.Count;
 
             emitted += slice.SourceFiles.Count;
@@ -159,7 +159,7 @@ public sealed class DryRunStreamHandler(
                 sliceFiles.Add(sweep.Files[start + i]);
                 sliceOps.Add(sweep.Ops[start + i] with { SubjectIndex = destinationCount + start + i });
             }
-            yield return new DryRunChunkResponse { DestinationFiles = sliceFiles, DestinationOperations = sliceOps };
+            yield return converter.Convert([], sliceFiles, [], sliceOps);
         }
 
         // Skip the projection on a truncated report — totals over a partial graph would be unsound.
@@ -176,5 +176,46 @@ public sealed class DryRunStreamHandler(
                 sweep.WalkMs, sweep.MergeMs, estimatorWatch.ElapsedMilliseconds, emitted, destinationCount,
                 sweep.Files.Count);
         yield return new DryRunCompleteResponse { GeneratedAt = time.GetUtcNow(), Truncated = truncated, Space = space };
+    }
+
+    /// <summary>Converts the engine's stringy slices to the normalized wire shape. One instance owns
+    /// the stream's whole directory-index space — the file-phase chunks and the handler-emitted sweep
+    /// chunks extend the same table, so every index stays a valid position into the client's
+    /// concatenated <c>Directories</c> list. Each outgoing chunk carries exactly the directory
+    /// entries it references first (<see cref="DryRunDirectoryTableBuilder.FlushNew"/>), before the
+    /// files/ops that use them.</summary>
+    private sealed class WireChunkConverter
+    {
+        private readonly DryRunDirectoryTableBuilder _dirs = new();
+
+        public DryRunChunkResponse Convert(DryRunChunk slice) =>
+            Convert(slice.SourceFiles, slice.DestinationFiles, slice.SourceOperations, slice.DestinationOperations);
+
+        public DryRunChunkResponse Convert(
+            IReadOnlyList<PhysicalFile> sourceFiles, IReadOnlyList<PhysicalFile> destinationFiles,
+            IReadOnlyList<VirtualFileOperation> sourceOps, IReadOnlyList<VirtualFileOperation> destinationOps)
+        {
+            List<DryRunFile> wireSourceFiles = new(sourceFiles.Count);
+            foreach (PhysicalFile f in sourceFiles)
+                wireSourceFiles.Add(_dirs.Convert(f));
+            List<DryRunFile> wireDestinationFiles = new(destinationFiles.Count);
+            foreach (PhysicalFile f in destinationFiles)
+                wireDestinationFiles.Add(_dirs.Convert(f));
+            List<DryRunOperation> wireSourceOps = new(sourceOps.Count);
+            foreach (VirtualFileOperation o in sourceOps)
+                wireSourceOps.Add(_dirs.Convert(o));
+            List<DryRunOperation> wireDestinationOps = new(destinationOps.Count);
+            foreach (VirtualFileOperation o in destinationOps)
+                wireDestinationOps.Add(_dirs.Convert(o));
+
+            return new DryRunChunkResponse
+            {
+                Directories = _dirs.FlushNew(),
+                SourceFiles = wireSourceFiles,
+                DestinationFiles = wireDestinationFiles,
+                SourceOperations = wireSourceOps,
+                DestinationOperations = wireDestinationOps,
+            };
+        }
     }
 }

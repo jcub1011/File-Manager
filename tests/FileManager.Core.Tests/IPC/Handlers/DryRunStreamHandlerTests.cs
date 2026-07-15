@@ -183,13 +183,13 @@ public sealed class DryRunStreamHandlerTests
             DryRunStreamHandler handler = NewHandler(profile, new ScriptedStreamEngine(chunk), maxStreamedFiles: 500);
             List<IpcResponse> frames = await Collect(handler, profile.Id);
 
-            List<VirtualFileOperation> deleted = frames.OfType<DryRunChunkResponse>()
+            List<DryRunOperation> deleted = frames.OfType<DryRunChunkResponse>()
                 .SelectMany(f => f.DestinationOperations)
                 .Where(o => o.Kind == OperationKind.Deleted)
                 .ToList();
 
             Assert.Equal(2, deleted.Count);
-            Assert.All(deleted, o => Assert.Contains("orphan", o.Path));
+            Assert.All(deleted, o => Assert.Contains("orphan", o.FileName));
             // destinationCount (1) + position → global SubjectIndex values are {1, 2}.
             Assert.Equal([1, 2], deleted.Select(o => o.SubjectIndex).OrderBy(i => i).ToArray());
 

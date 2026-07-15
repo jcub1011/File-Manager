@@ -25,7 +25,13 @@ namespace FileManager.Contracts.IPC;
 [JsonDerivedType(typeof(ShutdownRequest), "shutdown")]
 public abstract record IpcRequest
 {
-    public int ProtocolVersion { get; init; } = 1;
+    /// <summary>The protocol this build speaks. History: 1 — original wire format; 2 — dry-run
+    /// chunks normalized against a shared directory table (DryRunDirectory/DryRunFile/
+    /// DryRunOperation replace flat path strings). A mismatched service/UI pair must fail loud
+    /// (IPC_VERSION_MISMATCH), never half-parse.</summary>
+    public const int CurrentProtocolVersion = 2;
+
+    public int ProtocolVersion { get; init; } = CurrentProtocolVersion;
 }
 
 public sealed record GetStatusRequest : IpcRequest;

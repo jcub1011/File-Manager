@@ -37,27 +37,30 @@ public sealed class IpcServerStreamingTests : IAsyncLifetime
                 throw new InvalidOperationException("boom");
             }
 
+            // One builder across all chunks — each chunk's Directories slice carries only its
+            // first-referenced entries, exercising the client's cross-chunk table assembly.
+            DryRunDirectoryTableBuilder dirs = new();
             for (int b = 0; b < 3; b++)
             {
-                List<PhysicalFile> files = Enumerable.Range(0, 4)
-                    .Select(i => new PhysicalFile
+                List<DryRunFile> files = Enumerable.Range(0, 4)
+                    .Select(i => dirs.Convert(new PhysicalFile
                     {
                         Path = $@"C:\src\b{b}\f{i}.dat",
                         Root = @"C:\src",
                         Length = 0,
                         LastWritten = DateTimeOffset.UnixEpoch,
-                    })
+                    }))
                     .ToList();
-                List<VirtualFileOperation> ops = Enumerable.Range(0, 4)
-                    .Select(i => new VirtualFileOperation
+                List<DryRunOperation> ops = Enumerable.Range(0, 4)
+                    .Select(i => dirs.Convert(new VirtualFileOperation
                     {
                         Path = $@"C:\src\b{b}\f{i}.dat",
                         Root = @"C:\src",
                         Kind = OperationKind.Processed,
                         SourceIndex = b * 4 + i,
-                    })
+                    }))
                     .ToList();
-                yield return new DryRunChunkResponse { SourceFiles = files, SourceOperations = ops };
+                yield return new DryRunChunkResponse { Directories = dirs.FlushNew(), SourceFiles = files, SourceOperations = ops };
 
                 if (typed.ScopePath == "error-midway" && b == 1)
                 {
