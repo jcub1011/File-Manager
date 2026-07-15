@@ -42,44 +42,45 @@ public class DryRunViewModelBenchmarks
     /// destination operation references its source file by index, exactly as the engine emits it.</summary>
     private static DryRunReport BuildReport(int fileCount)
     {
-        var sourceFiles = new List<PhysicalFile>(fileCount);
-        var sourceOps = new List<VirtualFileOperation>(fileCount);
-        var destinationFiles = new List<PhysicalFile>();
-        var destinationOps = new List<VirtualFileOperation>();
+        DryRunDirectoryTableBuilder dirs = new();
+        var sourceFiles = new List<DryRunFile>(fileCount);
+        var sourceOps = new List<DryRunOperation>(fileCount);
+        var destinationFiles = new List<DryRunFile>();
+        var destinationOps = new List<DryRunOperation>();
 
         for (int i = 0; i < fileCount; i++)
         {
             string source = $@"C:\src\dir-{i % 64}\file-{i}.dat";
-            sourceFiles.Add(new PhysicalFile
+            sourceFiles.Add(dirs.Convert(new PhysicalFile
             {
                 Path = source,
                 Root = @"C:\src",
                 Length = i,
                 LastWritten = DateTimeOffset.UnixEpoch,
-            });
+            }));
 
             switch (i % 3)
             {
                 case 0:   // Processed with two targets — the rows the count passes iterate.
-                    sourceOps.Add(new VirtualFileOperation
+                    sourceOps.Add(dirs.Convert(new VirtualFileOperation
                     {
                         Path = source,
                         Root = @"C:\src",
                         Kind = OperationKind.Processed,
                         SourceIndex = i,
                         SourceDisposition = i % 6 == 0 ? OnSuccessAction.MoveToTrash : OnSuccessAction.KeepSource,
-                    });
+                    }));
 
                     string firstTarget = $@"C:\dst\file-{i}.dat";
                     if (i % 4 == 0)
                     {
                         int subject = destinationFiles.Count;
-                        destinationFiles.Add(new PhysicalFile { Path = firstTarget, Root = @"C:\dst", Length = i, LastWritten = DateTimeOffset.UnixEpoch });
-                        destinationOps.Add(new VirtualFileOperation { Path = firstTarget, Root = @"C:\dst", Kind = OperationKind.Overwrite, SourceIndex = i, SubjectIndex = subject, Detail = "existing file" });
+                        destinationFiles.Add(dirs.Convert(new PhysicalFile { Path = firstTarget, Root = @"C:\dst", Length = i, LastWritten = DateTimeOffset.UnixEpoch }));
+                        destinationOps.Add(dirs.Convert(new VirtualFileOperation { Path = firstTarget, Root = @"C:\dst", Kind = OperationKind.Overwrite, SourceIndex = i, SubjectIndex = subject, Detail = "existing file" }));
                     }
                     else
                     {
-                        destinationOps.Add(new VirtualFileOperation { Path = firstTarget, Root = @"C:\dst", Kind = OperationKind.New, SourceIndex = i });
+                        destinationOps.Add(dirs.Convert(new VirtualFileOperation { Path = firstTarget, Root = @"C:\dst", Kind = OperationKind.New, SourceIndex = i }));
                     }
 
                     if (i % 5 == 0)
@@ -87,39 +88,39 @@ public class DryRunViewModelBenchmarks
                         // A conflict rename: the suffixed new file plus the kept-original Untouched op.
                         string original = $@"C:\dst2\file-{i}.dat";
                         int subject = destinationFiles.Count;
-                        destinationFiles.Add(new PhysicalFile { Path = original, Root = @"C:\dst2", Length = i, LastWritten = DateTimeOffset.UnixEpoch });
-                        destinationOps.Add(new VirtualFileOperation { Path = $@"C:\dst2\file-{i} (1).dat", Root = @"C:\dst2", Kind = OperationKind.Rename, SourceIndex = i, Detail = "renamed to avoid a conflict" });
-                        destinationOps.Add(new VirtualFileOperation { Path = original, Root = @"C:\dst2", Kind = OperationKind.Untouched, SubjectIndex = subject, Detail = "kept" });
+                        destinationFiles.Add(dirs.Convert(new PhysicalFile { Path = original, Root = @"C:\dst2", Length = i, LastWritten = DateTimeOffset.UnixEpoch }));
+                        destinationOps.Add(dirs.Convert(new VirtualFileOperation { Path = $@"C:\dst2\file-{i} (1).dat", Root = @"C:\dst2", Kind = OperationKind.Rename, SourceIndex = i, Detail = "renamed to avoid a conflict" }));
+                        destinationOps.Add(dirs.Convert(new VirtualFileOperation { Path = original, Root = @"C:\dst2", Kind = OperationKind.Untouched, SubjectIndex = subject, Detail = "kept" }));
                     }
                     else
                     {
-                        destinationOps.Add(new VirtualFileOperation { Path = $@"C:\dst2\file-{i}.dat", Root = @"C:\dst2", Kind = OperationKind.New, SourceIndex = i });
+                        destinationOps.Add(dirs.Convert(new VirtualFileOperation { Path = $@"C:\dst2\file-{i}.dat", Root = @"C:\dst2", Kind = OperationKind.New, SourceIndex = i }));
                     }
                     break;
 
                 case 1:
-                    sourceOps.Add(new VirtualFileOperation
+                    sourceOps.Add(dirs.Convert(new VirtualFileOperation
                     {
                         Path = source,
                         Root = @"C:\src",
                         Kind = OperationKind.SkippedByFilter,
                         SourceIndex = i,
                         Detail = "exclude *.tmp",
-                    });
+                    }));
                     break;
 
                 default:
-                    sourceOps.Add(new VirtualFileOperation
+                    sourceOps.Add(dirs.Convert(new VirtualFileOperation
                     {
                         Path = source,
                         Root = @"C:\src",
                         Kind = OperationKind.SkippedUnchanged,
                         SourceIndex = i,
-                    });
+                    }));
                     string unchanged = $@"C:\dst\file-{i}.dat";
                     int unchangedSubject = destinationFiles.Count;
-                    destinationFiles.Add(new PhysicalFile { Path = unchanged, Root = @"C:\dst", Length = i, LastWritten = DateTimeOffset.UnixEpoch });
-                    destinationOps.Add(new VirtualFileOperation { Path = unchanged, Root = @"C:\dst", Kind = OperationKind.SkipUnchanged, SourceIndex = i, SubjectIndex = unchangedSubject, Detail = "identical content (SHA-256)" });
+                    destinationFiles.Add(dirs.Convert(new PhysicalFile { Path = unchanged, Root = @"C:\dst", Length = i, LastWritten = DateTimeOffset.UnixEpoch }));
+                    destinationOps.Add(dirs.Convert(new VirtualFileOperation { Path = unchanged, Root = @"C:\dst", Kind = OperationKind.SkipUnchanged, SourceIndex = i, SubjectIndex = unchangedSubject, Detail = "identical content (SHA-256)" }));
                     break;
             }
         }
@@ -128,6 +129,7 @@ public class DryRunViewModelBenchmarks
         {
             ProfileId = Guid.NewGuid(),
             GeneratedAt = DateTimeOffset.UtcNow,
+            Directories = dirs.Entries.ToList(),
             SourceFiles = sourceFiles,
             DestinationFiles = destinationFiles,
             SourceOperations = sourceOps,

@@ -166,13 +166,30 @@ public sealed class DryRunEngineTests : IDisposable
 
     // ----- helpers over the new report shape -----
 
-    private static VirtualFileOperation SourceOpFor(DryRunReport report, string sourcePathSuffix)
+    /// <summary>Materializes the report's directory table and Path.Joins a file/op back to its
+    /// absolute path (the wire carries (DirIndex, FileName) triples, not flat strings).</summary>
+    private static string PathOf(string[] dirPaths, DryRunFile file) =>
+        Path.Join(dirPaths[file.DirIndex], file.FileName);
+
+    private static string PathOf(string[] dirPaths, DryRunOperation op) =>
+        Path.Join(dirPaths[op.DirIndex], op.FileName);
+
+    private static string PathOf(DryRunReport report, DryRunFile file) =>
+        PathOf(DryRunDirectoryTable.Materialize(report.Directories), file);
+
+    private static string PathOf(DryRunReport report, DryRunOperation op) =>
+        PathOf(DryRunDirectoryTable.Materialize(report.Directories), op);
+
+    private static string RootOf(DryRunReport report, DryRunFile file) =>
+        DryRunDirectoryTable.Materialize(report.Directories)[file.RootDirIndex];
+
+    private static DryRunOperation SourceOpFor(DryRunReport report, string sourcePathSuffix)
     {
         int index = IndexOfSource(report, sourcePathSuffix);
         return report.SourceOperations.Single(o => o.SourceIndex == index);
     }
 
-    private static IReadOnlyList<VirtualFileOperation> DestOpsForSource(DryRunReport report, string sourcePathSuffix)
+    private static IReadOnlyList<DryRunOperation> DestOpsForSource(DryRunReport report, string sourcePathSuffix)
     {
         int index = IndexOfSource(report, sourcePathSuffix);
         return report.DestinationOperations.Where(o => o.SourceIndex == index).ToList();
@@ -180,8 +197,9 @@ public sealed class DryRunEngineTests : IDisposable
 
     private static int IndexOfSource(DryRunReport report, string sourcePathSuffix)
     {
+        string[] dirPaths = DryRunDirectoryTable.Materialize(report.Directories);
         for (int i = 0; i < report.SourceFiles.Count; i++)
-            if (report.SourceFiles[i].Path.EndsWith(sourcePathSuffix, StringComparison.OrdinalIgnoreCase))
+            if (PathOf(dirPaths, report.SourceFiles[i]).EndsWith(sourcePathSuffix, StringComparison.OrdinalIgnoreCase))
                 return i;
         Assert.Fail($"no source file ending in '{sourcePathSuffix}'");
         return -1;
@@ -191,19 +209,20 @@ public sealed class DryRunEngineTests : IDisposable
     /// position in the correct list, and an in-place subject's path matches the op's path.</summary>
     private static void AssertIndicesValid(DryRunReport report)
     {
-        foreach (VirtualFileOperation op in report.SourceOperations)
+        string[] dirPaths = DryRunDirectoryTable.Materialize(report.Directories);
+        foreach (DryRunOperation op in report.SourceOperations)
         {
             Assert.InRange(op.SourceIndex, 0, report.SourceFiles.Count - 1);
             Assert.Equal(-1, op.SubjectIndex);
         }
-        foreach (VirtualFileOperation op in report.DestinationOperations)
+        foreach (DryRunOperation op in report.DestinationOperations)
         {
             Assert.True(op.SourceIndex == -1 || (op.SourceIndex >= 0 && op.SourceIndex < report.SourceFiles.Count),
                 $"destination op SourceIndex {op.SourceIndex} out of range (SourceFiles={report.SourceFiles.Count})");
             Assert.True(op.SubjectIndex == -1 || (op.SubjectIndex >= 0 && op.SubjectIndex < report.DestinationFiles.Count),
                 $"destination op SubjectIndex {op.SubjectIndex} out of range (DestinationFiles={report.DestinationFiles.Count})");
             if (op.SubjectIndex >= 0)
-                Assert.Equal(report.DestinationFiles[op.SubjectIndex].Path, op.Path);
+                Assert.Equal(PathOf(dirPaths, report.DestinationFiles[op.SubjectIndex]), PathOf(dirPaths, op));
         }
     }
 
@@ -227,13 +246,13 @@ public sealed class DryRunEngineTests : IDisposable
         SourceFile("new.txt");
         DryRunReport report = await Simulate(ProfileUnderTest());
 
-        PhysicalFile file = Assert.Single(report.SourceFiles);
-        Assert.EndsWith("source", file.Root, StringComparison.OrdinalIgnoreCase);
+        DryRunFile file = Assert.Single(report.SourceFiles);
+        Assert.EndsWith("source", RootOf(report, file), StringComparison.OrdinalIgnoreCase);
         Assert.Equal(OperationKind.Processed, Assert.Single(report.SourceOperations).Kind);
 
-        VirtualFileOperation action = Assert.Single(report.DestinationOperations);
+        DryRunOperation action = Assert.Single(report.DestinationOperations);
         Assert.Equal(OperationKind.New, action.Kind);
-        Assert.Equal(Path.Combine(_target, "new.txt"), action.Path);
+        Assert.Equal(Path.Combine(_target, "new.txt"), PathOf(report, action));
         Assert.False(report.Truncated);
     }
 
@@ -254,20 +273,24 @@ public sealed class DryRunEngineTests : IDisposable
 
         DryRunReport report = await Simulate(profile);
 
-        PhysicalFile a = Assert.Single(report.SourceFiles, f => f.Path.EndsWith("a.txt"));
-        PhysicalFile b = Assert.Single(report.SourceFiles, f => f.Path.EndsWith("b.txt"));
-        Assert.EndsWith("source", a.Root, StringComparison.OrdinalIgnoreCase);      // ...\source
-        Assert.EndsWith("source-b", b.Root, StringComparison.OrdinalIgnoreCase);    // ...\source-b
-        Assert.NotEqual(a.Root, b.Root);
+        string[] dirPaths = DryRunDirectoryTable.Materialize(report.Directories);
+        DryRunFile a = Assert.Single(report.SourceFiles, f => PathOf(dirPaths, f).EndsWith("a.txt"));
+        DryRunFile b = Assert.Single(report.SourceFiles, f => PathOf(dirPaths, f).EndsWith("b.txt"));
+        Assert.EndsWith("source", dirPaths[a.RootDirIndex], StringComparison.OrdinalIgnoreCase);      // ...\source
+        Assert.EndsWith("source-b", dirPaths[b.RootDirIndex], StringComparison.OrdinalIgnoreCase);    // ...\source-b
+        Assert.NotEqual(dirPaths[a.RootDirIndex], dirPaths[b.RootDirIndex]);
     }
 
     [Fact]
     public async Task Report_truncates_at_the_byte_budget_and_the_serialized_response_fits()
     {
-        const int budget = 2048;
+        // Sized so the first unit fits but all 20 never do: under the directory-table wire shape the
+        // first bundle also pays for the whole ancestor chain of the (deep, machine-dependent) temp
+        // root — roughly a dozen table entries — before the flat per-file marginal cost kicks in.
+        const int budget = 6144;
         for (int i = 0; i < 20; i++)
-            // Backslash-heavy nesting and a non-ASCII name: JSON escaping (`\` doubles,
-            // non-ASCII becomes 6-byte \uXXXX) must count against the budget.
+            // Non-ASCII name: JSON escaping (non-ASCII counts 6-byte \uXXXX worst case) must count
+            // against the budget in the file/op records.
             SourceFile(Path.Combine("nested", "further", $"a-quite-long-file-name résumé ✓ {i:D4}.txt"), $"content {i}");
         Profile profile = ProfileUnderTest();
 
@@ -296,7 +319,8 @@ public sealed class DryRunEngineTests : IDisposable
 
         DryRunReport report = await Simulate(ProfileUnderTest());
 
-        List<string> paths = report.SourceFiles.Select(f => f.Path).ToList();
+        string[] dirPaths = DryRunDirectoryTable.Materialize(report.Directories);
+        List<string> paths = report.SourceFiles.Select(f => PathOf(dirPaths, f)).ToList();
         Assert.Equal(names.Length, paths.Count);
         Assert.Equal(paths.OrderBy(p => p, StringComparer.OrdinalIgnoreCase).ToList(), paths);
     }
@@ -319,7 +343,7 @@ public sealed class DryRunEngineTests : IDisposable
         Assert.InRange(report.SourceFiles.Count, 1, 39);
         AssertIndicesValid(report);
 
-        List<string> kept = report.SourceFiles.Select(f => Path.GetFileName(f.Path)).ToList();
+        List<string> kept = report.SourceFiles.Select(f => f.FileName).ToList();
         List<string> expectedPrefix = Enumerable.Range(0, 40).Select(i => $"{i:D3}.txt")
             .OrderBy(n => n, StringComparer.OrdinalIgnoreCase).Take(kept.Count).ToList();
         Assert.Equal(expectedPrefix, kept);
@@ -332,7 +356,7 @@ public sealed class DryRunEngineTests : IDisposable
         SourceFile("notes.txt");
         DryRunReport report = await Simulate(ProfileUnderTest(filters: new FilterSet { Include = ["*.wav"] }));
 
-        VirtualFileOperation skipped = SourceOpFor(report, "notes.txt");
+        DryRunOperation skipped = SourceOpFor(report, "notes.txt");
         Assert.Equal(OperationKind.SkippedByFilter, skipped.Kind);
         Assert.Contains("*.wav", skipped.Detail);
         Assert.Empty(DestOpsForSource(report, "notes.txt"));   // a filtered file writes nowhere
@@ -347,7 +371,7 @@ public sealed class DryRunEngineTests : IDisposable
         TargetFile("same.txt", "identical bytes");
         DryRunReport report = await Simulate(ProfileUnderTest(onSuccess: OnSuccessAction.MoveToTrash));
 
-        VirtualFileOperation sourceOp = Assert.Single(report.SourceOperations);
+        DryRunOperation sourceOp = Assert.Single(report.SourceOperations);
         Assert.Equal(OperationKind.SkippedUnchanged, sourceOp.Kind);
         Assert.Equal(OperationKind.SkipUnchanged, Assert.Single(report.DestinationOperations).Kind);
         // §3.4.1: an all-unchanged job closes Skipped without committing — no disposition runs.
@@ -373,12 +397,12 @@ public sealed class DryRunEngineTests : IDisposable
 
         // A rename emits a Rename op at the suffixed path (a target of the source) and an Untouched op
         // for the kept original (destination-only, SourceIndex == -1).
-        VirtualFileOperation rename = Assert.Single(report.DestinationOperations, o => o.Kind == OperationKind.Rename);
-        Assert.Equal(Path.Combine(_target, "dup (1).txt"), rename.Path);
+        DryRunOperation rename = Assert.Single(report.DestinationOperations, o => o.Kind == OperationKind.Rename);
+        Assert.Equal(Path.Combine(_target, "dup (1).txt"), PathOf(report, rename));
         Assert.Equal(0, rename.SourceIndex);   // single source file → index 0
 
-        VirtualFileOperation kept = Assert.Single(report.DestinationOperations, o => o.Kind == OperationKind.Untouched);
-        Assert.Equal(Path.Combine(_target, "dup.txt"), kept.Path);
+        DryRunOperation kept = Assert.Single(report.DestinationOperations, o => o.Kind == OperationKind.Untouched);
+        Assert.Equal(Path.Combine(_target, "dup.txt"), PathOf(report, kept));
         Assert.Equal(-1, kept.SourceIndex);
 
         // Only the rename is a target of the source; the kept original is not.
@@ -394,7 +418,7 @@ public sealed class DryRunEngineTests : IDisposable
             onSuccess: OnSuccessAction.MoveToTrash));
 
         Assert.Equal(OperationKind.SkipConflict, Assert.Single(report.DestinationOperations).Kind);
-        VirtualFileOperation sourceOp = Assert.Single(report.SourceOperations);
+        DryRunOperation sourceOp = Assert.Single(report.SourceOperations);
         Assert.Equal(OperationKind.Processed, sourceOp.Kind);
         Assert.Equal(OnSuccessAction.MoveToTrash, sourceOp.SourceDisposition);
     }
@@ -420,8 +444,8 @@ public sealed class DryRunEngineTests : IDisposable
         SourceFile(Path.Combine("nested", "deep", "file.txt"));
         DryRunReport report = await Simulate(ProfileUnderTest());
 
-        VirtualFileOperation action = Assert.Single(report.DestinationOperations);
-        Assert.Equal(Path.Combine(_target, "nested", "deep", "file.txt"), action.Path);
+        DryRunOperation action = Assert.Single(report.DestinationOperations);
+        Assert.Equal(Path.Combine(_target, "nested", "deep", "file.txt"), PathOf(report, action));
     }
 
     /// <summary>The frame-fit guarantee rests on the estimate being a TRUE upper bound of what the
@@ -505,10 +529,10 @@ public sealed class DryRunEngineTests : IDisposable
 
         DryRunReport report = await Simulate(ProfileUnderTest() with { SyncMode = SyncMode.Mirror });
 
-        VirtualFileOperation orphan = Assert.Single(report.DestinationOperations, o => o.Kind == OperationKind.Deleted);
-        Assert.EndsWith("orphan.txt", orphan.Path);
+        DryRunOperation orphan = Assert.Single(report.DestinationOperations, o => o.Kind == OperationKind.Deleted);
+        Assert.EndsWith("orphan.txt", PathOf(report, orphan));
         Assert.Equal(-1, orphan.SourceIndex);   // an orphan has no incoming source
-        Assert.EndsWith("orphan.txt", report.DestinationFiles[orphan.SubjectIndex].Path);
+        Assert.EndsWith("orphan.txt", PathOf(report, report.DestinationFiles[orphan.SubjectIndex]));
         Assert.Equal(before, SnapshotTree());
     }
 
@@ -520,8 +544,8 @@ public sealed class DryRunEngineTests : IDisposable
 
         DryRunReport report = await Simulate(ProfileUnderTest());   // AdditiveArchive
 
-        VirtualFileOperation entry = Assert.Single(report.DestinationOperations, o => o.Kind == OperationKind.Untouched);
-        Assert.EndsWith("preexisting.txt", entry.Path);
+        DryRunOperation entry = Assert.Single(report.DestinationOperations, o => o.Kind == OperationKind.Untouched);
+        Assert.EndsWith("preexisting.txt", PathOf(report, entry));
     }
 
     // ----- referential-integrity invariants -----
@@ -587,9 +611,10 @@ public sealed class DryRunEngineTests : IDisposable
         Profile profile = ProfileUnderTest();
 
         DryRunReport batched = await Simulate(profile);
-        Dictionary<int, VirtualFileOperation> batchedOps = batched.SourceOperations.ToDictionary(o => o.SourceIndex);
+        string[] dirPaths = DryRunDirectoryTable.Materialize(batched.Directories);
+        Dictionary<int, DryRunOperation> batchedOps = batched.SourceOperations.ToDictionary(o => o.SourceIndex);
         List<(string, OperationKind)> batchedPairs =
-            batched.SourceFiles.Select((f, i) => (f.Path, batchedOps[i].Kind)).ToList();
+            batched.SourceFiles.Select((f, i) => (PathOf(dirPaths, f), batchedOps[i].Kind)).ToList();
 
         List<(string SourcePath, OperationKind Kind)> streamed = await CollectStream(NewEngine(profile), profile.Id);
 

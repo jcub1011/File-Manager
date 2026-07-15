@@ -23,8 +23,12 @@ namespace FileManager.UI.ViewModels;
 //  Row / node models shared by the two tabs (Sources, Destinations).
 // ─────────────────────────────────────────────────────────────────────────────────────────────
 
-public sealed record DryRunTargetRow(string Path, string? TargetRoot, OperationKind Kind, string? Detail)
+public sealed record DryRunTargetRow(string DirPath, string FileName, string? TargetRoot, OperationKind Kind, string? Detail)
 {
+    /// <summary>The absolute resulting path, reconstructed on demand — rows share their directory
+    /// string instead of each retaining a full path.</summary>
+    public string Path => System.IO.Path.Join(DirPath, FileName);
+
     public string KindText => Kind.GetTitle();
 
     public bool IsOverwrite => Kind == OperationKind.Overwrite;
@@ -38,7 +42,8 @@ public sealed record DryRunTargetRow(string Path, string? TargetRoot, OperationK
 /// the source — filtered out or unchanged), Processed, and Deleted (a destructive source
 /// disposition). A processed-and-deleted file shows both the Processed and Deleted pills.</summary>
 public sealed record DryRunFileRow(
-    string SourcePath,
+    string DirPath,
+    string FileName,
     string? SourceRoot,
     OperationKind Disposition,
     string? DecidingFilter,
@@ -47,13 +52,14 @@ public sealed record DryRunFileRow(
     long SizeBytes = 0,
     string? SourceCommonRoot = null)
 {
-    /// <summary>The file name alone (line 1 of the row); the directory sits on line 2.</summary>
-    public string FileName => System.IO.Path.GetFileName(SourcePath);
+    /// <summary>The absolute source path, reconstructed on demand (tooltips, tree building) — rows
+    /// share their directory string instead of each retaining a full path.</summary>
+    public string SourcePath => System.IO.Path.Join(DirPath, FileName);
 
     /// <summary>The directory shown under the file name, relative to the tab's common root. Computed
     /// on demand: the list is virtualized, so only realized rows ever pay for it — storing it per row
     /// costs tens of MB at the streamed-report cap.</summary>
-    public string ParentDisplay => DryRunPaths.SplitForDisplay(SourcePath, SourceCommonRoot).ParentDisplay;
+    public string ParentDisplay => DryRunPaths.ParentDisplayFor(DirPath, SourceCommonRoot);
 
     /// <summary>The source file's size, human-readable (right-aligned on the row).</summary>
     public string SizeText => ByteSize.Format(SizeBytes);
@@ -106,8 +112,8 @@ public sealed record DryRunFileRow(
     public double ContentOpacity => IsFilterSkipped ? 0.55 : 1.0;
 
     public bool Matches(string term) =>
-        SourcePath.Contains(term, StringComparison.OrdinalIgnoreCase)
-        || Targets.Any(t => t.Path.Contains(term, StringComparison.OrdinalIgnoreCase));
+        DryRunPaths.PathContains(DirPath, FileName, term)
+        || Targets.Any(t => DryRunPaths.PathContains(t.DirPath, t.FileName, term));
 }
 
 /// <summary>How a destination-side file is affected in the Destinations tab. A display-oriented
@@ -120,18 +126,21 @@ public enum DestinationRowKind { Untouched, New, Overwritten, Deleted, Unknown }
 /// has no originating source (a Mirror deletion, a kept-around conflict original, a pre-existing
 /// untouched file).</summary>
 public sealed record DryRunDestinationEntry(
-    string TargetPath,
+    string DirPath,
+    string FileName,
     string TargetRoot,
     DestinationRowKind Kind,
     string? Detail,
     string? CommonRoot,
     long SizeBytes = 0)
 {
-    public string FileName => System.IO.Path.GetFileName(TargetPath);
+    /// <summary>The absolute resulting path, reconstructed on demand (tooltips, tree building) —
+    /// entries share their directory string instead of each retaining a full path.</summary>
+    public string TargetPath => System.IO.Path.Join(DirPath, FileName);
 
     /// <summary>Directory relative to the tab's common root; computed on demand — only realized
     /// (visible) rows ever run this.</summary>
-    public string ParentDisplay => DryRunPaths.SplitForDisplay(TargetPath, CommonRoot).ParentDisplay;
+    public string ParentDisplay => DryRunPaths.ParentDisplayFor(DirPath, CommonRoot);
 
     public string RelativeDisplay => ParentDisplay + FileName;
 
@@ -154,7 +163,7 @@ public sealed record DryRunDestinationEntry(
         _ => "Unknown",
     };
 
-    public bool Matches(string term) => TargetPath.Contains(term, StringComparison.OrdinalIgnoreCase);
+    public bool Matches(string term) => DryRunPaths.PathContains(DirPath, FileName, term);
 }
 
 /// <summary>A row in the Destinations tab: a source file and every destination it fans out to
@@ -162,23 +171,28 @@ public sealed record DryRunDestinationEntry(
 /// Rows with no originating source (<see cref="HasSource"/> false) carry a single
 /// <see cref="DryRunDestinationEntry"/> and render as a plain single-status row.</summary>
 public sealed record DryRunDestinationRow(
-    string? SourcePath,
+    string? SourceDirPath,
+    string? SourceFileName,
     string? SourceRoot,
     string? SourceCommonRoot,
     IReadOnlyList<DryRunDestinationEntry> Destinations)
 {
+    /// <summary>The absolute originating-source path, reconstructed on demand; null for rows with no
+    /// source (Mirror deletions, kept-around originals, pre-existing untouched files).</summary>
+    public string? SourcePath =>
+        SourceFileName is null ? null : System.IO.Path.Join(SourceDirPath!, SourceFileName);
+
     /// <summary>The source file's name, or the sole entry's name for a no-source row (its
     /// <see cref="Primary"/> target path IS the row's identity).</summary>
-    public string FileName =>
-        SourcePath is null ? Primary.FileName : System.IO.Path.GetFileName(SourcePath);
+    public string FileName => SourceFileName ?? Primary.FileName;
 
     /// <summary>"parent-dir\name" of the originating source, relative to the Sources tab's common
     /// root; "" for no-source rows. Computed on demand — only realized rows run this.</summary>
     public string SourceDisplay =>
-        SourcePath is null ? "" :
-        DryRunPaths.SplitForDisplay(SourcePath, SourceCommonRoot).ParentDisplay + System.IO.Path.GetFileName(SourcePath);
+        SourceFileName is null ? "" :
+        DryRunPaths.ParentDisplayFor(SourceDirPath!, SourceCommonRoot) + SourceFileName;
 
-    public bool HasSource => SourcePath is not null;
+    public bool HasSource => SourceFileName is not null;
 
     /// <summary>True for rows with no source — rendered with the simple filename + status + folder
     /// layout (their single entry is <see cref="Primary"/>).</summary>
@@ -189,7 +203,7 @@ public sealed record DryRunDestinationRow(
     public DryRunDestinationEntry Primary => Destinations[0];
 
     public bool Matches(string term) =>
-        (SourcePath?.Contains(term, StringComparison.OrdinalIgnoreCase) ?? false)
+        (SourceFileName is not null && DryRunPaths.PathContains(SourceDirPath!, SourceFileName, term))
         || Destinations.Any(d => d.Matches(term));
 }
 
@@ -445,8 +459,21 @@ public sealed partial class DryRunFacetRow : ViewModelBase
 /// comparison. The key is the path relative to its root; rows are ordered by that, then by root.</summary>
 internal static class DryRunSort
 {
-    public static string RelativeKey(string path, string? root) =>
-        string.IsNullOrEmpty(root) ? path : System.IO.Path.GetRelativePath(root, path);
+    /// <summary>The key for a (directory, file name) pair — identical ordering to relativizing the
+    /// joined absolute path, but <c>GetRelativePath</c> runs once per distinct (directory, root)
+    /// instead of once per row: callers pass a per-rebuild cache and rows sharing a directory reuse
+    /// its relativized form.</summary>
+    public static string RelativeKey(
+        string dirPath, string fileName, string? root,
+        Dictionary<(string DirPath, string? Root), string> relDirCache)
+    {
+        if (string.IsNullOrEmpty(root))
+            return System.IO.Path.Join(dirPath, fileName);
+        if (!relDirCache.TryGetValue((dirPath, root), out string? relDir))
+            relDirCache[(dirPath, root)] = relDir = System.IO.Path.GetRelativePath(root, dirPath);
+        // "." — the file sits in the root itself, so the key is just the name (Join would prepend ".\").
+        return relDir == "." ? fileName : System.IO.Path.Join(relDir, fileName);
+    }
 }
 
 internal static class DryRunFacets
@@ -620,8 +647,9 @@ public sealed partial class DryRunSourcesTab : ViewModelBase
 
         // Order by path-relative-to-root (then root) so a file lines up with the same file in the
         // Destinations tab. The key is computed once per row rather than on every comparison.
+        Dictionary<(string, string?), string> relDirCache = [];
         _visible = rows
-            .Select(r => (Row: r, Key: DryRunSort.RelativeKey(r.SourcePath, r.SourceRoot)))
+            .Select(r => (Row: r, Key: DryRunSort.RelativeKey(r.DirPath, r.FileName, r.SourceRoot, relDirCache)))
             .OrderBy(x => x.Key, StringComparer.OrdinalIgnoreCase)
             .ThenBy(x => x.Row.SourceRoot ?? "", StringComparer.OrdinalIgnoreCase)
             .Select(x => x.Row)
@@ -812,7 +840,8 @@ public sealed partial class DryRunDestinationsTab : ViewModelBase
 
             IEnumerable<DryRunDestinationEntry> entries = row.Destinations;
             if (destinations is not null) entries = entries.Where(e => destinations.Contains(e.TargetRoot));
-            if (term is not null && !(row.SourcePath?.Contains(term, StringComparison.OrdinalIgnoreCase) ?? false))
+            if (term is not null
+                && !(row.SourceFileName is not null && DryRunPaths.PathContains(row.SourceDirPath!, row.SourceFileName, term)))
                 entries = entries.Where(e => e.Matches(term));
 
             List<DryRunDestinationEntry> kept = entries.ToList();
@@ -823,10 +852,11 @@ public sealed partial class DryRunDestinationsTab : ViewModelBase
 
         // Order by the source file's relative path (grouped rows) or the destination's (no-source rows)
         // so the preview stays comparable to the Sources tab.
+        Dictionary<(string, string?), string> relDirCache = [];
         _visible = visible
             .Select(r => (Row: r, Key: r.HasSource
-                ? DryRunSort.RelativeKey(r.SourcePath!, r.SourceRoot)
-                : DryRunSort.RelativeKey(r.Primary.TargetPath, r.Primary.TargetRoot)))
+                ? DryRunSort.RelativeKey(r.SourceDirPath!, r.SourceFileName!, r.SourceRoot, relDirCache)
+                : DryRunSort.RelativeKey(r.Primary.DirPath, r.Primary.FileName, r.Primary.TargetRoot, relDirCache)))
             .OrderBy(x => x.Key, StringComparer.OrdinalIgnoreCase)
             .ThenBy(x => x.Row.SourceRoot ?? x.Row.Primary.TargetRoot, StringComparer.OrdinalIgnoreCase)
             .Select(x => x.Row)
@@ -1081,14 +1111,18 @@ public sealed partial class DryRunViewModel : ViewModelBase
 
     internal void ApplyReport(DryRunReport report)
     {
+        // The one per-directory string allocation: every row references entries of this array, so
+        // sibling files share their directory chain instead of each retaining a full path string.
+        string[] dirPaths = DryRunDirectoryTable.Materialize(report.Directories);
+
         // Destination ops grouped by the source file they carry content from (SourceIndex); the
         // rename-around Untouched and swept orphans have SourceIndex == -1 and so attach to no source.
-        ILookup<int, VirtualFileOperation> destOpsBySource =
+        ILookup<int, DryRunOperation> destOpsBySource =
             report.DestinationOperations.ToLookup(o => o.SourceIndex);
         // One source op per source file, addressable by the file's index. Guard against a duplicate
         // SourceIndex (a service-side bug) degrading gracefully to the first op rather than throwing
         // and wiping the entire preview — mirrors the ToLookup used for destination ops above.
-        Dictionary<int, VirtualFileOperation> sourceOpByIndex =
+        Dictionary<int, DryRunOperation> sourceOpByIndex =
             report.SourceOperations
                 .GroupBy(o => o.SourceIndex)
                 .ToDictionary(g => g.Key, g => g.First());
@@ -1097,31 +1131,22 @@ public sealed partial class DryRunViewModel : ViewModelBase
         // dir, else the common parent, else null (spanning drives → full paths). Distinct first so a
         // huge scan doesn't re-walk identical roots.
         string? sourceCommonRoot = DryRunPaths.CommonRoot(
-            report.SourceFiles.Select(f => f.Root).Distinct(StringComparer.OrdinalIgnoreCase));
+            report.SourceFiles.Select(f => f.RootDirIndex).Distinct().Select(i => dirPaths[i]));
         string? destCommonRoot = DryRunPaths.CommonRoot(
-            report.DestinationOperations.Select(o => o.Root).Distinct(StringComparer.OrdinalIgnoreCase));
-
-        // Roots repeat across nearly every contract record, but JSON deserialization does not intern —
-        // each record carries its own instance. Canonicalize through a local pool so the retained rows
-        // share one string per distinct root (~1.3M duplicates at the streamed cap). Full paths are
-        // unique — pooling them would only add dictionary overhead.
-        Dictionary<string, string> rootPool = new(StringComparer.Ordinal);
-        string? Intern(string? s) => s is null ? null : rootPool.TryGetValue(s, out string? v) ? v : rootPool[s] = s;
-        // Seed with the common roots so a root that equals the common root shares its instance too.
-        sourceCommonRoot = Intern(sourceCommonRoot);
-        destCommonRoot = Intern(destCommonRoot);
+            report.DestinationOperations.Select(o => o.RootDirIndex).Distinct().Select(i => dirPaths[i]));
 
         List<DryRunFileRow> fileRows = new(report.SourceFiles.Count);
         for (int i = 0; i < report.SourceFiles.Count; i++)
         {
-            PhysicalFile file = report.SourceFiles[i];
-            sourceOpByIndex.TryGetValue(i, out VirtualFileOperation? op);
+            DryRunFile file = report.SourceFiles[i];
+            sourceOpByIndex.TryGetValue(i, out DryRunOperation? op);
             List<DryRunTargetRow> targets = destOpsBySource[i]
-                .Select(t => new DryRunTargetRow(t.Path, Intern(t.Root), t.Kind, t.Detail))
+                .Select(t => new DryRunTargetRow(dirPaths[t.DirIndex], t.FileName, dirPaths[t.RootDirIndex], t.Kind, t.Detail))
                 .ToList();
             fileRows.Add(new DryRunFileRow(
-                file.Path,
-                Intern(file.Root),
+                dirPaths[file.DirIndex],
+                file.FileName,
+                dirPaths[file.RootDirIndex],
                 op?.Kind ?? OperationKind.Processed,
                 op?.Detail,
                 op?.SourceDisposition?.ToString(),
@@ -1132,7 +1157,7 @@ public sealed partial class DryRunViewModel : ViewModelBase
 
         // The byte size behind a destination op: the incoming content (its source file) for a write,
         // else the pre-existing file it touches (untouched / deleted / kept original), else nothing.
-        long OpSize(VirtualFileOperation o) =>
+        long OpSize(DryRunOperation o) =>
             o.SourceIndex >= 0 && o.SourceIndex < report.SourceFiles.Count ? report.SourceFiles[o.SourceIndex].Length
             : o.SubjectIndex >= 0 && o.SubjectIndex < report.DestinationFiles.Count ? report.DestinationFiles[o.SubjectIndex].Length
             : 0;
@@ -1142,8 +1167,8 @@ public sealed partial class DryRunViewModel : ViewModelBase
         // (each keeping its own status), instead of N near-identical rows. Ops with SourceIndex == -1
         // (a pre-existing untouched file, a kept-around conflict original, a Mirror orphan) have no
         // originating source and become their own single-entry rows.
-        DryRunDestinationEntry Entry(VirtualFileOperation o, long sizeBytes) =>
-            new(o.Path, Intern(o.Root)!, MapDestinationKind(o.Kind), o.Detail, destCommonRoot, sizeBytes);
+        DryRunDestinationEntry Entry(DryRunOperation o, long sizeBytes) =>
+            new(dirPaths[o.DirIndex], o.FileName, dirPaths[o.RootDirIndex], MapDestinationKind(o.Kind), o.Detail, destCommonRoot, sizeBytes);
 
         List<DryRunDestinationRow> destRows = [];
         for (int i = 0; i < report.SourceFiles.Count; i++)
@@ -1151,11 +1176,12 @@ public sealed partial class DryRunViewModel : ViewModelBase
             List<DryRunDestinationEntry> entries = destOpsBySource[i].Select(o => Entry(o, OpSize(o))).ToList();
             if (entries.Count == 0)
                 continue;   // a filtered/unchanged source that produced no destination op
-            PhysicalFile file = report.SourceFiles[i];
-            destRows.Add(new DryRunDestinationRow(file.Path, Intern(file.Root), sourceCommonRoot, entries));
+            DryRunFile file = report.SourceFiles[i];
+            destRows.Add(new DryRunDestinationRow(
+                dirPaths[file.DirIndex], file.FileName, dirPaths[file.RootDirIndex], sourceCommonRoot, entries));
         }
-        foreach (VirtualFileOperation o in report.DestinationOperations.Where(o => o.SourceIndex < 0))
-            destRows.Add(new DryRunDestinationRow(null, null, null, [Entry(o, OpSize(o))]));
+        foreach (DryRunOperation o in report.DestinationOperations.Where(o => o.SourceIndex < 0))
+            destRows.Add(new DryRunDestinationRow(null, null, null, null, [Entry(o, OpSize(o))]));
 
         TotalFiles = report.SourceFiles.Count;
         OverwriteCount = report.DestinationOperations.Count(static o => o.Kind == OperationKind.Overwrite);

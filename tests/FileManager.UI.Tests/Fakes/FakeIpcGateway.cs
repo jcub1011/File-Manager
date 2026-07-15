@@ -34,6 +34,7 @@ internal sealed class FakeIpcGateway : IIpcGateway
         {
             ProfileId = Guid.Empty,
             GeneratedAt = DateTimeOffset.UnixEpoch,
+            Directories = [],
             SourceFiles = [],
             DestinationFiles = [],
             SourceOperations = [],

@@ -117,8 +117,10 @@ public sealed class IpcServerStreamingTests : IAsyncLifetime
             Assert.True(result.TryGetValue(out DryRunReport? report));
             Assert.Equal(12, report!.SourceFiles.Count);
             Assert.False(report.Truncated);
-            Assert.Equal(@"C:\src\b0\f0.dat", report.SourceFiles[0].Path);   // order preserved across chunks
-            Assert.Equal(@"C:\src\b2\f3.dat", report.SourceFiles[^1].Path);
+            string[] dirPaths = DryRunDirectoryTable.Materialize(report.Directories);
+            string PathOf(DryRunFile f) => Path.Join(dirPaths[f.DirIndex], f.FileName);
+            Assert.Equal(@"C:\src\b0\f0.dat", PathOf(report.SourceFiles[0]));   // order preserved across chunks
+            Assert.Equal(@"C:\src\b2\f3.dat", PathOf(report.SourceFiles[^1]));
 
             // The same connection still serves the next request — the stream did not desync it.
             var followUp = await client.RequestAsync<StatusResponse>(new GetStatusRequest());

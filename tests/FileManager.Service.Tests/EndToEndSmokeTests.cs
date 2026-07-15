@@ -123,10 +123,12 @@ public sealed class EndToEndSmokeTests : IAsyncLifetime
             Assert.True(dryRun.TryGetValue(out DryRunResponse? dryRunResponse));
             DryRunReport report = dryRunResponse!.Report;
             Assert.Equal(2, report.SourceFiles.Count);
+            string[] dirPaths = DryRunDirectoryTable.Materialize(report.Directories);
+            string PathOf(DryRunOperation o) => Path.Join(dirPaths[o.DirIndex], o.FileName);
             Assert.Contains(report.SourceOperations, o =>
-                o.Path.EndsWith("fresh.txt") && o.Kind == OperationKind.Processed);
+                PathOf(o).EndsWith("fresh.txt") && o.Kind == OperationKind.Processed);
             Assert.Contains(report.SourceOperations, o =>
-                o.Path.EndsWith("same.txt") && o.Kind == OperationKind.SkippedUnchanged);
+                PathOf(o).EndsWith("same.txt") && o.Kind == OperationKind.SkippedUnchanged);
 
             // out-of-scope request → NOT_IMPLEMENTED
             var refused = await client.RequestAsync<OkResponse>(

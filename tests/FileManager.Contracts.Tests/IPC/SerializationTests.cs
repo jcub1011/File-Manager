@@ -141,25 +141,35 @@ public sealed class SerializationTests
         using JsonDocument document = JsonDocument.Parse(wire);
         Assert.Equal("Processed", document.RootElement
             .GetProperty("Report").GetProperty("SourceOperations")[0].GetProperty("Kind").GetString());
+        // Files carry FileName + a directory index on the wire, not a flat "Path" string.
+        Assert.Equal("one.txt", document.RootElement
+            .GetProperty("Report").GetProperty("SourceFiles")[0].GetProperty("FileName").GetString());
+        Assert.True(document.RootElement.GetProperty("Report").GetProperty("Directories").GetArrayLength() > 0);
 
         Assert.True(IpcSerializer.DeserializeResponse(wire).TryGetValue(out IpcResponse? reparsed));
         DryRunReport report = Assert.IsType<DryRunResponse>(reparsed).Report;
 
-        Assert.Equal(@"C:\a\one.txt", Assert.Single(report.SourceFiles).Path);
-        Assert.Equal(@"C:\t\one.txt", Assert.Single(report.DestinationFiles).Path);
+        // Files carry (DirIndex, FileName) into the shared table; resolve them back to paths.
+        string[] paths = DryRunDirectoryTable.Materialize(report.Directories);
+        DryRunFile sourceFile = Assert.Single(report.SourceFiles);
+        Assert.Equal(@"C:\a\one.txt", System.IO.Path.Join(paths[sourceFile.DirIndex], sourceFile.FileName));
+        DryRunFile destinationFile = Assert.Single(report.DestinationFiles);
+        Assert.Equal(@"C:\t\one.txt", System.IO.Path.Join(paths[destinationFile.DirIndex], destinationFile.FileName));
 
-        VirtualFileOperation sourceOp = Assert.Single(report.SourceOperations);
+        DryRunOperation sourceOp = Assert.Single(report.SourceOperations);
         Assert.Equal(OperationKind.Processed, sourceOp.Kind);
         Assert.Equal(0, sourceOp.SourceIndex);
         Assert.Equal(OnSuccessAction.KeepSource, sourceOp.SourceDisposition);
 
         // Indices survive the round-trip and resolve into the file lists.
-        VirtualFileOperation destOp = Assert.Single(report.DestinationOperations);
+        DryRunOperation destOp = Assert.Single(report.DestinationOperations);
         Assert.Equal(OperationKind.Overwrite, destOp.Kind);
         Assert.Equal(0, destOp.SourceIndex);
         Assert.Equal(0, destOp.SubjectIndex);
-        Assert.Equal(@"C:\a\one.txt", report.SourceFiles[destOp.SourceIndex].Path);
-        Assert.Equal(@"C:\t\one.txt", report.DestinationFiles[destOp.SubjectIndex].Path);
+        DryRunFile origin = report.SourceFiles[destOp.SourceIndex];
+        Assert.Equal(@"C:\a\one.txt", System.IO.Path.Join(paths[origin.DirIndex], origin.FileName));
+        DryRunFile subject = report.DestinationFiles[destOp.SubjectIndex];
+        Assert.Equal(@"C:\t\one.txt", System.IO.Path.Join(paths[subject.DirIndex], subject.FileName));
     }
 
     [Fact]
@@ -181,37 +191,52 @@ public sealed class SerializationTests
     }
 
     [Fact]
-    public void PhysicalFile_round_trips_standalone()
+    public void DryRunFile_round_trips_standalone()
     {
-        PhysicalFile file = new()
+        DryRunFile file = new()
         {
-            Path = @"C:\a\one.txt",
-            Root = @"C:\a",
+            DirIndex = 1,
+            FileName = "one.txt",
+            RootDirIndex = 1,
             Length = 42,
             LastWritten = DateTimeOffset.UnixEpoch,
             IsReparsePoint = true,
         };
-        byte[] wire = JsonSerializer.SerializeToUtf8Bytes(file, FileManagerJsonContext.Default.PhysicalFile);
-        PhysicalFile? roundTripped = JsonSerializer.Deserialize(wire, FileManagerJsonContext.Default.PhysicalFile);
+        byte[] wire = JsonSerializer.SerializeToUtf8Bytes(file, FileManagerJsonContext.Default.DryRunFile);
+        DryRunFile? roundTripped = JsonSerializer.Deserialize(wire, FileManagerJsonContext.Default.DryRunFile);
         Assert.Equal(file, roundTripped);
     }
 
     [Fact]
-    public void VirtualFileOperation_round_trips_standalone()
+    public void DryRunOperation_round_trips_standalone()
     {
-        VirtualFileOperation op = new()
+        DryRunOperation op = new()
         {
-            Path = @"C:\t\one (1).txt",
-            Root = @"C:\t",
+            DirIndex = 2,
+            FileName = "one (1).txt",
+            RootDirIndex = 2,
             Kind = OperationKind.Rename,
             SourceIndex = 3,
             SubjectIndex = -1,
             SourceDisposition = OnSuccessAction.MoveToTrash,
             Detail = "renamed to avoid a conflict",
         };
-        byte[] wire = JsonSerializer.SerializeToUtf8Bytes(op, FileManagerJsonContext.Default.VirtualFileOperation);
-        VirtualFileOperation? roundTripped = JsonSerializer.Deserialize(wire, FileManagerJsonContext.Default.VirtualFileOperation);
+        byte[] wire = JsonSerializer.SerializeToUtf8Bytes(op, FileManagerJsonContext.Default.DryRunOperation);
+        DryRunOperation? roundTripped = JsonSerializer.Deserialize(wire, FileManagerJsonContext.Default.DryRunOperation);
         Assert.Equal(op, roundTripped);
+    }
+
+    [Fact]
+    public void DryRunDirectory_round_trips_standalone()
+    {
+        DryRunDirectory root = new(@"C:\", -1);
+        DryRunDirectory child = new("a", 0);
+        Assert.Equal(root, JsonSerializer.Deserialize(
+            JsonSerializer.SerializeToUtf8Bytes(root, FileManagerJsonContext.Default.DryRunDirectory),
+            FileManagerJsonContext.Default.DryRunDirectory));
+        Assert.Equal(child, JsonSerializer.Deserialize(
+            JsonSerializer.SerializeToUtf8Bytes(child, FileManagerJsonContext.Default.DryRunDirectory),
+            FileManagerJsonContext.Default.DryRunDirectory));
     }
 
     [Fact]
@@ -411,28 +436,36 @@ public sealed class SerializationTests
         SourceDisposition = OnSuccessAction.KeepSource,
     };
 
-    /// <summary>A minimal report exercising all four collections: one source file overwritten at one
-    /// destination, with the destination op referencing both by index.</summary>
-    private static DryRunReport SampleReport() => new()
+    /// <summary>A minimal report exercising all four collections: one source file
+    /// (<c>C:\a\one.txt</c>) overwritten at one destination (<c>C:\t\one.txt</c>), with the
+    /// destination op referencing both by index. Built through the directory-table builder,
+    /// the same way the service builds reports.</summary>
+    private static DryRunReport SampleReport()
     {
-        ProfileId = SomeId,
-        GeneratedAt = DateTimeOffset.UnixEpoch,
-        SourceFiles = [SampleSourceFile()],
-        DestinationFiles = [SampleDestinationFile()],
-        SourceOperations = [SampleSourceOp()],
-        DestinationOperations =
-        [
-            new VirtualFileOperation
-            {
-                Path = @"C:\t\one.txt",
-                Root = @"C:\t",
-                Kind = OperationKind.Overwrite,
-                SourceIndex = 0,
-                SubjectIndex = 0,
-                Detail = "existing file last modified 1970-01-01",
-            },
-        ],
-    };
+        DryRunDirectoryTableBuilder dirs = new();
+        DryRunFile sourceFile = dirs.Convert(SampleSourceFile());
+        DryRunFile destinationFile = dirs.Convert(SampleDestinationFile());
+        DryRunOperation sourceOp = dirs.Convert(SampleSourceOp());
+        DryRunOperation destOp = dirs.Convert(new VirtualFileOperation
+        {
+            Path = @"C:\t\one.txt",
+            Root = @"C:\t",
+            Kind = OperationKind.Overwrite,
+            SourceIndex = 0,
+            SubjectIndex = 0,
+            Detail = "existing file last modified 1970-01-01",
+        });
+        return new DryRunReport
+        {
+            ProfileId = SomeId,
+            GeneratedAt = DateTimeOffset.UnixEpoch,
+            Directories = dirs.Entries,
+            SourceFiles = [sourceFile],
+            DestinationFiles = [destinationFile],
+            SourceOperations = [sourceOp],
+            DestinationOperations = [destOp],
+        };
+    }
 
     internal static Profile SampleProfile() => new()
     {

@@ -234,8 +234,9 @@ frame = one serialized `IpcRequest`, `IpcResponse`, or `EngineEvent` (§5.2), se
 - **Event subscription:** a client sends `SubscribeEventsRequest`; the server acknowledges, then
   the connection becomes a one-way event stream of `EngineEvent` frames until the client
   disconnects. The tray and the GUI activity view each hold one subscription connection.
-- **Versioning:** every request carries `ProtocolVersion` (const `1`). The server rejects
-  mismatches with `ErrorResponse("IPC_VERSION_MISMATCH", …)`.
+- **Versioning:** every request carries `ProtocolVersion` (`IpcRequest.CurrentProtocolVersion`,
+  currently `2` — v2 normalized the dry-run wire against a shared directory table). The server
+  rejects mismatches with `ErrorResponse("IPC_VERSION_MISMATCH", …)`.
 
 ### 3.3 Start-if-not-running handshake
 
@@ -1535,7 +1536,9 @@ Polymorphic envelopes, source-gen compatible:
 [JsonDerivedType(typeof(SubscribeEventsRequest), "subscribe")]
 public abstract record IpcRequest
 {
-    public int ProtocolVersion { get; init; } = 1;
+    public const int CurrentProtocolVersion = 2;
+
+    public int ProtocolVersion { get; init; } = CurrentProtocolVersion;
 }
 
 public sealed record GetStatusRequest : IpcRequest;

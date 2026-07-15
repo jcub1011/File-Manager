@@ -25,42 +25,44 @@ public class IpcFrameCodecBenchmarks
     [GlobalSetup]
     public void Setup()
     {
-        List<PhysicalFile> sourceFiles = new(FileCount);
-        List<PhysicalFile> destinationFiles = new(FileCount);
-        List<VirtualFileOperation> sourceOperations = new(FileCount);
-        List<VirtualFileOperation> destinationOperations = new(FileCount);
+        DryRunDirectoryTableBuilder dirs = new();
+        List<DryRunFile> sourceFiles = new(FileCount);
+        List<DryRunFile> destinationFiles = new(FileCount);
+        List<DryRunOperation> sourceOperations = new(FileCount);
+        List<DryRunOperation> destinationOperations = new(FileCount);
         for (int i = 0; i < FileCount; i++)
         {
             string sourcePath = $@"C:\src\dir{i % 16}\sub{i % 8}\file-{i}.dat";
             string targetPath = $@"C:\dst\dir{i % 16}\file-{i}.dat";
-            sourceFiles.Add(new PhysicalFile
+            sourceFiles.Add(dirs.Convert(new PhysicalFile
             {
                 Path = sourcePath,
                 Root = @"C:\src",
                 Length = 1024,
                 LastWritten = DateTimeOffset.UnixEpoch,
-            });
-            sourceOperations.Add(new VirtualFileOperation
+            }));
+            sourceOperations.Add(dirs.Convert(new VirtualFileOperation
             {
                 Path = sourcePath,
                 Root = @"C:\src",
                 Kind = OperationKind.Processed,
                 SourceIndex = i,
                 SourceDisposition = OnSuccessAction.KeepSource,
-            });
-            destinationOperations.Add(new VirtualFileOperation
+            }));
+            destinationOperations.Add(dirs.Convert(new VirtualFileOperation
             {
                 Path = targetPath,
                 Root = @"C:\dst",
                 Kind = OperationKind.New,
                 SourceIndex = i,
-            });
+            }));
         }
 
         DryRunReport report = new()
         {
             ProfileId = Guid.NewGuid(),
             GeneratedAt = DateTimeOffset.UnixEpoch,
+            Directories = dirs.Entries,
             SourceFiles = sourceFiles,
             DestinationFiles = destinationFiles,
             SourceOperations = sourceOperations,

@@ -21,36 +21,42 @@ public sealed class DryRunViewModelTests
     }
 
     // ── New-model fixture helpers ──────────────────────────────────────────────────────────────
-    // A dry-run report is now a bipartite graph: PhysicalFile nodes (SourceFiles / DestinationFiles)
-    // plus VirtualFileOperation edges (SourceOperations / DestinationOperations) that reference files
+    // A dry-run report is now a bipartite graph: DryRunFile nodes (SourceFiles / DestinationFiles)
+    // plus DryRunOperation edges (SourceOperations / DestinationOperations) that reference files
     // by integer index. The VM pairs SourceFiles[i] with the source op whose SourceIndex == i, and
     // groups destination ops by SourceIndex: each source file becomes ONE destination row listing its
     // fan-out of DryRunDestinationEntry targets. Ops with SourceIndex == -1 (kept-around originals,
     // Mirror orphans, pre-existing untouched files) become their own single-entry, no-source rows.
+    // Paths are normalized through a per-test directory table: the helpers keep their (path, root)
+    // string signatures and convert through the builder (xunit news the class up per test, so one
+    // builder spans exactly one report's index space).
 
-    private static PhysicalFile Pf(string path, string root) =>
-        new() { Path = path, Root = root, Length = 0, LastWritten = DateTimeOffset.UnixEpoch, IsReparsePoint = false };
+    private readonly DryRunDirectoryTableBuilder _dirs = new();
 
-    private static VirtualFileOperation SrcOp(
+    private DryRunFile Pf(string path, string root) =>
+        _dirs.Convert(new PhysicalFile { Path = path, Root = root, Length = 0, LastWritten = DateTimeOffset.UnixEpoch, IsReparsePoint = false });
+
+    private DryRunOperation SrcOp(
         int index, string path, string root, OperationKind kind,
         OnSuccessAction? disposition = null, string? detail = null) =>
-        new() { Path = path, Root = root, Kind = kind, SourceIndex = index, SubjectIndex = -1, SourceDisposition = disposition, Detail = detail };
+        _dirs.Convert(new VirtualFileOperation { Path = path, Root = root, Kind = kind, SourceIndex = index, SubjectIndex = -1, SourceDisposition = disposition, Detail = detail });
 
-    private static VirtualFileOperation DstOp(
+    private DryRunOperation DstOp(
         OperationKind kind, string path, string root, int sourceIndex = -1, int subjectIndex = -1, string? detail = null) =>
-        new() { Path = path, Root = root, Kind = kind, SourceIndex = sourceIndex, SubjectIndex = subjectIndex, Detail = detail };
+        _dirs.Convert(new VirtualFileOperation { Path = path, Root = root, Kind = kind, SourceIndex = sourceIndex, SubjectIndex = subjectIndex, Detail = detail });
 
-    private static DryRunReport Report(
+    private DryRunReport Report(
         Guid profileId,
-        IReadOnlyList<PhysicalFile> sourceFiles,
-        IReadOnlyList<VirtualFileOperation> sourceOps,
-        IReadOnlyList<PhysicalFile> destinationFiles,
-        IReadOnlyList<VirtualFileOperation> destinationOps,
+        IReadOnlyList<DryRunFile> sourceFiles,
+        IReadOnlyList<DryRunOperation> sourceOps,
+        IReadOnlyList<DryRunFile> destinationFiles,
+        IReadOnlyList<DryRunOperation> destinationOps,
         bool truncated = false) =>
         new()
         {
             ProfileId = profileId,
             GeneratedAt = DateTimeOffset.UnixEpoch,
+            Directories = _dirs.Entries.ToList(),
             SourceFiles = sourceFiles,
             DestinationFiles = destinationFiles,
             SourceOperations = sourceOps,
@@ -61,7 +67,7 @@ public sealed class DryRunViewModelTests
     // fresh.txt: new write (KeepSource). clobber.txt: overwrites one target + renames around another
     // (the kept original is a destination-only Untouched op), and its source is trashed (processed AND
     // deleted). junk.tmp: filtered out. same.txt: unchanged.
-    private static DryRunReport SampleReport(Guid profileId) => Report(profileId,
+    private DryRunReport SampleReport(Guid profileId) => Report(profileId,
         sourceFiles:
         [
             Pf(@"C:\s\fresh.txt", @"C:\s"),     // 0
@@ -190,11 +196,11 @@ public sealed class DryRunViewModelTests
     }
 
     // Builds a report of plain new-writes: one source file + one New destination op per write.
-    private static DryRunReport WritesReport(Guid profileId, params (string Src, string SrcRoot, string Dst, string DstRoot)[] writes)
+    private DryRunReport WritesReport(Guid profileId, params (string Src, string SrcRoot, string Dst, string DstRoot)[] writes)
     {
-        var sourceFiles = new List<PhysicalFile>();
-        var sourceOps = new List<VirtualFileOperation>();
-        var destinationOps = new List<VirtualFileOperation>();
+        var sourceFiles = new List<DryRunFile>();
+        var sourceOps = new List<DryRunOperation>();
+        var destinationOps = new List<DryRunOperation>();
         for (int i = 0; i < writes.Length; i++)
         {
             (string src, string srcRoot, string dst, string dstRoot) = writes[i];
@@ -358,7 +364,7 @@ public sealed class DryRunViewModelTests
 
     // Sources nested one level under a single root, so the tree's top level is the sub-folder (not
     // the drive) and that node rolls up the counts beneath it.
-    private static DryRunReport NestedSourcesReport(Guid profileId) => Report(profileId,
+    private DryRunReport NestedSourcesReport(Guid profileId) => Report(profileId,
         sourceFiles:
         [
             Pf(@"C:\proj\sub\one.txt", @"C:\proj"),
@@ -396,7 +402,7 @@ public sealed class DryRunViewModelTests
     }
 
     // Destinations nested one level under a single target root.
-    private static DryRunReport NestedDestinationsReport(Guid profileId) => Report(profileId,
+    private DryRunReport NestedDestinationsReport(Guid profileId) => Report(profileId,
         sourceFiles:
         [
             Pf(@"C:\in\fresh.txt", @"C:\in"),
@@ -572,7 +578,7 @@ public sealed class DryRunViewModelTests
     {
         var (viewModel, gateway) = NewViewModel();
         gateway.DryRunResult = Report(viewModel.ProfileId!.Value,
-            sourceFiles: [new PhysicalFile { Path = @"C:\s\a.dat", Root = @"C:\s", Length = 1536, LastWritten = DateTimeOffset.UnixEpoch }],
+            sourceFiles: [_dirs.Convert(new PhysicalFile { Path = @"C:\s\a.dat", Root = @"C:\s", Length = 1536, LastWritten = DateTimeOffset.UnixEpoch })],
             sourceOps: [SrcOp(0, @"C:\s\a.dat", @"C:\s", OperationKind.Processed, OnSuccessAction.KeepSource)],
             destinationFiles: [],
             destinationOps: [DstOp(OperationKind.New, @"D:\d\a.dat", @"D:\d", sourceIndex: 0)]);
@@ -644,7 +650,7 @@ public sealed class DryRunViewModelTests
     }
 
     // Two sources (C:\a with one process + one filter-skip, C:\b with two process).
-    private static DryRunReport MultiSourceReport(Guid profileId) => Report(profileId,
+    private DryRunReport MultiSourceReport(Guid profileId) => Report(profileId,
         sourceFiles:
         [
             Pf(@"C:\a\one.txt", @"C:\a"),     // 0
@@ -669,7 +675,7 @@ public sealed class DryRunViewModelTests
 
     // Sources nested two directory levels under a single root, so the tree has an interior folder
     // ("deep") below the auto-expanded top level — a node whose expansion the user can toggle.
-    private static DryRunReport DeepSourcesReport(Guid profileId) => Report(profileId,
+    private DryRunReport DeepSourcesReport(Guid profileId) => Report(profileId,
         sourceFiles:
         [
             Pf(@"C:\proj\sub\deep\one.txt", @"C:\proj"),
@@ -747,9 +753,9 @@ public sealed class DryRunViewModelTests
         var tab = new DryRunSourcesTab(TimeSpan.FromMilliseconds(60));
         List<DryRunFileRow> rows =
         [
-            new(@"C:\s\alpha.txt", @"C:\s", OperationKind.Processed, null, "KeepSource", []),
-            new(@"C:\s\beta.txt", @"C:\s", OperationKind.Processed, null, "KeepSource", []),
-            new(@"C:\s\gamma.txt", @"C:\s", OperationKind.Processed, null, "KeepSource", []),
+            new(@"C:\s", "alpha.txt", @"C:\s", OperationKind.Processed, null, "KeepSource", []),
+            new(@"C:\s", "beta.txt", @"C:\s", OperationKind.Processed, null, "KeepSource", []),
+            new(@"C:\s", "gamma.txt", @"C:\s", OperationKind.Processed, null, "KeepSource", []),
         ];
         tab.Load(rows, @"C:\s");
         Assert.Equal(3, tab.VisibleRows.Count);

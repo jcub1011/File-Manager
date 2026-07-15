@@ -18,17 +18,17 @@ namespace FileManager.UI.Tests;
 [Collection(HeadlessCollection.Name)]
 public sealed class DryRunViewSmokeTests(HeadlessSessionFixture headless)
 {
-    private static DryRunViewModel PopulatedViewModel()
+    private DryRunViewModel PopulatedViewModel()
     {
         FakeIpcGateway gateway = new();
         // Zero debounce: no pending Task.Delay is scheduled on the headless dispatcher.
         DryRunViewModel vm = new(gateway, searchDebounce: TimeSpan.Zero);
         vm.SetProfile(Guid.NewGuid(), "P");
 
-        var sourceFiles = new List<PhysicalFile>();
-        var sourceOps = new List<VirtualFileOperation>();
-        var destinationFiles = new List<PhysicalFile>();
-        var destinationOps = new List<VirtualFileOperation>();
+        var sourceFiles = new List<DryRunFile>();
+        var sourceOps = new List<DryRunOperation>();
+        var destinationFiles = new List<DryRunFile>();
+        var destinationOps = new List<DryRunOperation>();
         for (int i = 0; i < 200; i++)
         {
             string source = $@"C:\src\dir-{i % 8}\file-{i}.dat";
@@ -59,28 +59,32 @@ public sealed class DryRunViewSmokeTests(HeadlessSessionFixture headless)
         return vm;
     }
 
-    // New-model fixture helpers (see DryRunViewModelTests for the model shape).
-    private static PhysicalFile Pf(string path, string root) =>
-        new() { Path = path, Root = root, Length = 0, LastWritten = DateTimeOffset.UnixEpoch, IsReparsePoint = false };
+    // New-model fixture helpers (see DryRunViewModelTests for the model shape). Paths run through a
+    // per-test directory table (xunit news the class up per test, so one builder per report).
+    private readonly DryRunDirectoryTableBuilder _dirs = new();
 
-    private static VirtualFileOperation SrcOp(
+    private DryRunFile Pf(string path, string root) =>
+        _dirs.Convert(new PhysicalFile { Path = path, Root = root, Length = 0, LastWritten = DateTimeOffset.UnixEpoch, IsReparsePoint = false });
+
+    private DryRunOperation SrcOp(
         int index, string path, string root, OperationKind kind, OnSuccessAction? disposition = null, string? detail = null) =>
-        new() { Path = path, Root = root, Kind = kind, SourceIndex = index, SubjectIndex = -1, SourceDisposition = disposition, Detail = detail };
+        _dirs.Convert(new VirtualFileOperation { Path = path, Root = root, Kind = kind, SourceIndex = index, SubjectIndex = -1, SourceDisposition = disposition, Detail = detail });
 
-    private static VirtualFileOperation DstOp(
+    private DryRunOperation DstOp(
         OperationKind kind, string path, string root, int sourceIndex = -1, int subjectIndex = -1, string? detail = null) =>
-        new() { Path = path, Root = root, Kind = kind, SourceIndex = sourceIndex, SubjectIndex = subjectIndex, Detail = detail };
+        _dirs.Convert(new VirtualFileOperation { Path = path, Root = root, Kind = kind, SourceIndex = sourceIndex, SubjectIndex = subjectIndex, Detail = detail });
 
-    private static DryRunReport Report(
+    private DryRunReport Report(
         Guid profileId,
-        IReadOnlyList<PhysicalFile> sourceFiles,
-        IReadOnlyList<VirtualFileOperation> sourceOps,
-        IReadOnlyList<PhysicalFile> destinationFiles,
-        IReadOnlyList<VirtualFileOperation> destinationOps) =>
+        IReadOnlyList<DryRunFile> sourceFiles,
+        IReadOnlyList<DryRunOperation> sourceOps,
+        IReadOnlyList<DryRunFile> destinationFiles,
+        IReadOnlyList<DryRunOperation> destinationOps) =>
         new()
         {
             ProfileId = profileId,
             GeneratedAt = DateTimeOffset.UnixEpoch,
+            Directories = _dirs.Entries.ToList(),
             SourceFiles = sourceFiles,
             DestinationFiles = destinationFiles,
             SourceOperations = sourceOps,
@@ -141,9 +145,9 @@ public sealed class DryRunViewSmokeTests(HeadlessSessionFixture headless)
             DryRunViewModel vm = new(gateway, searchDebounce: TimeSpan.Zero);
             vm.SetProfile(Guid.NewGuid(), "P");
             // One source fanned out to several nested targets → one grouped row of wrapping chips.
-            var srcOps = new List<VirtualFileOperation>
+            var srcOps = new List<DryRunOperation>
                 { SrcOp(0, @"C:\src\reports\annual-summary.docx", @"C:\src", OperationKind.Processed, OnSuccessAction.KeepSource) };
-            var dstOps = new List<VirtualFileOperation>
+            var dstOps = new List<DryRunOperation>
             {
                 DstOp(OperationKind.New, @"D:\backup\2026\reports\annual-summary.docx", @"D:\backup", sourceIndex: 0),
                 DstOp(OperationKind.Overwrite, @"E:\archive\deep\nested\path\reports\annual-summary.docx", @"E:\archive", sourceIndex: 0),
@@ -174,9 +178,9 @@ public sealed class DryRunViewSmokeTests(HeadlessSessionFixture headless)
             DryRunViewModel vm = new(gateway, searchDebounce: TimeSpan.Zero);
             vm.SetProfile(Guid.NewGuid(), "P");
 
-            var sourceFiles = new List<PhysicalFile>();
-            var sourceOps = new List<VirtualFileOperation>();
-            var destinationOps = new List<VirtualFileOperation>();
+            var sourceFiles = new List<DryRunFile>();
+            var sourceOps = new List<DryRunOperation>();
+            var destinationOps = new List<DryRunOperation>();
             for (int i = 0; i < 40; i++)
             {
                 string source = $@"C:\src-{i % 2}\file-{i}.dat";

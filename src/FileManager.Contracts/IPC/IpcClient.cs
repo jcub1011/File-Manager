@@ -199,18 +199,15 @@ public sealed class IpcClient : IAsyncDisposable
                         destinationOperations.AddRange(chunk.DestinationOperations);
                         break;
                     case DryRunCompleteResponse complete:
-                        // TEMPORARY (directory-table migration, stage B): reconstruct the stringy
-                        // report until DryRunReport itself carries the normalized shape (stage C),
-                        // at which point the assembled lists return directly.
-                        string[] dirPaths = DryRunDirectoryTable.Materialize(directories);
                         return new DryRunReport
                         {
                             ProfileId = request.ProfileId,
                             GeneratedAt = complete.GeneratedAt,
-                            SourceFiles = sourceFiles.ConvertAll(f => ToPhysicalFile(f, dirPaths)),
-                            DestinationFiles = destinationFiles.ConvertAll(f => ToPhysicalFile(f, dirPaths)),
-                            SourceOperations = sourceOperations.ConvertAll(o => ToOperation(o, dirPaths)),
-                            DestinationOperations = destinationOperations.ConvertAll(o => ToOperation(o, dirPaths)),
+                            Directories = directories,
+                            SourceFiles = sourceFiles,
+                            DestinationFiles = destinationFiles,
+                            SourceOperations = sourceOperations,
+                            DestinationOperations = destinationOperations,
                             Truncated = complete.Truncated,
                             Space = complete.Space,
                         };
@@ -241,28 +238,6 @@ public sealed class IpcClient : IAsyncDisposable
             _requestGate.Release();
         }
     }
-
-    // TEMPORARY (directory-table migration, stage B): the stringy bridge from the normalized wire
-    // shape back to the current DryRunReport. Deleted when the report itself goes normalized.
-    private static PhysicalFile ToPhysicalFile(DryRunFile file, string[] dirPaths) => new()
-    {
-        Path = System.IO.Path.Join(dirPaths[file.DirIndex], file.FileName),
-        Root = dirPaths[file.RootDirIndex],
-        Length = file.Length,
-        LastWritten = file.LastWritten,
-        IsReparsePoint = file.IsReparsePoint,
-    };
-
-    private static VirtualFileOperation ToOperation(DryRunOperation op, string[] dirPaths) => new()
-    {
-        Path = System.IO.Path.Join(dirPaths[op.DirIndex], op.FileName),
-        Root = dirPaths[op.RootDirIndex],
-        Kind = op.Kind,
-        SourceIndex = op.SourceIndex,
-        SubjectIndex = op.SubjectIndex,
-        SourceDisposition = op.SourceDisposition,
-        Detail = op.Detail,
-    };
 
     /// <summary>Sends SubscribeEventsRequest; after the acknowledgment the connection is a
     /// one-way EngineEvent stream until disconnect (§3.2). Throws InvalidOperationException if

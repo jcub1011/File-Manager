@@ -169,8 +169,8 @@ public sealed class DryRunEngine(
         // entirely when the source pass truncated (the survivor set would be incomplete, so any
         // orphan classification is untrustworthy). Appended only while their size keeps the report
         // under budget; an overflow drops the rest and marks the report truncated.
-        DestinationSweepResult sweep = destinationProjector.Project(
-            profile, builder.DestinationOperations, truncated,
+        DestinationSweepResult sweep = destinationProjector.Sweep(
+            profile, builder.Survivors, truncated,
             DryRunConcurrency.ResolveManualWorkers(profile, settings.Current), ct);
         for (int i = 0; i < sweep.Files.Count; i++)
         {
@@ -199,6 +199,7 @@ public sealed class DryRunEngine(
         {
             ProfileId = profileId,
             GeneratedAt = completedAt,
+            Directories = builder.Directories,
             SourceFiles = builder.SourceFiles,
             DestinationFiles = builder.DestinationFiles,
             SourceOperations = builder.SourceOperations,
@@ -562,17 +563,28 @@ public sealed class DryRunEngine(
     }
 
     /// <summary>Batched-report accumulator with truncation to the serialized byte budget, fed bundles
-    /// in final (source-path) order. Sizing uses the tight upper-bound estimate only (see
-    /// <see cref="StringUpperBound"/>) — a true bound, so the serialized report always fits the
+    /// in final (source-path) order. Emits the normalized wire shape: records carry
+    /// (DirIndex, FileName) into a shared directory table built as bundles arrive. Sizing uses the
+    /// tight upper-bound estimate only (see <see cref="StringUpperBound"/>) — a true bound including
+    /// the directory entries a unit first references, so the serialized report always fits the
     /// budget; near the cap it may truncate a handful of records earlier than exact measurement
-    /// would, never later. A bundle is added atomically, so a retained operation never references
-    /// a dropped file.</summary>
+    /// would, never later. A unit is added atomically: a rejected unit's freshly-added directory
+    /// entries are rolled back, so a retained record never references a dropped table entry and the
+    /// table carries no unused tail.</summary>
     private sealed class ReportBuilder(long budget)
     {
-        public List<PhysicalFile> SourceFiles { get; } = [];
-        public List<PhysicalFile> DestinationFiles { get; } = [];
-        public List<VirtualFileOperation> SourceOperations { get; } = [];
-        public List<VirtualFileOperation> DestinationOperations { get; } = [];
+        private readonly DryRunDirectoryTableBuilder _dirs = new();
+
+        public IReadOnlyList<DryRunDirectory> Directories => _dirs.Entries;
+        public List<DryRunFile> SourceFiles { get; } = [];
+        public List<DryRunFile> DestinationFiles { get; } = [];
+        public List<DryRunOperation> SourceOperations { get; } = [];
+        public List<DryRunOperation> DestinationOperations { get; } = [];
+
+        /// <summary>Destination paths a kept source writes to, accumulated from the stringy bundles —
+        /// the batched path's input to the destination sweep (mirrors the streaming handler's
+        /// running survivor set).</summary>
+        public HashSet<NormalizedPath> Survivors { get; } = [];
 
         /// <summary>True once a unit was rejected because keeping it would cross the budget.</summary>
         public bool Truncated { get; private set; }
@@ -582,14 +594,46 @@ public sealed class DryRunEngine(
 
         private long _total;
 
-        /// <summary>Adds a whole per-file bundle atomically. Returns false (and sets
-        /// <see cref="Truncated"/>) without keeping it if it would cross the budget.</summary>
+        /// <summary>Adds a whole per-file bundle atomically, remapping bundle-local indices to global
+        /// positions exactly as <see cref="AppendGlobalized"/> does on the streamed path. Returns
+        /// false (and sets <see cref="Truncated"/>) without keeping anything if it would cross the
+        /// budget.</summary>
         public bool TryAddBundle(FileEvaluation bundle)
         {
-            if (!TryReserve(BundleUpperBound(bundle)))
+            int mark = _dirs.Mark();
+            DryRunFile sourceFile = _dirs.Convert(bundle.SourceFile);
+            DryRunOperation sourceOp = _dirs.Convert(bundle.SourceOp);
+            List<DryRunFile> destFiles = new(bundle.DestinationFiles.Count);
+            foreach (PhysicalFile file in bundle.DestinationFiles)
+                destFiles.Add(_dirs.Convert(file));
+            List<DryRunOperation> destOps = new(bundle.DestinationOps.Count);
+            foreach (VirtualFileOperation op in bundle.DestinationOps)
+                destOps.Add(_dirs.Convert(op));
+
+            long bytes = UpperBoundBytes(sourceFile) + UpperBoundBytes(sourceOp) + NewDirectoryBytes(mark);
+            foreach (DryRunFile file in destFiles)
+                bytes += UpperBoundBytes(file);
+            foreach (DryRunOperation op in destOps)
+                bytes += UpperBoundBytes(op);
+            if (!TryReserve(bytes))
+            {
+                _dirs.RollbackTo(mark);
                 return false;
-            AppendGlobalized(bundle, SourceFiles.Count, DestinationFiles.Count,
-                SourceFiles, DestinationFiles, SourceOperations, DestinationOperations);
+            }
+
+            int sourceIndex = SourceFiles.Count;
+            int destBase = DestinationFiles.Count;
+            SourceFiles.Add(sourceFile);
+            SourceOperations.Add(sourceOp with { SourceIndex = sourceIndex });
+            foreach (DryRunFile file in destFiles)
+                DestinationFiles.Add(file);
+            foreach (DryRunOperation op in destOps)
+                DestinationOperations.Add(op with
+                {
+                    SourceIndex = op.SourceIndex == 0 ? sourceIndex : -1,
+                    SubjectIndex = op.SubjectIndex >= 0 ? destBase + op.SubjectIndex : -1,
+                });
+            DestinationProjector.AccumulateSurvivors(Survivors, bundle.DestinationOps);
             return true;
         }
 
@@ -597,12 +641,28 @@ public sealed class DryRunEngine(
         /// file's new position.</summary>
         public bool TryAddSweepEntry(PhysicalFile file, VirtualFileOperation op)
         {
-            if (!TryReserve(UpperBoundBytes(file) + UpperBoundBytes(op)))
+            int mark = _dirs.Mark();
+            DryRunFile wireFile = _dirs.Convert(file);
+            DryRunOperation wireOp = _dirs.Convert(op);
+            if (!TryReserve(UpperBoundBytes(wireFile) + UpperBoundBytes(wireOp) + NewDirectoryBytes(mark)))
+            {
+                _dirs.RollbackTo(mark);
                 return false;
+            }
             int subjectIndex = DestinationFiles.Count;
-            DestinationFiles.Add(file);
-            DestinationOperations.Add(op with { SubjectIndex = subjectIndex });
+            DestinationFiles.Add(wireFile);
+            DestinationOperations.Add(wireOp with { SubjectIndex = subjectIndex });
             return true;
+        }
+
+        /// <summary>The serialized upper bound of the directory entries added since
+        /// <paramref name="mark"/> — a unit pays for the table entries it first references.</summary>
+        private long NewDirectoryBytes(int mark)
+        {
+            long bytes = 0;
+            for (int i = mark; i < _dirs.Count; i++)
+                bytes += DirectoryStructuralBytes + StringUpperBound(_dirs.Entries[i].Name);
+            return bytes;
         }
 
         private bool TryReserve(long upperBound)
@@ -656,9 +716,13 @@ public sealed class DryRunEngine(
     }
 
     // Fixed structural overhead (braces, property names, enum text, numeric fields, quotes) — generous
-    // so it is a true upper bound alongside the 6-bytes-per-char string bound.
+    // so it is a true upper bound alongside the 6-bytes-per-char string bound. The file/operation
+    // constants predate the normalized wire shape (whose records swap two path strings for two ints)
+    // and stay generous for it; the directory constant covers a DryRunDirectory's name-plus-parent
+    // envelope.
     private const int PhysicalFileStructuralBytes = 256;
     private const int OperationStructuralBytes = 320;
+    private const int DirectoryStructuralBytes = 64;
 
     private static long BundleUpperBound(FileEvaluation bundle)
     {
@@ -673,6 +737,12 @@ public sealed class DryRunEngine(
 
     private static long UpperBoundBytes(VirtualFileOperation op) =>
         OperationStructuralBytes + StringUpperBound(op.Path) + StringUpperBound(op.Root) + StringUpperBound(op.Detail);
+
+    private static long UpperBoundBytes(DryRunFile file) =>
+        PhysicalFileStructuralBytes + StringUpperBound(file.FileName);
+
+    private static long UpperBoundBytes(DryRunOperation op) =>
+        OperationStructuralBytes + StringUpperBound(op.FileName) + StringUpperBound(op.Detail);
 
     // Which ASCII chars the serializer's encoder (JavaScriptEncoder.Default — the JSON context
     // sets no custom encoder) writes through verbatim, built from the encoder itself so the table

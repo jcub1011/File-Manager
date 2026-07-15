@@ -17,10 +17,6 @@ namespace FileManager.Contracts;
 [JsonSerializable(typeof(DryRunDirectory))]
 [JsonSerializable(typeof(DryRunFile))]
 [JsonSerializable(typeof(DryRunOperation))]
-// Also serialized standalone: DryRunEngine measures each physical file against its report byte budget.
-[JsonSerializable(typeof(PhysicalFile))]
-// Also serialized standalone: DryRunEngine measures each operation against the same budget.
-[JsonSerializable(typeof(VirtualFileOperation))]
 // Also serialized standalone: SettingsService persists it to settings.json.
 [JsonSerializable(typeof(GlobalSettings))]
 public sealed partial class FileManagerJsonContext : JsonSerializerContext;

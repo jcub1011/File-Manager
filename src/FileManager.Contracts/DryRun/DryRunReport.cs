@@ -11,10 +11,12 @@ namespace FileManager.Contracts.DryRun;
 /// on disk under the profile's source roots and target roots respectively, pure ground truth with
 /// no verdicts. The <see cref="SourceOperations"/> and <see cref="DestinationOperations"/> lists are
 /// the <em>edges/annotations</em> — what the program would do, referencing the files they act on
-/// <b>by integer index</b> into the two file lists.
+/// <b>by integer index</b> into the two file lists. Paths are normalized: files/ops carry
+/// (<c>DirIndex</c>, <c>FileName</c>) into the shared <see cref="Directories"/> table rather than
+/// flat absolute strings, so sibling files share their directory chain structurally.
 /// <para>
-/// List order is a stable contract: an operation's <see cref="VirtualFileOperation.SourceIndex"/> /
-/// <see cref="VirtualFileOperation.SubjectIndex"/> is a position into these lists, so the engine's
+/// List order is a stable contract: an operation's <see cref="DryRunOperation.SourceIndex"/> /
+/// <see cref="DryRunOperation.SubjectIndex"/> is a position into these lists, so the engine's
 /// emit order must equal the streaming client's assembly order. Truncation happens only at whole
 /// per-file-bundle boundaries, so a retained operation never references a dropped file.
 /// </para>
@@ -23,19 +25,23 @@ public sealed record DryRunReport
 {
     public required Guid ProfileId { get; init; }
     public required DateTimeOffset GeneratedAt { get; init; }
+    /// <summary>The shared directory table every file/op's <c>DirIndex</c>/<c>RootDirIndex</c>
+    /// resolves into (see <see cref="DryRunDirectory"/>). Parents precede children, so
+    /// <see cref="DryRunDirectoryTable.Materialize"/> resolves it in one forward pass.</summary>
+    public required IReadOnlyList<DryRunDirectory> Directories { get; init; }
     /// <summary>Files discovered under the profile's source roots. Index space for
-    /// <see cref="VirtualFileOperation.SourceIndex"/>.</summary>
-    public required IReadOnlyList<PhysicalFile> SourceFiles { get; init; }
+    /// <see cref="DryRunOperation.SourceIndex"/>.</summary>
+    public required IReadOnlyList<DryRunFile> SourceFiles { get; init; }
     /// <summary>Pre-existing files discovered under the profile's target roots. Index space for
-    /// <see cref="VirtualFileOperation.SubjectIndex"/>.</summary>
-    public required IReadOnlyList<PhysicalFile> DestinationFiles { get; init; }
+    /// <see cref="DryRunOperation.SubjectIndex"/>.</summary>
+    public required IReadOnlyList<DryRunFile> DestinationFiles { get; init; }
     /// <summary>One operation per source file describing its fate (Processed / Skipped) and the
     /// disposition of the original. Source-side <see cref="OperationKind"/>s only.</summary>
-    public required IReadOnlyList<VirtualFileOperation> SourceOperations { get; init; }
+    public required IReadOnlyList<DryRunOperation> SourceOperations { get; init; }
     /// <summary>The destination "after" view: every resulting path with its operation
     /// (New/Overwrite/Rename/Skip/Untouched/Deleted/Unknown). Destination-side
     /// <see cref="OperationKind"/>s only.</summary>
-    public required IReadOnlyList<VirtualFileOperation> DestinationOperations { get; init; }
+    public required IReadOnlyList<DryRunOperation> DestinationOperations { get; init; }
     /// <summary>True when the engine stopped before the scan ran out — the report shows a prefix,
     /// not everything found. Mirror <see cref="OperationKind.Deleted"/> entries are never inferred
     /// on a truncated report.</summary>
@@ -99,7 +105,9 @@ public sealed record DryRunOperation
 }
 
 /// <summary>An actual file discovered on disk — pure ground truth, no verdict. <see cref="Length"/>
-/// and <see cref="LastWritten"/> come free from the enumeration/stat snapshot (no extra I/O).</summary>
+/// and <see cref="LastWritten"/> come free from the enumeration/stat snapshot (no extra I/O).
+/// Engine-internal currency: evaluation, hashing, and the destination sweep work on absolute
+/// paths; the wire carries <see cref="DryRunFile"/> instead.</summary>
 public sealed record PhysicalFile
 {
     public required string Path { get; init; }          // absolute
@@ -111,9 +119,9 @@ public sealed record PhysicalFile
 }
 
 /// <summary>What the program would do to a file. References the physical file(s) it acts on by
-/// integer index into <see cref="DryRunReport.SourceFiles"/> / <see cref="DryRunReport.DestinationFiles"/>.
-/// List membership (Source vs Destination operations) determines the "side"; there is no side
-/// discriminator.</summary>
+/// integer index into the report's file lists. List membership (Source vs Destination operations)
+/// determines the "side"; there is no side discriminator. Engine-internal currency: the wire
+/// carries <see cref="DryRunOperation"/> instead.</summary>
 public sealed record VirtualFileOperation
 {
     /// <summary>Source op: the source file's path. Destination op: the resulting path (which may be

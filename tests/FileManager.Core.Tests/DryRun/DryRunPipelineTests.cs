@@ -110,10 +110,11 @@ public sealed class DryRunPipelineTests : IDisposable
         Assert.True(report!.Truncated);
         // The accepted set is the first five in emission order; the report is that set sorted.
         List<string> expected = [.. emissionOrder.Take(5).OrderBy(n => n, StringComparer.OrdinalIgnoreCase)];
-        Assert.Equal(expected, report.SourceFiles.Select(f => Path.GetFileName(f.Path)).ToList());
+        Assert.Equal(expected, report.SourceFiles.Select(f => f.FileName).ToList());
         AssertIndicesValid(report);
+        string[] dirPaths = DryRunDirectoryTable.Materialize(report.Directories);
         Assert.DoesNotContain(report.DestinationOperations,
-            o => o.Path.EndsWith("orphan.txt", StringComparison.OrdinalIgnoreCase));
+            o => PathOf(dirPaths, o).EndsWith("orphan.txt", StringComparison.OrdinalIgnoreCase));
     }
 
     // ----- faults -----
@@ -352,21 +353,30 @@ public sealed class DryRunPipelineTests : IDisposable
     private void TargetFile(string name, string content = "content")
         => File.WriteAllText(Path.Combine(_target, name), content);
 
+    /// <summary>Materializes a report file/op back to its absolute path (the wire carries
+    /// (DirIndex, FileName) triples into the shared directory table, not flat strings).</summary>
+    private static string PathOf(string[] dirPaths, DryRunFile file) =>
+        Path.Join(dirPaths[file.DirIndex], file.FileName);
+
+    private static string PathOf(string[] dirPaths, DryRunOperation op) =>
+        Path.Join(dirPaths[op.DirIndex], op.FileName);
+
     private static void AssertIndicesValid(DryRunReport report)
     {
-        foreach (VirtualFileOperation op in report.SourceOperations)
+        string[] dirPaths = DryRunDirectoryTable.Materialize(report.Directories);
+        foreach (DryRunOperation op in report.SourceOperations)
         {
             Assert.InRange(op.SourceIndex, 0, report.SourceFiles.Count - 1);
             Assert.Equal(-1, op.SubjectIndex);
         }
-        foreach (VirtualFileOperation op in report.DestinationOperations)
+        foreach (DryRunOperation op in report.DestinationOperations)
         {
             Assert.True(op.SourceIndex == -1 || (op.SourceIndex >= 0 && op.SourceIndex < report.SourceFiles.Count),
                 $"destination op SourceIndex {op.SourceIndex} out of range (SourceFiles={report.SourceFiles.Count})");
             Assert.True(op.SubjectIndex == -1 || (op.SubjectIndex >= 0 && op.SubjectIndex < report.DestinationFiles.Count),
                 $"destination op SubjectIndex {op.SubjectIndex} out of range (DestinationFiles={report.DestinationFiles.Count})");
             if (op.SubjectIndex >= 0)
-                Assert.Equal(report.DestinationFiles[op.SubjectIndex].Path, op.Path);
+                Assert.Equal(PathOf(dirPaths, report.DestinationFiles[op.SubjectIndex]), PathOf(dirPaths, op));
         }
     }
 }

@@ -55,15 +55,19 @@ public static class DryRunPaths
     /// <summary>Splits an absolute path into its file name and a directory portion displayed relative
     /// to <paramref name="commonRoot"/> (with a trailing separator). Falls back to the absolute
     /// directory when there is no common root or the path lies outside it.</summary>
-    public static (string FileName, string ParentDisplay) SplitForDisplay(string absolutePath, string? commonRoot)
-    {
-        string fileName = Path.GetFileName(absolutePath);
-        string dir = Path.GetDirectoryName(absolutePath) ?? "";
+    public static (string FileName, string ParentDisplay) SplitForDisplay(string absolutePath, string? commonRoot) =>
+        (Path.GetFileName(absolutePath), ParentDisplayFor(Path.GetDirectoryName(absolutePath) ?? "", commonRoot));
 
-        string parent = dir;
-        if (!string.IsNullOrEmpty(commonRoot) && dir.Length > 0)
+    /// <summary>The display form of a directory: relative to <paramref name="commonRoot"/> (with a
+    /// trailing separator), falling back to the absolute directory when there is no common root or
+    /// the directory lies outside it. <see cref="SplitForDisplay"/> minus the file-name split, for
+    /// rows that already hold their (directory, file name) pair.</summary>
+    public static string ParentDisplayFor(string dirPath, string? commonRoot)
+    {
+        string parent = dirPath;
+        if (!string.IsNullOrEmpty(commonRoot) && dirPath.Length > 0)
         {
-            string rel = Path.GetRelativePath(commonRoot, dir);
+            string rel = Path.GetRelativePath(commonRoot, dirPath);
             if (rel == ".")
                 rel = "";
             if (!rel.StartsWith("..", StringComparison.Ordinal) && !Path.IsPathRooted(rel))
@@ -72,7 +76,46 @@ public static class DryRunPaths
 
         if (parent.Length > 0 && !EndsWithSeparator(parent))
             parent += Path.DirectorySeparatorChar;
-        return (fileName, parent);
+        return parent;
+    }
+
+    /// <summary>Whether the absolute path formed by <paramref name="dirPath"/> +
+    /// <paramref name="fileName"/> contains <paramref name="term"/> (ordinal, case-insensitive) —
+    /// allocation-free equivalent of <c>Path.Join(dirPath, fileName).Contains(term)</c>. Search runs
+    /// this against every row per (debounced) keystroke; joining first would allocate the very path
+    /// strings the rows exist to avoid. The two <see cref="string.Contains(string, StringComparison)"/>
+    /// probes cover matches inside either part; the tail scan covers only terms spanning the joint
+    /// (≤ term-length start positions).</summary>
+    public static bool PathContains(string dirPath, string fileName, string term)
+    {
+        if (term.Length == 0)
+            return true;
+        if (dirPath.Contains(term, StringComparison.OrdinalIgnoreCase)
+            || fileName.Contains(term, StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        // Path.Join inserts a separator only when dirPath doesn't already end with one ("C:\" doesn't
+        // get doubled); mirror that so the virtual string equals the joined path exactly.
+        int sepLen = dirPath.Length > 0 && EndsWithSeparator(dirPath) ? 0 : 1;
+        int dirLen = dirPath.Length;
+        int totalLen = dirLen + sepLen + fileName.Length;
+        int firstStart = Math.Max(0, dirLen + sepLen - term.Length);
+        int lastStart = Math.Min(dirLen + sepLen - 1, totalLen - term.Length);
+        for (int start = firstStart; start <= lastStart; start++)
+        {
+            bool match = true;
+            for (int i = 0; i < term.Length && match; i++)
+            {
+                int pos = start + i;
+                char c = pos < dirLen ? dirPath[pos]
+                    : pos < dirLen + sepLen ? Path.DirectorySeparatorChar
+                    : fileName[pos - dirLen - sepLen];
+                match = char.ToUpperInvariant(c) == char.ToUpperInvariant(term[i]);
+            }
+            if (match)
+                return true;
+        }
+        return false;
     }
 
     /// <summary>The path made relative to <paramref name="commonRoot"/> for building the tree forest,
