@@ -72,12 +72,13 @@ public sealed class DryRunViewModelMemoryTests(ITestOutputHelper output)
     }
 
     /// <summary>What turning on tree view adds on top of the populated preview — the forest of
-    /// <see cref="DryRunTreeNode"/>s plus the TreeDataGrid sources — and how long the synchronous
-    /// build blocks for, at the streamed cap on the realistic deep-path shape. The build runs on
-    /// the UI thread, so the wall time here is the freeze the user feels.</summary>
+    /// <see cref="DryRunTreeNode"/>s plus the TreeDataGrid sources — and how long the build takes,
+    /// at the streamed cap on the realistic deep-path shape. Past the sync-rebuild threshold the
+    /// build runs on the thread pool (the UI thread no longer freezes), so each toggle awaits its
+    /// <c>PendingRebuild</c> before the clock stops.</summary>
     [Fact]
     [Trait("Category", "Memory")]
-    public void Tree_toggle_retained_heap_and_build_time_at_streamed_cap_with_realistic_deep_paths()
+    public async Task Tree_toggle_retained_heap_and_build_time_at_streamed_cap_with_realistic_deep_paths()
     {
         (DryRunViewModel vm, WeakReference report) = BuildAndApplyDeep();
 
@@ -86,8 +87,10 @@ public sealed class DryRunViewModelMemoryTests(ITestOutputHelper output)
 
         Stopwatch watch = Stopwatch.StartNew();
         vm.Sources.ShowTree = true;
+        await vm.Sources.PendingRebuild;
         long sourcesMs = watch.ElapsedMilliseconds;
         vm.Destinations.ShowTree = true;
+        await vm.Destinations.PendingRebuild;
         watch.Stop();
 
         long after = GC.GetTotalMemory(forceFullCollection: true);

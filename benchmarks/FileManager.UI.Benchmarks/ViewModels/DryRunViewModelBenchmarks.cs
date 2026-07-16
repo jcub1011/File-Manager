@@ -17,6 +17,7 @@ namespace FileManager.UI.Benchmarks.ViewModels;
 public class DryRunViewModelBenchmarks
 {
     private DryRunViewModel _viewModel = null!;
+    private DryRunViewModel _populated = null!;
     private DryRunReport _report = null!;
 
     /// <summary>Source files to aggregate; 500k is the engine's <c>MaxStreamedFiles</c> cap — the
@@ -30,10 +31,32 @@ public class DryRunViewModelBenchmarks
     {
         _viewModel = new DryRunViewModel(gateway: null!);
         _report = BuildReport(FileCount);
+        _populated = new DryRunViewModel(gateway: null!);
+        _populated.ApplyReport(_report);
     }
 
     [Benchmark]
     public void ApplyReport() => _viewModel.ApplyReport(_report);
+
+    /// <summary>The pure projection alone — the part <c>RunAsync</c> now runs on the thread pool.
+    /// The delta between this and <see cref="ApplyReport"/> is what still lands on the UI thread
+    /// when a scan completes.</summary>
+    [Benchmark]
+    public object PrepareReport() => DryRunViewModel.PrepareReport(_report);   // object: the record is internal, benchmark methods must be public
+
+    /// <summary>A status-chip select and its deselect on a populated preview — the coalesced
+    /// rebuilds that used to freeze the UI. Both passes run per invocation so every invocation does
+    /// identical work: one real filter pass plus the deselect's no-filter fast path (alternating a
+    /// single toggle per invocation would blend a real and a near-free pass bimodally).</summary>
+    [Benchmark]
+    public async Task ToggleStatusFilter()
+    {
+        DryRunStatusFilter chip = _populated.Sources.StatusFilters[0];
+        chip.IsSelected = true;
+        await _populated.Sources.PendingRebuild;
+        chip.IsSelected = false;
+        await _populated.Sources.PendingRebuild;
+    }
 
     /// <summary>Spreads files across the three source dispositions with a mix of destination operation
     /// kinds so every projection and count pass in ApplyReport does real work: processed rows fan out to

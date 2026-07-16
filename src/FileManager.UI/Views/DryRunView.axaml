@@ -403,6 +403,16 @@
 
                     <TreeDataGrid Grid.Row="3" Classes="rows" Source="{Binding Sources.TreeSource}"
                                   IsVisible="{Binding Sources.ShowTree}" />
+
+                    <!-- Loading overlay: shown while a large rebuild (tree build / filter pass) runs
+                         on the thread pool — the view beneath is empty or stale until it publishes. -->
+                    <Panel Grid.Row="3" IsVisible="{Binding Sources.IsRebuilding}">
+                        <Border Background="{DynamicResource Brush.Window.Background}" Opacity="0.6" />
+                        <StackPanel Spacing="10" MinWidth="220" VerticalAlignment="Center" HorizontalAlignment="Center">
+                            <ProgressBar IsIndeterminate="True" />
+                            <TextBlock Classes="caption" Text="Building view…" HorizontalAlignment="Center" />
+                        </StackPanel>
+                    </Panel>
                 </Grid>
 
                 <GridSplitter Grid.Column="1" Width="6" ResizeDirection="Columns"
@@ -522,6 +532,16 @@
 
                     <TreeDataGrid Grid.Row="3" Classes="rows" Source="{Binding Destinations.TreeSource}"
                                   IsVisible="{Binding Destinations.ShowTree}" />
+
+                    <!-- Loading overlay: shown while a large rebuild (tree build / filter pass) runs
+                         on the thread pool — the view beneath is empty or stale until it publishes. -->
+                    <Panel Grid.Row="3" IsVisible="{Binding Destinations.IsRebuilding}">
+                        <Border Background="{DynamicResource Brush.Window.Background}" Opacity="0.6" />
+                        <StackPanel Spacing="10" MinWidth="220" VerticalAlignment="Center" HorizontalAlignment="Center">
+                            <ProgressBar IsIndeterminate="True" />
+                            <TextBlock Classes="caption" Text="Building view…" HorizontalAlignment="Center" />
+                        </StackPanel>
+                    </Panel>
                 </Grid>
             </Grid>
         </Grid>

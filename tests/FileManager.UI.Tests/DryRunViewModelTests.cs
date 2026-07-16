@@ -901,6 +901,99 @@ public sealed class DryRunViewModelTests
         Assert.EndsWith("gamma.txt", only.SourcePath);
     }
 
+    // Enough rows to cross DryRunRebuild.SyncThreshold, so rebuilds hop to the thread pool exactly
+    // as they do for a real large report. Even indices are processed, odd are filter-skipped.
+    private static List<DryRunFileRow> ManyRows(int count)
+    {
+        List<DryRunFileRow> rows = new(count);
+        for (int i = 0; i < count; i++)
+        {
+            rows.Add(new DryRunFileRow(
+                @"C:\s", $"file-{i:D6}.txt", @"C:\s",
+                i % 2 == 0 ? OperationKind.Processed : OperationKind.SkippedByFilter,
+                null,
+                i % 2 == 0 ? "KeepSource" : null,
+                []));
+        }
+        return rows;
+    }
+
+    [Fact]
+    public async Task Rapid_filter_toggles_on_a_large_report_coalesce_to_the_latest_state()
+    {
+        var tab = new DryRunSourcesTab(TimeSpan.Zero);
+        tab.Load(ManyRows(6_000), @"C:\s");
+        Assert.Equal(6_000, tab.VisibleRows.Count);
+
+        // Click chips in quick succession; each toggle supersedes the rebuild before it, so only
+        // the last filter state may publish.
+        tab.StatusFilters.Single(f => f.Key == "processed").IsSelected = true;
+        tab.StatusFilters.Single(f => f.Key == "processed").IsSelected = false;
+        tab.StatusFilters.Single(f => f.Key == "untouched").IsSelected = true;
+        await tab.PendingRebuild;
+
+        Assert.Equal(3_000, tab.VisibleRows.Count);
+        Assert.All(tab.VisibleRows, r => Assert.True(r.IsUntouched));
+    }
+
+    [Fact]
+    public async Task Loading_a_new_report_supersedes_an_in_flight_rebuild()
+    {
+        var tab = new DryRunSourcesTab(TimeSpan.Zero);
+        tab.Load(ManyRows(100_000), @"C:\s");   // large enough that the rebuild is still computing below
+
+        // Kick off a background rebuild, then load a replacement report while it is in flight —
+        // the load cancels it, and the superseded rebuild must never publish the old rows.
+        tab.StatusFilters.Single(f => f.Key == "processed").IsSelected = true;
+        Task superseded = tab.PendingRebuild;
+        List<DryRunFileRow> replacement =
+        [
+            new(@"C:\s", "alpha.txt", @"C:\s", OperationKind.Processed, null, "KeepSource", []),
+        ];
+        tab.Load(replacement, @"C:\s");
+        await superseded;
+
+        DryRunFileRow only = Assert.Single(tab.VisibleRows);
+        Assert.Equal("alpha.txt", only.FileName);
+    }
+
+    [Fact]
+    public async Task Large_rebuilds_flag_IsRebuilding_until_they_publish()
+    {
+        var tab = new DryRunSourcesTab(TimeSpan.Zero);
+        tab.Load(ManyRows(6_000), @"C:\s");
+        Assert.False(tab.IsRebuilding);
+
+        // The flag is set synchronously before the rebuild hops to the thread pool, and cleared by
+        // the publish — the window the view's loading overlay is visible for.
+        tab.StatusFilters.Single(f => f.Key == "untouched").IsSelected = true;
+        Assert.True(tab.IsRebuilding);
+        await tab.PendingRebuild;
+        Assert.False(tab.IsRebuilding);
+    }
+
+    [Fact]
+    public async Task Small_rebuilds_never_flag_IsRebuilding()
+    {
+        var (viewModel, gateway) = NewViewModel();
+        gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value);
+        await viewModel.RunAsync(CancellationToken.None);
+
+        // Under the sync threshold the rebuild completes in the same dispatcher frame — the
+        // loading overlay must never flicker for small reports.
+        viewModel.Sources.StatusFilters.Single(f => f.Key == "deleted").IsSelected = true;
+        Assert.False(viewModel.Sources.IsRebuilding);
+        Assert.Single(viewModel.Sources.VisibleRows);
+    }
+
+    [Fact]
+    public void Prepare_report_honours_cancellation()
+    {
+        DryRunReport report = SampleReport(Guid.NewGuid());
+        Assert.Throws<OperationCanceledException>(
+            () => DryRunViewModel.PrepareReport(report, new CancellationToken(canceled: true)));
+    }
+
     private static async Task WaitUntilAsync(Func<bool> condition, int timeoutMs = 2000)
     {
         System.Diagnostics.Stopwatch sw = System.Diagnostics.Stopwatch.StartNew();

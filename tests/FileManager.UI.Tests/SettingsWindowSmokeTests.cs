@@ -13,7 +13,7 @@ public sealed class SettingsWindowSmokeTests(HeadlessSessionFixture headless)
     [Fact]
     public async Task Settings_window_loads_with_the_startup_mode_combo()
     {
-        await headless.Session.Dispatch(async () =>
+        await headless.Session.DispatchAsync(async () =>
         {
             FakeIpcGateway gateway = new()
             {

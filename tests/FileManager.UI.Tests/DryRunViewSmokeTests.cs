@@ -102,7 +102,7 @@ public sealed class DryRunViewSmokeTests(HeadlessSessionFixture headless)
     [Fact]
     public async Task Sources_list_view_loads_and_lays_out()
     {
-        await headless.Session.Dispatch(async () =>
+        await headless.Session.DispatchAsync(async () =>
         {
             DryRunViewModel vm = PopulatedViewModel();
             await vm.RunAsync(CancellationToken.None);
@@ -121,7 +121,7 @@ public sealed class DryRunViewSmokeTests(HeadlessSessionFixture headless)
     [Fact]
     public async Task Destinations_tab_loads_and_lays_out()
     {
-        await headless.Session.Dispatch(async () =>
+        await headless.Session.DispatchAsync(async () =>
         {
             DryRunViewModel vm = PopulatedViewModel();
             await vm.RunAsync(CancellationToken.None);
@@ -139,7 +139,7 @@ public sealed class DryRunViewSmokeTests(HeadlessSessionFixture headless)
     [Fact]
     public async Task Destinations_tab_lays_out_a_replicated_files_wrapping_chip_list()
     {
-        await headless.Session.Dispatch(async () =>
+        await headless.Session.DispatchAsync(async () =>
         {
             FakeIpcGateway gateway = new();
             DryRunViewModel vm = new(gateway, searchDebounce: TimeSpan.Zero);
@@ -172,7 +172,7 @@ public sealed class DryRunViewSmokeTests(HeadlessSessionFixture headless)
     [Fact]
     public async Task Source_facet_renders_and_toggling_a_source_relayouts()
     {
-        await headless.Session.Dispatch(async () =>
+        await headless.Session.DispatchAsync(async () =>
         {
             FakeIpcGateway gateway = new();
             DryRunViewModel vm = new(gateway, searchDebounce: TimeSpan.Zero);
@@ -209,10 +209,12 @@ public sealed class DryRunViewSmokeTests(HeadlessSessionFixture headless)
     [Fact]
     public async Task Sources_tree_view_loads_and_lays_out()
     {
-        await headless.Session.Dispatch(() =>
+        await headless.Session.DispatchAsync(async () =>
         {
             DryRunViewModel vm = PopulatedViewModel();
-            vm.RunAsync(CancellationToken.None).GetAwaiter().GetResult();
+            // RunAsync hops to the thread pool for report preparation, so blocking the dispatcher
+            // thread with GetResult() here would deadlock — await it instead.
+            await vm.RunAsync(CancellationToken.None);
             vm.Sources.ShowTree = true;               // build the forest before showing so the TreeView realizes
 
             var (window, _) = ShowView(vm);           // no throw ⇒ TreeDataTemplate + pills + VSP + IsExpanded binding valid
@@ -230,10 +232,12 @@ public sealed class DryRunViewSmokeTests(HeadlessSessionFixture headless)
     [Fact]
     public async Task Destinations_tree_view_loads_and_lays_out()
     {
-        await headless.Session.Dispatch(() =>
+        await headless.Session.DispatchAsync(async () =>
         {
             DryRunViewModel vm = PopulatedViewModel();
-            vm.RunAsync(CancellationToken.None).GetAwaiter().GetResult();
+            // RunAsync hops to the thread pool for report preparation, so blocking the dispatcher
+            // thread with GetResult() here would deadlock — await it instead.
+            await vm.RunAsync(CancellationToken.None);
             vm.Destinations.ShowTree = true;
 
             var (window, _) = ShowView(vm);
@@ -251,7 +255,7 @@ public sealed class DryRunViewSmokeTests(HeadlessSessionFixture headless)
     public async Task Panels_lay_out_side_by_side_in_a_narrow_window()
     {
         // A narrow window exercises the toolbar/search-box shrink and the min-width columns without clipping.
-        await headless.Session.Dispatch(async () =>
+        await headless.Session.DispatchAsync(async () =>
         {
             DryRunViewModel vm = PopulatedViewModel();
             await vm.RunAsync(CancellationToken.None);
@@ -274,7 +278,7 @@ public sealed class DryRunViewSmokeTests(HeadlessSessionFixture headless)
     {
         // Exercises the StorageBar render (capacity-known bar + margin line), the per-folder Expander,
         // and the capacity-unknown text branch — runtime-only paths not reachable from the VM tests.
-        await headless.Session.Dispatch(async () =>
+        await headless.Session.DispatchAsync(async () =>
         {
             FakeIpcGateway gateway = new();
             DryRunViewModel vm = new(gateway, searchDebounce: TimeSpan.Zero);
@@ -322,7 +326,7 @@ public sealed class DryRunViewSmokeTests(HeadlessSessionFixture headless)
     [Fact]
     public async Task Resizing_relayouts_path_rows_without_reentrancy()
     {
-        await headless.Session.Dispatch(async () =>
+        await headless.Session.DispatchAsync(async () =>
         {
             DryRunViewModel vm = PopulatedViewModel();
             await vm.RunAsync(CancellationToken.None);
