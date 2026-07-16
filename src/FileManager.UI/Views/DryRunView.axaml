@@ -292,7 +292,9 @@
                 <!-- ============================= SOURCES ============================= -->
                 <Grid Grid.Column="0" RowDefinitions="Auto,Auto,Auto,*" RowSpacing="6" Margin="0,4,8,0">
 
-                    <!-- header: title + visible-row count | common root (right, trimmed) -->
+                    <!-- header: title + visible-row count | status filters (right). None selected → the
+                         list shows everything; selecting one or more narrows it. The ✕ clears them, and
+                         only appears while a status filter is active. -->
                     <Grid Grid.Row="0" ColumnDefinitions="Auto,*" ColumnSpacing="8">
                         <StackPanel Grid.Column="0" Orientation="Horizontal" Spacing="6" VerticalAlignment="Center">
                             <TextBlock Text="Sources" FontWeight="Bold" FontSize="14" />
@@ -300,31 +302,24 @@
                                 <Run Text="(" /><Run Text="{Binding Sources.VisibleRows.Count}" /><Run Text=")" />
                             </TextBlock>
                         </StackPanel>
-                        <TextBlock Grid.Column="1" Text="{Binding Sources.CommonRootDisplay}"
-                                   FontFamily="{StaticResource MonoFontFamily}" FontSize="11" Opacity="0.6"
-                                   TextAlignment="Right" TextTrimming="CharacterEllipsis"
-                                   VerticalAlignment="Center" ToolTip.Tip="{Binding Sources.CommonRoot}" />
-                    </Grid>
-
-                    <!-- summary: whole-run counts that double as status filters. None selected → the
-                         list shows everything; selecting one or more narrows it. The ✕ (right) clears
-                         them, and only appears while a status filter is active. -->
-                    <Grid Grid.Row="1" ColumnDefinitions="*,Auto">
-                        <ItemsControl Grid.Column="0" ItemsSource="{Binding Sources.StatusFilters}"
-                                      ItemTemplate="{StaticResource StatusFilterTemplate}">
-                            <ItemsControl.ItemsPanel>
-                                <ItemsPanelTemplate><WrapPanel /></ItemsPanelTemplate>
-                            </ItemsControl.ItemsPanel>
-                        </ItemsControl>
-                        <Button Grid.Column="1" Classes="iconButton" Content="✕" FontSize="12" Padding="6,2"
-                                VerticalAlignment="Center"
-                                IsVisible="{Binding Sources.AnyStatusSelected}"
-                                Command="{Binding Sources.ClearStatusFiltersCommand}"
-                                ToolTip.Tip="Clear status filters" />
+                        <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="6"
+                                    HorizontalAlignment="Right" VerticalAlignment="Center">
+                            <Button Classes="iconButton" Content="✕" FontSize="12" Padding="6,2"
+                                    VerticalAlignment="Center"
+                                    IsVisible="{Binding Sources.AnyStatusSelected}"
+                                    Command="{Binding Sources.ClearStatusFiltersCommand}"
+                                    ToolTip.Tip="Clear status filters" />
+                            <ItemsControl ItemsSource="{Binding Sources.StatusFilters}"
+                                          ItemTemplate="{StaticResource StatusFilterTemplate}">
+                                <ItemsControl.ItemsPanel>
+                                    <ItemsPanelTemplate><WrapPanel /></ItemsPanelTemplate>
+                                </ItemsControl.ItemsPanel>
+                            </ItemsControl>
+                        </StackPanel>
                     </Grid>
 
                     <!-- toolbar: search (stretches) | Filter flyout | list/tree toggle -->
-                    <Grid Grid.Row="2" ColumnDefinitions="*,Auto,Auto">
+                    <Grid Grid.Row="1" ColumnDefinitions="*,Auto,Auto">
                         <TextBox Grid.Column="0" Text="{Binding Sources.SearchText}"
                                  PlaceholderText="Filter by source or target path…" />
                         <Button Grid.Column="1" Content="{Binding Sources.FilterLabel}" FontSize="12"
@@ -358,6 +353,12 @@
                                       FontSize="12" Margin="8,0,0,0" VerticalAlignment="Stretch"
                                       ToolTip.Tip="Group the files into a navigable directory tree" />
                     </Grid>
+
+                    <!-- common root the listed paths are shown relative to (trimmed, full path in tooltip) -->
+                    <TextBlock Grid.Row="2" Text="{Binding Sources.CommonRootDisplay}"
+                               FontFamily="{StaticResource MonoFontFamily}" FontSize="11" Opacity="0.6"
+                               TextTrimming="CharacterEllipsis" VerticalAlignment="Center"
+                               ToolTip.Tip="{Binding Sources.CommonRoot}" />
 
                     <ListBox Grid.Row="3" Classes="rows" ItemsSource="{Binding Sources.VisibleRows}"
                              IsVisible="{Binding !Sources.ShowTree}"
@@ -410,7 +411,7 @@
                 <!-- ============================ DESTINATIONS ============================ -->
                 <Grid Grid.Column="2" RowDefinitions="Auto,Auto,Auto,*" RowSpacing="6" Margin="8,4,0,0">
 
-                    <!-- header: title + visible-row count | common root (right, trimmed) -->
+                    <!-- header: title + visible-row count | status filters (right, see Sources). -->
                     <Grid Grid.Row="0" ColumnDefinitions="Auto,*" ColumnSpacing="8">
                         <StackPanel Grid.Column="0" Orientation="Horizontal" Spacing="6" VerticalAlignment="Center">
                             <TextBlock Text="Destinations" FontWeight="Bold" FontSize="14" />
@@ -418,28 +419,23 @@
                                 <Run Text="(" /><Run Text="{Binding Destinations.VisibleRows.Count}" /><Run Text=")" />
                             </TextBlock>
                         </StackPanel>
-                        <TextBlock Grid.Column="1" Text="{Binding Destinations.CommonRootDisplay}"
-                                   FontFamily="{StaticResource MonoFontFamily}" FontSize="11" Opacity="0.6"
-                                   TextAlignment="Right" TextTrimming="CharacterEllipsis"
-                                   VerticalAlignment="Center" ToolTip.Tip="{Binding Destinations.CommonRoot}" />
+                        <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="6"
+                                    HorizontalAlignment="Right" VerticalAlignment="Center">
+                            <Button Classes="iconButton" Content="✕" FontSize="12" Padding="6,2"
+                                    VerticalAlignment="Center"
+                                    IsVisible="{Binding Destinations.AnyStatusSelected}"
+                                    Command="{Binding Destinations.ClearStatusFiltersCommand}"
+                                    ToolTip.Tip="Clear status filters" />
+                            <ItemsControl ItemsSource="{Binding Destinations.StatusFilters}"
+                                          ItemTemplate="{StaticResource StatusFilterTemplate}">
+                                <ItemsControl.ItemsPanel>
+                                    <ItemsPanelTemplate><WrapPanel /></ItemsPanelTemplate>
+                                </ItemsControl.ItemsPanel>
+                            </ItemsControl>
+                        </StackPanel>
                     </Grid>
 
-                    <!-- summary: whole-run counts that double as status filters (see Sources). -->
-                    <Grid Grid.Row="1" ColumnDefinitions="*,Auto">
-                        <ItemsControl Grid.Column="0" ItemsSource="{Binding Destinations.StatusFilters}"
-                                      ItemTemplate="{StaticResource StatusFilterTemplate}">
-                            <ItemsControl.ItemsPanel>
-                                <ItemsPanelTemplate><WrapPanel /></ItemsPanelTemplate>
-                            </ItemsControl.ItemsPanel>
-                        </ItemsControl>
-                        <Button Grid.Column="1" Classes="iconButton" Content="✕" FontSize="12" Padding="6,2"
-                                VerticalAlignment="Center"
-                                IsVisible="{Binding Destinations.AnyStatusSelected}"
-                                Command="{Binding Destinations.ClearStatusFiltersCommand}"
-                                ToolTip.Tip="Clear status filters" />
-                    </Grid>
-
-                    <Grid Grid.Row="2" ColumnDefinitions="*,Auto,Auto">
+                    <Grid Grid.Row="1" ColumnDefinitions="*,Auto,Auto">
                         <TextBox Grid.Column="0" Text="{Binding Destinations.SearchText}"
                                  PlaceholderText="Filter by destination or source path…" />
                         <Button Grid.Column="1" Content="{Binding Destinations.FilterLabel}" FontSize="12"
@@ -473,6 +469,12 @@
                                       FontSize="12" Margin="8,0,0,0" VerticalAlignment="Stretch"
                                       ToolTip.Tip="Group the resulting files into a navigable directory tree" />
                     </Grid>
+
+                    <!-- common root the listed paths are shown relative to (trimmed, full path in tooltip) -->
+                    <TextBlock Grid.Row="2" Text="{Binding Destinations.CommonRootDisplay}"
+                               FontFamily="{StaticResource MonoFontFamily}" FontSize="11" Opacity="0.6"
+                               TextTrimming="CharacterEllipsis" VerticalAlignment="Center"
+                               ToolTip.Tip="{Binding Destinations.CommonRoot}" />
 
                     <ListBox Grid.Row="3" Classes="rows" ItemsSource="{Binding Destinations.VisibleRows}"
                              IsVisible="{Binding !Destinations.ShowTree}"
