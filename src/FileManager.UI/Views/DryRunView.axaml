@@ -2,6 +2,7 @@
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
              xmlns:vm="using:FileManager.UI.ViewModels"
              xmlns:ctrl="using:FileManager.UI.Controls"
+             xmlns:conv="using:FileManager.UI.Converters"
              x:Class="FileManager.UI.Views.DryRunView"
              x:DataType="vm:DryRunViewModel">
 
@@ -17,18 +18,22 @@
                        TextTrimming="CharacterEllipsis" ToolTip.Tip="{Binding FullPath}" />
         </DataTemplate>
         <DataTemplate x:Key="DryRunPillsCell" x:DataType="vm:DryRunTreeNode">
+            <!-- WrapPanel (not a horizontal StackPanel) so a high-count node's rolled-up counts wrap
+                 to a second line rather than clipping or starving the Name column. Each pill is a
+                 colour-tinted glyph + count; the glyph/colour are resolved from the pill's resource
+                 keys (IconConverters) and the kind word is the tooltip. -->
             <ItemsControl ItemsSource="{Binding Pills}">
                 <ItemsControl.ItemsPanel>
                     <ItemsPanelTemplate>
-                        <StackPanel Orientation="Horizontal" Spacing="6" />
+                        <WrapPanel />
                     </ItemsPanelTemplate>
                 </ItemsControl.ItemsPanel>
                 <ItemsControl.ItemTemplate>
                     <DataTemplate x:DataType="vm:TreePill">
-                        <Border CornerRadius="10" Padding="10,3" Background="{Binding Background}"
-                                VerticalAlignment="Center">
-                            <TextBlock Text="{Binding Text}" FontSize="11" Foreground="{Binding Foreground}" />
-                        </Border>
+                        <ctrl:StatusCount Margin="0,0,10,2" ToolTip.Tip="{Binding Tip}"
+                                          Text="{Binding CountText}"
+                                          Icon="{Binding IconKey, Converter={x:Static conv:IconConverters.Geometry}}"
+                                          Glyph="{Binding ColorKey, Converter={x:Static conv:IconConverters.Brush}}" />
                     </DataTemplate>
                 </ItemsControl.ItemTemplate>
             </ItemsControl>
@@ -82,10 +87,12 @@
                         </TextBlock>
                     </StackPanel>
 
-                    <Border Classes="chip" HorizontalAlignment="Left" IsVisible="{Binding HasWarning}"
-                            Classes.chipDanger="{Binding IsDanger}" Classes.chipAmber="{Binding IsWarning}">
-                        <TextBlock Text="{Binding WarningText}" FontSize="11" />
-                    </Border>
+                    <StackPanel Orientation="Horizontal" HorizontalAlignment="Left" IsVisible="{Binding HasWarning}">
+                        <ctrl:StatusCount IsVisible="{Binding IsDanger}" Text="{Binding WarningText}"
+                                          Icon="{StaticResource IconWarning}" Glyph="{DynamicResource Brush.Danger}" />
+                        <ctrl:StatusCount IsVisible="{Binding IsWarning}" Text="{Binding WarningText}"
+                                          Icon="{StaticResource IconWarning}" Glyph="{DynamicResource Brush.Warning}" />
+                    </StackPanel>
 
                     <Expander IsVisible="{Binding HasFolders}" Header="By folder" Padding="0" Margin="0,2,0,0">
                         <ItemsControl ItemsSource="{Binding Folders}">
@@ -108,7 +115,7 @@
     </UserControl.Resources>
 
     <UserControl.Styles>
-        <!-- chip* and kind* classes are shared app-wide in Themes/Controls.axaml (token-backed). -->
+        <!-- Status glyphs use the ctrl:StatusCount control (theme in Themes/Controls.axaml). -->
 
         <!-- Virtualized row lists: strip default ListBoxItem chrome so rows render like plain rows. -->
         <Style Selector="ListBox.rows">
@@ -140,81 +147,105 @@
     </UserControl.Styles>
 
     <DockPanel>
-        <!-- controls row: the dry run always simulates every Source (the complete blast radius,
-             spec §8); the user narrows the *view* with the per-tab source/destination facets below. -->
-        <StackPanel DockPanel.Dock="Top" Spacing="6">
-            <Grid ColumnDefinitions="*,Auto,Auto" Margin="0,4,0,0">
-                <Button Grid.Column="1" Content="Run dry run" Classes="accent"
-                        Command="{Binding RunCommand}" />
-                <Button Grid.Column="2" Content="Cancel" Margin="6,0,0,0"
-                        Command="{Binding RunCancelCommand}"
+        <!-- ═══════════════ Command bar ═══════════════
+             One slim row: run controls (left), the blast-radius summary as inline chips (centre,
+             the whole point of a dry run per spec §8 — deletions and overwrites), and the run
+             timestamp (right). The dry run always simulates every source; the per-panel Filter
+             flyouts below only narrow the *view*. -->
+        <Grid DockPanel.Dock="Top" ColumnDefinitions="Auto,*,Auto" Margin="0,4,0,0">
+            <StackPanel Grid.Column="0" Orientation="Horizontal" Spacing="6" VerticalAlignment="Center">
+                <Button Content="Run dry run" Classes="accent" Command="{Binding RunCommand}" />
+                <Button Content="Cancel" Command="{Binding RunCancelCommand}"
                         IsVisible="{Binding RunCommand.IsRunning}" />
-            </Grid>
-            <ProgressBar IsIndeterminate="True" IsVisible="{Binding RunCommand.IsRunning}" />
-            <TextBlock Text="{Binding ErrorMessage}" Foreground="{DynamicResource Brush.Danger}" TextWrapping="Wrap"
-                       IsVisible="{Binding ErrorMessage, Converter={x:Static ObjectConverters.IsNotNull}}" />
-        </StackPanel>
+            </StackPanel>
 
-        <Grid Margin="0,8,0,0" IsVisible="{Binding HasReport}" RowDefinitions="Auto,Auto,Auto,*">
+            <!-- blast-radius: icon + count, in a WrapPanel so they wrap rather than clip when the
+                 window is narrow (the two 360-min list columns already eat the width). The kind is in
+                 each icon's tooltip. -->
+            <WrapPanel Grid.Column="1" Margin="12,0,12,0" VerticalAlignment="Center"
+                       IsVisible="{Binding HasReport}">
+                <ctrl:StatusCount Margin="0,2,12,2" ToolTip.Tip="Files scanned"
+                                  Text="{Binding TotalFiles, StringFormat={}{0:N0}}"
+                                  Icon="{StaticResource IconDocument}" Glyph="{DynamicResource Brush.Text.Secondary}" />
+                <ctrl:StatusCount Margin="0,2,12,2" ToolTip.Tip="Overwrites" IsVisible="{Binding !!OverwriteCount}"
+                                  Text="{Binding OverwriteCount, StringFormat={}{0:N0}}"
+                                  Icon="{StaticResource IconOverwrite}" Glyph="{DynamicResource Brush.Danger}" />
+                <ctrl:StatusCount Margin="0,2,12,2" ToolTip.Tip="Renames" IsVisible="{Binding !!RenameCount}"
+                                  Text="{Binding RenameCount, StringFormat={}{0:N0}}"
+                                  Icon="{StaticResource IconRename}" Glyph="{DynamicResource Brush.Warning}" />
+                <ctrl:StatusCount Margin="0,2,12,2" ToolTip.Tip="Source disposals" IsVisible="{Binding !!DisposalCount}"
+                                  Text="{Binding DisposalCount, StringFormat={}{0:N0}}"
+                                  Icon="{StaticResource IconTrash}" Glyph="{DynamicResource Brush.Danger}" />
+                <ctrl:StatusCount Margin="0,2,12,2" ToolTip.Tip="No destructive actions"
+                                  IsVisible="{Binding !HasDestructiveActions}"
+                                  Icon="{StaticResource IconCheckmark}" Glyph="{DynamicResource Brush.Success}" />
+            </WrapPanel>
 
-            <!-- truncation notice -->
-            <Border Grid.Row="0" Classes="chipAmber" CornerRadius="6" Padding="10" Margin="0,0,0,8"
-                    IsVisible="{Binding WasTruncated}">
-                <TextBlock Text="{Binding TruncationNotice}" FontWeight="SemiBold" TextWrapping="Wrap" />
-            </Border>
+            <TextBlock Grid.Column="2" Text="{Binding GeneratedAtText}" Classes="caption"
+                       VerticalAlignment="Center" IsVisible="{Binding HasReport}" />
+        </Grid>
 
-            <!-- blast-radius banner -->
-            <Border Grid.Row="1" Background="{DynamicResource SystemControlBackgroundListLowBrush}"
-                    CornerRadius="6" Padding="10" Margin="0,0,0,8">
-                <StackPanel Spacing="6">
-                    <StackPanel Orientation="Horizontal" Spacing="8">
-                        <TextBlock FontWeight="Bold" Text="Blast radius" VerticalAlignment="Center" />
-                        <TextBlock Text="{Binding GeneratedAtText}" Opacity="0.6" FontSize="11" VerticalAlignment="Center" />
-                    </StackPanel>
-                    <WrapPanel>
-                        <Border Classes="chip" Margin="0,0,6,0">
-                            <TextBlock><Run Text="{Binding TotalFiles}" /><Run Text=" files scanned" /></TextBlock>
-                        </Border>
-                        <Border Classes="chip chipDanger" Margin="0,0,6,0" IsVisible="{Binding !!OverwriteCount}">
-                            <TextBlock><Run Text="{Binding OverwriteCount}" /><Run Text=" OVERWRITES" /></TextBlock>
-                        </Border>
-                        <Border Classes="chip chipAmber" Margin="0,0,6,0" IsVisible="{Binding !!RenameCount}">
-                            <TextBlock><Run Text="{Binding RenameCount}" /><Run Text=" renames" /></TextBlock>
-                        </Border>
-                        <Border Classes="chip chipDanger" Margin="0,0,6,0" IsVisible="{Binding !!DisposalCount}">
-                            <TextBlock><Run Text="{Binding DisposalCount}" /><Run Text=" source disposals" /></TextBlock>
-                        </Border>
-                        <Border Classes="chip chipSafe" Margin="0,0,6,0" IsVisible="{Binding !HasDestructiveActions}">
-                            <TextBlock Text="no destructive actions" />
-                        </Border>
-                    </WrapPanel>
-                </StackPanel>
-            </Border>
+        <ProgressBar DockPanel.Dock="Top" IsIndeterminate="True" Margin="0,8,0,0"
+                     IsVisible="{Binding RunCommand.IsRunning}" />
 
-            <!-- storage / space preview: per-volume used·free·bounded-maximum, with a per-folder
-                 drill-down. Hidden when no projection was computed (truncated report, or volumes that
-                 could not be resolved). -->
-            <Border Grid.Row="2" Background="{DynamicResource SystemControlBackgroundListLowBrush}"
-                    CornerRadius="6" Padding="10" Margin="0,0,0,8"
+        <Border DockPanel.Dock="Top" Classes="infoBar danger" Margin="0,8,0,0"
+                IsVisible="{Binding ErrorMessage, Converter={x:Static ObjectConverters.IsNotNull}}">
+            <TextBlock Text="{Binding ErrorMessage}" TextWrapping="Wrap" />
+        </Border>
+
+        <Border DockPanel.Dock="Top" Classes="infoBar warning" Margin="0,8,0,0"
+                IsVisible="{Binding WasTruncated}">
+            <TextBlock Text="{Binding TruncationNotice}" FontWeight="SemiBold" TextWrapping="Wrap" />
+        </Border>
+
+        <!-- ═══════════════ Report body ═══════════════
+             A collapsible Storage panel (Auto) above the two file lists (*), so the lists take the
+             vast majority of the height. -->
+        <Grid Margin="0,8,0,0" IsVisible="{Binding HasReport}" RowDefinitions="Auto,*">
+
+            <!-- Storage: per-volume used·free·bounded-maximum with a per-folder drill-down. Collapsed
+                 by default to reclaim vertical space; the header carries a one-line summary and a
+                 badge, and the panel auto-opens (OneWay bind — never fights a manual collapse) only
+                 when a destination volume is at capacity risk. Hidden entirely when no projection was
+                 computed (truncated report, or volumes that could not be resolved). -->
+            <Border Grid.Row="0" Classes="card" Padding="0" Margin="0,0,0,8" ClipToBounds="True"
                     IsVisible="{Binding Space, Converter={x:Static ObjectConverters.IsNotNull}}">
-                <StackPanel Spacing="6">
-                    <StackPanel Orientation="Horizontal" Spacing="6">
-                        <TextBlock FontWeight="Bold" Text="Storage" VerticalAlignment="Center" />
-                        <Border Classes="chip" Margin="6,0,0,0">
-                            <TextBlock><Run Text="{Binding Space.TransferredText}" /><Run Text=" to transfer" /></TextBlock>
-                        </Border>
-                        <Border Classes="chip">
-                            <TextBlock><Run Text="{Binding Space.NetChangeText}" /><Run Text=" net change" /></TextBlock>
-                        </Border>
-                    </StackPanel>
+                <Expander Classes="card" HorizontalAlignment="Stretch"
+                          IsExpanded="{Binding Space.HasWarning, Mode=OneWay}">
+                    <!-- Neutralise Fluent's stock header/content chrome so the wrapping Border.card
+                         surface shows through and the panel reads like the app's other cards. -->
+                    <Expander.Resources>
+                        <SolidColorBrush x:Key="ExpanderHeaderBackground" Color="Transparent" />
+                        <SolidColorBrush x:Key="ExpanderHeaderBackgroundPointerOver" Color="#19808080" />
+                        <SolidColorBrush x:Key="ExpanderHeaderBackgroundPressed" Color="#0F808080" />
+                        <SolidColorBrush x:Key="ExpanderHeaderBackgroundDisabled" Color="Transparent" />
+                        <SolidColorBrush x:Key="ExpanderContentBackground" Color="Transparent" />
+                        <Thickness x:Key="ExpanderHeaderBorderThickness">0</Thickness>
+                        <Thickness x:Key="ExpanderContentDownBorderThickness">0</Thickness>
+                        <Thickness x:Key="ExpanderContentUpBorderThickness">0</Thickness>
+                        <Thickness x:Key="ExpanderHeaderPadding">12,8</Thickness>
+                        <Thickness x:Key="ExpanderContentPadding">12,0,12,12</Thickness>
+                        <x:Double x:Key="ExpanderMinHeight">0</x:Double>
+                    </Expander.Resources>
+                    <Expander.Header>
+                        <StackPanel Orientation="Horizontal" Spacing="8" VerticalAlignment="Center">
+                            <TextBlock Text="Storage" FontWeight="Bold" VerticalAlignment="Center" />
+                            <TextBlock Text="{Binding Space.SummaryText}" Classes="secondary"
+                                       FontSize="11" VerticalAlignment="Center" />
+                            <ctrl:StatusCount VerticalAlignment="Center" IsVisible="{Binding Space.HasWarning}"
+                                              Text="capacity risk" ToolTip.Tip="A destination drive may not have room"
+                                              Icon="{StaticResource IconWarning}" Glyph="{DynamicResource Brush.Warning}" />
+                        </StackPanel>
+                    </Expander.Header>
+
                     <ItemsControl ItemsSource="{Binding Space.Volumes}" ItemTemplate="{StaticResource VolumeSpaceTemplate}" />
-                </StackPanel>
+                </Expander>
             </Border>
 
             <!-- Sources and Destinations side by side (draggable split) so the whole picture is
                  visible at once. Paths are shown relative to each panel's common root to reclaim the
                  horizontal space that repeated drive prefixes used to waste. -->
-            <Grid Grid.Row="3">
+            <Grid Grid.Row="1">
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="*" MinWidth="360" />
                     <ColumnDefinition Width="Auto" />
@@ -222,71 +253,72 @@
                 </Grid.ColumnDefinitions>
 
                 <!-- ============================= SOURCES ============================= -->
-                <Grid Grid.Column="0" RowDefinitions="Auto,Auto,Auto,Auto,Auto,*" RowSpacing="8" Margin="0,8,8,0">
+                <Grid Grid.Column="0" RowDefinitions="Auto,Auto,Auto,*" RowSpacing="6" Margin="0,4,8,0">
 
-                    <TextBlock Grid.Row="0" Text="Sources" FontWeight="Bold" FontSize="14" />
-
-                    <!-- what the paths below are relative to -->
-                    <TextBlock Grid.Row="1" Text="{Binding Sources.CommonRootDisplay}"
-                               FontFamily="{StaticResource MonoFontFamily}" FontSize="11" Opacity="0.6"
-                               TextTrimming="CharacterEllipsis" ToolTip.Tip="{Binding Sources.CommonRoot}" />
-
-                    <!-- summary pills (whole-run counts) -->
-                    <WrapPanel Grid.Row="2">
-                        <Border Classes="chip chipInfo" Margin="0,0,6,0">
-                            <TextBlock><Run Text="{Binding Sources.UntouchedCount}" /><Run Text=" untouched" /></TextBlock>
-                        </Border>
-                        <Border Classes="chip chipSafe" Margin="0,0,6,0">
-                            <TextBlock><Run Text="{Binding Sources.ProcessedCount}" /><Run Text=" processed" /></TextBlock>
-                        </Border>
-                        <Border Classes="chip chipDanger" Margin="0,0,6,0">
-                            <TextBlock><Run Text="{Binding Sources.DeletedCount}" /><Run Text=" deleted" /></TextBlock>
-                        </Border>
-                    </WrapPanel>
-
-                    <!-- source + destination facets -->
-                    <StackPanel Grid.Row="3" Spacing="6">
-                        <Border IsVisible="{Binding Sources.ShowSourceFacet}"
-                                Background="{DynamicResource SystemControlBackgroundListLowBrush}"
-                                CornerRadius="6" Padding="10,6">
-                            <DockPanel LastChildFill="True">
-                                <TextBlock Text="Sources:" FontWeight="SemiBold" VerticalAlignment="Center"
-                                           DockPanel.Dock="Left" Margin="0,0,8,0" />
-                                <ItemsControl ItemsSource="{Binding Sources.SourceFacets}" ItemTemplate="{StaticResource FacetTemplate}">
-                                    <ItemsControl.ItemsPanel>
-                                        <ItemsPanelTemplate><WrapPanel /></ItemsPanelTemplate>
-                                    </ItemsControl.ItemsPanel>
-                                </ItemsControl>
-                            </DockPanel>
-                        </Border>
-                        <Border IsVisible="{Binding Sources.ShowDestinationFacet}"
-                                Background="{DynamicResource SystemControlBackgroundListLowBrush}"
-                                CornerRadius="6" Padding="10,6">
-                            <DockPanel LastChildFill="True">
-                                <TextBlock Text="Destinations:" FontWeight="SemiBold" VerticalAlignment="Center"
-                                           DockPanel.Dock="Left" Margin="0,0,8,0" />
-                                <ItemsControl ItemsSource="{Binding Sources.DestinationFacets}" ItemTemplate="{StaticResource FacetTemplate}">
-                                    <ItemsControl.ItemsPanel>
-                                        <ItemsPanelTemplate><WrapPanel /></ItemsPanelTemplate>
-                                    </ItemsControl.ItemsPanel>
-                                </ItemsControl>
-                            </DockPanel>
-                        </Border>
-                    </StackPanel>
-
-                    <!-- toolbar: count | tree toggle | search (search stretches, then shrinks when narrow) -->
-                    <Grid Grid.Row="4" ColumnDefinitions="Auto,Auto,*">
-                        <TextBlock Grid.Column="0" FontWeight="SemiBold" VerticalAlignment="Center">
-                            <Run Text="Source files (" /><Run Text="{Binding Sources.VisibleRows.Count}" /><Run Text=")" />
-                        </TextBlock>
-                        <ToggleButton Grid.Column="1" Content="Tree view" IsChecked="{Binding Sources.ShowTree}"
-                                      FontSize="12" Margin="12,0,8,0" VerticalAlignment="Center"
-                                      ToolTip.Tip="Group the files into a navigable directory tree" />
-                        <TextBox Grid.Column="2" MaxWidth="280" HorizontalAlignment="Stretch" Text="{Binding Sources.SearchText}"
-                                 PlaceholderText="Filter by source or target path…" />
+                    <!-- header: title + visible-row count | common root (right, trimmed) -->
+                    <Grid Grid.Row="0" ColumnDefinitions="Auto,*" ColumnSpacing="8">
+                        <StackPanel Grid.Column="0" Orientation="Horizontal" Spacing="6" VerticalAlignment="Center">
+                            <TextBlock Text="Sources" FontWeight="Bold" FontSize="14" />
+                            <TextBlock Classes="secondary" VerticalAlignment="Center">
+                                <Run Text="(" /><Run Text="{Binding Sources.VisibleRows.Count}" /><Run Text=")" />
+                            </TextBlock>
+                        </StackPanel>
+                        <TextBlock Grid.Column="1" Text="{Binding Sources.CommonRootDisplay}"
+                                   FontFamily="{StaticResource MonoFontFamily}" FontSize="11" Opacity="0.6"
+                                   TextAlignment="Right" TextTrimming="CharacterEllipsis"
+                                   VerticalAlignment="Center" ToolTip.Tip="{Binding Sources.CommonRoot}" />
                     </Grid>
 
-                    <ListBox Grid.Row="5" Classes="rows" ItemsSource="{Binding Sources.VisibleRows}"
+                    <!-- summary: icon + whole-run count (kind in the tooltip) -->
+                    <WrapPanel Grid.Row="1">
+                        <ctrl:StatusCount Margin="0,0,14,0" ToolTip.Tip="Untouched"
+                                          Text="{Binding Sources.UntouchedCount, StringFormat={}{0:N0}}"
+                                          Icon="{StaticResource IconUntouched}" Glyph="{DynamicResource Brush.Info}" />
+                        <ctrl:StatusCount Margin="0,0,14,0" ToolTip.Tip="Processed"
+                                          Text="{Binding Sources.ProcessedCount, StringFormat={}{0:N0}}"
+                                          Icon="{StaticResource IconCheckmark}" Glyph="{DynamicResource Brush.Success}" />
+                        <ctrl:StatusCount Margin="0,0,14,0" ToolTip.Tip="Deleted"
+                                          Text="{Binding Sources.DeletedCount, StringFormat={}{0:N0}}"
+                                          Icon="{StaticResource IconTrash}" Glyph="{DynamicResource Brush.Danger}" />
+                    </WrapPanel>
+
+                    <!-- toolbar: search (stretches) | Filter flyout | list/tree toggle -->
+                    <Grid Grid.Row="2" ColumnDefinitions="*,Auto,Auto">
+                        <TextBox Grid.Column="0" Text="{Binding Sources.SearchText}"
+                                 PlaceholderText="Filter by source or target path…" />
+                        <Button Grid.Column="1" Content="{Binding Sources.FilterLabel}" FontSize="12"
+                                Margin="8,0,8,0" VerticalAlignment="Stretch"
+                                IsVisible="{Binding Sources.ShowAnyFacet}"
+                                ToolTip.Tip="Narrow the view by source and destination root">
+                            <Button.Flyout>
+                                <Flyout Placement="BottomEdgeAlignedRight">
+                                    <StackPanel Spacing="10" MinWidth="200">
+                                        <StackPanel Spacing="6" IsVisible="{Binding Sources.ShowSourceFacet}">
+                                            <TextBlock Classes="panelHeader" Text="SOURCES" />
+                                            <ItemsControl ItemsSource="{Binding Sources.SourceFacets}" ItemTemplate="{StaticResource FacetTemplate}">
+                                                <ItemsControl.ItemsPanel>
+                                                    <ItemsPanelTemplate><WrapPanel MaxWidth="380" /></ItemsPanelTemplate>
+                                                </ItemsControl.ItemsPanel>
+                                            </ItemsControl>
+                                        </StackPanel>
+                                        <StackPanel Spacing="6" IsVisible="{Binding Sources.ShowDestinationFacet}">
+                                            <TextBlock Classes="panelHeader" Text="DESTINATIONS" />
+                                            <ItemsControl ItemsSource="{Binding Sources.DestinationFacets}" ItemTemplate="{StaticResource FacetTemplate}">
+                                                <ItemsControl.ItemsPanel>
+                                                    <ItemsPanelTemplate><WrapPanel MaxWidth="380" /></ItemsPanelTemplate>
+                                                </ItemsControl.ItemsPanel>
+                                            </ItemsControl>
+                                        </StackPanel>
+                                    </StackPanel>
+                                </Flyout>
+                            </Button.Flyout>
+                        </Button>
+                        <ToggleButton Grid.Column="2" Content="Tree view" IsChecked="{Binding Sources.ShowTree}"
+                                      FontSize="12" VerticalAlignment="Stretch"
+                                      ToolTip.Tip="Group the files into a navigable directory tree" />
+                    </Grid>
+
+                    <ListBox Grid.Row="3" Classes="rows" ItemsSource="{Binding Sources.VisibleRows}"
                              IsVisible="{Binding !Sources.ShowTree}"
                              SelectionMode="Single" ScrollViewer.HorizontalScrollBarVisibility="Disabled">
                         <ListBox.ItemTemplate>
@@ -299,25 +331,19 @@
                                                        Mode="EndPreservingExtension" FontFamily="{StaticResource MonoFontFamily}"
                                                        FontSize="13" VerticalAlignment="Center" Opacity="{Binding ContentOpacity}" />
 
-                                        <!-- line 1: pills — target-op kind, then source status -->
-                                        <StackPanel Grid.Row="0" Grid.Column="1" Orientation="Horizontal" Spacing="6"
+                                        <!-- line 1: status glyphs — the single target-op kind, then the
+                                             source-side status (Processed and Deleted can both show). -->
+                                        <StackPanel Grid.Row="0" Grid.Column="1" Orientation="Horizontal" Spacing="8"
                                                     Margin="8,0,0,0" VerticalAlignment="Center">
-                                            <Border Classes="chip" IsVisible="{Binding HasTargetKind}"
-                                                    Classes.chipDanger="{Binding IsPrimaryOverwrite}"
-                                                    Classes.chipAmber="{Binding IsPrimaryRename}"
-                                                    Classes.chipSafe="{Binding IsPrimaryWrite}"
-                                                    Classes.chipMuted="{Binding IsPrimarySkip}">
-                                                <TextBlock Text="{Binding PrimaryKindText}" FontSize="11" />
-                                            </Border>
-                                            <Border Classes="chip chipInfo" IsVisible="{Binding IsUntouched}">
-                                                <TextBlock Text="Untouched" FontSize="11" />
-                                            </Border>
-                                            <Border Classes="chip chipSafe" IsVisible="{Binding IsProcessed}">
-                                                <TextBlock Text="Processed" FontSize="11" />
-                                            </Border>
-                                            <Border Classes="chip chipDanger" IsVisible="{Binding IsDeleted}">
-                                                <TextBlock Text="Deleted" FontSize="11" />
-                                            </Border>
+                                            <ctrl:StatusCount IsVisible="{Binding HasTargetKind}" ToolTip.Tip="{Binding PrimaryKindText}"
+                                                              Icon="{Binding PrimaryKindIconKey, Converter={x:Static conv:IconConverters.Geometry}}"
+                                                              Glyph="{Binding PrimaryKindColorKey, Converter={x:Static conv:IconConverters.Brush}}" />
+                                            <ctrl:StatusCount IsVisible="{Binding IsUntouched}" ToolTip.Tip="Untouched"
+                                                              Icon="{StaticResource IconUntouched}" Glyph="{DynamicResource Brush.Info}" />
+                                            <ctrl:StatusCount IsVisible="{Binding IsProcessed}" ToolTip.Tip="Processed"
+                                                              Icon="{StaticResource IconCheckmark}" Glyph="{DynamicResource Brush.Success}" />
+                                            <ctrl:StatusCount IsVisible="{Binding IsDeleted}" ToolTip.Tip="Deleted"
+                                                              Icon="{StaticResource IconTrash}" Glyph="{DynamicResource Brush.Danger}" />
                                         </StackPanel>
 
                                         <!-- line 2: parent directory (relative, folder-truncated) + right-aligned size -->
@@ -333,7 +359,7 @@
                         </ListBox.ItemTemplate>
                     </ListBox>
 
-                    <TreeDataGrid Grid.Row="5" Classes="rows" Source="{Binding Sources.TreeSource}"
+                    <TreeDataGrid Grid.Row="3" Classes="rows" Source="{Binding Sources.TreeSource}"
                                   IsVisible="{Binding Sources.ShowTree}" />
                 </Grid>
 
@@ -341,70 +367,73 @@
                               Background="{DynamicResource SystemControlBackgroundListLowBrush}" />
 
                 <!-- ============================ DESTINATIONS ============================ -->
-                <Grid Grid.Column="2" RowDefinitions="Auto,Auto,Auto,Auto,Auto,*" RowSpacing="8" Margin="8,8,0,0">
+                <Grid Grid.Column="2" RowDefinitions="Auto,Auto,Auto,*" RowSpacing="6" Margin="8,4,0,0">
 
-                    <TextBlock Grid.Row="0" Text="Destinations" FontWeight="Bold" FontSize="14" />
-
-                    <TextBlock Grid.Row="1" Text="{Binding Destinations.CommonRootDisplay}"
-                               FontFamily="{StaticResource MonoFontFamily}" FontSize="11" Opacity="0.6"
-                               TextTrimming="CharacterEllipsis" ToolTip.Tip="{Binding Destinations.CommonRoot}" />
-
-                    <WrapPanel Grid.Row="2">
-                        <Border Classes="chip chipInfo" Margin="0,0,6,0">
-                            <TextBlock><Run Text="{Binding Destinations.UntouchedCount}" /><Run Text=" untouched" /></TextBlock>
-                        </Border>
-                        <Border Classes="chip chipSafe" Margin="0,0,6,0">
-                            <TextBlock><Run Text="{Binding Destinations.NewCount}" /><Run Text=" new" /></TextBlock>
-                        </Border>
-                        <Border Classes="chip chipAmber" Margin="0,0,6,0">
-                            <TextBlock><Run Text="{Binding Destinations.OverwrittenCount}" /><Run Text=" overwritten" /></TextBlock>
-                        </Border>
-                        <Border Classes="chip chipDanger" Margin="0,0,6,0">
-                            <TextBlock><Run Text="{Binding Destinations.DeletedCount}" /><Run Text=" deleted" /></TextBlock>
-                        </Border>
-                    </WrapPanel>
-
-                    <StackPanel Grid.Row="3" Spacing="6">
-                        <Border IsVisible="{Binding Destinations.ShowSourceFacet}"
-                                Background="{DynamicResource SystemControlBackgroundListLowBrush}"
-                                CornerRadius="6" Padding="10,6">
-                            <DockPanel LastChildFill="True">
-                                <TextBlock Text="Sources:" FontWeight="SemiBold" VerticalAlignment="Center"
-                                           DockPanel.Dock="Left" Margin="0,0,8,0" />
-                                <ItemsControl ItemsSource="{Binding Destinations.SourceFacets}" ItemTemplate="{StaticResource FacetTemplate}">
-                                    <ItemsControl.ItemsPanel>
-                                        <ItemsPanelTemplate><WrapPanel /></ItemsPanelTemplate>
-                                    </ItemsControl.ItemsPanel>
-                                </ItemsControl>
-                            </DockPanel>
-                        </Border>
-                        <Border IsVisible="{Binding Destinations.ShowDestinationFacet}"
-                                Background="{DynamicResource SystemControlBackgroundListLowBrush}"
-                                CornerRadius="6" Padding="10,6">
-                            <DockPanel LastChildFill="True">
-                                <TextBlock Text="Destinations:" FontWeight="SemiBold" VerticalAlignment="Center"
-                                           DockPanel.Dock="Left" Margin="0,0,8,0" />
-                                <ItemsControl ItemsSource="{Binding Destinations.DestinationFacets}" ItemTemplate="{StaticResource FacetTemplate}">
-                                    <ItemsControl.ItemsPanel>
-                                        <ItemsPanelTemplate><WrapPanel /></ItemsPanelTemplate>
-                                    </ItemsControl.ItemsPanel>
-                                </ItemsControl>
-                            </DockPanel>
-                        </Border>
-                    </StackPanel>
-
-                    <Grid Grid.Row="4" ColumnDefinitions="Auto,Auto,*">
-                        <TextBlock Grid.Column="0" FontWeight="SemiBold" VerticalAlignment="Center">
-                            <Run Text="Destination files (" /><Run Text="{Binding Destinations.VisibleRows.Count}" /><Run Text=")" />
-                        </TextBlock>
-                        <ToggleButton Grid.Column="1" Content="Tree view" IsChecked="{Binding Destinations.ShowTree}"
-                                      FontSize="12" Margin="12,0,8,0" VerticalAlignment="Center"
-                                      ToolTip.Tip="Group the resulting files into a navigable directory tree" />
-                        <TextBox Grid.Column="2" MaxWidth="280" HorizontalAlignment="Stretch" Text="{Binding Destinations.SearchText}"
-                                 PlaceholderText="Filter by destination or source path…" />
+                    <!-- header: title + visible-row count | common root (right, trimmed) -->
+                    <Grid Grid.Row="0" ColumnDefinitions="Auto,*" ColumnSpacing="8">
+                        <StackPanel Grid.Column="0" Orientation="Horizontal" Spacing="6" VerticalAlignment="Center">
+                            <TextBlock Text="Destinations" FontWeight="Bold" FontSize="14" />
+                            <TextBlock Classes="secondary" VerticalAlignment="Center">
+                                <Run Text="(" /><Run Text="{Binding Destinations.VisibleRows.Count}" /><Run Text=")" />
+                            </TextBlock>
+                        </StackPanel>
+                        <TextBlock Grid.Column="1" Text="{Binding Destinations.CommonRootDisplay}"
+                                   FontFamily="{StaticResource MonoFontFamily}" FontSize="11" Opacity="0.6"
+                                   TextAlignment="Right" TextTrimming="CharacterEllipsis"
+                                   VerticalAlignment="Center" ToolTip.Tip="{Binding Destinations.CommonRoot}" />
                     </Grid>
 
-                    <ListBox Grid.Row="5" Classes="rows" ItemsSource="{Binding Destinations.VisibleRows}"
+                    <WrapPanel Grid.Row="1">
+                        <ctrl:StatusCount Margin="0,0,14,0" ToolTip.Tip="Untouched"
+                                          Text="{Binding Destinations.UntouchedCount, StringFormat={}{0:N0}}"
+                                          Icon="{StaticResource IconUntouched}" Glyph="{DynamicResource Brush.Info}" />
+                        <ctrl:StatusCount Margin="0,0,14,0" ToolTip.Tip="New"
+                                          Text="{Binding Destinations.NewCount, StringFormat={}{0:N0}}"
+                                          Icon="{StaticResource IconAdd}" Glyph="{DynamicResource Brush.Success}" />
+                        <ctrl:StatusCount Margin="0,0,14,0" ToolTip.Tip="Overwritten"
+                                          Text="{Binding Destinations.OverwrittenCount, StringFormat={}{0:N0}}"
+                                          Icon="{StaticResource IconOverwrite}" Glyph="{DynamicResource Brush.Warning}" />
+                        <ctrl:StatusCount Margin="0,0,14,0" ToolTip.Tip="Deleted"
+                                          Text="{Binding Destinations.DeletedCount, StringFormat={}{0:N0}}"
+                                          Icon="{StaticResource IconTrash}" Glyph="{DynamicResource Brush.Danger}" />
+                    </WrapPanel>
+
+                    <Grid Grid.Row="2" ColumnDefinitions="*,Auto,Auto">
+                        <TextBox Grid.Column="0" Text="{Binding Destinations.SearchText}"
+                                 PlaceholderText="Filter by destination or source path…" />
+                        <Button Grid.Column="1" Content="{Binding Destinations.FilterLabel}" FontSize="12"
+                                Margin="8,0,8,0" VerticalAlignment="Stretch"
+                                IsVisible="{Binding Destinations.ShowAnyFacet}"
+                                ToolTip.Tip="Narrow the view by source and destination root">
+                            <Button.Flyout>
+                                <Flyout Placement="BottomEdgeAlignedRight">
+                                    <StackPanel Spacing="10" MinWidth="200">
+                                        <StackPanel Spacing="6" IsVisible="{Binding Destinations.ShowSourceFacet}">
+                                            <TextBlock Classes="panelHeader" Text="SOURCES" />
+                                            <ItemsControl ItemsSource="{Binding Destinations.SourceFacets}" ItemTemplate="{StaticResource FacetTemplate}">
+                                                <ItemsControl.ItemsPanel>
+                                                    <ItemsPanelTemplate><WrapPanel MaxWidth="380" /></ItemsPanelTemplate>
+                                                </ItemsControl.ItemsPanel>
+                                            </ItemsControl>
+                                        </StackPanel>
+                                        <StackPanel Spacing="6" IsVisible="{Binding Destinations.ShowDestinationFacet}">
+                                            <TextBlock Classes="panelHeader" Text="DESTINATIONS" />
+                                            <ItemsControl ItemsSource="{Binding Destinations.DestinationFacets}" ItemTemplate="{StaticResource FacetTemplate}">
+                                                <ItemsControl.ItemsPanel>
+                                                    <ItemsPanelTemplate><WrapPanel MaxWidth="380" /></ItemsPanelTemplate>
+                                                </ItemsControl.ItemsPanel>
+                                            </ItemsControl>
+                                        </StackPanel>
+                                    </StackPanel>
+                                </Flyout>
+                            </Button.Flyout>
+                        </Button>
+                        <ToggleButton Grid.Column="2" Content="Tree view" IsChecked="{Binding Destinations.ShowTree}"
+                                      FontSize="12" VerticalAlignment="Stretch"
+                                      ToolTip.Tip="Group the resulting files into a navigable directory tree" />
+                    </Grid>
+
+                    <ListBox Grid.Row="3" Classes="rows" ItemsSource="{Binding Destinations.VisibleRows}"
                              IsVisible="{Binding !Destinations.ShowTree}"
                              SelectionMode="Single" ScrollViewer.HorizontalScrollBarVisibility="Disabled">
                         <ListBox.ItemTemplate>
@@ -419,14 +448,10 @@
                                             <ctrl:PathText Grid.Row="0" Grid.Column="0" Text="{Binding FileName}"
                                                            Mode="EndPreservingExtension" FontFamily="{StaticResource MonoFontFamily}"
                                                            FontSize="13" VerticalAlignment="Center" />
-                                            <Border Grid.Row="0" Grid.Column="1" Classes="chip" Margin="8,0,0,0" VerticalAlignment="Center"
-                                                    Classes.chipInfo="{Binding Primary.IsUntouched}"
-                                                    Classes.chipSafe="{Binding Primary.IsNew}"
-                                                    Classes.chipAmber="{Binding Primary.IsOverwritten}"
-                                                    Classes.chipDanger="{Binding Primary.IsDeleted}"
-                                                    Classes.chipMuted="{Binding Primary.IsUnknown}">
-                                                <TextBlock Text="{Binding Primary.StatusText}" FontSize="11" />
-                                            </Border>
+                                            <ctrl:StatusCount Grid.Row="0" Grid.Column="1" Margin="8,0,0,0" VerticalAlignment="Center"
+                                                              ToolTip.Tip="{Binding Primary.StatusText}"
+                                                              Icon="{Binding Primary.StatusIconKey, Converter={x:Static conv:IconConverters.Geometry}}"
+                                                              Glyph="{Binding Primary.StatusColorKey, Converter={x:Static conv:IconConverters.Brush}}" />
                                             <ctrl:PathText Grid.Row="1" Grid.Column="0" Text="{Binding Primary.ParentDisplay}"
                                                            Mode="FolderMiddleEllipsis" FontFamily="{StaticResource MonoFontFamily}"
                                                            FontSize="11" Margin="0,2,0,0" Opacity="0.6" />
@@ -452,22 +477,19 @@
                                                 </ItemsControl.ItemsPanel>
                                                 <ItemsControl.ItemTemplate>
                                                     <DataTemplate x:DataType="vm:DryRunDestinationEntry">
-                                                        <Border Classes="chip" Margin="0,0,6,4" ToolTip.Tip="{Binding TargetPath}"
-                                                                Classes.chipInfo="{Binding IsUntouched}"
-                                                                Classes.chipSafe="{Binding IsNew}"
-                                                                Classes.chipAmber="{Binding IsOverwritten}"
-                                                                Classes.chipDanger="{Binding IsDeleted}"
-                                                                Classes.chipMuted="{Binding IsUnknown}">
-                                                            <StackPanel Orientation="Horizontal" Spacing="6">
-                                                                <TextBlock Text="{Binding RelativeDisplay}" FontFamily="{StaticResource MonoFontFamily}"
-                                                                           FontSize="11" MaxWidth="320" TextTrimming="CharacterEllipsis"
-                                                                           VerticalAlignment="Center" />
-                                                                <TextBlock Text="{Binding StatusText}" FontSize="10" FontWeight="SemiBold"
-                                                                           Opacity="0.85" VerticalAlignment="Center" />
-                                                                <TextBlock Text="{Binding SizeText}" FontSize="10" Opacity="0.7"
-                                                                           VerticalAlignment="Center" />
-                                                            </StackPanel>
-                                                        </Border>
+                                                        <!-- each resulting path: status glyph + relative path + size,
+                                                             no filled background -->
+                                                        <StackPanel Orientation="Horizontal" Spacing="6" Margin="0,0,14,4"
+                                                                    ToolTip.Tip="{Binding TargetPath}">
+                                                            <ctrl:StatusCount VerticalAlignment="Center" ToolTip.Tip="{Binding StatusText}"
+                                                                              Icon="{Binding StatusIconKey, Converter={x:Static conv:IconConverters.Geometry}}"
+                                                                              Glyph="{Binding StatusColorKey, Converter={x:Static conv:IconConverters.Brush}}" />
+                                                            <TextBlock Text="{Binding RelativeDisplay}" FontFamily="{StaticResource MonoFontFamily}"
+                                                                       FontSize="11" MaxWidth="320" TextTrimming="CharacterEllipsis"
+                                                                       VerticalAlignment="Center" />
+                                                            <TextBlock Text="{Binding SizeText}" FontSize="10" Opacity="0.7"
+                                                                       VerticalAlignment="Center" />
+                                                        </StackPanel>
                                                     </DataTemplate>
                                                 </ItemsControl.ItemTemplate>
                                             </ItemsControl>
@@ -478,7 +500,7 @@
                         </ListBox.ItemTemplate>
                     </ListBox>
 
-                    <TreeDataGrid Grid.Row="5" Classes="rows" Source="{Binding Destinations.TreeSource}"
+                    <TreeDataGrid Grid.Row="3" Classes="rows" Source="{Binding Destinations.TreeSource}"
                                   IsVisible="{Binding Destinations.ShowTree}" />
                 </Grid>
             </Grid>

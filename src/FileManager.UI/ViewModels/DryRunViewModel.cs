@@ -1,7 +1,6 @@
 using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Controls.Models.TreeDataGrid;
-using Avalonia.Media;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using FileManager.Contracts.DryRun;
@@ -80,6 +79,25 @@ public sealed record DryRunFileRow(
     public bool IsPrimaryRename => PrimaryTargetKind == OperationKind.Rename;
     public bool IsPrimaryWrite => PrimaryTargetKind == OperationKind.New;
     public bool IsPrimarySkip => PrimaryTargetKind == OperationKind.SkipConflict;
+
+    /// <summary>Icon/colour resource keys for the single target-op status glyph (resolved in the view
+    /// via IconConverters). Null when the file has no target operation.</summary>
+    public string? PrimaryKindIconKey => PrimaryTargetKind switch
+    {
+        OperationKind.Overwrite => "IconOverwrite",
+        OperationKind.Rename => "IconRename",
+        OperationKind.New => "IconAdd",
+        OperationKind.SkipConflict => "IconSkip",
+        _ => null,
+    };
+    public string? PrimaryKindColorKey => PrimaryTargetKind switch
+    {
+        OperationKind.Overwrite => "Brush.Danger",
+        OperationKind.Rename => "Brush.Warning",
+        OperationKind.New => "Brush.Success",
+        OperationKind.SkipConflict => "Brush.Muted",
+        _ => null,
+    };
 
     /// <summary>Anything other than keeping the source is destructive from the source's view.</summary>
     public bool IsSourceDisposalDestructive =>
@@ -163,6 +181,25 @@ public sealed record DryRunDestinationEntry(
         _ => "Unknown",
     };
 
+    /// <summary>Icon/colour resource keys for this entry's status glyph (resolved in the view via
+    /// IconConverters); <see cref="StatusText"/> is the tooltip word.</summary>
+    public string StatusIconKey => Kind switch
+    {
+        DestinationRowKind.Untouched => "IconUntouched",
+        DestinationRowKind.New => "IconAdd",
+        DestinationRowKind.Overwritten => "IconOverwrite",
+        DestinationRowKind.Deleted => "IconTrash",
+        _ => "IconQuestion",
+    };
+    public string StatusColorKey => Kind switch
+    {
+        DestinationRowKind.Untouched => "Brush.Info",
+        DestinationRowKind.New => "Brush.Success",
+        DestinationRowKind.Overwritten => "Brush.Warning",
+        DestinationRowKind.Deleted => "Brush.Danger",
+        _ => "Brush.Muted",
+    };
+
     public bool Matches(string term) => DryRunPaths.PathContains(DirPath, FileName, term);
 }
 
@@ -211,25 +248,15 @@ public sealed record DryRunDestinationRow(
 //  Tree: a single generic path-forest whose nodes carry rolled-up, colour-coded summary pills.
 // ─────────────────────────────────────────────────────────────────────────────────────────────
 
-/// <summary>A colour palette shared by the tree-node pills. Mirrors the chip colours in
-/// DryRunView.axaml so the tree and the list read the same.</summary>
-internal static class DryRunPalette
-{
-    public static readonly IBrush Untouched = new SolidColorBrush(Color.Parse("#1E88E5")); // blue
-    public static readonly IBrush Processed = new SolidColorBrush(Color.Parse("#2E7D32")); // green
-    public static readonly IBrush New = Processed;
-    public static readonly IBrush Overwritten = new SolidColorBrush(Color.Parse("#FFA000")); // amber
-    public static readonly IBrush Deleted = new SolidColorBrush(Color.Parse("#E53935")); // red
-    public static readonly IBrush Unknown = new SolidColorBrush(Color.Parse("#757575")); // grey
-    public static readonly IBrush White = Brushes.White;
-    public static readonly IBrush Black = Brushes.Black;
-}
+/// <summary>One rendered pill on a tree node: a count shown under a colour-tinted glyph. Icon and
+/// colour are carried as resource keys (resolved in the view via IconConverters against App.axaml /
+/// Tokens.axaml) so the icon set and palette stay defined once and this view-model type keeps no
+/// Avalonia/resource dependency — the pure view-model tests need no running application.</summary>
+public sealed record TreePill(string CountText, string IconKey, string ColorKey, string Tip);
 
-/// <summary>One rendered pill on a tree node.</summary>
-public sealed record TreePill(string Text, IBrush Background, IBrush Foreground);
-
-/// <summary>Declares a pill category for a tree: its label, colours, and the display order.</summary>
-public sealed record TreePillSpec(string Kind, string Label, IBrush Background, IBrush Foreground);
+/// <summary>Declares a pill category for a tree: its kind key, tooltip label, glyph + colour resource
+/// keys, and the display order.</summary>
+public sealed record TreePillSpec(string Kind, string Label, string IconKey, string ColorKey);
 
 /// <summary>A node in a path tree whose counts are the rolled-up totals of everything beneath it,
 /// rendered as coloured summary pills. The forest is derived from the directory structure the rows
@@ -442,6 +469,10 @@ public sealed partial class DryRunTreeNode : ObservableObject
         // the pills column is not meaningfully sortable.
         TemplateColumnOptions<DryRunTreeNode> nameOptions = new()
         {
+            // Names are the primary content: hold a readable floor so the Name column can never be
+            // squeezed to the default 30px minimum (and vanish) by a wide pills column — the deep,
+            // high-count directories of a large profile roll up to very long summary pills otherwise.
+            MinWidth = new GridLength(160, GridUnitType.Pixel),
             CompareAscending = (a, b) => CompareNodes(a, b, ascending: true),
             CompareDescending = (a, b) => CompareNodes(a, b, ascending: false),
         };
@@ -450,7 +481,14 @@ public sealed partial class DryRunTreeNode : ObservableObject
             CompareAscending = static (a, b) => (a?.SizeBytes ?? 0).CompareTo(b?.SizeBytes ?? 0),
             CompareDescending = static (a, b) => (b?.SizeBytes ?? 0).CompareTo(a?.SizeBytes ?? 0),
         };
-        TemplateColumnOptions<DryRunTreeNode> pillsOptions = new() { CanUserSortColumn = false };
+        // Cap the auto-sized pills column so it yields the row to the Name column instead of growing
+        // to its content; pills past the cap wrap to a second line (see the WrapPanel in the cell
+        // template) rather than clipping the counts.
+        TemplateColumnOptions<DryRunTreeNode> pillsOptions = new()
+        {
+            CanUserSortColumn = false,
+            MaxWidth = new GridLength(280, GridUnitType.Pixel),
+        };
 
         HierarchicalTreeDataGridSource<DryRunTreeNode> source = new(roots)
         {
@@ -518,7 +556,7 @@ public sealed partial class DryRunTreeNode : ObservableObject
                 {
                     TreePillSpec spec = specs[k];
                     pillCache[(k, count)] = pill =
-                        new TreePill($"{count:N0} {spec.Label}", spec.Background, spec.Foreground);
+                        new TreePill($"{count:N0}", spec.IconKey, spec.ColorKey, spec.Label);
                 }
                 (pills ??= []).Add(pill);
             }
@@ -631,9 +669,9 @@ public sealed partial class DryRunSourcesTab : ViewModelBase
 {
     private static readonly IReadOnlyList<TreePillSpec> TreeSpecs =
     [
-        new("untouched", "untouched", DryRunPalette.Untouched, DryRunPalette.White),
-        new("processed", "processed", DryRunPalette.Processed, DryRunPalette.White),
-        new("deleted", "deleted", DryRunPalette.Deleted, DryRunPalette.White),
+        new("untouched", "untouched", "IconUntouched", "Brush.Info"),
+        new("processed", "processed", "IconCheckmark", "Brush.Success"),
+        new("deleted", "deleted", "IconTrash", "Brush.Danger"),
     ];
 
     private readonly TimeSpan _searchDebounce;
@@ -653,12 +691,32 @@ public sealed partial class DryRunSourcesTab : ViewModelBase
 
     partial void OnTreeChanged(IReadOnlyList<DryRunTreeNode> value) =>
         TreeSource = value.Count == 0 ? null : DryRunTreeNode.BuildSource(value);
-    [ObservableProperty] public partial IReadOnlyList<DryRunFacetRow> SourceFacets { get; private set; } = [];
-    [ObservableProperty] public partial IReadOnlyList<DryRunFacetRow> DestinationFacets { get; private set; } = [];
-    [ObservableProperty] public partial bool ShowSourceFacet { get; private set; }
-    [ObservableProperty] public partial bool ShowDestinationFacet { get; private set; }
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(ActiveFilterCount), nameof(FilterLabel))]
+    public partial IReadOnlyList<DryRunFacetRow> SourceFacets { get; private set; } = [];
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(ActiveFilterCount), nameof(FilterLabel))]
+    public partial IReadOnlyList<DryRunFacetRow> DestinationFacets { get; private set; } = [];
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(ShowAnyFacet))]
+    public partial bool ShowSourceFacet { get; private set; }
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(ShowAnyFacet))]
+    public partial bool ShowDestinationFacet { get; private set; }
     [ObservableProperty] public partial string SearchText { get; set; } = "";
     [ObservableProperty] public partial bool ShowTree { get; set; }
+
+    /// <summary>Whether this tab has any facet filter to offer — gates the toolbar's Filter button.</summary>
+    public bool ShowAnyFacet => ShowSourceFacet || ShowDestinationFacet;
+
+    /// <summary>How many facet values are currently deselected (i.e. actively filtering the view).
+    /// Drives the Filter button's badge so an active filter is visible once the facets are collapsed
+    /// into the flyout.</summary>
+    public int ActiveFilterCount =>
+        SourceFacets.Count(f => !f.IsSelected) + DestinationFacets.Count(f => !f.IsSelected);
+
+    /// <summary>The Filter button caption, carrying the active-filter count when non-zero.</summary>
+    public string FilterLabel => ActiveFilterCount > 0 ? $"Filter ({ActiveFilterCount})" : "Filter";
 
     /// <summary>The folder every displayed source path is shown relative to (null when the sources
     /// span drives, so full paths are shown). Surfaced to the user by <see cref="CommonRootDisplay"/>
@@ -732,7 +790,11 @@ public sealed partial class DryRunSourcesTab : ViewModelBase
     {
         if (_applying) return;
         if (e.PropertyName == nameof(DryRunFacetRow.IsSelected))
+        {
+            OnPropertyChanged(nameof(ActiveFilterCount));
+            OnPropertyChanged(nameof(FilterLabel));
             Rebuild();
+        }
     }
 
     private async Task DebouncedRebuildAsync(CancellationToken ct)
@@ -813,11 +875,11 @@ public sealed partial class DryRunDestinationsTab : ViewModelBase
 {
     private static readonly IReadOnlyList<TreePillSpec> TreeSpecs =
     [
-        new("untouched", "untouched", DryRunPalette.Untouched, DryRunPalette.White),
-        new("new", "new", DryRunPalette.New, DryRunPalette.White),
-        new("overwritten", "overwritten", DryRunPalette.Overwritten, DryRunPalette.Black),
-        new("deleted", "deleted", DryRunPalette.Deleted, DryRunPalette.White),
-        new("unknown", "unknown", DryRunPalette.Unknown, DryRunPalette.White),
+        new("untouched", "untouched", "IconUntouched", "Brush.Info"),
+        new("new", "new", "IconAdd", "Brush.Success"),
+        new("overwritten", "overwritten", "IconOverwrite", "Brush.Warning"),
+        new("deleted", "deleted", "IconTrash", "Brush.Danger"),
+        new("unknown", "unknown", "IconQuestion", "Brush.Muted"),
     ];
 
     private const string NoSourceKey = "(no source)";
@@ -839,12 +901,32 @@ public sealed partial class DryRunDestinationsTab : ViewModelBase
 
     partial void OnTreeChanged(IReadOnlyList<DryRunTreeNode> value) =>
         TreeSource = value.Count == 0 ? null : DryRunTreeNode.BuildSource(value);
-    [ObservableProperty] public partial IReadOnlyList<DryRunFacetRow> SourceFacets { get; private set; } = [];
-    [ObservableProperty] public partial IReadOnlyList<DryRunFacetRow> DestinationFacets { get; private set; } = [];
-    [ObservableProperty] public partial bool ShowSourceFacet { get; private set; }
-    [ObservableProperty] public partial bool ShowDestinationFacet { get; private set; }
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(ActiveFilterCount), nameof(FilterLabel))]
+    public partial IReadOnlyList<DryRunFacetRow> SourceFacets { get; private set; } = [];
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(ActiveFilterCount), nameof(FilterLabel))]
+    public partial IReadOnlyList<DryRunFacetRow> DestinationFacets { get; private set; } = [];
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(ShowAnyFacet))]
+    public partial bool ShowSourceFacet { get; private set; }
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(ShowAnyFacet))]
+    public partial bool ShowDestinationFacet { get; private set; }
     [ObservableProperty] public partial string SearchText { get; set; } = "";
     [ObservableProperty] public partial bool ShowTree { get; set; }
+
+    /// <summary>Whether this tab has any facet filter to offer — gates the toolbar's Filter button.</summary>
+    public bool ShowAnyFacet => ShowSourceFacet || ShowDestinationFacet;
+
+    /// <summary>How many facet values are currently deselected (i.e. actively filtering the view).
+    /// Drives the Filter button's badge so an active filter is visible once the facets are collapsed
+    /// into the flyout.</summary>
+    public int ActiveFilterCount =>
+        SourceFacets.Count(f => !f.IsSelected) + DestinationFacets.Count(f => !f.IsSelected);
+
+    /// <summary>The Filter button caption, carrying the active-filter count when non-zero.</summary>
+    public string FilterLabel => ActiveFilterCount > 0 ? $"Filter ({ActiveFilterCount})" : "Filter";
 
     /// <summary>The folder every displayed destination path is shown relative to (null when the
     /// targets span drives). See <see cref="DryRunSourcesTab.CommonRoot"/>.</summary>
@@ -923,7 +1005,11 @@ public sealed partial class DryRunDestinationsTab : ViewModelBase
     {
         if (_applying) return;
         if (e.PropertyName == nameof(DryRunFacetRow.IsSelected))
+        {
+            OnPropertyChanged(nameof(ActiveFilterCount));
+            OnPropertyChanged(nameof(FilterLabel));
             Rebuild();
+        }
     }
 
     private async Task DebouncedRebuildAsync(CancellationToken ct)
@@ -1039,6 +1125,13 @@ public sealed class DryRunSpaceViewModel
     public string TransferredText { get; }
     public string NetChangeText { get; }
     public IReadOnlyList<VolumeSpaceRow> Volumes { get; }
+
+    /// <summary>Any destination volume is at risk (amber worst-case or red likely-won't-fit) — the
+    /// Storage panel's header carries a badge and auto-expands when this is true.</summary>
+    public bool HasWarning => Volumes.Any(v => v.HasWarning);
+
+    /// <summary>The one-line summary shown in the collapsed Storage panel's header.</summary>
+    public string SummaryText => $"{TransferredText} to transfer · {NetChangeText} net change";
 
     /// <summary>A net change is signed for the reader: "+1.2 GB" grows the drives, "-400 MB" frees them.</summary>
     internal static string SignedText(long bytes) => bytes > 0 ? $"+{ByteSize.Format(bytes)}" : ByteSize.Format(bytes);

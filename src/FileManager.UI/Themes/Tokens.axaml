@@ -106,15 +106,15 @@
     <!-- ===================== Semantic colours (variant-independent) =====================
          Kept identical across variants so the meaning of a colour never shifts; the soft
          variants are low-alpha tints that read correctly over both dark and light surfaces. -->
-    <SolidColorBrush x:Key="Brush.Danger" Color="#E53935" />
-    <SolidColorBrush x:Key="Brush.Warning" Color="#FFA000" />
-    <SolidColorBrush x:Key="Brush.Success" Color="#4CAF50" />
-    <SolidColorBrush x:Key="Brush.Info" Color="#1E88E5" />
-    <SolidColorBrush x:Key="Brush.Danger.Soft" Color="#26E53935" />
-    <SolidColorBrush x:Key="Brush.Warning.Soft" Color="#26FFA000" />
-    <SolidColorBrush x:Key="Brush.Success.Soft" Color="#264CAF50" />
-    <SolidColorBrush x:Key="Brush.Info.Soft" Color="#261E88E5" />
-    <SolidColorBrush x:Key="Brush.Muted" Color="#757575" />
+    <SolidColorBrush x:Key="Brush.Danger" Color="#C05A54" />
+    <SolidColorBrush x:Key="Brush.Warning" Color="#C39A3C" />
+    <SolidColorBrush x:Key="Brush.Success" Color="#56986E" />
+    <SolidColorBrush x:Key="Brush.Info" Color="#4E86B6" />
+    <SolidColorBrush x:Key="Brush.Danger.Soft" Color="#26C05A54" />
+    <SolidColorBrush x:Key="Brush.Warning.Soft" Color="#26C39A3C" />
+    <SolidColorBrush x:Key="Brush.Success.Soft" Color="#2656986E" />
+    <SolidColorBrush x:Key="Brush.Info.Soft" Color="#264E86B6" />
+    <SolidColorBrush x:Key="Brush.Muted" Color="#717780" />
     <SolidColorBrush x:Key="Brush.OnColor.Light" Color="#FFFFFF" />
     <SolidColorBrush x:Key="Brush.OnColor.Dark" Color="#1E1E1E" />
 

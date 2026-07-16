@@ -28,15 +28,12 @@ namespace FileManager.UI.Controls;
 /// </para></summary>
 public sealed class StorageBar : Control
 {
-    // Palette mirrors DryRunPalette / the axaml chip colours so the bar reads the same as the pills.
+    // The semantic band colours are resolved from the shared palette tokens at render time (see
+    // ResolveBands) so the bar tracks Tokens.axaml — the single source of truth. Only the palette-
+    // independent neutrals (track, worst-case-calm headroom, dashed margin) are fixed here. Fallback
+    // hexes below match the tokens in case resolution fails (e.g. no application in a headless test).
     private static readonly IBrush TrackBrush = new SolidColorBrush(Color.FromArgb(40, 128, 128, 128));
-    private static readonly IBrush UsedNowBrush = new SolidColorBrush(Color.Parse("#757575"));   // grey
-    private static readonly IBrush AddedBrush = new SolidColorBrush(Color.Parse("#2E7D32"));      // green
-    private static readonly IBrush FreedBrush = new SolidColorBrush(Color.FromArgb(120, 46, 125, 50)); // faint green
-    private static readonly IBrush TransientBrush = new SolidColorBrush(Color.Parse("#1E88E5"));  // blue
     private static readonly IBrush WorstCalmBrush = new SolidColorBrush(Color.FromArgb(90, 158, 158, 158)); // faint grey
-    private static readonly IBrush AmberBrush = new SolidColorBrush(Color.Parse("#FFA000"));      // amber
-    private static readonly IBrush RedBrush = new SolidColorBrush(Color.Parse("#E53935"));        // red
     private static readonly IPen MarginPen =
         new Pen(new SolidColorBrush(Color.FromArgb(170, 120, 120, 120)), 1.5) { DashStyle = DashStyle.Dash };
 
@@ -133,6 +130,20 @@ public sealed class StorageBar : Control
             if (cap <= 0)
                 return;   // capacity unknown — the VM shows a text fallback instead of a bar
 
+            // Semantic band colours from the shared palette tokens (Tokens.axaml); fallbacks match the
+            // tokens for the headless/no-application case. Resolved per render — a cheap dictionary walk.
+            IBrush usedNow = Band("Brush.Muted", Color.Parse("#717780"));
+            IBrush added = Band("Brush.Success", Color.Parse("#56986E"));
+            IBrush transient = Band("Brush.Info", Color.Parse("#4E86B6"));
+            IBrush amber = Band("Brush.Warning", Color.Parse("#C39A3C"));
+            IBrush red = Band("Brush.Danger", Color.Parse("#C05A54"));
+            // "Will free" band: the success hue at ~47% alpha.
+            Color addedColor = added is ISolidColorBrush s ? s.Color : Color.Parse("#56986E");
+            IBrush freed = new SolidColorBrush(Color.FromArgb(120, addedColor.R, addedColor.G, addedColor.B));
+
+            IBrush Band(string key, Color fallback) =>
+                this.TryFindResource(key, out object? r) && r is ISolidColorBrush b ? b : new SolidColorBrush(fallback);
+
             double scale = w / cap;
             double Clamp(double v) => Math.Clamp(v, 0, cap) * scale;
             void Seg(double from, double to, IBrush brush, string acronym, string expanded, IBrush labelBrush)
@@ -159,21 +170,21 @@ public sealed class StorageBar : Control
             // the run net-frees space on this volume).
             if (settled >= used)
             {
-                Seg(0, used, UsedNowBrush, "CSU", "Current Storage Used", LabelLight);
-                Seg(used, settled, AddedBrush, "SUAR", "Storage Used At Rest", LabelLight);
+                Seg(0, used, usedNow, "CSU", "Current Storage Used", LabelLight);
+                Seg(used, settled, added, "SUAR", "Storage Used At Rest", LabelLight);
             }
             else
             {
                 // Net-frees space: the grey that remains is the settled at-rest total; the faint band
                 // above it is what the run releases.
-                Seg(0, settled, UsedNowBrush, "SUAR", "Storage Used At Rest", LabelLight);
-                Seg(settled, used, FreedBrush, "Freed", "Space Freed", LabelDark);
+                Seg(0, settled, usedNow, "SUAR", "Storage Used At Rest", LabelLight);
+                Seg(settled, used, freed, "Freed", "Space Freed", LabelDark);
             }
 
             // Transient (settled → realistic peak) and worst-case headroom (peak → safe ceiling).
-            Seg(settled, peak, overRed ? RedBrush : TransientBrush,
+            Seg(settled, peak, overRed ? red : transient,
                 "RPSU", "Realistic Peak Storage Usage", LabelLight);
-            Seg(peak, ceiling, overRed ? RedBrush : overAmber ? AmberBrush : WorstCalmBrush,
+            Seg(peak, ceiling, overRed ? red : overAmber ? amber : WorstCalmBrush,
                 "APSU", "Absolute Peak Storage Usage", overRed ? LabelLight : LabelDark);
 
             if (marginLine > 0 && marginLine < cap)

@@ -395,10 +395,9 @@ public sealed class DryRunViewModelTests
         Assert.True(sub.IsDirectory);
         Assert.True(sub.IsExpanded);
         Assert.Equal(@"C:\proj\sub", sub.FullPath);   // FullPath stays absolute for the tooltip
-        var texts = sub.Pills.Select(p => p.Text).ToList();
-        Assert.Contains("1 untouched", texts);
-        Assert.Contains("2 processed", texts);
-        Assert.Contains("1 deleted", texts);
+        Assert.Contains(sub.Pills, p => p.Tip == "untouched" && p.CountText == "1");
+        Assert.Contains(sub.Pills, p => p.Tip == "processed" && p.CountText == "2");
+        Assert.Contains(sub.Pills, p => p.Tip == "deleted" && p.CountText == "1");
     }
 
     // Destinations nested one level under a single target root.
@@ -433,10 +432,9 @@ public sealed class DryRunViewModelTests
         DryRunTreeNode sub = Assert.Single(viewModel.Destinations.Tree);
         Assert.Equal("sub", sub.Name);
         Assert.Equal(@"C:\out\sub", sub.FullPath);
-        var texts = sub.Pills.Select(p => p.Text).ToList();
-        Assert.Contains("1 new", texts);
-        Assert.Contains("1 overwritten", texts);
-        Assert.Contains("1 untouched", texts);
+        Assert.Contains(sub.Pills, p => p.Tip == "new" && p.CountText == "1");
+        Assert.Contains(sub.Pills, p => p.Tip == "overwritten" && p.CountText == "1");
+        Assert.Contains(sub.Pills, p => p.Tip == "untouched" && p.CountText == "1");
     }
 
     [Fact]

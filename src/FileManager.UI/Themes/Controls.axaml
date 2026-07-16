@@ -1,5 +1,28 @@
 <Styles xmlns="https://github.com/avaloniaui"
-        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:ctrl="using:FileManager.UI.Controls">
+
+    <!-- Status indicator (dry-run): a colour-tinted glyph + optional count. Replaces the old filled
+         status pills; the icon carries the meaning (pair with ToolTip.Tip), the text an optional
+         count (hidden when empty → icon-only). -->
+    <Styles.Resources>
+        <ControlTheme x:Key="{x:Type ctrl:StatusCount}" TargetType="ctrl:StatusCount">
+            <Setter Property="VerticalAlignment" Value="Center" />
+            <Setter Property="Template">
+                <ControlTemplate>
+                    <StackPanel Orientation="Horizontal" Spacing="4" VerticalAlignment="Center">
+                        <PathIcon Width="14" Height="14" VerticalAlignment="Center"
+                                  Data="{TemplateBinding Icon}" Foreground="{TemplateBinding Glyph}" />
+                        <TextBlock VerticalAlignment="Center" FontSize="{StaticResource Font.Small}"
+                                   Foreground="{DynamicResource Brush.Text.Primary}"
+                                   Text="{TemplateBinding Text}"
+                                   IsVisible="{Binding Text, RelativeSource={RelativeSource TemplatedParent}, Converter={x:Static StringConverters.IsNotNullOrEmpty}}" />
+                    </StackPanel>
+                </ControlTemplate>
+            </Setter>
+        </ControlTheme>
+    </Styles.Resources>
+
     <!--
       Shared, class-based styles layered on top of FluentTheme. Included after <FluentTheme/> in
       App.axaml so these win. Colours come from Tokens.axaml (DynamicResource so they track the
@@ -171,66 +194,29 @@
         <Setter Property="Background" Value="{DynamicResource Brush.Info.Soft}" />
     </Style>
 
-    <!-- ============================ Chips / pills ============================
-         Shared by DryRunView and the profile list. Colour classes set a solid background and a
-         contrasting foreground on the contained text. -->
-    <Style Selector="Border.chip">
-        <Setter Property="CornerRadius" Value="10" />
-        <Setter Property="Padding" Value="10,3" />
-        <Setter Property="Background" Value="{DynamicResource Brush.Chip.Background}" />
-    </Style>
-    <Style Selector="Border.chipDanger">
-        <Setter Property="Background" Value="{DynamicResource Brush.Danger}" />
-    </Style>
-    <Style Selector="Border.chipDanger TextBlock">
-        <Setter Property="Foreground" Value="White" />
-    </Style>
-    <Style Selector="Border.chipAmber">
-        <Setter Property="Background" Value="{DynamicResource Brush.Warning}" />
-    </Style>
-    <Style Selector="Border.chipAmber TextBlock">
-        <Setter Property="Foreground" Value="Black" />
-    </Style>
-    <Style Selector="Border.chipSafe">
-        <Setter Property="Background" Value="{DynamicResource Brush.Success}" />
-    </Style>
-    <Style Selector="Border.chipSafe TextBlock">
-        <Setter Property="Foreground" Value="White" />
-    </Style>
-    <Style Selector="Border.chipMuted">
-        <Setter Property="Background" Value="{DynamicResource Brush.Muted}" />
-    </Style>
-    <Style Selector="Border.chipMuted TextBlock">
-        <Setter Property="Foreground" Value="White" />
-    </Style>
-    <Style Selector="Border.chipInfo">
-        <Setter Property="Background" Value="{DynamicResource Brush.Info}" />
-    </Style>
-    <Style Selector="Border.chipInfo TextBlock">
-        <Setter Property="Foreground" Value="White" />
+    <!-- Flyout popup surface (the only flyout in the app is the dry-run facet filter). Match the
+         token-driven card look instead of Fluent's stock presenter chrome, and cap the width so a
+         long list of facet keys wraps rather than sprawling across the screen. -->
+    <Style Selector="FlyoutPresenter">
+        <Setter Property="Background" Value="{DynamicResource Brush.Panel.Background}" />
+        <Setter Property="BorderBrush" Value="{DynamicResource Brush.Panel.Border}" />
+        <Setter Property="BorderThickness" Value="1" />
+        <Setter Property="CornerRadius" Value="{StaticResource Radius.Card}" />
+        <Setter Property="Padding" Value="12" />
+        <Setter Property="MaxWidth" Value="440" />
     </Style>
 
-    <!-- per-target kind tags (DryRun Sources list nested targets) -->
-    <Style Selector="TextBlock.kind">
-        <Setter Property="FontSize" Value="{StaticResource Font.Caption}" />
-        <Setter Property="FontWeight" Value="SemiBold" />
-        <Setter Property="VerticalAlignment" Value="Center" />
+    <!-- Card-like Expander (the dry-run Storage panel). The header/content backgrounds and borders
+         are neutralised inline on the instance (Expander.Resources) so the wrapping Border.card
+         surface shows through; here we only tune the styled properties. -->
+    <Style Selector="Expander.card">
+        <Setter Property="MinHeight" Value="0" />
+        <Setter Property="Background" Value="Transparent" />
+        <Setter Property="BorderThickness" Value="0" />
     </Style>
-    <Style Selector="TextBlock.kind.overwrite">
-        <Setter Property="Foreground" Value="{DynamicResource Brush.Danger}" />
-    </Style>
-    <Style Selector="TextBlock.kind.rename">
-        <Setter Property="Foreground" Value="{DynamicResource Brush.Warning}" />
-    </Style>
-    <Style Selector="TextBlock.kind.write">
-        <Setter Property="Foreground" Value="{DynamicResource Brush.Success}" />
-    </Style>
-    <Style Selector="TextBlock.kind.skip">
-        <Setter Property="Foreground" Value="{DynamicResource Brush.Muted}" />
-    </Style>
-    <Style Selector="TextBlock.kind.unknown">
-        <Setter Property="Foreground" Value="#8E24AA" />
-    </Style>
+
+    <!-- (Status pills/chips and the dead per-target "kind" text tags were replaced by the
+         ctrl:StatusCount control above — the dry-run view was their only consumer.) -->
 
     <!-- ============================ Profile list ============================
          VS Solution-Explorer feel: transparent rows, subtle hover, an accent left-bar on the
