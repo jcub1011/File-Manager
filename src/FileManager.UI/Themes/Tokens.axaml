@@ -112,6 +112,12 @@
     <SolidColorBrush x:Key="Brush.Info" Color="#4E86B6" />
     <SolidColorBrush x:Key="Brush.Danger.Soft" Color="#26C05A54" />
     <SolidColorBrush x:Key="Brush.Warning.Soft" Color="#26C39A3C" />
+    <!-- Manila-folder tint for directory rows in the dry-run trees; low alpha so it reads as a slight
+         wash over both the dark and light row surfaces. -->
+    <SolidColorBrush x:Key="Brush.Folder.Soft" Color="#33D9B48A" />
+    <!-- Light-blue row hover highlight for the dry-run list and tree rows; low alpha so it reads over
+         both the dark and light row surfaces (and over the folder tint). -->
+    <SolidColorBrush x:Key="Brush.Hover.Soft" Color="#334E9BE6" />
     <SolidColorBrush x:Key="Brush.Success.Soft" Color="#2656986E" />
     <SolidColorBrush x:Key="Brush.Info.Soft" Color="#264E86B6" />
     <SolidColorBrush x:Key="Brush.Muted" Color="#717780" />

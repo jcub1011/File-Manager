@@ -239,6 +239,16 @@ public sealed record DryRunDestinationRow(
     /// template binds its status and folder off this.</summary>
     public DryRunDestinationEntry Primary => Destinations[0];
 
+    /// <summary>One entry per distinct destination status kind, in kind order — drives the row's
+    /// status glyphs so a source fanning out to N targets shows one icon per kind, not N identical
+    /// icons.</summary>
+    public IReadOnlyList<DryRunDestinationEntry> DistinctStatusEntries =>
+        Destinations.DistinctBy(e => e.Kind).OrderBy(e => e.Kind).ToList();
+
+    /// <summary>The row tooltip: the originating source path, or the resulting path for rows that
+    /// have no source (Mirror deletions, kept-around originals, pre-existing untouched files).</summary>
+    public string HoverPath => SourcePath ?? Primary.TargetPath;
+
     public bool Matches(string term) =>
         (SourceFileName is not null && DryRunPaths.PathContains(SourceDirPath!, SourceFileName, term))
         || Destinations.Any(d => d.Matches(term));
@@ -476,7 +486,9 @@ public sealed partial class DryRunTreeNode : ObservableObject
             CompareAscending = (a, b) => CompareNodes(a, b, ascending: true),
             CompareDescending = (a, b) => CompareNodes(a, b, ascending: false),
         };
-        TextColumnOptions<DryRunTreeNode> sizeOptions = new()
+        // A TemplateColumn (not a TextColumn) so the size renders through the same centred, monospace
+        // cell path as the name and the two line up vertically; sort still compares the raw byte count.
+        TemplateColumnOptions<DryRunTreeNode> sizeOptions = new()
         {
             CompareAscending = static (a, b) => (a?.SizeBytes ?? 0).CompareTo(b?.SizeBytes ?? 0),
             CompareDescending = static (a, b) => (b?.SizeBytes ?? 0).CompareTo(a?.SizeBytes ?? 0),
@@ -500,7 +512,7 @@ public sealed partial class DryRunTreeNode : ObservableObject
                     x => x.Children,
                     x => x.HasChildren,
                     x => x.IsExpanded),
-                new TextColumn<DryRunTreeNode, string>("Size", x => x.SizeText, width: null, options: sizeOptions),
+                new TemplateColumn<DryRunTreeNode>("Size", "DryRunSizeCell", options: sizeOptions),
                 new TemplateColumn<DryRunTreeNode>("Status", "DryRunPillsCell", options: pillsOptions),
             },
         };

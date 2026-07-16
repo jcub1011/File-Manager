@@ -17,6 +17,16 @@
                        VerticalAlignment="Center" Classes.dir="{Binding IsDirectory}"
                        TextTrimming="CharacterEllipsis" ToolTip.Tip="{Binding FullPath}" />
         </DataTemplate>
+        <!-- Rendered through the same (centred) template-cell path as the name, in the same monospace
+             font, so the size and name share identical vertical metrics and line up on one centreline
+             — a plain TextColumn cell uses the default proportional font and drifts off-centre. -->
+        <DataTemplate x:Key="DryRunSizeCell" x:DataType="vm:DryRunTreeNode">
+            <!-- Horizontal margin restores the gap the old TextColumn's cell padding gave: space from
+                 the name on the left and from the status pills on the right. -->
+            <TextBlock Text="{Binding SizeText}" FontFamily="{StaticResource MonoFontFamily}"
+                       VerticalAlignment="Center" TextAlignment="Right" Opacity="0.7"
+                       Margin="8,0,8,0" />
+        </DataTemplate>
         <DataTemplate x:Key="DryRunPillsCell" x:DataType="vm:DryRunTreeNode">
             <!-- WrapPanel (not a horizontal StackPanel) so a high-count node's rolled-up counts wrap
                  to a second line rather than clipping or starving the Name column. Each pill is a
@@ -140,6 +150,10 @@
             <Setter Property="Margin" Value="0" />
             <Setter Property="MinHeight" Value="0" />
         </Style>
+        <!-- Light-blue hover highlight on list rows (override Fluent's default grey pointer-over). -->
+        <Style Selector="ListBox.rows > ListBoxItem:pointerover /template/ ContentPresenter#PART_ContentPresenter">
+            <Setter Property="Background" Value="{DynamicResource Brush.Hover.Soft}" />
+        </Style>
 
         <Style Selector="TextBlock.dir">
             <Setter Property="FontWeight" Value="SemiBold" />
@@ -155,6 +169,17 @@
         </Style>
         <Style Selector="TreeDataGrid.rows TreeDataGridRow">
             <Setter Property="MinHeight" Value="24" />
+            <!-- Directory rows get a slight manila-folder wash so folders stand out from files; the
+                 row's DataContext is the DryRunTreeNode, so IsDirectory drives the tint. DataType pins
+                 the compiled-binding type to the row node (the ambient x:DataType is the view model), so
+                 this stays a compiled, AOT-safe binding rather than a reflection one. -->
+            <Setter Property="Background"
+                    Value="{Binding IsDirectory, DataType=vm:DryRunTreeNode, Converter={x:Static conv:IconConverters.FolderTint}}" />
+        </Style>
+        <!-- Light-blue hover highlight on tree rows; overrides the folder tint / transparent base while
+             the pointer is over the row. -->
+        <Style Selector="TreeDataGrid.rows TreeDataGridRow:pointerover">
+            <Setter Property="Background" Value="{DynamicResource Brush.Hover.Soft}" />
         </Style>
     </UserControl.Styles>
 
@@ -303,7 +328,7 @@
                         <TextBox Grid.Column="0" Text="{Binding Sources.SearchText}"
                                  PlaceholderText="Filter by source or target path…" />
                         <Button Grid.Column="1" Content="{Binding Sources.FilterLabel}" FontSize="12"
-                                Margin="8,0,8,0" VerticalAlignment="Stretch"
+                                Margin="8,0,0,0" VerticalAlignment="Stretch"
                                 IsVisible="{Binding Sources.ShowAnyFacet}"
                                 ToolTip.Tip="Narrow the view by source and destination root">
                             <Button.Flyout>
@@ -330,7 +355,7 @@
                             </Button.Flyout>
                         </Button>
                         <ToggleButton Grid.Column="2" Content="Tree view" IsChecked="{Binding Sources.ShowTree}"
-                                      FontSize="12" VerticalAlignment="Stretch"
+                                      FontSize="12" Margin="8,0,0,0" VerticalAlignment="Stretch"
                                       ToolTip.Tip="Group the files into a navigable directory tree" />
                     </Grid>
 
@@ -365,7 +390,7 @@
                                         <!-- line 2: parent directory (relative, folder-truncated) + right-aligned size -->
                                         <ctrl:PathText Grid.Row="1" Grid.Column="0" Text="{Binding ParentDisplay}"
                                                        Mode="FolderMiddleEllipsis" FontFamily="{StaticResource MonoFontFamily}"
-                                                       FontSize="11" Margin="0,2,0,0" Opacity="0.6" />
+                                                       FontSize="11" Margin="0,2,0,0" Opacity="0.6" VerticalAlignment="Center" />
                                         <TextBlock Grid.Row="1" Grid.Column="1" Text="{Binding SizeText}"
                                                    FontSize="11" Opacity="0.6" VerticalAlignment="Center"
                                                    HorizontalAlignment="Right" Margin="8,2,0,0" />
@@ -418,7 +443,7 @@
                         <TextBox Grid.Column="0" Text="{Binding Destinations.SearchText}"
                                  PlaceholderText="Filter by destination or source path…" />
                         <Button Grid.Column="1" Content="{Binding Destinations.FilterLabel}" FontSize="12"
-                                Margin="8,0,8,0" VerticalAlignment="Stretch"
+                                Margin="8,0,0,0" VerticalAlignment="Stretch"
                                 IsVisible="{Binding Destinations.ShowAnyFacet}"
                                 ToolTip.Tip="Narrow the view by source and destination root">
                             <Button.Flyout>
@@ -445,7 +470,7 @@
                             </Button.Flyout>
                         </Button>
                         <ToggleButton Grid.Column="2" Content="Tree view" IsChecked="{Binding Destinations.ShowTree}"
-                                      FontSize="12" VerticalAlignment="Stretch"
+                                      FontSize="12" Margin="8,0,0,0" VerticalAlignment="Stretch"
                                       ToolTip.Tip="Group the resulting files into a navigable directory tree" />
                     </Grid>
 
@@ -456,61 +481,38 @@
                             <DataTemplate x:DataType="vm:DryRunDestinationRow">
                                 <Border BorderThickness="0,0,0,1" BorderBrush="{DynamicResource SystemControlBackgroundListLowBrush}"
                                         Padding="4,6">
-                                    <Panel>
-                                        <!-- No-source row (a Mirror deletion, a kept-around conflict original, a
-                                             pre-existing untouched file): the classic filename + status + folder layout. -->
-                                        <Grid IsVisible="{Binding IsSingle}" RowDefinitions="Auto,Auto" ColumnDefinitions="*,Auto"
-                                              ToolTip.Tip="{Binding Primary.TargetPath}">
-                                            <ctrl:PathText Grid.Row="0" Grid.Column="0" Text="{Binding FileName}"
-                                                           Mode="EndPreservingExtension" FontFamily="{StaticResource MonoFontFamily}"
-                                                           FontSize="13" VerticalAlignment="Center" />
-                                            <ctrl:StatusCount Grid.Row="0" Grid.Column="1" Margin="8,0,0,0" VerticalAlignment="Center"
-                                                              ToolTip.Tip="{Binding Primary.StatusText}"
-                                                              Icon="{Binding Primary.StatusIconKey, Converter={x:Static conv:IconConverters.Geometry}}"
-                                                              Glyph="{Binding Primary.StatusColorKey, Converter={x:Static conv:IconConverters.Brush}}" />
-                                            <ctrl:PathText Grid.Row="1" Grid.Column="0" Text="{Binding Primary.ParentDisplay}"
-                                                           Mode="FolderMiddleEllipsis" FontFamily="{StaticResource MonoFontFamily}"
-                                                           FontSize="11" Margin="0,2,0,0" Opacity="0.6" />
-                                            <TextBlock Grid.Row="1" Grid.Column="1" Text="{Binding Primary.SizeText}"
-                                                       FontSize="11" Opacity="0.6" VerticalAlignment="Center"
-                                                       HorizontalAlignment="Right" Margin="8,2,0,0" />
-                                        </Grid>
+                                    <!-- Compact 2-row layout mirroring the source row: destination name + status
+                                         glyphs (one per distinct kind) on line 1, the first destination's relative
+                                         folder + size on line 2. Fan-out targets share the same relative path, so
+                                         only the first is shown (filter by destination to split them); the tooltip
+                                         carries the originating source path. -->
+                                    <Grid RowDefinitions="Auto,Auto" ColumnDefinitions="*,Auto"
+                                          ToolTip.Tip="{Binding HoverPath}">
+                                        <ctrl:PathText Grid.Row="0" Grid.Column="0" Text="{Binding Primary.FileName}"
+                                                       Mode="EndPreservingExtension" FontFamily="{StaticResource MonoFontFamily}"
+                                                       FontSize="13" VerticalAlignment="Center" />
 
-                                        <!-- Source-backed row: the source file on top, then every destination it fans
-                                             out to as a wrapping list of chips, each coloured by its own status. -->
-                                        <StackPanel IsVisible="{Binding HasSource}" Spacing="4" ToolTip.Tip="{Binding SourcePath}">
-                                            <ctrl:PathText Text="{Binding FileName}" Mode="EndPreservingExtension"
-                                                           FontFamily="{StaticResource MonoFontFamily}" FontSize="13" />
-                                            <DockPanel LastChildFill="True">
-                                                <TextBlock Text="from" DockPanel.Dock="Left" FontSize="11" Opacity="0.5"
-                                                           VerticalAlignment="Center" Margin="0,0,6,0" />
-                                                <ctrl:PathText Text="{Binding SourceDisplay}" Mode="FolderMiddleEllipsis"
-                                                               FontFamily="{StaticResource MonoFontFamily}" FontSize="11" Opacity="0.6" />
-                                            </DockPanel>
-                                            <ItemsControl ItemsSource="{Binding Destinations}" Margin="0,2,0,0">
-                                                <ItemsControl.ItemsPanel>
-                                                    <ItemsPanelTemplate><WrapPanel /></ItemsPanelTemplate>
-                                                </ItemsControl.ItemsPanel>
-                                                <ItemsControl.ItemTemplate>
-                                                    <DataTemplate x:DataType="vm:DryRunDestinationEntry">
-                                                        <!-- each resulting path: status glyph + relative path + size,
-                                                             no filled background -->
-                                                        <StackPanel Orientation="Horizontal" Spacing="6" Margin="0,0,14,4"
-                                                                    ToolTip.Tip="{Binding TargetPath}">
-                                                            <ctrl:StatusCount VerticalAlignment="Center" ToolTip.Tip="{Binding StatusText}"
-                                                                              Icon="{Binding StatusIconKey, Converter={x:Static conv:IconConverters.Geometry}}"
-                                                                              Glyph="{Binding StatusColorKey, Converter={x:Static conv:IconConverters.Brush}}" />
-                                                            <TextBlock Text="{Binding RelativeDisplay}" FontFamily="{StaticResource MonoFontFamily}"
-                                                                       FontSize="11" MaxWidth="320" TextTrimming="CharacterEllipsis"
-                                                                       VerticalAlignment="Center" />
-                                                            <TextBlock Text="{Binding SizeText}" FontSize="10" Opacity="0.7"
-                                                                       VerticalAlignment="Center" />
-                                                        </StackPanel>
-                                                    </DataTemplate>
-                                                </ItemsControl.ItemTemplate>
-                                            </ItemsControl>
-                                        </StackPanel>
-                                    </Panel>
+                                        <ItemsControl Grid.Row="0" Grid.Column="1" ItemsSource="{Binding DistinctStatusEntries}"
+                                                      Margin="8,0,0,0" VerticalAlignment="Center" HorizontalAlignment="Right">
+                                            <ItemsControl.ItemsPanel>
+                                                <ItemsPanelTemplate><StackPanel Orientation="Horizontal" Spacing="8" /></ItemsPanelTemplate>
+                                            </ItemsControl.ItemsPanel>
+                                            <ItemsControl.ItemTemplate>
+                                                <DataTemplate x:DataType="vm:DryRunDestinationEntry">
+                                                    <ctrl:StatusCount VerticalAlignment="Center" ToolTip.Tip="{Binding StatusText}"
+                                                                      Icon="{Binding StatusIconKey, Converter={x:Static conv:IconConverters.Geometry}}"
+                                                                      Glyph="{Binding StatusColorKey, Converter={x:Static conv:IconConverters.Brush}}" />
+                                                </DataTemplate>
+                                            </ItemsControl.ItemTemplate>
+                                        </ItemsControl>
+
+                                        <ctrl:PathText Grid.Row="1" Grid.Column="0" Text="{Binding Primary.ParentDisplay}"
+                                                       Mode="FolderMiddleEllipsis" FontFamily="{StaticResource MonoFontFamily}"
+                                                       FontSize="11" Margin="0,2,0,0" Opacity="0.6" VerticalAlignment="Center" />
+                                        <TextBlock Grid.Row="1" Grid.Column="1" Text="{Binding Primary.SizeText}"
+                                                   FontSize="11" Opacity="0.6" VerticalAlignment="Center"
+                                                   HorizontalAlignment="Right" Margin="8,2,0,0" />
+                                    </Grid>
                                 </Border>
                             </DataTemplate>
                         </ListBox.ItemTemplate>
