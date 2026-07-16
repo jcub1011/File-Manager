@@ -255,4 +255,31 @@
         <Setter Property="Height" Value="3" />
         <Setter Property="Background" Value="{DynamicResource Brush.Accent}" />
     </Style>
+
+    <!-- ============================ Dry-run status chips ============================
+         The dry-run summary counts double as filters: each is a toggleable StatusCount. Idle it
+         reads like the old read-only summary (flat, no chrome); checked it gains a soft tinted fill
+         and an accent border so an active filter is obvious. The border stays 1px in every state so
+         toggling never shifts the row's layout. Fluent paints the checked/hover fill inside the
+         template, so the state selectors target /template/ ContentPresenter. -->
+    <Style Selector="ToggleButton.statusFilter">
+        <Setter Property="Background" Value="Transparent" />
+        <Setter Property="BorderThickness" Value="1" />
+        <Setter Property="BorderBrush" Value="Transparent" />
+        <Setter Property="CornerRadius" Value="{StaticResource Radius.Control}" />
+        <Setter Property="VerticalAlignment" Value="Center" />
+        <Setter Property="MinHeight" Value="0" />
+    </Style>
+    <Style Selector="ToggleButton.statusFilter:pointerover /template/ ContentPresenter">
+        <Setter Property="Background" Value="{DynamicResource Brush.Item.Hover}" />
+        <Setter Property="BorderBrush" Value="Transparent" />
+    </Style>
+    <Style Selector="ToggleButton.statusFilter:checked /template/ ContentPresenter">
+        <Setter Property="Background" Value="{DynamicResource Brush.Item.Selected}" />
+        <Setter Property="BorderBrush" Value="{DynamicResource Brush.Accent}" />
+    </Style>
+    <Style Selector="ToggleButton.statusFilter:checked:pointerover /template/ ContentPresenter">
+        <Setter Property="Background" Value="{DynamicResource Brush.Item.Selected}" />
+        <Setter Property="BorderBrush" Value="{DynamicResource Brush.Accent}" />
+    </Style>
 </Styles>

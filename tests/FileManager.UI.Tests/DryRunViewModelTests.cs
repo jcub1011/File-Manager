@@ -318,6 +318,89 @@ public sealed class DryRunViewModelTests
     }
 
     [Fact]
+    public async Task Sources_status_filter_narrows_to_selected_statuses()
+    {
+        var (viewModel, gateway) = NewViewModel();
+        gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value);
+        await viewModel.RunAsync(CancellationToken.None);
+
+        // No selection → the list is unfiltered.
+        Assert.False(viewModel.Sources.AnyStatusSelected);
+        Assert.Equal(4, viewModel.Sources.VisibleRows.Count);
+
+        // Deleted → only clobber.txt (the one trashed source).
+        viewModel.Sources.StatusFilters.Single(f => f.Key == "deleted").IsSelected = true;
+        Assert.True(viewModel.Sources.AnyStatusSelected);
+        Assert.EndsWith("clobber.txt", Assert.Single(viewModel.Sources.VisibleRows).SourcePath);
+
+        // Untouched → the filtered-out + unchanged files (junk.tmp + same.txt).
+        viewModel.Sources.StatusFilters.Single(f => f.Key == "deleted").IsSelected = false;
+        viewModel.Sources.StatusFilters.Single(f => f.Key == "untouched").IsSelected = true;
+        Assert.Equal(2, viewModel.Sources.VisibleRows.Count);
+        Assert.All(viewModel.Sources.VisibleRows, r => Assert.True(r.IsUntouched));
+
+        // A view filter never changes the whole-run summary counts.
+        Assert.Equal(1, viewModel.Sources.DeletedCount);
+        Assert.Equal(2, viewModel.Sources.UntouchedCount);
+    }
+
+    [Fact]
+    public async Task Sources_status_filters_union_and_clear_restores_all()
+    {
+        var (viewModel, gateway) = NewViewModel();
+        gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value);
+        await viewModel.RunAsync(CancellationToken.None);
+
+        // Processed OR Deleted — clobber.txt carries both, so the union is fresh + clobber (a
+        // both-statuses row shows once, not twice).
+        viewModel.Sources.StatusFilters.Single(f => f.Key == "processed").IsSelected = true;
+        viewModel.Sources.StatusFilters.Single(f => f.Key == "deleted").IsSelected = true;
+        var names = viewModel.Sources.VisibleRows.Select(r => r.FileName).ToList();
+        Assert.Equal(2, names.Count);
+        Assert.Contains("fresh.txt", names);
+        Assert.Contains("clobber.txt", names);
+
+        // The clear command drops every selection and shows everything again.
+        viewModel.Sources.ClearStatusFiltersCommand.Execute(null);
+        Assert.False(viewModel.Sources.AnyStatusSelected);
+        Assert.All(viewModel.Sources.StatusFilters, f => Assert.False(f.IsSelected));
+        Assert.Equal(4, viewModel.Sources.VisibleRows.Count);
+    }
+
+    [Fact]
+    public async Task Destinations_status_filter_prunes_entries_and_keeps_counts()
+    {
+        var (viewModel, gateway) = NewViewModel();
+        gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value);
+        await viewModel.RunAsync(CancellationToken.None);
+
+        // New only: keeps fresh.txt and clobber.txt's rename target, dropping clobber's Overwrite
+        // entry and the untouched rows entirely.
+        viewModel.Destinations.StatusFilters.Single(f => f.Key == "new").IsSelected = true;
+        var entries = viewModel.Destinations.VisibleRows.SelectMany(r => r.Destinations).ToList();
+        Assert.NotEmpty(entries);
+        Assert.All(entries, e => Assert.True(e.IsNew));
+
+        // Counts stay over the whole run, independent of the filtered view.
+        Assert.Equal(2, viewModel.Destinations.NewCount);
+        Assert.Equal(1, viewModel.Destinations.OverwrittenCount);
+        Assert.Equal(2, viewModel.Destinations.UntouchedCount);
+    }
+
+    [Fact]
+    public async Task Status_filter_and_search_combine()
+    {
+        var (viewModel, gateway) = NewViewModel();
+        gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value);
+        await viewModel.RunAsync(CancellationToken.None);
+
+        // Processed matches fresh + clobber; the search AND-restricts it to fresh.
+        viewModel.Sources.StatusFilters.Single(f => f.Key == "processed").IsSelected = true;
+        viewModel.Sources.SearchText = "fresh";
+        Assert.EndsWith("fresh.txt", Assert.Single(viewModel.Sources.VisibleRows).SourcePath);
+    }
+
+    [Fact]
     public async Task Source_facet_lists_each_distinct_source()
     {
         var (viewModel, gateway) = NewViewModel();

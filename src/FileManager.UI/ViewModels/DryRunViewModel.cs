@@ -606,6 +606,23 @@ public sealed partial class DryRunFacetRow : ViewModelBase
     [ObservableProperty] public partial bool IsSelected { get; set; } = true;
 }
 
+/// <summary>A selectable status chip in a tab's summary row (e.g. Processed, Deleted). Unlike a
+/// <see cref="DryRunFacetRow"/>, it defaults to <em>unselected</em>: with none selected the list
+/// shows everything; selecting one or more narrows the list to rows carrying any selected status.
+/// Icon/colour are carried as resource keys (resolved in the view via IconConverters), matching the
+/// tree pill specs.</summary>
+public sealed partial class DryRunStatusFilter : ViewModelBase
+{
+    public required string Key { get; init; }        // "untouched","processed","deleted","new","overwritten"
+    public required string Label { get; init; }      // tooltip word, e.g. "Processed"
+    public required string IconKey { get; init; }    // resolved via IconConverters.Geometry
+    public required string ColorKey { get; init; }   // resolved via IconConverters.Brush
+    public required int Count { get; init; }
+    public string CountText => Count.ToString("N0");
+
+    [ObservableProperty] public partial bool IsSelected { get; set; }
+}
+
 /// <summary>Ordering shared by both tabs so a file sits in the same position in the Sources and
 /// Destinations lists — otherwise the differing root prefixes (e.g. <c>C:\src\…</c> vs
 /// <c>D:\dst\…</c>) scatter the same logical file to different rows and defeat side-by-side
@@ -733,6 +750,13 @@ public sealed partial class DryRunSourcesTab : ViewModelBase
     [ObservableProperty] public partial int ProcessedCount { get; private set; }
     [ObservableProperty] public partial int DeletedCount { get; private set; }
 
+    /// <summary>The clickable summary chips (Untouched / Processed / Deleted). None selected → the
+    /// list shows everything; selecting one or more narrows it to rows carrying any selected status.</summary>
+    [ObservableProperty] public partial IReadOnlyList<DryRunStatusFilter> StatusFilters { get; private set; } = [];
+
+    /// <summary>Whether any status chip is selected — drives the clear (✕) button's visibility.</summary>
+    public bool AnyStatusSelected => StatusFilters.Any(f => f.IsSelected);
+
     public void Load(IReadOnlyList<DryRunFileRow> rows, string? commonRoot)
     {
         _applying = true;
@@ -741,6 +765,7 @@ public sealed partial class DryRunSourcesTab : ViewModelBase
         UntouchedCount = _all.Count(r => r.IsUntouched);
         ProcessedCount = _all.Count(r => r.IsProcessed);
         DeletedCount = _all.Count(r => r.IsDeleted);
+        StatusFilters = BuildStatusFilters();
 
         SourceFacets = DryRunFacets.Build(CountBy(_all.Where(r => r.SourceRoot is not null), r => r.SourceRoot!), OnFacetChanged);
         ShowSourceFacet = SourceFacets.Count > 0;
@@ -768,7 +793,40 @@ public sealed partial class DryRunSourcesTab : ViewModelBase
         SearchText = "";
         ShowTree = false;
         UntouchedCount = ProcessedCount = DeletedCount = 0;
+        StatusFilters = [];
+        OnPropertyChanged(nameof(AnyStatusSelected));
         _applying = false;
+    }
+
+    /// <summary>The status chips for this tab, wired so toggling one re-filters the list.</summary>
+    private IReadOnlyList<DryRunStatusFilter> BuildStatusFilters()
+    {
+        DryRunStatusFilter[] filters =
+        [
+            new() { Key = "untouched", Label = "Untouched", IconKey = "IconUntouched",  ColorKey = "Brush.Info",    Count = UntouchedCount },
+            new() { Key = "processed", Label = "Processed", IconKey = "IconCheckmark", ColorKey = "Brush.Success", Count = ProcessedCount },
+            new() { Key = "deleted",   Label = "Deleted",   IconKey = "IconTrash",     ColorKey = "Brush.Danger",  Count = DeletedCount },
+        ];
+        foreach (DryRunStatusFilter f in filters)
+            f.PropertyChanged += OnStatusFilterChanged;
+        return filters;
+    }
+
+    /// <summary>The selected status keys, or null when none are selected (the common case → show all).</summary>
+    private HashSet<string>? SelectedStatusKeys()
+    {
+        HashSet<string> keys = StatusFilters.Where(f => f.IsSelected).Select(f => f.Key).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        return keys.Count == 0 ? null : keys;
+    }
+
+    [RelayCommand]
+    private void ClearStatusFilters()
+    {
+        _applying = true;
+        foreach (DryRunStatusFilter f in StatusFilters) f.IsSelected = false;
+        _applying = false;
+        OnPropertyChanged(nameof(AnyStatusSelected));
+        Rebuild();
     }
 
     partial void OnSearchTextChanged(string value)
@@ -797,6 +855,16 @@ public sealed partial class DryRunSourcesTab : ViewModelBase
         }
     }
 
+    private void OnStatusFilterChanged(object? sender, PropertyChangedEventArgs e)
+    {
+        if (_applying) return;
+        if (e.PropertyName == nameof(DryRunStatusFilter.IsSelected))
+        {
+            OnPropertyChanged(nameof(AnyStatusSelected));
+            Rebuild();
+        }
+    }
+
     private async Task DebouncedRebuildAsync(CancellationToken ct)
     {
         try
@@ -818,10 +886,16 @@ public sealed partial class DryRunSourcesTab : ViewModelBase
         string? term = string.IsNullOrWhiteSpace(SearchText) ? null : SearchText.Trim();
         HashSet<string>? sources = DryRunFacets.SelectedKeys(SourceFacets);
         HashSet<string>? destinations = DryRunFacets.SelectedKeys(DestinationFacets);
+        HashSet<string>? statuses = SelectedStatusKeys();
 
         IEnumerable<DryRunFileRow> rows = _all;
         if (sources is not null) rows = rows.Where(r => r.SourceRoot is not null && sources.Contains(r.SourceRoot));
         if (destinations is not null) rows = rows.Where(r => r.TargetRoots.Any(destinations.Contains));
+        if (statuses is not null)
+            rows = rows.Where(r =>
+                (statuses.Contains("untouched") && r.IsUntouched) ||
+                (statuses.Contains("processed") && r.IsProcessed) ||
+                (statuses.Contains("deleted") && r.IsDeleted));
         if (term is not null) rows = rows.Where(r => r.Matches(term));
 
         // Order by path-relative-to-root (then root) so a file lines up with the same file in the
@@ -942,6 +1016,13 @@ public sealed partial class DryRunDestinationsTab : ViewModelBase
     [ObservableProperty] public partial int OverwrittenCount { get; private set; }
     [ObservableProperty] public partial int DeletedCount { get; private set; }
 
+    /// <summary>The clickable summary chips (Untouched / New / Overwritten / Deleted). None selected →
+    /// the list shows everything; selecting one or more narrows it to destinations of that kind.</summary>
+    [ObservableProperty] public partial IReadOnlyList<DryRunStatusFilter> StatusFilters { get; private set; } = [];
+
+    /// <summary>Whether any status chip is selected — drives the clear (✕) button's visibility.</summary>
+    public bool AnyStatusSelected => StatusFilters.Any(f => f.IsSelected);
+
     public void Load(IReadOnlyList<DryRunDestinationRow> rows, string? commonRoot)
     {
         _applying = true;
@@ -954,6 +1035,7 @@ public sealed partial class DryRunDestinationsTab : ViewModelBase
         NewCount = entries.Count(e => e.IsNew);
         OverwrittenCount = entries.Count(e => e.IsOverwritten);
         DeletedCount = entries.Count(e => e.IsDeleted);
+        StatusFilters = BuildStatusFilters();
 
         SourceFacets = DryRunFacets.Build(CountBy(_all, r => r.SourceRoot ?? NoSourceKey), OnFacetChanged);
         ShowSourceFacet = SourceFacets.Count > 0;
@@ -983,7 +1065,52 @@ public sealed partial class DryRunDestinationsTab : ViewModelBase
         SearchText = "";
         ShowTree = false;
         UntouchedCount = NewCount = OverwrittenCount = DeletedCount = 0;
+        StatusFilters = [];
+        OnPropertyChanged(nameof(AnyStatusSelected));
         _applying = false;
+    }
+
+    /// <summary>The status chips for this tab, wired so toggling one re-filters the list.</summary>
+    private IReadOnlyList<DryRunStatusFilter> BuildStatusFilters()
+    {
+        DryRunStatusFilter[] filters =
+        [
+            new() { Key = "untouched",   Label = "Untouched",   IconKey = "IconUntouched", ColorKey = "Brush.Info",    Count = UntouchedCount },
+            new() { Key = "new",         Label = "New",         IconKey = "IconAdd",       ColorKey = "Brush.Success", Count = NewCount },
+            new() { Key = "overwritten", Label = "Overwritten", IconKey = "IconOverwrite", ColorKey = "Brush.Warning", Count = OverwrittenCount },
+            new() { Key = "deleted",     Label = "Deleted",     IconKey = "IconTrash",     ColorKey = "Brush.Danger",  Count = DeletedCount },
+        ];
+        foreach (DryRunStatusFilter f in filters)
+            f.PropertyChanged += OnStatusFilterChanged;
+        return filters;
+    }
+
+    /// <summary>The selected status keys, or null when none are selected (the common case → show all).</summary>
+    private HashSet<string>? SelectedStatusKeys()
+    {
+        HashSet<string> keys = StatusFilters.Where(f => f.IsSelected).Select(f => f.Key).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        return keys.Count == 0 ? null : keys;
+    }
+
+    /// <summary>The status-chip key a destination entry filters under (mirrors the summary vocabulary);
+    /// Unknown entries carry no summary chip, so they never survive an active status filter.</summary>
+    private static string StatusKey(DestinationRowKind kind) => kind switch
+    {
+        DestinationRowKind.Untouched => "untouched",
+        DestinationRowKind.New => "new",
+        DestinationRowKind.Overwritten => "overwritten",
+        DestinationRowKind.Deleted => "deleted",
+        _ => "unknown",
+    };
+
+    [RelayCommand]
+    private void ClearStatusFilters()
+    {
+        _applying = true;
+        foreach (DryRunStatusFilter f in StatusFilters) f.IsSelected = false;
+        _applying = false;
+        OnPropertyChanged(nameof(AnyStatusSelected));
+        Rebuild();
     }
 
     partial void OnSearchTextChanged(string value)
@@ -1012,6 +1139,16 @@ public sealed partial class DryRunDestinationsTab : ViewModelBase
         }
     }
 
+    private void OnStatusFilterChanged(object? sender, PropertyChangedEventArgs e)
+    {
+        if (_applying) return;
+        if (e.PropertyName == nameof(DryRunStatusFilter.IsSelected))
+        {
+            OnPropertyChanged(nameof(AnyStatusSelected));
+            Rebuild();
+        }
+    }
+
     private async Task DebouncedRebuildAsync(CancellationToken ct)
     {
         try
@@ -1033,10 +1170,11 @@ public sealed partial class DryRunDestinationsTab : ViewModelBase
         string? term = string.IsNullOrWhiteSpace(SearchText) ? null : SearchText.Trim();
         HashSet<string>? sources = DryRunFacets.SelectedKeys(SourceFacets);
         HashSet<string>? destinations = DryRunFacets.SelectedKeys(DestinationFacets);
+        HashSet<string>? statuses = SelectedStatusKeys();
 
         // Filter at the destination-entry level and drop rows left with nothing, so a grouped row
-        // shows only the destinations that survived the destination-facet / search filters. The source
-        // facet applies to the whole row; a search hit on the source path keeps all of its entries.
+        // shows only the destinations that survived the destination-facet / status / search filters.
+        // The source facet applies to the whole row; a search hit on the source path keeps all entries.
         List<DryRunDestinationRow> visible = [];
         foreach (DryRunDestinationRow row in _all)
         {
@@ -1045,6 +1183,7 @@ public sealed partial class DryRunDestinationsTab : ViewModelBase
 
             IEnumerable<DryRunDestinationEntry> entries = row.Destinations;
             if (destinations is not null) entries = entries.Where(e => destinations.Contains(e.TargetRoot));
+            if (statuses is not null) entries = entries.Where(e => statuses.Contains(StatusKey(e.Kind)));
             if (term is not null
                 && !(row.SourceFileName is not null && DryRunPaths.PathContains(row.SourceDirPath!, row.SourceFileName, term)))
                 entries = entries.Where(e => e.Matches(term));

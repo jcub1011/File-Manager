@@ -45,6 +45,18 @@
                       Content="{Binding Label}" ToolTip.Tip="{Binding Key}" />
         </DataTemplate>
 
+        <!-- A summary status chip that doubles as a filter: a toggleable StatusCount (icon + count).
+             Selecting one or more narrows the pane's list to rows carrying that status; the chip's
+             checked state is styled in Controls.axaml (ToggleButton.statusFilter). -->
+        <DataTemplate x:Key="StatusFilterTemplate" x:DataType="vm:DryRunStatusFilter">
+            <ToggleButton Classes="statusFilter" IsChecked="{Binding IsSelected}"
+                          ToolTip.Tip="{Binding Label}" Margin="0,0,8,0" Padding="7,3">
+                <ctrl:StatusCount Text="{Binding CountText}"
+                                  Icon="{Binding IconKey, Converter={x:Static conv:IconConverters.Geometry}}"
+                                  Glyph="{Binding ColorKey, Converter={x:Static conv:IconConverters.Brush}}" />
+            </ToggleButton>
+        </DataTemplate>
+
         <!-- One destination volume: header (root + settled used/free), the nested-increment storage
              bar, a details line, an optional warning, and an optional per-target-root drill-down. -->
         <DataTemplate x:Key="VolumeSpaceTemplate" x:DataType="vm:VolumeSpaceRow">
@@ -269,18 +281,22 @@
                                    VerticalAlignment="Center" ToolTip.Tip="{Binding Sources.CommonRoot}" />
                     </Grid>
 
-                    <!-- summary: icon + whole-run count (kind in the tooltip) -->
-                    <WrapPanel Grid.Row="1">
-                        <ctrl:StatusCount Margin="0,0,14,0" ToolTip.Tip="Untouched"
-                                          Text="{Binding Sources.UntouchedCount, StringFormat={}{0:N0}}"
-                                          Icon="{StaticResource IconUntouched}" Glyph="{DynamicResource Brush.Info}" />
-                        <ctrl:StatusCount Margin="0,0,14,0" ToolTip.Tip="Processed"
-                                          Text="{Binding Sources.ProcessedCount, StringFormat={}{0:N0}}"
-                                          Icon="{StaticResource IconCheckmark}" Glyph="{DynamicResource Brush.Success}" />
-                        <ctrl:StatusCount Margin="0,0,14,0" ToolTip.Tip="Deleted"
-                                          Text="{Binding Sources.DeletedCount, StringFormat={}{0:N0}}"
-                                          Icon="{StaticResource IconTrash}" Glyph="{DynamicResource Brush.Danger}" />
-                    </WrapPanel>
+                    <!-- summary: whole-run counts that double as status filters. None selected → the
+                         list shows everything; selecting one or more narrows it. The ✕ (right) clears
+                         them, and only appears while a status filter is active. -->
+                    <Grid Grid.Row="1" ColumnDefinitions="*,Auto">
+                        <ItemsControl Grid.Column="0" ItemsSource="{Binding Sources.StatusFilters}"
+                                      ItemTemplate="{StaticResource StatusFilterTemplate}">
+                            <ItemsControl.ItemsPanel>
+                                <ItemsPanelTemplate><WrapPanel /></ItemsPanelTemplate>
+                            </ItemsControl.ItemsPanel>
+                        </ItemsControl>
+                        <Button Grid.Column="1" Classes="iconButton" Content="✕" FontSize="12" Padding="6,2"
+                                VerticalAlignment="Center"
+                                IsVisible="{Binding Sources.AnyStatusSelected}"
+                                Command="{Binding Sources.ClearStatusFiltersCommand}"
+                                ToolTip.Tip="Clear status filters" />
+                    </Grid>
 
                     <!-- toolbar: search (stretches) | Filter flyout | list/tree toggle -->
                     <Grid Grid.Row="2" ColumnDefinitions="*,Auto,Auto">
@@ -383,20 +399,20 @@
                                    VerticalAlignment="Center" ToolTip.Tip="{Binding Destinations.CommonRoot}" />
                     </Grid>
 
-                    <WrapPanel Grid.Row="1">
-                        <ctrl:StatusCount Margin="0,0,14,0" ToolTip.Tip="Untouched"
-                                          Text="{Binding Destinations.UntouchedCount, StringFormat={}{0:N0}}"
-                                          Icon="{StaticResource IconUntouched}" Glyph="{DynamicResource Brush.Info}" />
-                        <ctrl:StatusCount Margin="0,0,14,0" ToolTip.Tip="New"
-                                          Text="{Binding Destinations.NewCount, StringFormat={}{0:N0}}"
-                                          Icon="{StaticResource IconAdd}" Glyph="{DynamicResource Brush.Success}" />
-                        <ctrl:StatusCount Margin="0,0,14,0" ToolTip.Tip="Overwritten"
-                                          Text="{Binding Destinations.OverwrittenCount, StringFormat={}{0:N0}}"
-                                          Icon="{StaticResource IconOverwrite}" Glyph="{DynamicResource Brush.Warning}" />
-                        <ctrl:StatusCount Margin="0,0,14,0" ToolTip.Tip="Deleted"
-                                          Text="{Binding Destinations.DeletedCount, StringFormat={}{0:N0}}"
-                                          Icon="{StaticResource IconTrash}" Glyph="{DynamicResource Brush.Danger}" />
-                    </WrapPanel>
+                    <!-- summary: whole-run counts that double as status filters (see Sources). -->
+                    <Grid Grid.Row="1" ColumnDefinitions="*,Auto">
+                        <ItemsControl Grid.Column="0" ItemsSource="{Binding Destinations.StatusFilters}"
+                                      ItemTemplate="{StaticResource StatusFilterTemplate}">
+                            <ItemsControl.ItemsPanel>
+                                <ItemsPanelTemplate><WrapPanel /></ItemsPanelTemplate>
+                            </ItemsControl.ItemsPanel>
+                        </ItemsControl>
+                        <Button Grid.Column="1" Classes="iconButton" Content="✕" FontSize="12" Padding="6,2"
+                                VerticalAlignment="Center"
+                                IsVisible="{Binding Destinations.AnyStatusSelected}"
+                                Command="{Binding Destinations.ClearStatusFiltersCommand}"
+                                ToolTip.Tip="Clear status filters" />
+                    </Grid>
 
                     <Grid Grid.Row="2" ColumnDefinitions="*,Auto,Auto">
                         <TextBox Grid.Column="0" Text="{Binding Destinations.SearchText}"
