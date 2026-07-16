@@ -882,7 +882,7 @@ public sealed partial class DryRunDestinationsTab : ViewModelBase
         new("unknown", "unknown", "IconQuestion", "Brush.Muted"),
     ];
 
-    private const string NoSourceKey = "(no source)";
+    private const string NoSourceKey = "[From Destination]";
 
     private readonly TimeSpan _searchDebounce;
     private CancellationTokenSource? _searchCts;
