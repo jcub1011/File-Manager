@@ -60,6 +60,7 @@ public sealed class SerializationTests
         { new MatchingProfilesResponse { Matches = [] }, "matching" },
         { new DryRunResponse { Report = SampleReport() }, "dry-run-report" },
         { new DryRunChunkResponse { Directories = SampleDirectories(), SourceFiles = [SampleWireFile()], SourceOperations = [SampleWireSourceOp()] }, "dry-run-chunk" },
+        { new DryRunProgressResponse { Phase = DryRunProgressPhase.ScanningSources, SourceFiles = 1, DestinationFiles = 2 }, "dry-run-progress" },
         { new DryRunCompleteResponse { GeneratedAt = DateTimeOffset.UnixEpoch, Truncated = false }, "dry-run-complete" },
         { new RecentJobsResponse { Jobs = [] }, "recent-jobs" },
         { new JobLogResponse { Lines = ["a"] }, "job-log" },

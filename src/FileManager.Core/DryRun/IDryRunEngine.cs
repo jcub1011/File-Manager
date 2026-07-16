@@ -18,9 +18,12 @@ public interface IDryRunEngine
     /// into the fully assembled lists. A fatal setup/scan error is a single failure item that ends
     /// the stream; cancellation surfaces as <see cref="OperationCanceledException"/> from the
     /// enumerator. The stream carries only the per-source-file phase; the destination sweep
-    /// (orphans / untouched) is run by the handler after the file phase.</summary>
+    /// (orphans / untouched) is run by the handler after the file phase. When
+    /// <paramref name="progress"/> is supplied, its source counter is incremented per scanned
+    /// candidate so a caller can sample it for live progress.</summary>
     IAsyncEnumerable<Result<DryRunChunk, string>> SimulateStreamAsync(
-        Guid profileId, string? scopePath, CancellationToken ct = default);
+        Guid profileId, string? scopePath, DryRunProgressCounters? progress = null,
+        CancellationToken ct = default);
 }
 
 /// <summary>One streamed slice of a dry-run report. Indices in the operations are already global

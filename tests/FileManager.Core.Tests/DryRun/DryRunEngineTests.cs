@@ -121,7 +121,7 @@ public sealed class DryRunEngineTests : IDisposable
     {
         List<PhysicalFile> files = [];
         Dictionary<int, VirtualFileOperation> ops = [];
-        await foreach (Result<DryRunChunk, string> chunk in engine.SimulateStreamAsync(profileId, scope, ct))
+        await foreach (Result<DryRunChunk, string> chunk in engine.SimulateStreamAsync(profileId, scope, ct: ct))
         {
             Assert.True(chunk.TryGetValue(out DryRunChunk? c), "stream yielded a failure chunk");
             files.AddRange(c!.SourceFiles);
@@ -688,7 +688,7 @@ public sealed class DryRunEngineTests : IDisposable
 
         await Assert.ThrowsAnyAsync<OperationCanceledException>(async () =>
         {
-            await foreach (var _ in NewEngine(profile).SimulateStreamAsync(profile.Id, null, cts.Token))
+            await foreach (var _ in NewEngine(profile).SimulateStreamAsync(profile.Id, null, ct: cts.Token))
             {
             }
         });

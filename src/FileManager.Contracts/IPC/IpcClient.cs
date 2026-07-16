@@ -128,7 +128,9 @@ public sealed class IpcClient : IAsyncDisposable
 
     /// <summary>Sends a streaming dry-run request and reassembles the chunk frames
     /// (<see cref="DryRunChunkResponse"/>) into one <see cref="DryRunReport"/>, stopping at the
-    /// <see cref="DryRunCompleteResponse"/> terminator. Because the report arrives as many small
+    /// <see cref="DryRunCompleteResponse"/> terminator. Interleaved <see cref="DryRunProgressResponse"/>
+    /// frames are relayed to <paramref name="progress"/> (when supplied) without touching reassembly.
+    /// Because the report arrives as many small
     /// frames it is not bounded by the single-frame size cap. An ErrorResponse (e.g. PROFILE_NOT_FOUND,
     /// DRY_RUN_FAILED) and every transport fault surface as an <see cref="IpcError"/>; cancellation is
     /// a Canceled result, never a throw. Holds the request gate for the whole stream (§3.2).
@@ -137,7 +139,7 @@ public sealed class IpcClient : IAsyncDisposable
     /// therefore be discarded after a cancellation (as callers do — one connection per dry run);
     /// reusing it for another request would read the stale frames and desync the protocol.</summary>
     public async Task<Result<DryRunReport, IpcError>> DryRunStreamAsync(
-        DryRunStreamRequest request, CancellationToken ct = default)
+        DryRunStreamRequest request, IProgress<DryRunProgress>? progress = null, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
 
@@ -222,6 +224,11 @@ public sealed class IpcClient : IAsyncDisposable
                             Truncated = complete.Truncated,
                             Space = complete.Space,
                         };
+                    case DryRunProgressResponse progressFrame:
+                        // Informational only — reassembly state is untouched, the loop just continues.
+                        progress?.Report(new DryRunProgress(
+                            progressFrame.Phase, progressFrame.SourceFiles, progressFrame.DestinationFiles));
+                        break;
                     case ErrorResponse error:
                         return new IpcError(error.Code, error.Message);
                     default:

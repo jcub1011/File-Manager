@@ -67,7 +67,7 @@ public sealed class IpcGateway : IIpcGateway, IAsyncDisposable
             new ShutdownRequest(), static _ => true, ct);
 
     public async Task<Result<DryRunReport, IpcError>> DryRunAsync(
-        Guid profileId, CancellationToken ct = default)
+        Guid profileId, IProgress<DryRunProgress>? progress = null, CancellationToken ct = default)
     {
         // Own connection: cancel = dispose, leaving the shared channel clean.
         var connected = await ServiceLauncher.ConnectOrStartAsync(ct).ConfigureAwait(false);
@@ -87,7 +87,7 @@ public sealed class IpcGateway : IIpcGateway, IAsyncDisposable
             // simulates every source (ScopePath stays null) and focuses the result in the view;
             // scoped enumeration remains a service/CLI capability.
             var response = await client!.DryRunStreamAsync(
-                new DryRunStreamRequest { ProfileId = profileId, ScopePath = null }, ct).ConfigureAwait(false);
+                new DryRunStreamRequest { ProfileId = profileId, ScopePath = null }, progress, ct).ConfigureAwait(false);
             if (response.IsCanceled)
                 return Result<DryRunReport, IpcError>.Canceled();
             if (response.TryGetError(out IpcError? error))

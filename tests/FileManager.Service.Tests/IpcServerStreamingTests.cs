@@ -61,6 +61,14 @@ public sealed class IpcServerStreamingTests : IAsyncLifetime
                     }))
                     .ToList();
                 yield return new DryRunChunkResponse { Directories = dirs.FlushNew(), SourceFiles = files, SourceOperations = ops };
+                // An informational progress frame after every chunk: the client must relay it to the
+                // caller's IProgress and reassemble the report exactly as if it were not there.
+                yield return new DryRunProgressResponse
+                {
+                    Phase = DryRunProgressPhase.ScanningSources,
+                    SourceFiles = (b + 1) * 4,
+                    DestinationFiles = 0,
+                };
 
                 if (typed.ScopePath == "error-midway" && b == 1)
                 {
@@ -125,6 +133,32 @@ public sealed class IpcServerStreamingTests : IAsyncLifetime
             // The same connection still serves the next request — the stream did not desync it.
             var followUp = await client.RequestAsync<StatusResponse>(new GetStatusRequest());
             Assert.True(followUp.TryGetValue(out _));
+        }
+    }
+
+    /// <summary>Synchronous relay — unlike Progress&lt;T&gt; (which posts to the pool when there is no
+    /// UI context), reports land in the sink before DryRunStreamAsync returns, so asserts are
+    /// race-free.</summary>
+    private sealed class CollectingProgress(List<DryRunProgress> sink) : IProgress<DryRunProgress>
+    {
+        public void Report(DryRunProgress value) => sink.Add(value);
+    }
+
+    [Fact]
+    public async Task Interleaved_progress_frames_reach_the_callback_and_leave_the_report_intact()
+    {
+        var connected = await IpcClient.ConnectAsync();
+        Assert.True(connected.TryGetValue(out IpcClient? client));
+        await using (client)
+        {
+            List<DryRunProgress> updates = [];
+            var result = await client!.DryRunStreamAsync(
+                new DryRunStreamRequest { ProfileId = Guid.NewGuid() }, new CollectingProgress(updates));
+
+            Assert.True(result.TryGetValue(out DryRunReport? report));
+            Assert.Equal(12, report!.SourceFiles.Count);   // reassembly untouched by the extra frames
+            Assert.Equal([4, 8, 12], updates.Select(u => u.SourceFiles).ToArray());
+            Assert.All(updates, u => Assert.Equal(DryRunProgressPhase.ScanningSources, u.Phase));
         }
     }
 

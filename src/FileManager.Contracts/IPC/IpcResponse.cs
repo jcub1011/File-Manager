@@ -16,6 +16,7 @@ namespace FileManager.Contracts.IPC;
 [JsonDerivedType(typeof(MatchingProfilesResponse), "matching")]
 [JsonDerivedType(typeof(DryRunResponse), "dry-run-report")]
 [JsonDerivedType(typeof(DryRunChunkResponse), "dry-run-chunk")]
+[JsonDerivedType(typeof(DryRunProgressResponse), "dry-run-progress")]
 [JsonDerivedType(typeof(DryRunCompleteResponse), "dry-run-complete")]
 [JsonDerivedType(typeof(RecentJobsResponse), "recent-jobs")]
 [JsonDerivedType(typeof(JobLogResponse), "job-log")]
@@ -56,6 +57,16 @@ public sealed record DryRunChunkResponse : IpcResponse
     public IReadOnlyList<DryRunFile> DestinationFiles { get; init; } = [];
     public IReadOnlyList<DryRunOperation> SourceOperations { get; init; } = [];
     public IReadOnlyList<DryRunOperation> DestinationOperations { get; init; } = [];
+}
+/// <summary>An informational progress snapshot interleaved in a streamed dry run. Zero or more may
+/// appear anywhere in the stream before the <see cref="DryRunCompleteResponse"/> terminator; they
+/// carry no report data and do not affect chunk reassembly. Counts are cumulative files discovered
+/// so far (see <see cref="DryRunProgress"/>).</summary>
+public sealed record DryRunProgressResponse : IpcResponse
+{
+    public required DryRunProgressPhase Phase { get; init; }
+    public required long SourceFiles { get; init; }
+    public required long DestinationFiles { get; init; }
 }
 /// <summary>Terminates a streamed dry-run report. GeneratedAt is stamped when the report finishes;
 /// Truncated is true only if a service-side safety bound cut the report short.</summary>

@@ -27,9 +27,10 @@ public abstract record IpcRequest
 {
     /// <summary>The protocol this build speaks. History: 1 — original wire format; 2 — dry-run
     /// chunks normalized against a shared directory table (DryRunDirectory/DryRunFile/
-    /// DryRunOperation replace flat path strings). A mismatched service/UI pair must fail loud
+    /// DryRunOperation replace flat path strings); 3 — dry-run streams may interleave
+    /// dry-run-progress frames before the terminator. A mismatched service/UI pair must fail loud
     /// (IPC_VERSION_MISMATCH), never half-parse.</summary>
-    public const int CurrentProtocolVersion = 2;
+    public const int CurrentProtocolVersion = 3;
 
     public int ProtocolVersion { get; init; } = CurrentProtocolVersion;
 }

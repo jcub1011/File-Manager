@@ -23,7 +23,11 @@ public interface IIpcGateway
     Task<Result<Profile, IpcError>> GetProfileAsync(Guid profileId, CancellationToken ct = default);
     Task<Result<SaveOutcome, IpcError>> SaveProfileAsync(Profile profile, bool acknowledgeWarnings, CancellationToken ct = default);
     Task<Result<bool, IpcError>> DeleteProfileAsync(Guid profileId, CancellationToken ct = default);
-    Task<Result<DryRunReport, IpcError>> DryRunAsync(Guid profileId, CancellationToken ct = default);
+    /// <summary>Runs a streamed dry run. <paramref name="progress"/> (when supplied) receives
+    /// throttled discovery updates as the service reports them; construct the
+    /// <see cref="Progress{T}"/> on the UI thread so reports marshal there automatically.</summary>
+    Task<Result<DryRunReport, IpcError>> DryRunAsync(
+        Guid profileId, IProgress<DryRunProgress>? progress = null, CancellationToken ct = default);
     Task<Result<GlobalSettings, IpcError>> GetSettingsAsync(CancellationToken ct = default);
     Task<Result<GlobalSettings, IpcError>> SaveSettingsAsync(GlobalSettings settings, CancellationToken ct = default);
     /// <summary>Asks the service to shut itself down (StartAndStopWithProgram mode on UI close).</summary>

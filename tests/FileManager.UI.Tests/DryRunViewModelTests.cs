@@ -685,6 +685,50 @@ public sealed class DryRunViewModelTests
     }
 
     [Fact]
+    public async Task Run_status_shows_phases_and_clears_when_the_run_completes()
+    {
+        var (viewModel, gateway) = NewViewModel();
+        gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value);
+        List<string> observed = [];
+        viewModel.PropertyChanged += (_, e) =>
+        {
+            if (e.PropertyName == nameof(DryRunViewModel.RunStatusText))
+                observed.Add(viewModel.RunStatusText);
+        };
+
+        await viewModel.RunAsync(CancellationToken.None);
+
+        // The synchronous phase transitions: an immediate scanning caption, the building caption
+        // once the gateway resolves, and empty once the run is over.
+        Assert.Equal("Scanning sources…", observed.First());
+        Assert.Contains("Building the lists…", observed);
+        Assert.Equal("", viewModel.RunStatusText);
+    }
+
+    [Fact]
+    public async Task Run_status_formats_streamed_progress_counts()
+    {
+        var (viewModel, gateway) = NewViewModel();
+        gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value);
+        gateway.ScriptedProgress = [new DryRunProgress(DryRunProgressPhase.ScanningSources, 12345, 0)];
+        gateway.DryRunGate = new TaskCompletionSource();
+
+        Task running = viewModel.RunAsync(CancellationToken.None);
+
+        // Progress<T> marshals its reports through the ambient context, so the caption update is
+        // asynchronous relative to the fake's Report call — wait for it (bounded) instead of racing.
+        string expected = $"Scanning sources… {12345:N0} files found";
+        for (int i = 0; i < 200 && viewModel.RunStatusText != expected; i++)
+            await Task.Delay(10);
+        Assert.Equal(expected, viewModel.RunStatusText);
+
+        gateway.DryRunGate.SetResult();
+        await running;
+
+        Assert.Equal("", viewModel.RunStatusText);
+    }
+
+    [Fact]
     public async Task Cancellation_resets_to_a_calm_state()
     {
         var (viewModel, gateway) = NewViewModel();

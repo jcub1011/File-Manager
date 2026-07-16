@@ -126,7 +126,8 @@ public sealed class DryRunEngine(
         try
         {
             outcome = await ScanAndEvaluateAsync(
-                profile, scopePath, filtersBySourceRoot!, hasTransformers, MaxBatchCandidates, counters, ct)
+                profile, scopePath, filtersBySourceRoot!, hasTransformers, MaxBatchCandidates, counters,
+                progress: null, ct)
                 .ConfigureAwait(false);
         }
         catch (OperationCanceledException)
@@ -219,7 +220,8 @@ public sealed class DryRunEngine(
     /// after the file phase). A fatal setup/scan error is a single failure item that ends the stream;
     /// cancellation surfaces as <see cref="OperationCanceledException"/> from the enumerator.</summary>
     public async IAsyncEnumerable<Result<DryRunChunk, string>> SimulateStreamAsync(
-        Guid profileId, string? scopePath, [EnumeratorCancellation] CancellationToken ct = default)
+        Guid profileId, string? scopePath, DryRunProgressCounters? progress = null,
+        [EnumeratorCancellation] CancellationToken ct = default)
     {
         DateTimeOffset startedAt = time.GetUtcNow();
         if (logger.IsEnabled(LogLevel.Information))
@@ -253,7 +255,8 @@ public sealed class DryRunEngine(
         // OperationCanceledException from the enumerator, exactly as before.
         RunCounters counters = new();
         PipelineOutcome outcome = await ScanAndEvaluateAsync(
-            profile, scopePath, filtersBySourceRoot!, hasTransformers, MaxScannedCandidates, counters, ct)
+            profile, scopePath, filtersBySourceRoot!, hasTransformers, MaxScannedCandidates, counters,
+            progress, ct)
             .ConfigureAwait(false);
 
         if (outcome.FatalScanError is not null)
@@ -351,6 +354,7 @@ public sealed class DryRunEngine(
         bool hasTransformers,
         int candidateCap,
         RunCounters counters,
+        DryRunProgressCounters? progress,
         CancellationToken ct)
     {
         using CancellationTokenSource linked = CancellationTokenSource.CreateLinkedTokenSource(ct);
@@ -399,6 +403,7 @@ public sealed class DryRunEngine(
                     scanned.TryGetValue(out Payload? payload);
                     await channel.Writer.WriteAsync(payload!, linked.Token).ConfigureAwait(false);
                     accepted++;
+                    progress?.SourceDiscovered();
                 }
             }
             finally

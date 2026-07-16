@@ -52,6 +52,10 @@ internal sealed class FakeIpcGateway : IIpcGateway
     /// <summary>When set, DryRunAsync throws it (unexpected-exception tests).</summary>
     public Exception? DryRunException { get; set; }
 
+    /// <summary>When set, DryRunAsync reports these to the caller's IProgress (synchronously, in
+    /// order) before returning — progress-caption tests.</summary>
+    public IReadOnlyList<DryRunProgress>? ScriptedProgress { get; set; }
+
     public Task<Result<EngineStatusSnapshot, IpcError>> GetStatusAsync(CancellationToken ct = default) =>
         Task.FromResult(StatusResult);
 
@@ -75,11 +79,14 @@ internal sealed class FakeIpcGateway : IIpcGateway
     }
 
     public async Task<Result<DryRunReport, IpcError>> DryRunAsync(
-        Guid profileId, CancellationToken ct = default)
+        Guid profileId, IProgress<DryRunProgress>? progress = null, CancellationToken ct = default)
     {
         DryRunCalls.Add(profileId);
         if (DryRunException is not null)
             throw DryRunException;
+        if (ScriptedProgress is not null && progress is not null)
+            foreach (DryRunProgress update in ScriptedProgress)
+                progress.Report(update);
         if (DryRunGate is not null)
         {
             try

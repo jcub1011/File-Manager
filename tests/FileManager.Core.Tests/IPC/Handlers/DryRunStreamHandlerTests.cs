@@ -32,7 +32,8 @@ public sealed class DryRunStreamHandlerTests
             throw new NotSupportedException();
 
         public async IAsyncEnumerable<Result<DryRunChunk, string>> SimulateStreamAsync(
-            Guid profileId, string? scopePath, [EnumeratorCancellation] CancellationToken ct = default)
+            Guid profileId, string? scopePath, DryRunProgressCounters? progress = null,
+            [EnumeratorCancellation] CancellationToken ct = default)
         {
             for (int emitted = 0; emitted < totalFiles;)
             {
@@ -132,7 +133,8 @@ public sealed class DryRunStreamHandlerTests
             throw new NotSupportedException();
 
         public async IAsyncEnumerable<Result<DryRunChunk, string>> SimulateStreamAsync(
-            Guid profileId, string? scopePath, [EnumeratorCancellation] CancellationToken ct = default)
+            Guid profileId, string? scopePath, DryRunProgressCounters? progress = null,
+            [EnumeratorCancellation] CancellationToken ct = default)
         {
             foreach (DryRunChunk chunk in chunks)
             {
@@ -274,5 +276,56 @@ public sealed class DryRunStreamHandlerTests
         {
             Directory.Delete(root, recursive: true);
         }
+    }
+
+    // ── Interleaved progress frames ──────────────────────────────────────────────────────────────
+
+    /// <summary>Holds the stream's first advance open long enough for the handler's progress poll
+    /// (100 ms) to observe the source counter moving, mimicking the real engine (whose whole scan
+    /// runs inside the first MoveNextAsync), then yields one chunk.</summary>
+    private sealed class SlowScanEngine : IDryRunEngine
+    {
+        public Task<Result<DryRunReport, string>> SimulateAsync(
+            Guid profileId, string? scopePath, CancellationToken ct = default) =>
+            throw new NotSupportedException();
+
+        public async IAsyncEnumerable<Result<DryRunChunk, string>> SimulateStreamAsync(
+            Guid profileId, string? scopePath, DryRunProgressCounters? progress = null,
+            [EnumeratorCancellation] CancellationToken ct = default)
+        {
+            for (int i = 0; i < 3; i++)
+            {
+                progress?.SourceDiscovered();
+                await Task.Delay(150, ct);
+            }
+            yield return Result<DryRunChunk, string>.Success(new DryRunChunk(
+                [Phys(@"C:\src\a.dat", @"C:\src")], [],
+                [Op(@"C:\src\a.dat", @"C:\src", OperationKind.Processed, 0)], []));
+        }
+    }
+
+    [Fact]
+    public async Task Interleaves_throttled_progress_frames_without_disturbing_the_report()
+    {
+        Profile profile = TestProfiles.Valid();
+        DryRunStreamHandler handler = NewHandler(profile, new SlowScanEngine(), maxStreamedFiles: 500);
+
+        List<IpcResponse> frames = await Collect(handler, profile.Id);
+
+        // A live scan count reached the stream before the first data chunk.
+        int firstChunk = frames.FindIndex(f => f is DryRunChunkResponse);
+        int firstScan = frames.FindIndex(f => f is DryRunProgressResponse { Phase: DryRunProgressPhase.ScanningSources });
+        Assert.True(firstScan >= 0, "expected at least one ScanningSources progress frame");
+        Assert.True(firstChunk >= 0 && firstScan < firstChunk, "scan progress must precede the first chunk");
+        Assert.True(((DryRunProgressResponse)frames[firstScan]).SourceFiles > 0);
+
+        // Exactly one BuildingLists frame, carrying the final discovery counts.
+        DryRunProgressResponse building = Assert.Single(
+            frames.OfType<DryRunProgressResponse>().Where(p => p.Phase == DryRunProgressPhase.BuildingLists));
+        Assert.Equal(3, building.SourceFiles);
+
+        // The terminator is still last, and reassembly sees the same single-file report.
+        Assert.IsType<DryRunCompleteResponse>(frames[^1]);
+        Assert.Equal(1, frames.OfType<DryRunChunkResponse>().Sum(c => c.SourceFiles.Count));
     }
 }

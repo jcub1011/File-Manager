@@ -196,11 +196,22 @@
                         IsVisible="{Binding RunCommand.IsRunning}" />
             </StackPanel>
 
+            <!-- Live run status: phase + discovery counts while the dry run works. Shares Column 1
+                 with the blast-radius chips — the chips hide during a run (see the MultiBinding
+                 below) so a re-run's stale numbers never sit beside the live caption. -->
+            <TextBlock Grid.Column="1" Margin="12,0,12,0" VerticalAlignment="Center" Classes="caption"
+                       Text="{Binding RunStatusText}" IsVisible="{Binding RunCommand.IsRunning}" />
+
             <!-- blast-radius: icon + count, in a WrapPanel so they wrap rather than clip when the
                  window is narrow (the two 360-min list columns already eat the width). The kind is in
                  each icon's tooltip. -->
-            <WrapPanel Grid.Column="1" Margin="12,0,12,0" VerticalAlignment="Center"
-                       IsVisible="{Binding HasReport}">
+            <WrapPanel Grid.Column="1" Margin="12,0,12,0" VerticalAlignment="Center">
+                <WrapPanel.IsVisible>
+                    <MultiBinding Converter="{x:Static BoolConverters.And}">
+                        <Binding Path="HasReport" />
+                        <Binding Path="!RunCommand.IsRunning" />
+                    </MultiBinding>
+                </WrapPanel.IsVisible>
                 <ctrl:StatusCount Margin="0,2,12,2" ToolTip.Tip="Files scanned"
                                   Text="{Binding TotalFiles, StringFormat={}{0:N0}}"
                                   Icon="{StaticResource IconDocument}" Glyph="{DynamicResource Brush.Text.Secondary}" />

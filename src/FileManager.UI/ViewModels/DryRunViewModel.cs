@@ -1773,6 +1773,12 @@ public sealed partial class DryRunViewModel : ViewModelBase
     [ObservableProperty] public partial bool WasTruncated { get; set; }
     [ObservableProperty] public partial string TruncationNotice { get; set; } = "";
 
+    /// <summary>Live phase/count caption shown beside the run buttons while a dry run works
+    /// ("Scanning sources… 12,345 files found" → destinations → "Building the lists…"). The view
+    /// gates its visibility on <c>RunCommand.IsRunning</c>, so a late progress post after the run
+    /// ends is harmless.</summary>
+    [ObservableProperty] public partial string RunStatusText { get; set; } = "";
+
     // Blast-radius banner numbers (spec §8: deletions and overwrites are the report's whole point).
     [ObservableProperty] public partial int TotalFiles { get; set; }
     [ObservableProperty] public partial int OverwriteCount { get; set; }
@@ -1808,10 +1814,14 @@ public sealed partial class DryRunViewModel : ViewModelBase
             return;
         int epoch = _reportEpoch;
         ErrorMessage = null;
+        RunStatusText = "Scanning sources…";
+        // Constructed on the UI thread, so Progress<T> captures the UI SynchronizationContext and
+        // every report marshals there — the service's throttling (~10 frames/sec) bounds the load.
+        var progress = new Progress<DryRunProgress>(p => RunStatusText = FormatRunStatus(p));
 
         try
         {
-            var run = await _gateway.DryRunAsync(profileId, ct);
+            var run = await _gateway.DryRunAsync(profileId, progress, ct);
             if (run.IsCanceled)
             {
                 Log.Debug("Dry run for profile {ProfileId} cancelled by the user", profileId);
@@ -1826,6 +1836,9 @@ public sealed partial class DryRunViewModel : ViewModelBase
                 return;
             }
             run.TryGetValue(out DryRunReport? report);
+            // Set unconditionally (not only via a progress frame): a fast run may finish before any
+            // frame arrives, and the projection below is real seconds of work worth labelling.
+            RunStatusText = "Building the lists…";
             // Projecting a full report is seconds of CPU at the streamed cap, so it runs on the
             // thread pool. No ConfigureAwait(false): the continuation must resume on the UI
             // context so ApplyPrepared raises its property changes on the UI thread.
@@ -1848,7 +1861,18 @@ public sealed partial class DryRunViewModel : ViewModelBase
             Log.Error(ex, "Dry run for profile {ProfileId} failed unexpectedly", profileId);
             ErrorMessage = $"Dry run failed unexpectedly: {ex.Message}";
         }
+        finally
+        {
+            RunStatusText = "";
+        }
     }
+
+    private static string FormatRunStatus(DryRunProgress p) => p.Phase switch
+    {
+        DryRunProgressPhase.ScanningSources => $"Scanning sources… {p.SourceFiles:N0} files found",
+        DryRunProgressPhase.SweepingDestinations => $"Scanning destinations… {p.DestinationFiles:N0} files found",
+        _ => "Building the lists…",
+    };
 
     /// <summary>Shared by every source row with no destination ops (skipped files, ~2/3 of a typical
     /// report) — a fresh empty list per row is ~10 MB at the streamed cap.</summary>

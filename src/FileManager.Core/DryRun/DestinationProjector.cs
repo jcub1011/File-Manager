@@ -76,8 +76,11 @@ public sealed class DestinationProjector(
     /// the degree of parallelism to the target medium (local vs. network).</param>
     /// <param name="maxEntries">Best-effort upper bound on emitted entries — workers stop feeding the
     /// sink once it is crossed and the merge trims to exactly this many, marking the result capped.</param>
+    /// <param name="progress">When supplied, its destination counter is incremented per classified
+    /// file so a caller can sample it for live progress.</param>
     public DestinationSweepResult Sweep(
-        Profile profile, ISet<NormalizedPath> survivors, bool truncated, int? manualWorkers, CancellationToken ct, int maxEntries = int.MaxValue)
+        Profile profile, ISet<NormalizedPath> survivors, bool truncated, int? manualWorkers, CancellationToken ct,
+        int maxEntries = int.MaxValue, DryRunProgressCounters? progress = null)
     {
         ArgumentNullException.ThrowIfNull(profile);
         ArgumentNullException.ThrowIfNull(survivors);
@@ -138,7 +141,7 @@ public sealed class DestinationProjector(
                     try
                     {
                         if (!ct.IsCancellationRequested && !state.Capped)
-                            Walk(item, state, sink, survivors, sourceRoots, mirror, maxEntries);
+                            Walk(item, state, sink, survivors, sourceRoots, mirror, maxEntries, progress);
                     }
                     finally
                     {
@@ -185,7 +188,8 @@ public sealed class DestinationProjector(
         ISet<NormalizedPath> survivors,
         List<NormalizedPath> sourceRoots,
         bool mirror,
-        int maxEntries)
+        int maxEntries,
+        DryRunProgressCounters? progress)
     {
         foreach (Result<FileSystemEntry, EnumerationFault> entry in fileSystem.EnumerateEntries(item.Dir))
         {
@@ -254,6 +258,7 @@ public sealed class DestinationProjector(
                 },
                 kind,
                 isReparse ? "reparse point (symlink/junction)" : null));
+            progress?.DestinationDiscovered();
         }
     }
 

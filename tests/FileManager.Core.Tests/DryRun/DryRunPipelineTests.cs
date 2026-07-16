@@ -209,7 +209,7 @@ public sealed class DryRunPipelineTests : IDisposable
 
         await Assert.ThrowsAnyAsync<OperationCanceledException>(async () =>
         {
-            await foreach (var _ in NewEngine(scanner, profile, hasher).SimulateStreamAsync(profile.Id, null, cts.Token))
+            await foreach (var _ in NewEngine(scanner, profile, hasher).SimulateStreamAsync(profile.Id, null, ct: cts.Token))
             {
             }
         });
