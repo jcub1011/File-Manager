@@ -269,6 +269,54 @@ public sealed class DryRunViewModelTests
         Assert.Equal(new[] { "one", "two", "z" }, details);
     }
 
+    [Fact]
+    public async Task Large_report_parallel_projection_preserves_stable_ordering()
+    {
+        // Above DryRunRebuild.SyncThreshold (5,000) PrepareReport projects and sorts on the thread pool
+        // (parallel row build, parallel key fill, concurrent tab loads). This drives that path and pins
+        // the invariant it must uphold: keys sort ascending and rows equal on key keep report order.
+        // Every row's key is just its file name (all under one root); three names give three big tie
+        // groups, and each op's detail carries its report index so stable order = strictly increasing.
+        const int n = 6_000;
+        string[] names = ["a.txt", "b.txt", "c.txt"];
+        var sourceFiles = new List<DryRunFile>(n);
+        var sourceOps = new List<DryRunOperation>(n);
+        var destinationOps = new List<DryRunOperation>(n);
+        for (int i = 0; i < n; i++)
+        {
+            string src = $@"C:\src\{names[i % 3]}";
+            string dst = $@"D:\dst\{names[i % 3]}";
+            sourceFiles.Add(Pf(src, @"C:\src"));
+            sourceOps.Add(SrcOp(i, src, @"C:\src", OperationKind.Processed, OnSuccessAction.KeepSource, detail: i.ToString()));
+            destinationOps.Add(DstOp(OperationKind.New, dst, @"D:\dst", sourceIndex: i, detail: i.ToString()));
+        }
+        var (viewModel, gateway) = NewViewModel();
+        gateway.DryRunResult = Report(viewModel.ProfileId!.Value, sourceFiles, sourceOps, [], destinationOps);
+
+        await viewModel.RunAsync(CancellationToken.None);
+
+        AssertStableByName(viewModel.Sources.VisibleRows.Select(r => (r.FileName, r.DecidingFilter!)).ToList());
+        AssertStableByName(viewModel.Destinations.VisibleRows.Select(r => (r.FileName, r.Primary.Detail!)).ToList());
+
+        // Keys ascending, and within each equal-key group the report-index marker strictly increases —
+        // the tertiary original-index tiebreak the (unstable) Array.Sort depends on.
+        static void AssertStableByName(List<(string Name, string Marker)> rows)
+        {
+            Assert.Equal(n, rows.Count);
+            Assert.Equal(rows.Select(r => r.Name).OrderBy(x => x, StringComparer.OrdinalIgnoreCase).ToList(),
+                rows.Select(r => r.Name).ToList());
+            string current = "";
+            int last = -1;
+            foreach ((string name, string marker) in rows)
+            {
+                if (name != current) { current = name; last = -1; }
+                int index = int.Parse(marker);
+                Assert.True(index > last, $"stable order violated within '{name}': {index} after {last}");
+                last = index;
+            }
+        }
+    }
+
     // Builds a report of plain new-writes: one source file + one New destination op per write.
     private DryRunReport WritesReport(Guid profileId, params (string Src, string SrcRoot, string Dst, string DstRoot)[] writes)
     {

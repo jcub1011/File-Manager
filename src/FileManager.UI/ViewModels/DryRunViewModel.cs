@@ -919,12 +919,29 @@ public sealed partial class DryRunSourcesTab : ViewModelBase
         // LINQ OrderBy/ThenBy so rows equal on key+root keep report order.
         DryRunFileRow[] rowArray = rows as DryRunFileRow[] ?? rows.ToArray();
         int n = rowArray.Length;
-        Dictionary<(string, string?), string> relDirCache = [];
         string[] keys = new string[n];
-        for (int j = 0; j < n; j++)
+        if (n <= DryRunRebuild.SyncThreshold)
         {
-            DryRunFileRow r = rowArray[j];
-            keys[j] = DryRunSort.RelativeKey(r.DirPath, r.FileName, r.SourceRoot, relDirCache);
+            Dictionary<(string, string?), string> relDirCache = [];
+            for (int j = 0; j < n; j++)
+            {
+                DryRunFileRow r = rowArray[j];
+                keys[j] = DryRunSort.RelativeKey(r.DirPath, r.FileName, r.SourceRoot, relDirCache);
+            }
+        }
+        else
+        {
+            // Each partition owns a lock-free relDir cache (a shared ConcurrentDictionary would add
+            // per-lookup sync); GetRelativePath is pure, so identical keys result regardless of split.
+            Parallel.For(0, n, new ParallelOptions { CancellationToken = ct },
+                () => new Dictionary<(string, string?), string>(),
+                (j, _, cache) =>
+                {
+                    DryRunFileRow r = rowArray[j];
+                    keys[j] = DryRunSort.RelativeKey(r.DirPath, r.FileName, r.SourceRoot, cache);
+                    return cache;
+                },
+                _ => { });
         }
         ct.ThrowIfCancellationRequested();
         int[] order = new int[n];
@@ -1348,14 +1365,33 @@ public sealed partial class DryRunDestinationsTab : ViewModelBase
         // tiebreak keeps Array.Sort stable, matching the prior LINQ OrderBy/ThenBy.
         DryRunDestinationRow[] rowArray = rows as DryRunDestinationRow[] ?? rows.ToArray();
         int n = rowArray.Length;
-        Dictionary<(string, string?), string> relDirCache = [];
         string[] keys = new string[n];
-        for (int j = 0; j < n; j++)
+        if (n <= DryRunRebuild.SyncThreshold)
         {
-            DryRunDestinationRow r = rowArray[j];
-            keys[j] = r.HasSource
-                ? DryRunSort.RelativeKey(r.SourceDirPath!, r.SourceFileName!, r.SourceRoot, relDirCache)
-                : DryRunSort.RelativeKey(r.Primary.DirPath, r.Primary.FileName, r.Primary.TargetRoot, relDirCache);
+            Dictionary<(string, string?), string> relDirCache = [];
+            for (int j = 0; j < n; j++)
+            {
+                DryRunDestinationRow r = rowArray[j];
+                keys[j] = r.HasSource
+                    ? DryRunSort.RelativeKey(r.SourceDirPath!, r.SourceFileName!, r.SourceRoot, relDirCache)
+                    : DryRunSort.RelativeKey(r.Primary.DirPath, r.Primary.FileName, r.Primary.TargetRoot, relDirCache);
+            }
+        }
+        else
+        {
+            // Each partition owns a lock-free relDir cache; GetRelativePath is pure so the split can't
+            // change any key.
+            Parallel.For(0, n, new ParallelOptions { CancellationToken = ct },
+                () => new Dictionary<(string, string?), string>(),
+                (j, _, cache) =>
+                {
+                    DryRunDestinationRow r = rowArray[j];
+                    keys[j] = r.HasSource
+                        ? DryRunSort.RelativeKey(r.SourceDirPath!, r.SourceFileName!, r.SourceRoot, cache)
+                        : DryRunSort.RelativeKey(r.Primary.DirPath, r.Primary.FileName, r.Primary.TargetRoot, cache);
+                    return cache;
+                },
+                _ => { });
         }
         ct.ThrowIfCancellationRequested();
         int[] order = new int[n];
@@ -1997,11 +2033,15 @@ public sealed partial class DryRunViewModel : ViewModelBase
         string? destCommonRoot = DryRunPaths.CommonRoot(
             report.DestinationOperations.Select(o => o.RootDirIndex).Distinct().Select(i => dirPaths[i]));
 
+        // Build the source rows into a preallocated array — in parallel above the sync threshold. Each
+        // slot [i] is written once from a disjoint iteration reading only immutable inputs (dirPaths,
+        // the CSR arrays, sourceOpByIndex, EmptyTargets, sourceCommonRoot; rows are immutable records),
+        // so no locking is needed; disposalCount, the sole shared accumulator, sums partition-locals.
+        DryRunFileRow[] fileRowArr = new DryRunFileRow[sourceCount];
         int disposalCount = 0;
-        List<DryRunFileRow> fileRows = new(sourceCount);
-        for (int i = 0; i < sourceCount; i++)
+
+        DryRunFileRow BuildFileRow(int i)
         {
-            if ((i & 0x3FFF) == 0) ct.ThrowIfCancellationRequested();
             DryRunFile file = report.SourceFiles[i];
             DryRunOperation? op = sourceOpByIndex[i];
             int start = offsets[i], end = offsets[i + 1];
@@ -2011,7 +2051,7 @@ public sealed partial class DryRunViewModel : ViewModelBase
                 DryRunOperation t = destOps[ordered[j]];
                 targets.Add(new DryRunTargetRow(dirPaths[t.DirIndex], t.FileName, dirPaths[t.RootDirIndex], t.Kind, t.Detail));
             }
-            DryRunFileRow row = new(
+            return new DryRunFileRow(
                 dirPaths[file.DirIndex],
                 file.FileName,
                 dirPaths[file.RootDirIndex],
@@ -2021,9 +2061,33 @@ public sealed partial class DryRunViewModel : ViewModelBase
                 targets.Count == 0 ? EmptyTargets : targets,
                 file.Length,
                 sourceCommonRoot);
-            if (row.IsSourceDisposalDestructive)
-                disposalCount++;
-            fileRows.Add(row);
+        }
+
+        if (sourceCount <= DryRunRebuild.SyncThreshold)
+        {
+            for (int i = 0; i < sourceCount; i++)
+            {
+                if ((i & 0x3FFF) == 0) ct.ThrowIfCancellationRequested();
+                DryRunFileRow row = BuildFileRow(i);
+                if (row.IsSourceDisposalDestructive) disposalCount++;
+                fileRowArr[i] = row;
+            }
+        }
+        else
+        {
+            // ParallelOptions.CancellationToken makes Parallel.For poll ct between iterations and throw
+            // a clean OperationCanceledException — no explicit body check (which would risk being
+            // wrapped in an AggregateException) is needed.
+            Parallel.For(0, sourceCount, new ParallelOptions { CancellationToken = ct },
+                () => 0,
+                (i, _, localDisposal) =>
+                {
+                    DryRunFileRow row = BuildFileRow(i);
+                    if (row.IsSourceDisposalDestructive) localDisposal++;
+                    fileRowArr[i] = row;
+                    return localDisposal;
+                },
+                localDisposal => Interlocked.Add(ref disposalCount, localDisposal));
         }
 
         // The byte size behind a destination op: the incoming content (its source file) for a write,
@@ -2041,13 +2105,17 @@ public sealed partial class DryRunViewModel : ViewModelBase
         DryRunDestinationEntry Entry(DryRunOperation o, long sizeBytes) =>
             new(dirPaths[o.DirIndex], o.FileName, dirPaths[o.RootDirIndex], MapDestinationKind(o.Kind), o.Detail, destCommonRoot, sizeBytes);
 
-        List<DryRunDestinationRow> destRows = [];
-        for (int i = 0; i < sourceCount; i++)
+        // Build the grouped destination rows into a preallocated array (null = a source with no dest
+        // op), in parallel above the sync threshold — same disjoint-slot, immutable-input safety as the
+        // source loop. Then compact in 0..N-1 order (deterministic, matching the old sequential append)
+        // and append the no-source rows single-threaded.
+        DryRunDestinationRow?[] destRowArr = new DryRunDestinationRow?[sourceCount];
+
+        DryRunDestinationRow? BuildDestRow(int i)
         {
-            if ((i & 0x3FFF) == 0) ct.ThrowIfCancellationRequested();
             int start = offsets[i], end = offsets[i + 1];
             if (end == start)
-                continue;   // a filtered/unchanged source that produced no destination op
+                return null;   // a filtered/unchanged source that produced no destination op
             List<DryRunDestinationEntry> entries = new(end - start);
             for (int j = start; j < end; j++)
             {
@@ -2055,8 +2123,29 @@ public sealed partial class DryRunViewModel : ViewModelBase
                 entries.Add(Entry(o, OpSize(o)));
             }
             DryRunFile file = report.SourceFiles[i];
-            destRows.Add(new DryRunDestinationRow(
-                dirPaths[file.DirIndex], file.FileName, dirPaths[file.RootDirIndex], sourceCommonRoot, entries));
+            return new DryRunDestinationRow(
+                dirPaths[file.DirIndex], file.FileName, dirPaths[file.RootDirIndex], sourceCommonRoot, entries);
+        }
+
+        if (sourceCount <= DryRunRebuild.SyncThreshold)
+        {
+            for (int i = 0; i < sourceCount; i++)
+            {
+                if ((i & 0x3FFF) == 0) ct.ThrowIfCancellationRequested();
+                destRowArr[i] = BuildDestRow(i);
+            }
+        }
+        else
+        {
+            Parallel.For(0, sourceCount, new ParallelOptions { CancellationToken = ct },
+                i => destRowArr[i] = BuildDestRow(i));
+        }
+
+        List<DryRunDestinationRow> destRows = new(sourceCount);
+        for (int i = 0; i < sourceCount; i++)
+        {
+            if (destRowArr[i] is { } row)
+                destRows.Add(row);
         }
         foreach (int k in noSource)
         {
@@ -2075,9 +2164,30 @@ public sealed partial class DryRunViewModel : ViewModelBase
             else if (o.Kind == OperationKind.Deleted) anyDestinationDeleted = true;
         }
 
+        // The two tabs' loads share no mutable state, so run their independent O(n log n) sorts
+        // concurrently above the sync threshold — overlapping the two single-threaded sorts. Below it
+        // they run inline (no Task/Parallel overhead) so small reports and tests stay deterministic.
+        DryRunSourcesTab.LoadData sourcesLoad;
+        DryRunDestinationsTab.LoadData destinationsLoad;
+        if (sourceCount <= DryRunRebuild.SyncThreshold)
+        {
+            sourcesLoad = DryRunSourcesTab.ComputeLoad(fileRowArr, sourceCommonRoot, ct);
+            destinationsLoad = DryRunDestinationsTab.ComputeLoad(destRows, destCommonRoot, ct);
+        }
+        else
+        {
+            DryRunSourcesTab.LoadData? s = null;
+            DryRunDestinationsTab.LoadData? d = null;
+            Parallel.Invoke(new ParallelOptions { CancellationToken = ct },
+                () => s = DryRunSourcesTab.ComputeLoad(fileRowArr, sourceCommonRoot, ct),
+                () => d = DryRunDestinationsTab.ComputeLoad(destRows, destCommonRoot, ct));
+            sourcesLoad = s!;
+            destinationsLoad = d!;
+        }
+
         return new PreparedReport(
-            DryRunSourcesTab.ComputeLoad(fileRows, sourceCommonRoot, ct),
-            DryRunDestinationsTab.ComputeLoad(destRows, destCommonRoot, ct),
+            sourcesLoad,
+            destinationsLoad,
             TotalFiles: report.SourceFiles.Count,
             OverwriteCount: overwriteCount,
             RenameCount: renameCount,
