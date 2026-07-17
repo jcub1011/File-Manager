@@ -1,3 +1,5 @@
+using System;
+using System.Globalization;
 using Avalonia;
 using Avalonia.Data.Converters;
 using Avalonia.Media;
@@ -23,6 +25,20 @@ public static class IconConverters
     /// only folder rows in the dry-run trees carry the wash.</summary>
     public static readonly FuncValueConverter<bool, IBrush?> FolderTint =
         new(isDirectory => isDirectory ? Resolve("Brush.Folder.Soft") as IBrush : null);
+
+    /// <summary>Passes the <c>ConverterParameter</c> through when the bound bool is true, otherwise
+    /// null. Used to attach the shared folder context menu to directory rows only (a file row's
+    /// ContextFlyout resolves to null, so right-clicking a file shows nothing).</summary>
+    public static readonly IValueConverter WhenTrue = new WhenTrueConverter();
+
+    private sealed class WhenTrueConverter : IValueConverter
+    {
+        public object? Convert(object? value, Type targetType, object? parameter, CultureInfo culture) =>
+            value is true ? parameter : null;
+
+        public object? ConvertBack(object? value, Type targetType, object? parameter, CultureInfo culture) =>
+            throw new NotSupportedException();
+    }
 
     private static object? Resolve(string? key) =>
         key is not null && Application.Current is { } app && app.TryGetResource(key, null, out object? value)

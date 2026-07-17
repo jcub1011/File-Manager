@@ -52,6 +52,20 @@
             </ItemsControl>
         </DataTemplate>
 
+        <!-- Right-click menu for navigating large trees, attached to whole folder rows via the
+             TreeDataGridRow style below (gated to directories, so file rows get no menu). Shared
+             across rows; on open its DataContext is the right-clicked node, so the items bind to
+             that node's commands. CompileBindings off because the row style sits at UserControl
+             (view-model) scope, not the node's. -->
+        <MenuFlyout x:Key="FolderContextMenu" x:CompileBindings="False">
+            <MenuItem Header="Open Folder" Command="{Binding OpenFolderCommand}" />
+            <MenuItem Header="Open Folder and All Nested Folders" Command="{Binding OpenFolderRecursiveCommand}" />
+            <MenuItem Header="Close Folder" Command="{Binding CloseFolderCommand}" />
+            <Separator />
+            <MenuItem Header="Expand All Folders" Command="{Binding ExpandAllCommand}" />
+            <MenuItem Header="Close All Folders" Command="{Binding CloseAllCommand}" />
+        </MenuFlyout>
+
         <!-- A tab's source + destination filter facets: two WrapPanels of checkboxes. -->
         <DataTemplate x:Key="FacetTemplate" x:DataType="vm:DryRunFacetRow">
             <CheckBox IsChecked="{Binding IsSelected}" Margin="0,0,12,0"
@@ -178,6 +192,11 @@
                  this stays a compiled, AOT-safe binding rather than a reflection one. -->
             <Setter Property="Background"
                     Value="{Binding IsDirectory, DataType=vm:DryRunTreeNode, Converter={x:Static conv:IconConverters.FolderTint}}" />
+            <!-- Whole-row right-click menu, but folders only: WhenTrue passes the shared menu through
+                 for directory rows and null for files. The row's DataContext is the node, so the menu
+                 opens with the right node's commands. -->
+            <Setter Property="ContextFlyout"
+                    Value="{Binding IsDirectory, DataType=vm:DryRunTreeNode, Converter={x:Static conv:IconConverters.WhenTrue}, ConverterParameter={StaticResource FolderContextMenu}}" />
         </Style>
         <!-- Light-blue hover highlight on tree rows; overrides the folder tint / transparent base while
              the pointer is over the row. -->

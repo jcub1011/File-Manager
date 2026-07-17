@@ -688,6 +688,64 @@ public sealed class DryRunViewModelTests
     }
 
     [Fact]
+    public async Task Folder_context_menu_commands_drive_expansion_through_the_source()
+    {
+        // A single top-level folder "a" with three subfolders, each holding a file: "a" auto-expands
+        // (few top-level children) while the subfolders start collapsed. Exercises the folder
+        // right-click commands, which the view binds from the tree cell's context menu.
+        var (viewModel, gateway) = NewViewModel();
+        gateway.DryRunResult = Report(viewModel.ProfileId!.Value,
+            sourceFiles:
+            [
+                Pf(@"C:\r\a\s0\f0.txt", @"C:\r"),
+                Pf(@"C:\r\a\s1\f1.txt", @"C:\r"),
+                Pf(@"C:\r\a\s2\f2.txt", @"C:\r"),
+            ],
+            sourceOps:
+            [
+                SrcOp(0, @"C:\r\a\s0\f0.txt", @"C:\r", OperationKind.Processed, OnSuccessAction.KeepSource),
+                SrcOp(1, @"C:\r\a\s1\f1.txt", @"C:\r", OperationKind.Processed, OnSuccessAction.KeepSource),
+                SrcOp(2, @"C:\r\a\s2\f2.txt", @"C:\r", OperationKind.Processed, OnSuccessAction.KeepSource),
+            ],
+            destinationFiles: [], destinationOps: []);
+        await viewModel.RunAsync(CancellationToken.None);
+
+        viewModel.Sources.ShowTree = true;
+        await viewModel.Sources.PendingRebuild;
+        Assert.NotNull(viewModel.Sources.TreeSource);   // BuildSource attached the source to the controller
+
+        DryRunTreeNode top = Assert.Single(viewModel.Sources.Tree);
+        var subfolders = top.Children.Where(c => c.IsDirectory).ToList();
+        Assert.Equal(3, subfolders.Count);
+        Assert.True(top.IsExpanded);                           // auto-expanded top level
+        Assert.All(subfolders, s => Assert.False(s.IsExpanded));
+
+        // Open Folder and All Nested Folders → the whole subtree under "a" expands (source API,
+        // viewport-independent — the subfolders were never realized).
+        top.OpenFolderRecursiveCommand.Execute(null);
+        Assert.True(top.IsExpanded);
+        Assert.All(subfolders, s => Assert.True(s.IsExpanded));
+
+        // Close All Folders → every folder in the tree collapses.
+        top.CloseAllCommand.Execute(null);
+        Assert.False(top.IsExpanded);
+        Assert.All(subfolders, s => Assert.False(s.IsExpanded));
+
+        // Expand All Folders → every folder in the tree expands.
+        top.ExpandAllCommand.Execute(null);
+        Assert.True(top.IsExpanded);
+        Assert.All(subfolders, s => Assert.True(s.IsExpanded));
+
+        // Single Open/Close affect only the target folder, not its siblings.
+        DryRunTreeNode one = subfolders[0];
+        one.CloseFolderCommand.Execute(null);
+        Assert.False(one.IsExpanded);
+        Assert.True(subfolders[1].IsExpanded);
+        one.OpenFolderCommand.Execute(null);
+        Assert.True(one.IsExpanded);
+    }
+
+    [Fact]
     public async Task Lazy_leaves_merge_duplicate_names_with_summed_counts()
     {
         // Two rows at the same resulting path collapse to one leaf whose counts sum — the same dedup the

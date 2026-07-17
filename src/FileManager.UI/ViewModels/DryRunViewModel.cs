@@ -283,6 +283,15 @@ public sealed record TreePill(string CountText, string IconKey, string ColorKey,
 /// keys, and the display order.</summary>
 public sealed record TreePillSpec(string Kind, string Label, string IconKey, string ColorKey);
 
+/// <summary>Per-forest handle to the grid source, shared by every directory node in a forest and
+/// assigned once the source is built (nodes are constructed before the source exists). Lets a
+/// node's folder context-menu commands reach the source API for whole-tree / subtree expansion —
+/// the only reliable path, since setting a model's IsExpanded only affects already-realized rows.</summary>
+internal sealed class DryRunTreeController
+{
+    public HierarchicalTreeDataGridSource<DryRunTreeNode>? Source { get; set; }
+}
+
 /// <summary>A node in a path tree whose counts are the rolled-up totals of everything beneath it,
 /// rendered as coloured summary pills. The forest is derived from the directory structure the rows
 /// already share (their directory strings reference the report's materialized directory table), so
@@ -314,6 +323,10 @@ public sealed partial class DryRunTreeNode : ObservableObject
     // result is cached into _children. _hasChildren drives the expander chevron without materializing.
     private Func<IReadOnlyList<DryRunTreeNode>>? _leafFactory;
     private bool _hasChildren;
+    // Per-forest handle to the grid source, shared by every directory node so the folder context-menu
+    // commands can drive whole-tree / subtree expansion through the source API (the only viewport-
+    // independent path). Null on leaves — files show no menu — and until BuildSource attaches it.
+    private readonly DryRunTreeController? _controller;
 
     // Directories before files, then alphabetical — the familiar file-explorer order, applied both to
     // the up-front subdirectory sort and to the lazy merge of subdirs + freshly built leaves.
@@ -322,13 +335,15 @@ public sealed partial class DryRunTreeNode : ObservableObject
             ? (a.IsDirectory ? -1 : 1)
             : string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase);
 
-    private DryRunTreeNode(string name, string? dirFullPath, string? parentDirPath, bool isDirectory, int depth)
+    private DryRunTreeNode(string name, string? dirFullPath, string? parentDirPath, bool isDirectory, int depth,
+        DryRunTreeController? controller = null)
     {
         Name = name;
         _dirFullPath = dirFullPath;
         _parentDirPath = parentDirPath;
         IsDirectory = isDirectory;
         Depth = depth;
+        _controller = controller;
     }
 
     public string Name { get; }
@@ -369,6 +384,40 @@ public sealed partial class DryRunTreeNode : ObservableObject
     [ObservableProperty] public partial bool IsExpanded { get; set; }
 
     public bool HasChildren => _hasChildren;
+
+    // Folder right-click context-menu commands (see DryRunView.axaml's TextBlock.dir ContextFlyout).
+    // Single open/close set the two-way-bound IsExpanded directly: the right-clicked folder is on
+    // screen, so its cell is realized and the change propagates to the row. The recursive and
+    // whole-tree operations go through the source API instead — setting IsExpanded on off-screen
+    // descendants would not take effect until their cells realize, whereas the source rebuilds the
+    // flattened row list in one shot.
+    [RelayCommand] private void OpenFolder() => IsExpanded = true;
+    [RelayCommand] private void CloseFolder() => IsExpanded = false;
+
+    [RelayCommand]
+    private void OpenFolderRecursive()
+    {
+        if (_controller?.Source is not { } source)
+        {
+            IsExpanded = true;   // no source attached (e.g. tests) — at least open this folder
+            return;
+        }
+        if (FindRow(source, this) is { } row)
+            source.ExpandCollapseRecursive(row, static _ => true);
+    }
+
+    [RelayCommand] private void ExpandAll() => _controller?.Source?.ExpandAll();
+    [RelayCommand] private void CloseAll() => _controller?.Source?.CollapseAll();
+
+    // The clicked folder is visible, so its HierarchicalRow is present in the flattened Rows list.
+    private static HierarchicalRow<DryRunTreeNode>? FindRow(
+        HierarchicalTreeDataGridSource<DryRunTreeNode> source, DryRunTreeNode node)
+    {
+        foreach (object? r in source.Rows)
+            if (r is HierarchicalRow<DryRunTreeNode> hr && ReferenceEquals(hr.Model, node))
+                return hr;
+        return null;
+    }
 
     /// <summary>Test seam: true while this directory still has file leaves waiting to be built (i.e.
     /// <see cref="Children"/> has not been accessed since the forest was built). Lets tests assert that
@@ -417,6 +466,10 @@ public sealed partial class DryRunTreeNode : ObservableObject
         // root, so its files sit at forest-root level.
         Dictionary<string, DryRunTreeNode?> dirNodeByPath = new(StringComparer.OrdinalIgnoreCase);
         string? rootPrefix = string.IsNullOrEmpty(commonRoot) ? null : commonRoot.TrimEnd('\\', '/');
+
+        // Shared by every directory node in this forest; BuildSource attaches the built source to it
+        // so the folder context-menu commands can drive expansion through the source API.
+        DryRunTreeController controller = new();
 
         Dictionary<string, int> specIndex = new(specs.Count, StringComparer.Ordinal);
         for (int k = 0; k < specs.Count; k++)
@@ -553,7 +606,7 @@ public sealed partial class DryRunTreeNode : ObservableObject
                     // rebuilds. On the first build (no prior state) everything starts collapsed here; the
                     // top-level auto-expand is applied afterward, once the child metric is known.
                     bool expanded = expandedPaths is not null && expandedPaths.Contains(prefix);
-                    node = new DryRunTreeNode(segment, prefix, parentDirPath: null, isDirectory: true, i)
+                    node = new DryRunTreeNode(segment, prefix, parentDirPath: null, isDirectory: true, i, controller)
                     {
                         IsExpanded = expanded,
                     };
@@ -659,6 +712,17 @@ public sealed partial class DryRunTreeNode : ObservableObject
                 new TemplateColumn<DryRunTreeNode>("Status", "DryRunPillsCell", options: pillsOptions),
             },
         };
+
+        // Attach the source to the forest's shared controller so folder context-menu commands can
+        // reach it. Every directory node shares one instance, so the first directory root carries it;
+        // a file-only forest has no folders (hence no menu) and nothing to attach.
+        foreach (DryRunTreeNode root in roots)
+            if (root._controller is { } c)
+            {
+                c.Source = source;
+                break;
+            }
+
         return source;
     }
 
