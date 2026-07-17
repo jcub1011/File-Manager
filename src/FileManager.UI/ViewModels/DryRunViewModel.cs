@@ -293,14 +293,34 @@ public sealed partial class DryRunTreeNode : ObservableObject
 {
     private static readonly char[] Separators = ['\\', '/'];
 
+    /// <summary>On the first tree build the top-level folders auto-expand only when the first level of
+    /// expansion would reveal at most this many rows — the files at the common root plus the immediate
+    /// children (subfolders + files) of each top-level folder. Above it the tree opens fully collapsed.
+    /// Counting only the top level's own children (not the whole subtree) keeps a deep tree with a few
+    /// top-level folders auto-expanded while a wide top level collapses.</summary>
+    internal const int AutoExpandChildLimit = 100;
+
     // Directory nodes store their absolute path; leaves hold a reference to their directory's
     // shared string and reconstruct on demand — FullPath is only ever read by the tooltip and
     // CollectExpanded, and per-leaf absolute paths alone are hundreds of MB at the streamed cap.
     private readonly string? _dirFullPath;      // directory nodes only
     private readonly string? _parentDirPath;    // leaves only — the row's shared directory string
-    private List<DryRunTreeNode>? _children;    // created on first child; leaves stay null
+    private List<DryRunTreeNode>? _children;    // subdirectory nodes; leaves are added lazily on expand
     private int[]? _counts;                     // per-spec counts, released once the pills are built
     private long _sizeBytes;
+    // A directory node's file leaves are not built up front — they cost one node + one counts buffer
+    // each (~500k of both at the streamed cap). Instead the directory keeps a factory that builds its
+    // leaves the first time TreeDataGrid asks for its children (i.e. when the user expands it), and the
+    // result is cached into _children. _hasChildren drives the expander chevron without materializing.
+    private Func<IReadOnlyList<DryRunTreeNode>>? _leafFactory;
+    private bool _hasChildren;
+
+    // Directories before files, then alphabetical — the familiar file-explorer order, applied both to
+    // the up-front subdirectory sort and to the lazy merge of subdirs + freshly built leaves.
+    private static readonly Comparison<DryRunTreeNode> DirsFirstByName = static (a, b) =>
+        a.IsDirectory != b.IsDirectory
+            ? (a.IsDirectory ? -1 : 1)
+            : string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase);
 
     private DryRunTreeNode(string name, string? dirFullPath, string? parentDirPath, bool isDirectory, int depth)
     {
@@ -319,13 +339,41 @@ public sealed partial class DryRunTreeNode : ObservableObject
 
     public bool IsDirectory { get; }
     public int Depth { get; }
-    public IReadOnlyList<DryRunTreeNode> Children => (IReadOnlyList<DryRunTreeNode>?)_children ?? [];
+
+    /// <summary>The node's children. Directory nodes carry their subdirectories eagerly but build their
+    /// file leaves lazily on first access (TreeDataGrid pulls this only when a row is expanded): the
+    /// leaves are merged with the subdirectories, sorted once, and cached, so every later access returns
+    /// the same instance (the grid rebuilds child rows only when the reference changes). Runs on the UI
+    /// thread only — build-time passes use the <c>_children</c> field directly and never trip this.</summary>
+    public IReadOnlyList<DryRunTreeNode> Children
+    {
+        get
+        {
+            if (_leafFactory is { } factory)
+            {
+                IReadOnlyList<DryRunTreeNode> leaves = factory();
+                List<DryRunTreeNode> merged = new((_children?.Count ?? 0) + leaves.Count);
+                if (_children is { } subs)
+                    merged.AddRange(subs);
+                merged.AddRange(leaves);
+                merged.Sort(DirsFirstByName);
+                _children = merged;
+                _leafFactory = null;   // materialize exactly once; the reference is stable hereafter
+            }
+            return (IReadOnlyList<DryRunTreeNode>?)_children ?? [];
+        }
+    }
 
     /// <summary>Expand/collapse state, bound two-way to the TreeDataGrid expander column's
     /// <c>IsExpandedBinding</c>, so a rebuild can restore what the user had open.</summary>
     [ObservableProperty] public partial bool IsExpanded { get; set; }
 
-    public bool HasChildren => _children is { Count: > 0 };
+    public bool HasChildren => _hasChildren;
+
+    /// <summary>Test seam: true while this directory still has file leaves waiting to be built (i.e.
+    /// <see cref="Children"/> has not been accessed since the forest was built). Lets tests assert that
+    /// snapshotting expansion or reading directory pills does not force materialization.</summary>
+    internal bool LeavesPending => _leafFactory is not null;
 
     /// <summary>Rolled-up total byte size of everything beneath this node.</summary>
     public long SizeBytes => _sizeBytes;
@@ -347,7 +395,11 @@ public sealed partial class DryRunTreeNode : ObservableObject
     /// node's <see cref="FullPath"/> stays absolute for the tooltip. Each leaf accumulates its
     /// (kind, count) increments and size locally; one post-order pass rolls the totals up the
     /// ancestor chain and renders pills in <paramref name="specs"/> order for every kind with a
-    /// non-zero count. Top-level nodes start expanded so the tree opens on something to see.</summary>
+    /// non-zero count. On the first build (no <paramref name="expandedPaths"/>) the top-level folders
+    /// start expanded so the tree opens on something to see — but only when doing so reveals a modest
+    /// number of rows (root-level files plus the immediate children of the top-level folders, see
+    /// <see cref="AutoExpandChildLimit"/>); a wide top level opens fully collapsed, while a deep tree
+    /// with a few top-level folders still auto-expands.</summary>
     public static IReadOnlyList<DryRunTreeNode> BuildForest<T>(
         IEnumerable<T> rows,
         Func<T, string> dirSelector,
@@ -370,31 +422,71 @@ public sealed partial class DryRunTreeNode : ObservableObject
         for (int k = 0; k < specs.Count; k++)
             specIndex[specs[k].Kind] = k;
 
+        // Rows under a real directory are bucketed on that directory and their contribution rolled onto
+        // it now (so its pills/size are correct before any leaf exists); the leaf nodes themselves are
+        // deferred to first expand. Rows that sit in the common root itself (dirNode == null) have no
+        // directory to defer under and the forest root is always realized, so they stay eager.
+        Dictionary<DryRunTreeNode, List<T>> bucketByDir = [];
         foreach (T row in rows)
         {
             string dirPath = dirSelector(row);
             if (!dirNodeByPath.TryGetValue(dirPath, out DryRunTreeNode? dirNode))
                 dirNodeByPath[dirPath] = dirNode = ResolveDirectory(dirPath);
 
-            string fileName = nameSelector(row);
-            Dictionary<string, DryRunTreeNode> index = dirNode is null ? rootIndex : IndexOf(dirNode);
-            if (!index.TryGetValue(fileName, out DryRunTreeNode? leaf))
+            if (dirNode is null)
             {
-                leaf = new DryRunTreeNode(fileName, dirFullPath: null, dirPath, isDirectory: false,
-                    depth: dirNode is null ? 0 : dirNode.Depth + 1);
-                (dirNode is null ? roots : dirNode._children ??= []).Add(leaf);
-                index[fileName] = leaf;
+                string fileName = nameSelector(row);
+                if (!rootIndex.TryGetValue(fileName, out DryRunTreeNode? leaf))
+                {
+                    leaf = new DryRunTreeNode(fileName, dirFullPath: null, dirPath, isDirectory: false, depth: 0);
+                    roots.Add(leaf);
+                    rootIndex[fileName] = leaf;
+                }
+                Accumulate(leaf, row);
             }
+            else
+            {
+                if (!bucketByDir.TryGetValue(dirNode, out List<T>? bucket))
+                    bucketByDir[dirNode] = bucket = [];
+                bucket.Add(row);
+                Accumulate(dirNode, row);
+            }
+        }
 
-            // Increments and size land on the leaf only; FinishRecursive rolls them up afterwards —
-            // O(rows + nodes) instead of per-row walks of the whole ancestor chain. Kinds absent
-            // from the specs are dropped, exactly as pills always rendered only spec kinds.
-            foreach ((string kind, int increment) in categorizer(row))
+        // One leaf-pill cache shared across every directory's factory in THIS forest — the leaf's single
+        // "1 <label>" pill dominates, so sharing maximizes de-dup. Allocated here (off-thread) but only
+        // ever touched by BuildLeaves, which runs on the UI thread when a directory is expanded.
+        Dictionary<(int Spec, int Count), TreePill> leafPillCache = [];
+        Dictionary<TreePill, IReadOnlyList<TreePill>> leafSingleLists = [];
+        foreach ((DryRunTreeNode dir, List<T> bucket) in bucketByDir)
+        {
+            List<T> capturedBucket = bucket;
+            int leafDepth = dir.Depth + 1;
+            dir._leafFactory = () => BuildLeaves(
+                capturedBucket, leafDepth, nameSelector, dirSelector, categorizer, sizeSelector,
+                specs, specIndex, leafPillCache, leafSingleLists);
+        }
+
+        // First build: auto-expand the top-level folders only when the first level of expansion stays
+        // small — root-level files plus each top-level folder's immediate children (its subfolders and
+        // its own files). Only the top level's children count, so a deep tree with a few top-level
+        // folders still opens expanded, while a wide top level opens collapsed. (On a rebuild the saved
+        // per-node state in expandedPaths already drove the flags in ResolveDirectory.)
+        if (expandedPaths is null)
+        {
+            long revealed = 0;
+            foreach (DryRunTreeNode root in roots)
             {
-                if (specIndex.TryGetValue(kind, out int k))
-                    (leaf._counts ??= new int[specs.Count])[k] += increment;
+                if (!root.IsDirectory)
+                    revealed++;   // a file sitting directly at the common root
+                else
+                    revealed += (root._children?.Count ?? 0)
+                              + (bucketByDir.TryGetValue(root, out List<T>? bucket) ? bucket.Count : 0);
             }
-            leaf._sizeBytes += sizeSelector?.Invoke(row) ?? 0;
+            if (revealed <= AutoExpandChildLimit)
+                foreach (DryRunTreeNode root in roots)
+                    if (root.IsDirectory)
+                        root.IsExpanded = true;
         }
 
         SortRecursive(roots);
@@ -402,6 +494,19 @@ public sealed partial class DryRunTreeNode : ObservableObject
         foreach (DryRunTreeNode root in roots)
             root._counts = null;
         return roots;
+
+        // Rolls one row's (kind, count) increments and size onto a node — the leaf's own node for a
+        // root-level file, otherwise the directory node (its leaves are deferred). Kinds absent from the
+        // specs are dropped, exactly as pills only ever rendered spec kinds.
+        void Accumulate(DryRunTreeNode node, T row)
+        {
+            foreach ((string kind, int increment) in categorizer(row))
+            {
+                if (specIndex.TryGetValue(kind, out int k))
+                    (node._counts ??= new int[specs.Count])[k] += increment;
+            }
+            node._sizeBytes += sizeSelector?.Invoke(row) ?? 0;
+        }
 
         Dictionary<string, DryRunTreeNode> IndexOf(DryRunTreeNode node)
         {
@@ -445,8 +550,9 @@ public sealed partial class DryRunTreeNode : ObservableObject
                 if (!index.TryGetValue(segment, out node))
                 {
                     // Restore the user's prior expand/collapse state (keyed by absolute path) across
-                    // rebuilds; on the first build (no prior state) top-level nodes open by default.
-                    bool expanded = expandedPaths is null ? i == 0 : expandedPaths.Contains(prefix);
+                    // rebuilds. On the first build (no prior state) everything starts collapsed here; the
+                    // top-level auto-expand is applied afterward, once the child metric is known.
+                    bool expanded = expandedPaths is not null && expandedPaths.Contains(prefix);
                     node = new DryRunTreeNode(segment, prefix, parentDirPath: null, isDirectory: true, i)
                     {
                         IsExpanded = expanded,
@@ -486,13 +592,19 @@ public sealed partial class DryRunTreeNode : ObservableObject
         Walk(nodes);
         return into;
 
-        void Walk(IEnumerable<DryRunTreeNode> level)
+        // Recurse the internal _children field, never the public Children getter — snapshotting the
+        // expanded set (on every filter keystroke) must not force lazy leaf materialization. _children
+        // always holds every subdirectory, so all expandable descendants are still reached; leaves are
+        // absent before materialization and, being non-expandable, irrelevant after.
+        void Walk(IEnumerable<DryRunTreeNode>? level)
         {
+            if (level is null)
+                return;
             foreach (DryRunTreeNode n in level)
             {
                 if (n.IsExpanded)
                     into.Add(n.FullPath);
-                Walk(n.Children);
+                Walk(n._children);
             }
         }
     }
@@ -587,44 +699,102 @@ public sealed partial class DryRunTreeNode : ObservableObject
                 }
             }
 
-            if (node._counts is not int[] own)
-                continue;   // nothing categorized beneath — Pills stays empty
-            List<TreePill>? pills = null;
-            for (int k = 0; k < specs.Count; k++)
-            {
-                int count = own[k];
-                if (count == 0)
-                    continue;
-                if (!pillCache.TryGetValue((k, count), out TreePill? pill))
-                {
-                    TreePillSpec spec = specs[k];
-                    pillCache[(k, count)] = pill =
-                        new TreePill($"{count:N0}", spec.IconKey, spec.ColorKey, spec.Label);
-                }
-                (pills ??= []).Add(pill);
-            }
-            if (pills is null)
-                continue;
-            if (pills.Count == 1)
-            {
-                // The dominant case (a leaf's single pill) shares one list per distinct pill.
-                if (!singlePillLists.TryGetValue(pills[0], out IReadOnlyList<TreePill>? shared))
-                    singlePillLists[pills[0]] = shared = [pills[0]];
-                node.Pills = shared;
-            }
-            else
-            {
-                node.Pills = pills;
-            }
+            // A directory shows an expander if it carries subdirectories OR still has file leaves waiting
+            // to be built (a deferred factory). Leaves have neither, so this stays false for them.
+            node._hasChildren = node._children is { Count: > 0 } || node._leafFactory is not null;
+
+            BuildPills(node, specs, pillCache, singlePillLists);
         }
     }
 
-    // Directories before files, then alphabetical — a familiar file-explorer ordering.
+    /// <summary>Renders a node's rolled-up counts into its <see cref="Pills"/> in spec order, skipping
+    /// zero counts. Pills are memoized per (spec, count) and single-pill nodes — the dominant leaf case —
+    /// share one list instance per distinct pill. Shared by the up-front directory roll-up and the lazy
+    /// leaf build.</summary>
+    private static void BuildPills(
+        DryRunTreeNode node,
+        IReadOnlyList<TreePillSpec> specs,
+        Dictionary<(int Spec, int Count), TreePill> pillCache,
+        Dictionary<TreePill, IReadOnlyList<TreePill>> singlePillLists)
+    {
+        if (node._counts is not int[] own)
+            return;   // nothing categorized beneath — Pills stays empty
+        List<TreePill>? pills = null;
+        for (int k = 0; k < specs.Count; k++)
+        {
+            int count = own[k];
+            if (count == 0)
+                continue;
+            if (!pillCache.TryGetValue((k, count), out TreePill? pill))
+            {
+                TreePillSpec spec = specs[k];
+                pillCache[(k, count)] = pill =
+                    new TreePill($"{count:N0}", spec.IconKey, spec.ColorKey, spec.Label);
+            }
+            (pills ??= []).Add(pill);
+        }
+        if (pills is null)
+            return;
+        if (pills.Count == 1)
+        {
+            // The dominant case (a leaf's single pill) shares one list per distinct pill.
+            if (!singlePillLists.TryGetValue(pills[0], out IReadOnlyList<TreePill>? shared))
+                singlePillLists[pills[0]] = shared = [pills[0]];
+            node.Pills = shared;
+        }
+        else
+        {
+            node.Pills = pills;
+        }
+    }
+
+    /// <summary>Builds a directory's file-leaf nodes on demand — the first time TreeDataGrid asks for the
+    /// directory's children (i.e. the user expands it). Rows sharing a file name merge into one leaf with
+    /// summed counts/size (the same dedup the eager build did inline). Order is irrelevant: the
+    /// <see cref="Children"/> getter re-sorts the merged subdirectory + leaf list.</summary>
+    private static List<DryRunTreeNode> BuildLeaves<T>(
+        List<T> bucket,
+        int leafDepth,
+        Func<T, string> nameSelector,
+        Func<T, string> dirSelector,
+        Func<T, IReadOnlyList<(string Kind, int Increment)>> categorizer,
+        Func<T, long>? sizeSelector,
+        IReadOnlyList<TreePillSpec> specs,
+        Dictionary<string, int> specIndex,
+        Dictionary<(int Spec, int Count), TreePill> pillCache,
+        Dictionary<TreePill, IReadOnlyList<TreePill>> singlePillLists)
+    {
+        Dictionary<string, DryRunTreeNode> byName = new(StringComparer.OrdinalIgnoreCase);
+        List<DryRunTreeNode> leaves = new(bucket.Count);
+        foreach (T row in bucket)
+        {
+            string fileName = nameSelector(row);
+            if (!byName.TryGetValue(fileName, out DryRunTreeNode? leaf))
+            {
+                leaf = new DryRunTreeNode(fileName, dirFullPath: null, dirSelector(row), isDirectory: false, leafDepth);
+                byName[fileName] = leaf;
+                leaves.Add(leaf);
+            }
+            foreach ((string kind, int increment) in categorizer(row))
+            {
+                if (specIndex.TryGetValue(kind, out int k))
+                    (leaf._counts ??= new int[specs.Count])[k] += increment;
+            }
+            leaf._sizeBytes += sizeSelector?.Invoke(row) ?? 0;
+        }
+        foreach (DryRunTreeNode leaf in leaves)
+        {
+            BuildPills(leaf, specs, pillCache, singlePillLists);
+            leaf._counts = null;   // a leaf is terminal — nothing rolls up from it
+        }
+        return leaves;
+    }
+
+    // Sorts the subdirectory nodes at each level (leaves are added and sorted later, lazily, by the
+    // Children getter using the same DirsFirstByName comparator).
     private static void SortRecursive(List<DryRunTreeNode> nodes)
     {
-        nodes.Sort(static (a, b) => a.IsDirectory != b.IsDirectory
-            ? (a.IsDirectory ? -1 : 1)
-            : string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase));
+        nodes.Sort(DirsFirstByName);
         foreach (DryRunTreeNode node in nodes)
         {
             if (node._children is { Count: > 0 } children)
@@ -1227,7 +1397,7 @@ public sealed partial class DryRunSourcesTab : ViewModelBase
             if (r.IsDeleted) cats.Add(("deleted", 1));
             return cats;
             // A prior forest (expandedPaths non-null) → restore its expansion; the very first build
-            // → null so the BuildForest default (top level expanded) applies.
+            // → null so BuildForest's top-level auto-expand heuristic applies.
         }, TreeSpecs, commonRoot, expandedPaths, static r => r.SizeBytes);
 }
 

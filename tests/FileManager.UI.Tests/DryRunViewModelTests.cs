@@ -605,6 +605,149 @@ public sealed class DryRunViewModelTests
         Assert.Contains(sub.Pills, p => p.Tip == "deleted" && p.CountText == "1");
     }
 
+    [Fact]
+    public async Task Tree_collapses_top_level_when_first_expansion_reveals_too_many_rows()
+    {
+        // One top-level folder holding more direct files than the limit → expanding it would flood the
+        // view, so the tree opens collapsed (chevron shown, nothing expanded).
+        const int n = DryRunTreeNode.AutoExpandChildLimit + 1;
+        var sourceFiles = new List<DryRunFile>(n);
+        var sourceOps = new List<DryRunOperation>(n);
+        for (int i = 0; i < n; i++)
+        {
+            string path = $@"C:\r\big\file-{i}.txt";
+            sourceFiles.Add(Pf(path, @"C:\r"));
+            sourceOps.Add(SrcOp(i, path, @"C:\r", OperationKind.Processed, OnSuccessAction.KeepSource));
+        }
+        var (viewModel, gateway) = NewViewModel();
+        gateway.DryRunResult = Report(viewModel.ProfileId!.Value, sourceFiles, sourceOps, [], []);
+        await viewModel.RunAsync(CancellationToken.None);
+
+        viewModel.Sources.ShowTree = true;
+        await viewModel.Sources.PendingRebuild;
+
+        DryRunTreeNode top = Assert.Single(viewModel.Sources.Tree);
+        Assert.Equal("big", top.Name);
+        Assert.True(top.HasChildren);
+        Assert.False(top.IsExpanded);
+    }
+
+    [Fact]
+    public async Task Tree_stays_expanded_for_a_deep_tree_with_few_top_level_children()
+    {
+        // A single top-level folder with only 3 immediate subfolders — deep, and well over the limit in
+        // TOTAL files, but only 3 top-level children. The threshold counts the top level's own children,
+        // not the whole subtree, so it still auto-expands; the deeper subfolders stay collapsed.
+        const int n = DryRunTreeNode.AutoExpandChildLimit + 50;   // total files > limit
+        var sourceFiles = new List<DryRunFile>(n);
+        var sourceOps = new List<DryRunOperation>(n);
+        for (int i = 0; i < n; i++)
+        {
+            string path = $@"C:\r\a\s{i % 3}\file-{i}.txt";
+            sourceFiles.Add(Pf(path, @"C:\r"));
+            sourceOps.Add(SrcOp(i, path, @"C:\r", OperationKind.Processed, OnSuccessAction.KeepSource));
+        }
+        var (viewModel, gateway) = NewViewModel();
+        gateway.DryRunResult = Report(viewModel.ProfileId!.Value, sourceFiles, sourceOps, [], []);
+        await viewModel.RunAsync(CancellationToken.None);
+
+        viewModel.Sources.ShowTree = true;
+        await viewModel.Sources.PendingRebuild;
+
+        DryRunTreeNode top = Assert.Single(viewModel.Sources.Tree);
+        Assert.Equal("a", top.Name);
+        Assert.True(top.IsExpanded);   // only 3 top-level children → auto-expands despite the file count
+
+        // The three subfolders are revealed but themselves collapsed — depth doesn't auto-expand.
+        var subfolders = top.Children.Where(c => c.IsDirectory).ToList();
+        Assert.Equal(3, subfolders.Count);
+        Assert.All(subfolders, s => Assert.False(s.IsExpanded));
+    }
+
+    [Fact]
+    public async Task Tree_materializes_file_leaves_lazily_on_expand()
+    {
+        // The forest is built with directory nodes + rolled-up pills only; a directory's file leaves are
+        // not created until its Children are read (the user expands it). This keeps ~1 node per file off
+        // the heap for collapsed subtrees.
+        var (viewModel, gateway) = NewViewModel();
+        gateway.DryRunResult = NestedSourcesReport(viewModel.ProfileId!.Value);
+        await viewModel.RunAsync(CancellationToken.None);
+        viewModel.Sources.ShowTree = true;
+
+        DryRunTreeNode sub = Assert.Single(viewModel.Sources.Tree);
+        Assert.True(sub.HasChildren);          // chevron shows without the leaves existing
+        Assert.True(sub.LeavesPending);        // …and they do not exist yet
+        Assert.Contains(sub.Pills, p => p.Tip == "processed" && p.CountText == "2");   // dir totals are ready
+
+        IReadOnlyList<DryRunTreeNode> children = sub.Children;   // expanding materializes the leaves
+        Assert.False(sub.LeavesPending);
+        Assert.Equal(new[] { "one.txt", "three.txt", "two.tmp" }, children.Select(c => c.Name));  // files, alpha
+        Assert.All(children, c => Assert.False(c.IsDirectory));
+        Assert.Same(children, sub.Children);   // stable reference — the grid won't rebuild child rows
+    }
+
+    [Fact]
+    public async Task Lazy_leaves_merge_duplicate_names_with_summed_counts()
+    {
+        // Two rows at the same resulting path collapse to one leaf whose counts sum — the same dedup the
+        // eager build did inline, now reproduced when leaves are built on expand.
+        var (viewModel, gateway) = NewViewModel();
+        gateway.DryRunResult = Report(viewModel.ProfileId!.Value,
+            sourceFiles:
+            [
+                Pf(@"C:\p\sub\dup.txt", @"C:\p"),
+                Pf(@"C:\p\sub\dup.txt", @"C:\p"),
+                Pf(@"C:\p\sub\z.txt", @"C:\p"),
+            ],
+            sourceOps:
+            [
+                SrcOp(0, @"C:\p\sub\dup.txt", @"C:\p", OperationKind.Processed, OnSuccessAction.KeepSource),
+                SrcOp(1, @"C:\p\sub\dup.txt", @"C:\p", OperationKind.Processed, OnSuccessAction.KeepSource),
+                SrcOp(2, @"C:\p\sub\z.txt", @"C:\p", OperationKind.Processed, OnSuccessAction.KeepSource),
+            ],
+            destinationFiles: [], destinationOps: []);
+        await viewModel.RunAsync(CancellationToken.None);
+        viewModel.Sources.ShowTree = true;
+
+        DryRunTreeNode sub = Assert.Single(viewModel.Sources.Tree);
+        var children = sub.Children;
+        Assert.Equal(new[] { "dup.txt", "z.txt" }, children.Select(c => c.Name));   // dup merged into one leaf
+        DryRunTreeNode dup = children.Single(c => c.Name == "dup.txt");
+        Assert.Contains(dup.Pills, p => p.Tip == "processed" && p.CountText == "2");
+    }
+
+    [Fact]
+    public async Task Snapshotting_expansion_does_not_materialize_leaves()
+    {
+        // CollectExpanded runs on every filter keystroke to preserve expand state. It must walk the
+        // internal subdirectory structure, never force lazy leaf materialization.
+        var (viewModel, gateway) = NewViewModel();
+        gateway.DryRunResult = Report(viewModel.ProfileId!.Value,
+            sourceFiles:
+            [
+                Pf(@"C:\p\sub\top.txt", @"C:\p"),
+                Pf(@"C:\p\sub\deep\a.txt", @"C:\p"),
+                Pf(@"C:\p\sub\deep\b.txt", @"C:\p"),
+            ],
+            sourceOps:
+            [
+                SrcOp(0, @"C:\p\sub\top.txt", @"C:\p", OperationKind.Processed, OnSuccessAction.KeepSource),
+                SrcOp(1, @"C:\p\sub\deep\a.txt", @"C:\p", OperationKind.Processed, OnSuccessAction.KeepSource),
+                SrcOp(2, @"C:\p\sub\deep\b.txt", @"C:\p", OperationKind.Processed, OnSuccessAction.KeepSource),
+            ],
+            destinationFiles: [], destinationOps: []);
+        await viewModel.RunAsync(CancellationToken.None);
+        viewModel.Sources.ShowTree = true;
+
+        DryRunTreeNode sub = Assert.Single(viewModel.Sources.Tree);
+        Assert.True(sub.LeavesPending);   // sub's direct file (top.txt) is deferred
+
+        DryRunTreeNode.CollectExpanded(viewModel.Sources.Tree);   // what a filter keystroke snapshots
+
+        Assert.True(sub.LeavesPending);   // the snapshot did not build any leaves
+    }
+
     // Destinations nested one level under a single target root.
     private DryRunReport NestedDestinationsReport(Guid profileId) => Report(profileId,
         sourceFiles:

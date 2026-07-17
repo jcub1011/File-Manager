@@ -72,10 +72,12 @@ public sealed class DryRunViewModelMemoryTests(ITestOutputHelper output)
     }
 
     /// <summary>What turning on tree view adds on top of the populated preview — the forest of
-    /// <see cref="DryRunTreeNode"/>s plus the TreeDataGrid sources — and how long the build takes,
-    /// at the streamed cap on the realistic deep-path shape. Past the sync-rebuild threshold the
+    /// directory <see cref="DryRunTreeNode"/>s plus the TreeDataGrid sources — and how long the build
+    /// takes, at the streamed cap on the realistic deep-path shape. Past the sync-rebuild threshold the
     /// build runs on the thread pool (the UI thread no longer freezes), so each toggle awaits its
-    /// <c>PendingRebuild</c> before the clock stops.</summary>
+    /// <c>PendingRebuild</c> before the clock stops. Headless there is no grid, so no directory is
+    /// expanded and file leaves are never materialized — this measures the up-front (collapsed) forest
+    /// cost, which lazy leaf materialization is designed to minimize.</summary>
     [Fact]
     [Trait("Category", "Memory")]
     public async Task Tree_toggle_retained_heap_and_build_time_at_streamed_cap_with_realistic_deep_paths()
@@ -102,10 +104,12 @@ public sealed class DryRunViewModelMemoryTests(ITestOutputHelper output)
         // Budget guard. History at this shape/count: 681 MB / ~4.8 s when BuildForest split every
         // row's absolute path (one node per file, each retaining its own full path, counts
         // dictionary, and pill strings); 116 MB / ~1.6 s building from the shared directory
-        // structure (leaves reference their rows' strings; pills memoized). Time is reported but
-        // not asserted — wall clock flakes across machines.
-        Assert.True(retained < 150L * 1024 * 1024,
-            $"Tree toggle retained {retained / (1024.0 * 1024.0):F1} MB — over the 150 MB budget");
+        // structure (leaves reference their rows' strings; pills memoized); 48 MB / ~0.6 s once file
+        // leaves became lazy — only directory nodes + per-directory row buckets are built up front,
+        // so the collapsed forest no longer carries a node per file. Time is reported but not asserted
+        // — wall clock flakes across machines.
+        Assert.True(retained < 90L * 1024 * 1024,
+            $"Tree toggle retained {retained / (1024.0 * 1024.0):F1} MB — over the 90 MB budget");
 
         GC.KeepAlive(vm);
     }
