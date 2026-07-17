@@ -769,6 +769,31 @@ public sealed class DryRunViewModelTests
     }
 
     [Fact]
+    public async Task Re_running_after_a_tree_toggle_replaces_the_grid_source()
+    {
+        // Regression for the tree-view memory leak: OnTreeChanged now disposes the previous
+        // HierarchicalTreeDataGridSource when the forest is replaced (its realized row cache and
+        // per-node IsExpanded subscriptions otherwise strand the whole old forest, so each toggle +
+        // re-run stacked another forest on the heap). Headless there's no control to root the leak, so
+        // this pins the observable contract and exercises the realize → re-run → dispose path: no throw
+        // from the dispose ordering, and the previous source is gone after the next run.
+        var (viewModel, gateway) = NewViewModel();
+        gateway.DryRunResult = NestedSourcesReport(viewModel.ProfileId!.Value);
+        await viewModel.RunAsync(CancellationToken.None);
+
+        viewModel.Sources.ShowTree = true;
+        await viewModel.Sources.PendingRebuild;
+        var previous = viewModel.Sources.TreeSource;
+        Assert.NotNull(previous);
+        _ = previous.Rows.Count;   // realize the row cache the leak used to strand
+
+        gateway.DryRunResult = NestedSourcesReport(viewModel.ProfileId!.Value);
+        await viewModel.RunAsync(CancellationToken.None);
+
+        Assert.Null(viewModel.Sources.TreeSource);   // list-view default; the prior source was released
+    }
+
+    [Fact]
     public async Task Truncated_report_surfaces_a_notice_mentioning_deletions_are_hidden()
     {
         var (viewModel, gateway) = NewViewModel();

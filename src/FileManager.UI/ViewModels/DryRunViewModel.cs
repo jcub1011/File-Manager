@@ -827,8 +827,18 @@ public sealed partial class DryRunSourcesTab : ViewModelBase
     /// forest changes (null while empty so the grid shows nothing).</summary>
     [ObservableProperty] public partial HierarchicalTreeDataGridSource<DryRunTreeNode>? TreeSource { get; private set; }
 
-    partial void OnTreeChanged(IReadOnlyList<DryRunTreeNode> value) =>
+    partial void OnTreeChanged(IReadOnlyList<DryRunTreeNode> value)
+    {
+        // Dispose the previous grid source after the new value has propagated to the bound
+        // TreeDataGrid. HierarchicalTreeDataGridSource owns a realized HierarchicalRows cache whose
+        // per-row wrappers subscribe to each node's IsExpanded — never disposing it lets the control's
+        // realization keep the whole old forest alive, so every tree toggle (and every re-run after
+        // one) stacks another forest on the heap. Assign first, dispose second, so the grid never
+        // briefly binds to a disposed source.
+        HierarchicalTreeDataGridSource<DryRunTreeNode>? previous = TreeSource;
         TreeSource = value.Count == 0 ? null : DryRunTreeNode.BuildSource(value);
+        previous?.Dispose();
+    }
     [ObservableProperty]
     [NotifyPropertyChangedFor(nameof(ActiveFilterCount), nameof(FilterLabel))]
     public partial IReadOnlyList<DryRunFacetRow> SourceFacets { get; private set; } = [];
@@ -1262,8 +1272,18 @@ public sealed partial class DryRunDestinationsTab : ViewModelBase
     /// forest changes (null while empty so the grid shows nothing).</summary>
     [ObservableProperty] public partial HierarchicalTreeDataGridSource<DryRunTreeNode>? TreeSource { get; private set; }
 
-    partial void OnTreeChanged(IReadOnlyList<DryRunTreeNode> value) =>
+    partial void OnTreeChanged(IReadOnlyList<DryRunTreeNode> value)
+    {
+        // Dispose the previous grid source after the new value has propagated to the bound
+        // TreeDataGrid. HierarchicalTreeDataGridSource owns a realized HierarchicalRows cache whose
+        // per-row wrappers subscribe to each node's IsExpanded — never disposing it lets the control's
+        // realization keep the whole old forest alive, so every tree toggle (and every re-run after
+        // one) stacks another forest on the heap. Assign first, dispose second, so the grid never
+        // briefly binds to a disposed source.
+        HierarchicalTreeDataGridSource<DryRunTreeNode>? previous = TreeSource;
         TreeSource = value.Count == 0 ? null : DryRunTreeNode.BuildSource(value);
+        previous?.Dispose();
+    }
     [ObservableProperty]
     [NotifyPropertyChangedFor(nameof(ActiveFilterCount), nameof(FilterLabel))]
     public partial IReadOnlyList<DryRunFacetRow> SourceFacets { get; private set; } = [];

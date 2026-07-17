@@ -415,8 +415,20 @@
                         </ListBox.ItemTemplate>
                     </ListBox>
 
-                    <TreeDataGrid Grid.Row="3" Classes="rows" Source="{Binding Sources.TreeSource}"
-                                  IsVisible="{Binding Sources.ShowTree}" />
+                    <!-- The tree grid is hosted in a ContentControl (not a plain IsVisible toggle) so it
+                         is created only while a forest is present and destroyed the moment the tree is
+                         toggled off: TreeSource goes null, the ContentPresenter drops the TreeDataGrid,
+                         and the control's realized rows / element-recycle pool — which root the whole
+                         forest of nodes and would otherwise stack across toggles — go with it. A fresh
+                         grid is built when the tree is turned back on. -->
+                    <ContentControl Grid.Row="3" IsVisible="{Binding Sources.ShowTree}"
+                                    Content="{Binding Sources.TreeSource}">
+                        <ContentControl.ContentTemplate>
+                            <DataTemplate x:CompileBindings="False">
+                                <TreeDataGrid Classes="rows" Source="{Binding}" />
+                            </DataTemplate>
+                        </ContentControl.ContentTemplate>
+                    </ContentControl>
 
                     <!-- Loading overlay: shown while a large rebuild (tree build / filter pass) runs
                          on the thread pool — the view beneath is empty or stale until it publishes. -->
@@ -544,8 +556,17 @@
                         </ListBox.ItemTemplate>
                     </ListBox>
 
-                    <TreeDataGrid Grid.Row="3" Classes="rows" Source="{Binding Destinations.TreeSource}"
-                                  IsVisible="{Binding Destinations.ShowTree}" />
+                    <!-- Hosted in a ContentControl so the grid is created/destroyed with the forest —
+                         see the Sources tab above for why (releasing the TreeDataGrid's realized rows
+                         on toggle-off instead of stranding them). -->
+                    <ContentControl Grid.Row="3" IsVisible="{Binding Destinations.ShowTree}"
+                                    Content="{Binding Destinations.TreeSource}">
+                        <ContentControl.ContentTemplate>
+                            <DataTemplate x:CompileBindings="False">
+                                <TreeDataGrid Classes="rows" Source="{Binding}" />
+                            </DataTemplate>
+                        </ContentControl.ContentTemplate>
+                    </ContentControl>
 
                     <!-- Loading overlay: shown while a large rebuild (tree build / filter pass) runs
                          on the thread pool — the view beneath is empty or stale until it publishes. -->
