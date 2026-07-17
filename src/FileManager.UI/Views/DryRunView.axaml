@@ -61,13 +61,13 @@
              the right option is quick to spot. -->
         <MenuFlyout x:Key="NodeContextMenu" x:CompileBindings="False">
             <!-- Folder navigation (folders only) -->
-            <MenuItem Header="Open Folder" Command="{Binding OpenFolderCommand}" IsVisible="{Binding IsDirectory}">
+            <MenuItem Header="Open Folder" Command="{Binding OpenFolderCommand}" IsVisible="{Binding IsDirectory}" InputGesture="Enter">
                 <MenuItem.Icon><PathIcon Data="{StaticResource IconAdd}" Width="16" Height="16" /></MenuItem.Icon>
             </MenuItem>
-            <MenuItem Header="Open Folder and All Nested Folders" Command="{Binding OpenFolderRecursiveCommand}" IsVisible="{Binding IsDirectory}">
+            <MenuItem Header="Open Folder and All Nested Folders" Command="{Binding OpenFolderRecursiveCommand}" IsVisible="{Binding IsDirectory}" InputGesture="Ctrl+Enter">
                 <MenuItem.Icon><PathIcon Data="{StaticResource IconAdd}" Width="16" Height="16" /></MenuItem.Icon>
             </MenuItem>
-            <MenuItem Header="Close Folder" Command="{Binding CloseFolderCommand}" IsVisible="{Binding IsDirectory}">
+            <MenuItem Header="Close Folder" Command="{Binding CloseFolderCommand}" IsVisible="{Binding IsDirectory}" InputGesture="Enter">
                 <MenuItem.Icon><PathIcon Data="{StaticResource IconMinimize}" Width="16" Height="16" /></MenuItem.Icon>
             </MenuItem>
             <Separator IsVisible="{Binding IsDirectory}" />
@@ -79,27 +79,27 @@
             </MenuItem>
             <Separator IsVisible="{Binding IsDirectory}" />
             <!-- Copy (both kinds; the name item's label differs by kind) -->
-            <MenuItem Header="Copy Path" Command="{Binding CopyPathCommand}">
+            <MenuItem Header="Copy Path" Command="{Binding CopyPathCommand}" InputGesture="Ctrl+C">
                 <MenuItem.Icon><PathIcon Data="{StaticResource IconRestore}" Width="16" Height="16" /></MenuItem.Icon>
             </MenuItem>
-            <MenuItem Header="Copy File Name" Command="{Binding CopyNameCommand}" IsVisible="{Binding !IsDirectory}">
+            <MenuItem Header="Copy File Name" Command="{Binding CopyNameCommand}" IsVisible="{Binding !IsDirectory}" InputGesture="Alt+C">
                 <MenuItem.Icon><PathIcon Data="{StaticResource IconRestore}" Width="16" Height="16" /></MenuItem.Icon>
             </MenuItem>
             <MenuItem Header="Copy File Name Without Extension" Command="{Binding CopyNameWithoutExtensionCommand}" IsVisible="{Binding !IsDirectory}">
                 <MenuItem.Icon><PathIcon Data="{StaticResource IconRestore}" Width="16" Height="16" /></MenuItem.Icon>
             </MenuItem>
-            <MenuItem Header="Copy Folder Name" Command="{Binding CopyNameCommand}" IsVisible="{Binding IsDirectory}">
+            <MenuItem Header="Copy Folder Name" Command="{Binding CopyNameCommand}" IsVisible="{Binding IsDirectory}" InputGesture="Alt+C">
                 <MenuItem.Icon><PathIcon Data="{StaticResource IconRestore}" Width="16" Height="16" /></MenuItem.Icon>
             </MenuItem>
             <Separator />
             <!-- Open (file → default app / reveal; folder → reveal) -->
-            <MenuItem Header="Open File" Command="{Binding OpenFileCommand}" IsVisible="{Binding !IsDirectory}">
+            <MenuItem Header="Open File" Command="{Binding OpenFileCommand}" IsVisible="{Binding !IsDirectory}" InputGesture="Shift+Space">
                 <MenuItem.Icon><PathIcon Data="{StaticResource IconDocument}" Width="16" Height="16" /></MenuItem.Icon>
             </MenuItem>
-            <MenuItem Header="Open File In Explorer" Command="{Binding RevealInExplorerCommand}" IsVisible="{Binding !IsDirectory}">
+            <MenuItem Header="Open File In Explorer" Command="{Binding RevealInExplorerCommand}" IsVisible="{Binding !IsDirectory}" InputGesture="Ctrl+Space">
                 <MenuItem.Icon><PathIcon Data="{StaticResource IconFolder}" Width="16" Height="16" /></MenuItem.Icon>
             </MenuItem>
-            <MenuItem Header="Open Folder In Explorer" Command="{Binding OpenFolderInExplorerCommand}" IsVisible="{Binding IsDirectory}">
+            <MenuItem Header="Open Folder In Explorer" Command="{Binding OpenFolderInExplorerCommand}" IsVisible="{Binding IsDirectory}" InputGesture="Ctrl+Space">
                 <MenuItem.Icon><PathIcon Data="{StaticResource IconFolder}" Width="16" Height="16" /></MenuItem.Icon>
             </MenuItem>
         </MenuFlyout>
@@ -109,20 +109,20 @@
              open the items bind against whichever row's DataContext they were shown on. Open File /
              Open File In Explorer grey out (CanExecute disk check) when the file isn't on disk. -->
         <MenuFlyout x:Key="FileContextMenu" x:CompileBindings="False">
-            <MenuItem Header="Copy Path" Command="{Binding CopyPathCommand}">
+            <MenuItem Header="Copy Path" Command="{Binding CopyPathCommand}" InputGesture="Ctrl+C">
                 <MenuItem.Icon><PathIcon Data="{StaticResource IconRestore}" Width="16" Height="16" /></MenuItem.Icon>
             </MenuItem>
-            <MenuItem Header="Copy File Name" Command="{Binding CopyNameCommand}">
+            <MenuItem Header="Copy File Name" Command="{Binding CopyNameCommand}" InputGesture="Alt+C">
                 <MenuItem.Icon><PathIcon Data="{StaticResource IconRestore}" Width="16" Height="16" /></MenuItem.Icon>
             </MenuItem>
             <MenuItem Header="Copy File Name Without Extension" Command="{Binding CopyNameWithoutExtensionCommand}">
                 <MenuItem.Icon><PathIcon Data="{StaticResource IconRestore}" Width="16" Height="16" /></MenuItem.Icon>
             </MenuItem>
             <Separator />
-            <MenuItem Header="Open File" Command="{Binding OpenFileCommand}">
+            <MenuItem Header="Open File" Command="{Binding OpenFileCommand}" InputGesture="Shift+Space">
                 <MenuItem.Icon><PathIcon Data="{StaticResource IconDocument}" Width="16" Height="16" /></MenuItem.Icon>
             </MenuItem>
-            <MenuItem Header="Open File In Explorer" Command="{Binding RevealInExplorerCommand}">
+            <MenuItem Header="Open File In Explorer" Command="{Binding RevealInExplorerCommand}" InputGesture="Ctrl+Space">
                 <MenuItem.Icon><PathIcon Data="{StaticResource IconFolder}" Width="16" Height="16" /></MenuItem.Icon>
             </MenuItem>
         </MenuFlyout>

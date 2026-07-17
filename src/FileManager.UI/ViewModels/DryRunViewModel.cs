@@ -458,6 +458,19 @@ public sealed partial class DryRunTreeNode : ObservableObject
     [RelayCommand] private void ExpandAll() => _controller?.Source?.ExpandAll();
     [RelayCommand] private void CloseAll() => _controller?.Source?.CollapseAll();
 
+    // The Ctrl+Enter keyboard toggle: this folder and everything under it — expand the whole
+    // subtree when the folder is collapsed, collapse it (resetting every descendant) when open. Both
+    // directions go through the source so the grid's rows and the models stay in sync; the recursive
+    // collapse resets descendants correctly (see HierarchicalRows.ExpandCollapseRecursive).
+    [RelayCommand]
+    private void ToggleExpandCollapseAll()
+    {
+        bool expand = !IsExpanded;
+        if (_controller?.Source is { } source && FindRow(source, this) is { } row)
+            source.ExpandCollapseRecursive(row, _ => expand);
+        IsExpanded = expand;
+    }
+
     // Clipboard / shell right-click commands, on files and folders alike (the node menu gates which
     // are shown by IsDirectory). All route through the forest's shared actions service; Open File /
     // reveal / Open Folder in Explorer are gated by a disk check so they grey out for a planned entry

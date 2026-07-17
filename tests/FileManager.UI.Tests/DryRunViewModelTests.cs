@@ -746,6 +746,57 @@ public sealed class DryRunViewModelTests
     }
 
     [Fact]
+    public async Task Toggle_expand_collapse_all_flips_the_whole_subtree_by_current_state()
+    {
+        // Same shape as above: "a" auto-expands, its three subfolders start collapsed. The Ctrl+Enter
+        // keyboard toggle (ToggleExpandCollapseAll) expands the whole subtree when the folder is
+        // collapsed and collapses it when open — driving off the folder's own IsExpanded.
+        var (viewModel, gateway) = NewViewModel();
+        gateway.DryRunResult = Report(viewModel.ProfileId!.Value,
+            sourceFiles:
+            [
+                Pf(@"C:\r\a\s0\f0.txt", @"C:\r"),
+                Pf(@"C:\r\a\s1\f1.txt", @"C:\r"),
+                Pf(@"C:\r\a\s2\f2.txt", @"C:\r"),
+            ],
+            sourceOps:
+            [
+                SrcOp(0, @"C:\r\a\s0\f0.txt", @"C:\r", OperationKind.Processed, OnSuccessAction.KeepSource),
+                SrcOp(1, @"C:\r\a\s1\f1.txt", @"C:\r", OperationKind.Processed, OnSuccessAction.KeepSource),
+                SrcOp(2, @"C:\r\a\s2\f2.txt", @"C:\r", OperationKind.Processed, OnSuccessAction.KeepSource),
+            ],
+            destinationFiles: [], destinationOps: []);
+        await viewModel.RunAsync(CancellationToken.None);
+
+        viewModel.Sources.ShowTree = true;
+        await viewModel.Sources.PendingRebuild;
+
+        DryRunTreeNode top = Assert.Single(viewModel.Sources.Tree);
+        var subfolders = top.Children.Where(c => c.IsDirectory).ToList();
+        Assert.True(top.IsExpanded);   // auto-expanded, subfolders collapsed
+
+        // Open → toggle collapses the whole subtree (the folder itself and every descendant).
+        top.ToggleExpandCollapseAllCommand.Execute(null);
+        Assert.False(top.IsExpanded);
+        Assert.All(subfolders, s => Assert.False(s.IsExpanded));
+
+        // Collapsed → toggle expands the whole subtree.
+        top.ToggleExpandCollapseAllCommand.Execute(null);
+        Assert.True(top.IsExpanded);
+        Assert.All(subfolders, s => Assert.True(s.IsExpanded));
+
+        // Regression: after expand-all then collapse-all, re-opening ONLY the top folder must show the
+        // subfolders collapsed — the collapse must reset the descendants, not leave them flagged open.
+        top.ToggleExpandCollapseAllCommand.Execute(null);   // collapse the whole subtree again
+        Assert.False(top.IsExpanded);
+        Assert.All(subfolders, s => Assert.False(s.IsExpanded));
+
+        top.OpenFolderCommand.Execute(null);                 // single open of just the top folder
+        Assert.True(top.IsExpanded);
+        Assert.All(subfolders, s => Assert.False(s.IsExpanded));   // subfolders stay collapsed
+    }
+
+    [Fact]
     public async Task Lazy_leaves_merge_duplicate_names_with_summed_counts()
     {
         // Two rows at the same resulting path collapse to one leaf whose counts sum — the same dedup the
