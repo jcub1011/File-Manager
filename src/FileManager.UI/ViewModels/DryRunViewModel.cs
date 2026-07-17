@@ -912,15 +912,34 @@ public sealed partial class DryRunSourcesTab : ViewModelBase
         }
         ct.ThrowIfCancellationRequested();
 
-        // Order by path-relative-to-root (then root) so a file lines up with the same file in the
-        // Destinations tab. The key is computed once per row rather than on every comparison.
+        // Order by path-relative-to-root (then root, then original position) so a file lines up with
+        // the same file in the Destinations tab. Keys are computed once per row up front, then an index
+        // array is sorted — no per-comparison Path.Join, no per-row tuple, no OrderBy buffering. The
+        // final original-index tiebreak keeps the sort stable (Array.Sort is not), matching the prior
+        // LINQ OrderBy/ThenBy so rows equal on key+root keep report order.
+        DryRunFileRow[] rowArray = rows as DryRunFileRow[] ?? rows.ToArray();
+        int n = rowArray.Length;
         Dictionary<(string, string?), string> relDirCache = [];
-        List<DryRunFileRow> sorted = rows
-            .Select(r => (Row: r, Key: DryRunSort.RelativeKey(r.DirPath, r.FileName, r.SourceRoot, relDirCache)))
-            .OrderBy(x => x.Key, StringComparer.OrdinalIgnoreCase)
-            .ThenBy(x => x.Row.SourceRoot ?? "", StringComparer.OrdinalIgnoreCase)
-            .Select(x => x.Row)
-            .ToList();
+        string[] keys = new string[n];
+        for (int j = 0; j < n; j++)
+        {
+            DryRunFileRow r = rowArray[j];
+            keys[j] = DryRunSort.RelativeKey(r.DirPath, r.FileName, r.SourceRoot, relDirCache);
+        }
+        ct.ThrowIfCancellationRequested();
+        int[] order = new int[n];
+        for (int j = 0; j < n; j++)
+            order[j] = j;
+        Array.Sort(order, (a, b) =>
+        {
+            int c = string.Compare(keys[a], keys[b], StringComparison.OrdinalIgnoreCase);
+            if (c != 0) return c;
+            c = string.Compare(rowArray[a].SourceRoot ?? "", rowArray[b].SourceRoot ?? "", StringComparison.OrdinalIgnoreCase);
+            return c != 0 ? c : a.CompareTo(b);
+        });
+        List<DryRunFileRow> sorted = new(n);
+        for (int j = 0; j < n; j++)
+            sorted.Add(rowArray[order[j]]);
         ct.ThrowIfCancellationRequested();
         return new(sorted, commonRoot, untouched, processed, deleted, sourceCounts, destinationCounts);
     }
@@ -1324,16 +1343,37 @@ public sealed partial class DryRunDestinationsTab : ViewModelBase
         ct.ThrowIfCancellationRequested();
 
         // Order by the source file's relative path (grouped rows) or the destination's (no-source
-        // rows) so the preview stays comparable to the Sources tab.
+        // rows) so the preview stays comparable to the Sources tab. Keys are computed once per row up
+        // front, then an index array is sorted (key → root → original position); the final index
+        // tiebreak keeps Array.Sort stable, matching the prior LINQ OrderBy/ThenBy.
+        DryRunDestinationRow[] rowArray = rows as DryRunDestinationRow[] ?? rows.ToArray();
+        int n = rowArray.Length;
         Dictionary<(string, string?), string> relDirCache = [];
-        List<DryRunDestinationRow> sorted = rows
-            .Select(r => (Row: r, Key: r.HasSource
+        string[] keys = new string[n];
+        for (int j = 0; j < n; j++)
+        {
+            DryRunDestinationRow r = rowArray[j];
+            keys[j] = r.HasSource
                 ? DryRunSort.RelativeKey(r.SourceDirPath!, r.SourceFileName!, r.SourceRoot, relDirCache)
-                : DryRunSort.RelativeKey(r.Primary.DirPath, r.Primary.FileName, r.Primary.TargetRoot, relDirCache)))
-            .OrderBy(x => x.Key, StringComparer.OrdinalIgnoreCase)
-            .ThenBy(x => x.Row.SourceRoot ?? x.Row.Primary.TargetRoot, StringComparer.OrdinalIgnoreCase)
-            .Select(x => x.Row)
-            .ToList();
+                : DryRunSort.RelativeKey(r.Primary.DirPath, r.Primary.FileName, r.Primary.TargetRoot, relDirCache);
+        }
+        ct.ThrowIfCancellationRequested();
+        int[] order = new int[n];
+        for (int j = 0; j < n; j++)
+            order[j] = j;
+        Array.Sort(order, (a, b) =>
+        {
+            int c = string.Compare(keys[a], keys[b], StringComparison.OrdinalIgnoreCase);
+            if (c != 0) return c;
+            c = string.Compare(
+                rowArray[a].SourceRoot ?? rowArray[a].Primary.TargetRoot,
+                rowArray[b].SourceRoot ?? rowArray[b].Primary.TargetRoot,
+                StringComparison.OrdinalIgnoreCase);
+            return c != 0 ? c : a.CompareTo(b);
+        });
+        List<DryRunDestinationRow> sorted = new(n);
+        for (int j = 0; j < n; j++)
+            sorted.Add(rowArray[order[j]]);
         ct.ThrowIfCancellationRequested();
         return new(sorted, commonRoot, untouched, added, overwritten, deleted, sourceCounts, destinationCounts);
     }
@@ -1907,17 +1947,47 @@ public sealed partial class DryRunViewModel : ViewModelBase
         // sibling files share their directory chain instead of each retaining a full path string.
         string[] dirPaths = DryRunDirectoryTable.Materialize(report.Directories);
 
-        // Destination ops grouped by the source file they carry content from (SourceIndex); the
-        // rename-around Untouched and swept orphans have SourceIndex == -1 and so attach to no source.
-        ILookup<int, DryRunOperation> destOpsBySource =
-            report.DestinationOperations.ToLookup(o => o.SourceIndex);
-        // One source op per source file, addressable by the file's index. Guard against a duplicate
-        // SourceIndex (a service-side bug) degrading gracefully to the first op rather than throwing
-        // and wiping the entire preview — mirrors the ToLookup used for destination ops above.
-        Dictionary<int, DryRunOperation> sourceOpByIndex =
-            report.SourceOperations
-                .GroupBy(o => o.SourceIndex)
-                .ToDictionary(g => g.Key, g => g.First());
+        int sourceCount = report.SourceFiles.Count;
+
+        // One source op per source file, addressable by the file's index — a dense array rather than a
+        // GroupBy/ToDictionary (SourceIndex is dense over [0, sourceCount)). Keep the FIRST op for a
+        // duplicate SourceIndex (a service-side bug) and harmlessly ignore out-of-range/-1 indices —
+        // degrade gracefully rather than throwing and wiping the entire preview.
+        DryRunOperation?[] sourceOpByIndex = new DryRunOperation?[sourceCount];
+        foreach (DryRunOperation op in report.SourceOperations)
+        {
+            int idx = op.SourceIndex;
+            if (idx >= 0 && idx < sourceCount && sourceOpByIndex[idx] is null)
+                sourceOpByIndex[idx] = op;
+        }
+
+        // Destination ops grouped by the source file they carry content from (SourceIndex), as a
+        // compressed-sparse-row layout instead of a ToLookup: `ordered[offsets[i]..offsets[i+1]]` holds
+        // source i's op indices in their original DestinationOperations order (matching ToLookup's
+        // within-group insertion order). Ops with SourceIndex == -1 (the rename-around Untouched, swept
+        // orphans) attach to no source and collect into `noSource` for their own single-entry rows;
+        // an out-of-range-high SourceIndex is dropped, exactly as the prior ToLookup key was never read.
+        IReadOnlyList<DryRunOperation> destOps = report.DestinationOperations;
+        int[] offsets = new int[sourceCount + 1];
+        List<int> noSource = [];
+        for (int k = 0; k < destOps.Count; k++)
+        {
+            int idx = destOps[k].SourceIndex;
+            if (idx >= 0 && idx < sourceCount)
+                offsets[idx + 1]++;
+            else if (idx < 0)
+                noSource.Add(k);
+        }
+        for (int i = 0; i < sourceCount; i++)
+            offsets[i + 1] += offsets[i];   // prefix-sum: offsets[i] is bucket i's start, offsets[i+1] its end
+        int[] ordered = new int[offsets[sourceCount]];
+        int[] cursor = new int[sourceCount];   // per-bucket fill position — preserves within-bucket order
+        for (int k = 0; k < destOps.Count; k++)
+        {
+            int idx = destOps[k].SourceIndex;
+            if (idx >= 0 && idx < sourceCount)
+                ordered[offsets[idx] + cursor[idx]++] = k;
+        }
 
         // The folder every displayed path is shown relative to, per panel: the single source/target
         // dir, else the common parent, else null (spanning drives → full paths). Distinct first so a
@@ -1928,15 +1998,19 @@ public sealed partial class DryRunViewModel : ViewModelBase
             report.DestinationOperations.Select(o => o.RootDirIndex).Distinct().Select(i => dirPaths[i]));
 
         int disposalCount = 0;
-        List<DryRunFileRow> fileRows = new(report.SourceFiles.Count);
-        for (int i = 0; i < report.SourceFiles.Count; i++)
+        List<DryRunFileRow> fileRows = new(sourceCount);
+        for (int i = 0; i < sourceCount; i++)
         {
             if ((i & 0x3FFF) == 0) ct.ThrowIfCancellationRequested();
             DryRunFile file = report.SourceFiles[i];
-            sourceOpByIndex.TryGetValue(i, out DryRunOperation? op);
-            List<DryRunTargetRow> targets = destOpsBySource[i]
-                .Select(t => new DryRunTargetRow(dirPaths[t.DirIndex], t.FileName, dirPaths[t.RootDirIndex], t.Kind, t.Detail))
-                .ToList();
+            DryRunOperation? op = sourceOpByIndex[i];
+            int start = offsets[i], end = offsets[i + 1];
+            List<DryRunTargetRow> targets = new(end - start);
+            for (int j = start; j < end; j++)
+            {
+                DryRunOperation t = destOps[ordered[j]];
+                targets.Add(new DryRunTargetRow(dirPaths[t.DirIndex], t.FileName, dirPaths[t.RootDirIndex], t.Kind, t.Detail));
+            }
             DryRunFileRow row = new(
                 dirPaths[file.DirIndex],
                 file.FileName,
@@ -1968,18 +2042,27 @@ public sealed partial class DryRunViewModel : ViewModelBase
             new(dirPaths[o.DirIndex], o.FileName, dirPaths[o.RootDirIndex], MapDestinationKind(o.Kind), o.Detail, destCommonRoot, sizeBytes);
 
         List<DryRunDestinationRow> destRows = [];
-        for (int i = 0; i < report.SourceFiles.Count; i++)
+        for (int i = 0; i < sourceCount; i++)
         {
             if ((i & 0x3FFF) == 0) ct.ThrowIfCancellationRequested();
-            List<DryRunDestinationEntry> entries = destOpsBySource[i].Select(o => Entry(o, OpSize(o))).ToList();
-            if (entries.Count == 0)
+            int start = offsets[i], end = offsets[i + 1];
+            if (end == start)
                 continue;   // a filtered/unchanged source that produced no destination op
+            List<DryRunDestinationEntry> entries = new(end - start);
+            for (int j = start; j < end; j++)
+            {
+                DryRunOperation o = destOps[ordered[j]];
+                entries.Add(Entry(o, OpSize(o)));
+            }
             DryRunFile file = report.SourceFiles[i];
             destRows.Add(new DryRunDestinationRow(
                 dirPaths[file.DirIndex], file.FileName, dirPaths[file.RootDirIndex], sourceCommonRoot, entries));
         }
-        foreach (DryRunOperation o in report.DestinationOperations.Where(o => o.SourceIndex < 0))
+        foreach (int k in noSource)
+        {
+            DryRunOperation o = destOps[k];
             destRows.Add(new DryRunDestinationRow(null, null, null, null, [Entry(o, OpSize(o))]));
+        }
 
         // One pass over the destination ops for the blast-radius banner numbers (previously three
         // full Count/Any scans).

@@ -195,6 +195,80 @@ public sealed class DryRunViewModelTests
         Assert.Equal(sourceRel, destRel);   // identical relative-path ordering in both tabs
     }
 
+    [Fact]
+    public async Task Sources_rows_with_duplicate_key_and_root_keep_report_order()
+    {
+        // Guards the sort's tertiary tiebreak: rows equal on BOTH the relative key ("a.txt") AND the
+        // root (C:\src) must keep their original report order — a stable LINQ OrderBy does, a raw
+        // (unstable) Array.Sort would not. Indices 1-3 collide on key+root; only their disposition
+        // distinguishes them, and it must come out in report order after z.txt (index 0) sorts last.
+        var (viewModel, gateway) = NewViewModel();
+        gateway.DryRunResult = Report(viewModel.ProfileId!.Value,
+            sourceFiles:
+            [
+                Pf(@"C:\src\z.txt", @"C:\src"),   // 0 — distinct key, sorts last
+                Pf(@"C:\src\a.txt", @"C:\src"),   // 1 ┐
+                Pf(@"C:\src\a.txt", @"C:\src"),   // 2 ├ duplicate key + root
+                Pf(@"C:\src\a.txt", @"C:\src"),   // 3 ┘
+            ],
+            sourceOps:
+            [
+                SrcOp(0, @"C:\src\z.txt", @"C:\src", OperationKind.Processed, OnSuccessAction.KeepSource),
+                SrcOp(1, @"C:\src\a.txt", @"C:\src", OperationKind.Processed, OnSuccessAction.KeepSource),
+                SrcOp(2, @"C:\src\a.txt", @"C:\src", OperationKind.SkippedByFilter, detail: "glob"),
+                SrcOp(3, @"C:\src\a.txt", @"C:\src", OperationKind.SkippedUnchanged),
+            ],
+            destinationFiles: [],
+            destinationOps: []);
+
+        await viewModel.RunAsync(CancellationToken.None);
+
+        var order = viewModel.Sources.VisibleRows.Select(r => r.Disposition).ToList();
+        Assert.Equal(
+            new[]
+            {
+                OperationKind.Processed,          // a.txt (index 1)
+                OperationKind.SkippedByFilter,    // a.txt (index 2)
+                OperationKind.SkippedUnchanged,   // a.txt (index 3)
+                OperationKind.Processed,          // z.txt (index 0), sorts last
+            },
+            order);
+    }
+
+    [Fact]
+    public async Task Destination_rows_with_duplicate_key_and_root_keep_report_order()
+    {
+        // The Destinations-tab counterpart: two grouped rows collide on the source relative key
+        // ("a.txt") and the source root (C:\src); their report order (src 1 before src 2) must survive
+        // the sort ahead of z.txt (src 0). Only the destination detail distinguishes the colliding rows.
+        var (viewModel, gateway) = NewViewModel();
+        gateway.DryRunResult = Report(viewModel.ProfileId!.Value,
+            sourceFiles:
+            [
+                Pf(@"C:\src\z.txt", @"C:\src"),   // 0
+                Pf(@"C:\src\a.txt", @"C:\src"),   // 1 ┐ duplicate key + root
+                Pf(@"C:\src\a.txt", @"C:\src"),   // 2 ┘
+            ],
+            sourceOps:
+            [
+                SrcOp(0, @"C:\src\z.txt", @"C:\src", OperationKind.Processed, OnSuccessAction.KeepSource),
+                SrcOp(1, @"C:\src\a.txt", @"C:\src", OperationKind.Processed, OnSuccessAction.KeepSource),
+                SrcOp(2, @"C:\src\a.txt", @"C:\src", OperationKind.Processed, OnSuccessAction.KeepSource),
+            ],
+            destinationFiles: [],
+            destinationOps:
+            [
+                DstOp(OperationKind.New, @"D:\dst\z.txt", @"D:\dst", sourceIndex: 0, detail: "z"),
+                DstOp(OperationKind.New, @"D:\dst\a.txt", @"D:\dst", sourceIndex: 1, detail: "one"),
+                DstOp(OperationKind.New, @"D:\dst\a.txt", @"D:\dst", sourceIndex: 2, detail: "two"),
+            ]);
+
+        await viewModel.RunAsync(CancellationToken.None);
+
+        var details = viewModel.Destinations.VisibleRows.Select(r => r.Primary.Detail).ToList();
+        Assert.Equal(new[] { "one", "two", "z" }, details);
+    }
+
     // Builds a report of plain new-writes: one source file + one New destination op per write.
     private DryRunReport WritesReport(Guid profileId, params (string Src, string SrcRoot, string Dst, string DstRoot)[] writes)
     {
