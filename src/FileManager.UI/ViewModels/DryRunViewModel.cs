@@ -1888,8 +1888,14 @@ public sealed partial class DryRunViewModel : ViewModelBase
     {
         if (ProfileId is not Guid profileId)
             return;
+        // Release the previous preview's rows and forest now — this is the intentional "fresh run"
+        // path, so ClearReport bumps the epoch and nulls both tabs' _all/_visible/VisibleRows/Tree/
+        // TreeSource. Without it the old report stays alive while PrepareReport builds the next one, so
+        // consecutive runs peak at ~2x the row footprint (the Gen2-GC pressure that makes a re-run feel
+        // worse). The epoch bump also supersedes any run still in flight; the guard below drops this
+        // run's result if a later clear/run supersedes it in turn.
+        ClearReport();
         int epoch = _reportEpoch;
-        ErrorMessage = null;
         RunStatusText = "Scanning sources…";
         // Constructed on the UI thread, so Progress<T> captures the UI SynchronizationContext and
         // every report marshals there — the service's throttling (~10 frames/sec) bounds the load.

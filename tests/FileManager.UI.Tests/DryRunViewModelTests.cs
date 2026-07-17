@@ -741,6 +741,34 @@ public sealed class DryRunViewModelTests
     }
 
     [Fact]
+    public async Task Starting_a_new_run_releases_the_previous_preview_before_building_the_next()
+    {
+        // Change 7: a re-run must release the prior report's rows at run start, not hold them alive
+        // until the next report is built — otherwise consecutive runs peak at ~2x the row footprint.
+        var (viewModel, gateway) = NewViewModel();
+        gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value);
+        await viewModel.RunAsync(CancellationToken.None);
+        Assert.True(viewModel.HasReport);
+        Assert.NotEmpty(viewModel.Sources.VisibleRows);
+
+        // Gate the second run so it stays parked in the scan, after RunAsync's synchronous prologue.
+        gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value);
+        gateway.DryRunGate = new TaskCompletionSource();
+        Task running = viewModel.RunAsync(CancellationToken.None);
+
+        // The previous preview is already gone — released synchronously before the gateway await, well
+        // before the new report exists to replace it.
+        Assert.False(viewModel.HasReport);
+        Assert.Empty(viewModel.Sources.VisibleRows);
+        Assert.Empty(viewModel.Destinations.VisibleRows);
+
+        gateway.DryRunGate.SetResult();
+        await running;
+        Assert.True(viewModel.HasReport);   // the new report applies normally
+        Assert.NotEmpty(viewModel.Sources.VisibleRows);
+    }
+
+    [Fact]
     public async Task Truncated_report_surfaces_a_notice_mentioning_deletions_are_hidden()
     {
         var (viewModel, gateway) = NewViewModel();
