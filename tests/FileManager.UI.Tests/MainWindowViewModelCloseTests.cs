@@ -11,7 +11,7 @@ namespace FileManager.UI.Tests;
 public sealed class MainWindowViewModelCloseTests
 {
     private static MainWindowViewModel NewVm(FakeIpcGateway gateway) =>
-        new(gateway, new FakeFolderPicker(), new FakeLogFolder());
+        new(gateway, new FakeFolderPicker(), new FakeLogFolder(), new FakeDryRunItemActions());
 
     [Fact]
     public async Task Non_stop_mode_allows_close_and_leaves_the_service_running()
@@ -74,4 +74,12 @@ public sealed class MainWindowViewModelCloseTests
 internal sealed class FakeLogFolder : ILogFolderService
 {
     public void OpenLogFolder() { }
+}
+
+internal sealed class FakeDryRunItemActions : IDryRunItemActions
+{
+    public void CopyText(string? text) { }
+    public void OpenFile(string path) { }
+    public void RevealInExplorer(string path) { }
+    public void OpenFolderInExplorer(string path) { }
 }

@@ -1,5 +1,3 @@
-using System;
-using System.Globalization;
 using Avalonia;
 using Avalonia.Data.Converters;
 using Avalonia.Media;
@@ -21,24 +19,12 @@ public static class IconConverters
     public static readonly FuncValueConverter<string?, IBrush?> Brush =
         new(key => Resolve(key) as IBrush);
 
-    /// <summary>True (a directory node) → the manila folder tint; false → no brush (transparent), so
-    /// only folder rows in the dry-run trees carry the wash.</summary>
+    /// <summary>True (a directory node) → the manila folder tint; false → a transparent brush, so
+    /// only folder rows carry the wash while file rows still hit-test across their whole width (a
+    /// null background would only catch the pointer on the painted text, making the row's right-click
+    /// menu reachable from the file name alone).</summary>
     public static readonly FuncValueConverter<bool, IBrush?> FolderTint =
-        new(isDirectory => isDirectory ? Resolve("Brush.Folder.Soft") as IBrush : null);
-
-    /// <summary>Passes the <c>ConverterParameter</c> through when the bound bool is true, otherwise
-    /// null. Used to attach the shared folder context menu to directory rows only (a file row's
-    /// ContextFlyout resolves to null, so right-clicking a file shows nothing).</summary>
-    public static readonly IValueConverter WhenTrue = new WhenTrueConverter();
-
-    private sealed class WhenTrueConverter : IValueConverter
-    {
-        public object? Convert(object? value, Type targetType, object? parameter, CultureInfo culture) =>
-            value is true ? parameter : null;
-
-        public object? ConvertBack(object? value, Type targetType, object? parameter, CultureInfo culture) =>
-            throw new NotSupportedException();
-    }
+        new(isDirectory => isDirectory ? Resolve("Brush.Folder.Soft") as IBrush : Brushes.Transparent);
 
     private static object? Resolve(string? key) =>
         key is not null && Application.Current is { } app && app.TryGetResource(key, null, out object? value)

@@ -40,7 +40,7 @@ public sealed record DryRunTargetRow(string DirPath, string FileName, string? Ta
 /// <summary>A source file in the Sources tab. Carries its own pills: Untouched (nothing happens to
 /// the source — filtered out or unchanged), Processed, and Deleted (a destructive source
 /// disposition). A processed-and-deleted file shows both the Processed and Deleted pills.</summary>
-public sealed record DryRunFileRow(
+public sealed partial record DryRunFileRow(
     string DirPath,
     string FileName,
     string? SourceRoot,
@@ -51,6 +51,30 @@ public sealed record DryRunFileRow(
     long SizeBytes = 0,
     string? SourceCommonRoot = null)
 {
+    /// <summary>Clipboard/shell actions behind this row's right-click menu; set at build time, null
+    /// in headless tests (the commands then no-op).</summary>
+    public IDryRunItemActions? Actions { get; init; }
+
+    // File right-click commands (the Sources list rows are always real source files). Names mirror
+    // DryRunTreeNode so the shared file menu markup binds the same command names on either type.
+    // These are computed get-only properties — NOT [ObservableProperty]/[RelayCommand] fields and
+    // NOT cached in a field — so they never join this record's value equality (a cached command per
+    // instance would break the presorted-rows dedup in DryRunRebuild.SameRows / the `with` copies).
+    // A command is allocated only when the menu is opened; Open File / reveal grey out via a live
+    // disk check evaluated when the right-click realizes the command.
+    public IRelayCommand CopyPathCommand => new RelayCommand(() => Actions?.CopyText(SourcePath));
+    public IRelayCommand CopyNameCommand => new RelayCommand(() => Actions?.CopyText(FileName));
+    // Disabled for a name that is all extension (a dotfile like ".git" — stem is empty, so there is
+    // nothing to copy).
+    public IRelayCommand CopyNameWithoutExtensionCommand =>
+        new RelayCommand(
+            () => Actions?.CopyText(System.IO.Path.GetFileNameWithoutExtension(FileName)),
+            () => System.IO.Path.GetFileNameWithoutExtension(FileName).Length > 0);
+    public IRelayCommand OpenFileCommand =>
+        new RelayCommand(() => Actions?.OpenFile(SourcePath), () => System.IO.File.Exists(SourcePath));
+    public IRelayCommand RevealInExplorerCommand =>
+        new RelayCommand(() => Actions?.RevealInExplorer(SourcePath), () => System.IO.File.Exists(SourcePath));
+
     /// <summary>The absolute source path, reconstructed on demand (tooltips) — rows share their
     /// directory string instead of each retaining a full path.</summary>
     public string SourcePath => System.IO.Path.Join(DirPath, FileName);
@@ -222,13 +246,34 @@ public sealed record DryRunDestinationEntry(
 /// (replication collapses to one row with a list of destinations instead of one row per target).
 /// Rows with no originating source (<see cref="HasSource"/> false) carry a single
 /// <see cref="DryRunDestinationEntry"/> and render as a plain single-status row.</summary>
-public sealed record DryRunDestinationRow(
+public sealed partial record DryRunDestinationRow(
     string? SourceDirPath,
     string? SourceFileName,
     string? SourceRoot,
     string? SourceCommonRoot,
     IReadOnlyList<DryRunDestinationEntry> Destinations)
 {
+    /// <summary>Clipboard/shell actions behind this row's right-click menu; set at build time, null
+    /// in headless tests (the commands then no-op).</summary>
+    public IDryRunItemActions? Actions { get; init; }
+
+    // File right-click commands acting on the representative destination (Primary) — a destination
+    // row is a resulting file (or fan-out); folders only appear in the tree. Names mirror the tree
+    // node / source row so the shared file menu markup binds identically. Computed get-only (see the
+    // note on DryRunFileRow) so they never join this record's value equality; Open File / reveal grey
+    // out via a live disk check, so a planned (not-yet-written) destination shows them disabled.
+    public IRelayCommand CopyPathCommand => new RelayCommand(() => Actions?.CopyText(Primary.TargetPath));
+    public IRelayCommand CopyNameCommand => new RelayCommand(() => Actions?.CopyText(Primary.FileName));
+    // Disabled for a name that is all extension (a dotfile like ".git" — stem is empty).
+    public IRelayCommand CopyNameWithoutExtensionCommand =>
+        new RelayCommand(
+            () => Actions?.CopyText(System.IO.Path.GetFileNameWithoutExtension(Primary.FileName)),
+            () => System.IO.Path.GetFileNameWithoutExtension(Primary.FileName).Length > 0);
+    public IRelayCommand OpenFileCommand =>
+        new RelayCommand(() => Actions?.OpenFile(Primary.TargetPath), () => System.IO.File.Exists(Primary.TargetPath));
+    public IRelayCommand RevealInExplorerCommand =>
+        new RelayCommand(() => Actions?.RevealInExplorer(Primary.TargetPath), () => System.IO.File.Exists(Primary.TargetPath));
+
     /// <summary>The absolute originating-source path, reconstructed on demand; null for rows with no
     /// source (Mirror deletions, kept-around originals, pre-existing untouched files).</summary>
     public string? SourcePath =>
@@ -290,6 +335,10 @@ public sealed record TreePillSpec(string Kind, string Label, string IconKey, str
 internal sealed class DryRunTreeController
 {
     public HierarchicalTreeDataGridSource<DryRunTreeNode>? Source { get; set; }
+
+    /// <summary>The clipboard/shell actions behind the node right-click menu, shared by every node
+    /// in the forest (null in headless tests, where the menu commands simply no-op).</summary>
+    public IDryRunItemActions? Actions { get; set; }
 }
 
 /// <summary>A node in a path tree whose counts are the rolled-up totals of everything beneath it,
@@ -409,6 +458,32 @@ public sealed partial class DryRunTreeNode : ObservableObject
     [RelayCommand] private void ExpandAll() => _controller?.Source?.ExpandAll();
     [RelayCommand] private void CloseAll() => _controller?.Source?.CollapseAll();
 
+    // Clipboard / shell right-click commands, on files and folders alike (the node menu gates which
+    // are shown by IsDirectory). All route through the forest's shared actions service; Open File /
+    // reveal / Open Folder in Explorer are gated by a disk check so they grey out for a planned entry
+    // that does not exist on disk (e.g. a not-yet-written destination file).
+    [RelayCommand] private void CopyPath() => _controller?.Actions?.CopyText(FullPath);
+    [RelayCommand] private void CopyName() => _controller?.Actions?.CopyText(Name);
+    [RelayCommand(CanExecute = nameof(CanCopyNameWithoutExtension))]
+    private void CopyNameWithoutExtension() =>
+        _controller?.Actions?.CopyText(System.IO.Path.GetFileNameWithoutExtension(Name));
+
+    [RelayCommand(CanExecute = nameof(CanOpenFile))]
+    private void OpenFile() => _controller?.Actions?.OpenFile(FullPath);
+    [RelayCommand(CanExecute = nameof(CanOpenFile))]
+    private void RevealInExplorer() => _controller?.Actions?.RevealInExplorer(FullPath);
+    [RelayCommand(CanExecute = nameof(CanOpenFolder))]
+    private void OpenFolderInExplorer() => _controller?.Actions?.OpenFolderInExplorer(FullPath);
+
+    /// <summary>A file that exists on disk right now — drives whether Open File / Open File In
+    /// Explorer are enabled (checked when the menu realizes the command, per the right-click).</summary>
+    private bool CanOpenFile => !IsDirectory && System.IO.File.Exists(FullPath);
+    /// <summary>A folder that exists on disk right now — drives Open Folder In Explorer.</summary>
+    private bool CanOpenFolder => IsDirectory && System.IO.Directory.Exists(FullPath);
+    /// <summary>The name has something before its extension — false for an all-extension dotfile
+    /// (".git"), so Copy File Name Without Extension greys out rather than copying an empty string.</summary>
+    private bool CanCopyNameWithoutExtension => System.IO.Path.GetFileNameWithoutExtension(Name).Length > 0;
+
     // The clicked folder is visible, so its HierarchicalRow is present in the flattened Rows list.
     private static HierarchicalRow<DryRunTreeNode>? FindRow(
         HierarchicalTreeDataGridSource<DryRunTreeNode> source, DryRunTreeNode node)
@@ -457,7 +532,8 @@ public sealed partial class DryRunTreeNode : ObservableObject
         IReadOnlyList<TreePillSpec> specs,
         string? commonRoot = null,
         IReadOnlySet<string>? expandedPaths = null,
-        Func<T, long>? sizeSelector = null)
+        Func<T, long>? sizeSelector = null,
+        IDryRunItemActions? actions = null)
     {
         List<DryRunTreeNode> roots = [];
         Dictionary<string, DryRunTreeNode> rootIndex = new(StringComparer.OrdinalIgnoreCase);
@@ -467,9 +543,10 @@ public sealed partial class DryRunTreeNode : ObservableObject
         Dictionary<string, DryRunTreeNode?> dirNodeByPath = new(StringComparer.OrdinalIgnoreCase);
         string? rootPrefix = string.IsNullOrEmpty(commonRoot) ? null : commonRoot.TrimEnd('\\', '/');
 
-        // Shared by every directory node in this forest; BuildSource attaches the built source to it
-        // so the folder context-menu commands can drive expansion through the source API.
-        DryRunTreeController controller = new();
+        // Shared by every node in this forest; BuildSource attaches the built source to it so the
+        // folder context-menu commands can drive expansion through the source API, and it carries the
+        // clipboard/shell actions the file + folder right-click commands route through.
+        DryRunTreeController controller = new() { Actions = actions };
 
         Dictionary<string, int> specIndex = new(specs.Count, StringComparer.Ordinal);
         for (int k = 0; k < specs.Count; k++)
@@ -491,7 +568,7 @@ public sealed partial class DryRunTreeNode : ObservableObject
                 string fileName = nameSelector(row);
                 if (!rootIndex.TryGetValue(fileName, out DryRunTreeNode? leaf))
                 {
-                    leaf = new DryRunTreeNode(fileName, dirFullPath: null, dirPath, isDirectory: false, depth: 0);
+                    leaf = new DryRunTreeNode(fileName, dirFullPath: null, dirPath, isDirectory: false, depth: 0, controller);
                     roots.Add(leaf);
                     rootIndex[fileName] = leaf;
                 }
@@ -517,7 +594,7 @@ public sealed partial class DryRunTreeNode : ObservableObject
             int leafDepth = dir.Depth + 1;
             dir._leafFactory = () => BuildLeaves(
                 capturedBucket, leafDepth, nameSelector, dirSelector, categorizer, sizeSelector,
-                specs, specIndex, leafPillCache, leafSingleLists);
+                specs, specIndex, leafPillCache, leafSingleLists, controller);
         }
 
         // First build: auto-expand the top-level folders only when the first level of expansion stays
@@ -826,7 +903,8 @@ public sealed partial class DryRunTreeNode : ObservableObject
         IReadOnlyList<TreePillSpec> specs,
         Dictionary<string, int> specIndex,
         Dictionary<(int Spec, int Count), TreePill> pillCache,
-        Dictionary<TreePill, IReadOnlyList<TreePill>> singlePillLists)
+        Dictionary<TreePill, IReadOnlyList<TreePill>> singlePillLists,
+        DryRunTreeController? controller)
     {
         Dictionary<string, DryRunTreeNode> byName = new(StringComparer.OrdinalIgnoreCase);
         List<DryRunTreeNode> leaves = new(bucket.Count);
@@ -835,7 +913,7 @@ public sealed partial class DryRunTreeNode : ObservableObject
             string fileName = nameSelector(row);
             if (!byName.TryGetValue(fileName, out DryRunTreeNode? leaf))
             {
-                leaf = new DryRunTreeNode(fileName, dirFullPath: null, dirSelector(row), isDirectory: false, leafDepth);
+                leaf = new DryRunTreeNode(fileName, dirFullPath: null, dirSelector(row), isDirectory: false, leafDepth, controller);
                 byName[fileName] = leaf;
                 leaves.Add(leaf);
             }
@@ -1042,7 +1120,14 @@ public sealed partial class DryRunSourcesTab : ViewModelBase
     private List<DryRunFileRow> _all = [];      // presorted by DryRunSort at load, never mutated after
     private List<DryRunFileRow> _visible = [];
 
-    public DryRunSourcesTab(TimeSpan searchDebounce) => _searchDebounce = searchDebounce;
+    /// <summary>Clipboard/shell actions for the row + tree right-click menus (null in headless tests).</summary>
+    private readonly IDryRunItemActions? _actions;
+
+    public DryRunSourcesTab(TimeSpan searchDebounce, IDryRunItemActions? actions = null)
+    {
+        _searchDebounce = searchDebounce;
+        _actions = actions;
+    }
 
     /// <summary>The in-flight (or last completed) rebuild. Rebuilds over
     /// <see cref="DryRunRebuild.SyncThreshold"/> rows run on the thread pool; tests that cross that
@@ -1360,7 +1445,8 @@ public sealed partial class DryRunSourcesTab : ViewModelBase
                 CommonRoot,
                 _all,
                 _visible,
-                ShowTree && Tree.Count > 0 ? DryRunTreeNode.CollectExpanded(Tree) : null);
+                ShowTree && Tree.Count > 0 ? DryRunTreeNode.CollectExpanded(Tree) : null,
+                _actions);
 
             RebuildResult result;
             if (input.All.Count <= DryRunRebuild.SyncThreshold)
@@ -1410,7 +1496,8 @@ public sealed partial class DryRunSourcesTab : ViewModelBase
         string? CommonRoot,
         List<DryRunFileRow> All,
         List<DryRunFileRow> CurrentVisible,
-        IReadOnlySet<string>? ExpandedPaths);
+        IReadOnlySet<string>? ExpandedPaths,
+        IDryRunItemActions? Actions);
 
     private sealed record RebuildResult(List<DryRunFileRow> Visible, IReadOnlyList<DryRunTreeNode>? Forest);
 
@@ -1448,11 +1535,12 @@ public sealed partial class DryRunSourcesTab : ViewModelBase
                 visible = input.CurrentVisible;
         }
         ct.ThrowIfCancellationRequested();
-        return new(visible, input.ShowTree ? BuildTree(visible, input.CommonRoot, input.ExpandedPaths) : null);
+        return new(visible, input.ShowTree ? BuildTree(visible, input.CommonRoot, input.ExpandedPaths, input.Actions) : null);
     }
 
     private static IReadOnlyList<DryRunTreeNode> BuildTree(
-        IReadOnlyList<DryRunFileRow> rows, string? commonRoot, IReadOnlySet<string>? expandedPaths) =>
+        IReadOnlyList<DryRunFileRow> rows, string? commonRoot, IReadOnlySet<string>? expandedPaths,
+        IDryRunItemActions? actions) =>
         DryRunTreeNode.BuildForest(rows, static r => r.DirPath, static r => r.FileName, static r =>
         {
             List<(string, int)> cats = [];
@@ -1462,7 +1550,7 @@ public sealed partial class DryRunSourcesTab : ViewModelBase
             return cats;
             // A prior forest (expandedPaths non-null) → restore its expansion; the very first build
             // → null so BuildForest's top-level auto-expand heuristic applies.
-        }, TreeSpecs, commonRoot, expandedPaths, static r => r.SizeBytes);
+        }, TreeSpecs, commonRoot, expandedPaths, static r => r.SizeBytes, actions);
 }
 
 /// <summary>The Destinations tab: the resulting destination structure — files a run would add
@@ -1487,7 +1575,14 @@ public sealed partial class DryRunDestinationsTab : ViewModelBase
     private List<DryRunDestinationRow> _all = [];      // presorted by DryRunSort at load, never mutated after
     private List<DryRunDestinationRow> _visible = [];
 
-    public DryRunDestinationsTab(TimeSpan searchDebounce) => _searchDebounce = searchDebounce;
+    /// <summary>Clipboard/shell actions for the row + tree right-click menus (null in headless tests).</summary>
+    private readonly IDryRunItemActions? _actions;
+
+    public DryRunDestinationsTab(TimeSpan searchDebounce, IDryRunItemActions? actions = null)
+    {
+        _searchDebounce = searchDebounce;
+        _actions = actions;
+    }
 
     /// <summary>The in-flight (or last completed) rebuild. Rebuilds over
     /// <see cref="DryRunRebuild.SyncThreshold"/> rows run on the thread pool; tests that cross that
@@ -1836,7 +1931,8 @@ public sealed partial class DryRunDestinationsTab : ViewModelBase
                 CommonRoot,
                 _all,
                 _visible,
-                ShowTree && Tree.Count > 0 ? DryRunTreeNode.CollectExpanded(Tree) : null);
+                ShowTree && Tree.Count > 0 ? DryRunTreeNode.CollectExpanded(Tree) : null,
+                _actions);
 
             RebuildResult result;
             if (input.All.Count <= DryRunRebuild.SyncThreshold)
@@ -1886,7 +1982,8 @@ public sealed partial class DryRunDestinationsTab : ViewModelBase
         string? CommonRoot,
         List<DryRunDestinationRow> All,
         List<DryRunDestinationRow> CurrentVisible,
-        IReadOnlySet<string>? ExpandedPaths);
+        IReadOnlySet<string>? ExpandedPaths,
+        IDryRunItemActions? Actions);
 
     private sealed record RebuildResult(List<DryRunDestinationRow> Visible, IReadOnlyList<DryRunTreeNode>? Forest);
 
@@ -1931,11 +2028,12 @@ public sealed partial class DryRunDestinationsTab : ViewModelBase
                 visible = input.CurrentVisible;
         }
         ct.ThrowIfCancellationRequested();
-        return new(visible, input.ShowTree ? BuildTree(visible, input.CommonRoot, input.ExpandedPaths) : null);
+        return new(visible, input.ShowTree ? BuildTree(visible, input.CommonRoot, input.ExpandedPaths, input.Actions) : null);
     }
 
     private static IReadOnlyList<DryRunTreeNode> BuildTree(
-        IReadOnlyList<DryRunDestinationRow> rows, string? commonRoot, IReadOnlySet<string>? expandedPaths) =>
+        IReadOnlyList<DryRunDestinationRow> rows, string? commonRoot, IReadOnlySet<string>? expandedPaths,
+        IDryRunItemActions? actions) =>
         // Flatten grouped rows back to one leaf per resulting path — the tree is per-file, unchanged.
         DryRunTreeNode.BuildForest(rows.SelectMany(static r => r.Destinations), static e => e.DirPath, static e => e.FileName, static e =>
         {
@@ -1949,7 +2047,7 @@ public sealed partial class DryRunDestinationsTab : ViewModelBase
             };
             return new[] { (kind, 1) };
         }, TreeSpecs, commonRoot, expandedPaths,
-           static e => e.SizeBytes);
+           static e => e.SizeBytes, actions);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────
@@ -2082,12 +2180,17 @@ public sealed partial class DryRunViewModel : ViewModelBase
 {
     private readonly IIpcGateway _gateway;
 
-    public DryRunViewModel(IIpcGateway gateway, TimeSpan? searchDebounce = null)
+    /// <summary>The clipboard/shell actions behind the row/node right-click menus; null in
+    /// headless view-model tests, where the menu commands simply no-op.</summary>
+    private readonly IDryRunItemActions? _actions;
+
+    public DryRunViewModel(IIpcGateway gateway, IDryRunItemActions? actions = null, TimeSpan? searchDebounce = null)
     {
         _gateway = gateway;
+        _actions = actions;
         TimeSpan debounce = searchDebounce ?? TimeSpan.FromMilliseconds(200);
-        Sources = new DryRunSourcesTab(debounce);
-        Destinations = new DryRunDestinationsTab(debounce);
+        Sources = new DryRunSourcesTab(debounce, actions);
+        Destinations = new DryRunDestinationsTab(debounce, actions);
     }
 
     public DryRunSourcesTab Sources { get; }
@@ -2180,7 +2283,7 @@ public sealed partial class DryRunViewModel : ViewModelBase
             // context so ApplyPrepared raises its property changes on the UI thread.
             // RunCommand.IsRunning spans the preparation, so the view's progress bar keeps
             // animating instead of the window freezing.
-            PreparedReport prepared = await Task.Run(() => PrepareReport(report!, ct), ct);
+            PreparedReport prepared = await Task.Run(() => PrepareReport(report!, ct, _actions), ct);
             if (_reportEpoch != epoch)
                 return;   // the preview was cleared while running — a stale report must not apply
             ApplyPrepared(prepared);
@@ -2232,12 +2335,13 @@ public sealed partial class DryRunViewModel : ViewModelBase
 
     /// <summary>Synchronous prepare-and-apply, kept for the benchmarks and memory tests that gauge
     /// the whole projection; the app path runs <see cref="PrepareReport"/> on the thread pool.</summary>
-    internal void ApplyReport(DryRunReport report) => ApplyPrepared(PrepareReport(report));
+    internal void ApplyReport(DryRunReport report) => ApplyPrepared(PrepareReport(report, actions: _actions));
 
     /// <summary>The pure, thread-safe half of applying a report: projects the wire report into both
     /// tabs' presorted rows, counts, and facets, plus the banner numbers. O(n) over up to the
     /// ~500k-file streamed cap — always run this off the UI thread for real reports.</summary>
-    internal static PreparedReport PrepareReport(DryRunReport report, CancellationToken ct = default)
+    internal static PreparedReport PrepareReport(DryRunReport report, CancellationToken ct = default,
+        IDryRunItemActions? actions = null)
     {
         // The one per-directory string allocation: every row references entries of this array, so
         // sibling files share their directory chain instead of each retaining a full path string.
@@ -2320,7 +2424,8 @@ public sealed partial class DryRunViewModel : ViewModelBase
                 op?.SourceDisposition?.ToString(),
                 targets.Count == 0 ? EmptyTargets : targets,
                 file.Length,
-                sourceCommonRoot);
+                sourceCommonRoot)
+            { Actions = actions };
         }
 
         if (sourceCount <= DryRunRebuild.SyncThreshold)
@@ -2384,7 +2489,8 @@ public sealed partial class DryRunViewModel : ViewModelBase
             }
             DryRunFile file = report.SourceFiles[i];
             return new DryRunDestinationRow(
-                dirPaths[file.DirIndex], file.FileName, dirPaths[file.RootDirIndex], sourceCommonRoot, entries);
+                dirPaths[file.DirIndex], file.FileName, dirPaths[file.RootDirIndex], sourceCommonRoot, entries)
+            { Actions = actions };
         }
 
         if (sourceCount <= DryRunRebuild.SyncThreshold)
@@ -2410,7 +2516,7 @@ public sealed partial class DryRunViewModel : ViewModelBase
         foreach (int k in noSource)
         {
             DryRunOperation o = destOps[k];
-            destRows.Add(new DryRunDestinationRow(null, null, null, null, [Entry(o, OpSize(o))]));
+            destRows.Add(new DryRunDestinationRow(null, null, null, null, [Entry(o, OpSize(o))]) { Actions = actions });
         }
 
         // One pass over the destination ops for the blast-radius banner numbers (previously three

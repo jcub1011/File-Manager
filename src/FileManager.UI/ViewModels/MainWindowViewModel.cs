@@ -16,13 +16,14 @@ public sealed partial class MainWindowViewModel : ViewModelBase
     private readonly IIpcGateway _gateway;
     private readonly ILogFolderService _logFolder;
 
-    public MainWindowViewModel(IIpcGateway gateway, IFolderPicker folderPicker, ILogFolderService logFolder)
+    public MainWindowViewModel(IIpcGateway gateway, IFolderPicker folderPicker, ILogFolderService logFolder,
+        IDryRunItemActions dryRunActions)
     {
         _gateway = gateway;
         _logFolder = logFolder;
         List = new ProfileListViewModel(gateway);
         Editor = new ProfileEditorViewModel(gateway, folderPicker);
-        DryRun = new DryRunViewModel(gateway);
+        DryRun = new DryRunViewModel(gateway, dryRunActions);
         StatusBar = new StatusBarViewModel(gateway);
 
         List.CanNavigate = () => !Editor.IsDirty;

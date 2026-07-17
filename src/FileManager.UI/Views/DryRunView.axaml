@@ -52,18 +52,79 @@
             </ItemsControl>
         </DataTemplate>
 
-        <!-- Right-click menu for navigating large trees, attached to whole folder rows via the
-             TreeDataGridRow style below (gated to directories, so file rows get no menu). Shared
-             across rows; on open its DataContext is the right-clicked node, so the items bind to
-             that node's commands. CompileBindings off because the row style sits at UserControl
-             (view-model) scope, not the node's. -->
-        <MenuFlyout x:Key="FolderContextMenu" x:CompileBindings="False">
-            <MenuItem Header="Open Folder" Command="{Binding OpenFolderCommand}" />
-            <MenuItem Header="Open Folder and All Nested Folders" Command="{Binding OpenFolderRecursiveCommand}" />
-            <MenuItem Header="Close Folder" Command="{Binding CloseFolderCommand}" />
+        <!-- Right-click menu for the tree rows, attached to every row via the TreeDataGridRow style
+             below. One shared flyout serves both folders and files: the folder-navigation items and
+             the file-only items toggle on IsDirectory, so a folder shows the nav + folder actions and
+             a file shows only the file actions. On open its DataContext is the right-clicked node, so
+             every item binds to that node's commands. CompileBindings off because the row style sits
+             at UserControl (view-model) scope, not the node's; every item carries a leading icon so
+             the right option is quick to spot. -->
+        <MenuFlyout x:Key="NodeContextMenu" x:CompileBindings="False">
+            <!-- Folder navigation (folders only) -->
+            <MenuItem Header="Open Folder" Command="{Binding OpenFolderCommand}" IsVisible="{Binding IsDirectory}">
+                <MenuItem.Icon><PathIcon Data="{StaticResource IconAdd}" Width="16" Height="16" /></MenuItem.Icon>
+            </MenuItem>
+            <MenuItem Header="Open Folder and All Nested Folders" Command="{Binding OpenFolderRecursiveCommand}" IsVisible="{Binding IsDirectory}">
+                <MenuItem.Icon><PathIcon Data="{StaticResource IconAdd}" Width="16" Height="16" /></MenuItem.Icon>
+            </MenuItem>
+            <MenuItem Header="Close Folder" Command="{Binding CloseFolderCommand}" IsVisible="{Binding IsDirectory}">
+                <MenuItem.Icon><PathIcon Data="{StaticResource IconMinimize}" Width="16" Height="16" /></MenuItem.Icon>
+            </MenuItem>
+            <Separator IsVisible="{Binding IsDirectory}" />
+            <MenuItem Header="Expand All Folders" Command="{Binding ExpandAllCommand}" IsVisible="{Binding IsDirectory}">
+                <MenuItem.Icon><PathIcon Data="{StaticResource IconAdd}" Width="16" Height="16" /></MenuItem.Icon>
+            </MenuItem>
+            <MenuItem Header="Close All Folders" Command="{Binding CloseAllCommand}" IsVisible="{Binding IsDirectory}">
+                <MenuItem.Icon><PathIcon Data="{StaticResource IconMinimize}" Width="16" Height="16" /></MenuItem.Icon>
+            </MenuItem>
+            <Separator IsVisible="{Binding IsDirectory}" />
+            <!-- Copy (both kinds; the name item's label differs by kind) -->
+            <MenuItem Header="Copy Path" Command="{Binding CopyPathCommand}">
+                <MenuItem.Icon><PathIcon Data="{StaticResource IconRestore}" Width="16" Height="16" /></MenuItem.Icon>
+            </MenuItem>
+            <MenuItem Header="Copy File Name" Command="{Binding CopyNameCommand}" IsVisible="{Binding !IsDirectory}">
+                <MenuItem.Icon><PathIcon Data="{StaticResource IconRestore}" Width="16" Height="16" /></MenuItem.Icon>
+            </MenuItem>
+            <MenuItem Header="Copy File Name Without Extension" Command="{Binding CopyNameWithoutExtensionCommand}" IsVisible="{Binding !IsDirectory}">
+                <MenuItem.Icon><PathIcon Data="{StaticResource IconRestore}" Width="16" Height="16" /></MenuItem.Icon>
+            </MenuItem>
+            <MenuItem Header="Copy Folder Name" Command="{Binding CopyNameCommand}" IsVisible="{Binding IsDirectory}">
+                <MenuItem.Icon><PathIcon Data="{StaticResource IconRestore}" Width="16" Height="16" /></MenuItem.Icon>
+            </MenuItem>
             <Separator />
-            <MenuItem Header="Expand All Folders" Command="{Binding ExpandAllCommand}" />
-            <MenuItem Header="Close All Folders" Command="{Binding CloseAllCommand}" />
+            <!-- Open (file → default app / reveal; folder → reveal) -->
+            <MenuItem Header="Open File" Command="{Binding OpenFileCommand}" IsVisible="{Binding !IsDirectory}">
+                <MenuItem.Icon><PathIcon Data="{StaticResource IconDocument}" Width="16" Height="16" /></MenuItem.Icon>
+            </MenuItem>
+            <MenuItem Header="Open File In Explorer" Command="{Binding RevealInExplorerCommand}" IsVisible="{Binding !IsDirectory}">
+                <MenuItem.Icon><PathIcon Data="{StaticResource IconFolder}" Width="16" Height="16" /></MenuItem.Icon>
+            </MenuItem>
+            <MenuItem Header="Open Folder In Explorer" Command="{Binding OpenFolderInExplorerCommand}" IsVisible="{Binding IsDirectory}">
+                <MenuItem.Icon><PathIcon Data="{StaticResource IconFolder}" Width="16" Height="16" /></MenuItem.Icon>
+            </MenuItem>
+        </MenuFlyout>
+
+        <!-- Right-click menu for the flat Sources/Destinations list rows (always files). Shared by
+             both lists: DryRunFileRow and DryRunDestinationRow expose the same command names, so on
+             open the items bind against whichever row's DataContext they were shown on. Open File /
+             Open File In Explorer grey out (CanExecute disk check) when the file isn't on disk. -->
+        <MenuFlyout x:Key="FileContextMenu" x:CompileBindings="False">
+            <MenuItem Header="Copy Path" Command="{Binding CopyPathCommand}">
+                <MenuItem.Icon><PathIcon Data="{StaticResource IconRestore}" Width="16" Height="16" /></MenuItem.Icon>
+            </MenuItem>
+            <MenuItem Header="Copy File Name" Command="{Binding CopyNameCommand}">
+                <MenuItem.Icon><PathIcon Data="{StaticResource IconRestore}" Width="16" Height="16" /></MenuItem.Icon>
+            </MenuItem>
+            <MenuItem Header="Copy File Name Without Extension" Command="{Binding CopyNameWithoutExtensionCommand}">
+                <MenuItem.Icon><PathIcon Data="{StaticResource IconRestore}" Width="16" Height="16" /></MenuItem.Icon>
+            </MenuItem>
+            <Separator />
+            <MenuItem Header="Open File" Command="{Binding OpenFileCommand}">
+                <MenuItem.Icon><PathIcon Data="{StaticResource IconDocument}" Width="16" Height="16" /></MenuItem.Icon>
+            </MenuItem>
+            <MenuItem Header="Open File In Explorer" Command="{Binding RevealInExplorerCommand}">
+                <MenuItem.Icon><PathIcon Data="{StaticResource IconFolder}" Width="16" Height="16" /></MenuItem.Icon>
+            </MenuItem>
         </MenuFlyout>
 
         <!-- A tab's source + destination filter facets: two WrapPanels of checkboxes. -->
@@ -192,11 +253,10 @@
                  this stays a compiled, AOT-safe binding rather than a reflection one. -->
             <Setter Property="Background"
                     Value="{Binding IsDirectory, DataType=vm:DryRunTreeNode, Converter={x:Static conv:IconConverters.FolderTint}}" />
-            <!-- Whole-row right-click menu, but folders only: WhenTrue passes the shared menu through
-                 for directory rows and null for files. The row's DataContext is the node, so the menu
-                 opens with the right node's commands. -->
-            <Setter Property="ContextFlyout"
-                    Value="{Binding IsDirectory, DataType=vm:DryRunTreeNode, Converter={x:Static conv:IconConverters.WhenTrue}, ConverterParameter={StaticResource FolderContextMenu}}" />
+            <!-- Whole-row right-click menu on every row; the shared flyout shows the folder actions or
+                 the file actions per the node's IsDirectory. The row's DataContext is the node, so the
+                 menu opens with the right node's commands. -->
+            <Setter Property="ContextFlyout" Value="{StaticResource NodeContextMenu}" />
         </Style>
         <!-- Light-blue hover highlight on tree rows; overrides the folder tint / transparent base while
              the pointer is over the row. -->
@@ -398,8 +458,9 @@
                              SelectionMode="Single" ScrollViewer.HorizontalScrollBarVisibility="Disabled">
                         <ListBox.ItemTemplate>
                             <DataTemplate x:DataType="vm:DryRunFileRow">
-                                <Border BorderThickness="0,0,0,1" BorderBrush="{DynamicResource SystemControlBackgroundListLowBrush}"
-                                        Padding="4,6,16,6" ToolTip.Tip="{Binding SourcePath}"><!-- right inset reserves a gutter for the overlay scrollbar so the status glyphs aren't covered -->
+                                <Border Background="Transparent" BorderThickness="0,0,0,1" BorderBrush="{DynamicResource SystemControlBackgroundListLowBrush}"
+                                        Padding="4,6,16,6" ToolTip.Tip="{Binding SourcePath}"
+                                        ContextFlyout="{StaticResource FileContextMenu}"><!-- Transparent (not null) background so the whole row hit-tests for the right-click menu, not just the painted text; right inset reserves a gutter for the overlay scrollbar so the status glyphs aren't covered -->
                                     <Grid RowDefinitions="Auto,Auto" ColumnDefinitions="*,Auto">
                                         <!-- line 1: file name (extension preserved on truncation) -->
                                         <ctrl:PathText Grid.Row="0" Grid.Column="0" Text="{Binding FileName}"
@@ -536,8 +597,8 @@
                              SelectionMode="Single" ScrollViewer.HorizontalScrollBarVisibility="Disabled">
                         <ListBox.ItemTemplate>
                             <DataTemplate x:DataType="vm:DryRunDestinationRow">
-                                <Border BorderThickness="0,0,0,1" BorderBrush="{DynamicResource SystemControlBackgroundListLowBrush}"
-                                        Padding="4,6,16,6"><!-- right inset reserves a gutter for the overlay scrollbar so the status glyphs aren't covered -->
+                                <Border Background="Transparent" BorderThickness="0,0,0,1" BorderBrush="{DynamicResource SystemControlBackgroundListLowBrush}"
+                                        Padding="4,6,16,6" ContextFlyout="{StaticResource FileContextMenu}"><!-- Transparent (not null) background so the whole row hit-tests for the right-click menu, not just the painted text; right inset reserves a gutter for the overlay scrollbar so the status glyphs aren't covered -->
                                     <!-- Compact 2-row layout mirroring the source row: destination name + status
                                          glyphs (one per distinct kind) on line 1, the first destination's relative
                                          folder + size on line 2. Fan-out targets share the same relative path, so

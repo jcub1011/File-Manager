@@ -28,7 +28,8 @@ namespace FileManager.UI
                 MainWindow window = new();
                 StorageProviderFolderPicker folderPicker = new(window);
                 LogFolderService logFolder = new();
-                MainWindowViewModel viewModel = new(_gateway, folderPicker, logFolder);
+                DryRunItemActions dryRunActions = new(window);
+                MainWindowViewModel viewModel = new(_gateway, folderPicker, logFolder, dryRunActions);
                 viewModel.ShowSettingsDialog = async settings =>
                 {
                     SettingsWindow dialog = new() { DataContext = settings };
