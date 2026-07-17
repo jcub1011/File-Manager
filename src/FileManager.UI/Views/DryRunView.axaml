@@ -32,7 +32,10 @@
                  to a second line rather than clipping or starving the Name column. Each pill is a
                  colour-tinted glyph + count; the glyph/colour are resolved from the pill's resource
                  keys (IconConverters) and the kind word is the tooltip. -->
-            <ItemsControl ItemsSource="{Binding Pills}">
+            <!-- Right margin reserves a gutter for the overlay vertical scrollbar (Avalonia's
+                 Fluent bar floats over content and reserves no width), so the pills — the
+                 rightmost column — aren't hidden behind it when the tree scrolls. -->
+            <ItemsControl ItemsSource="{Binding Pills}" Margin="0,0,16,0">
                 <ItemsControl.ItemsPanel>
                     <ItemsPanelTemplate>
                         <WrapPanel />
@@ -377,7 +380,7 @@
                         <ListBox.ItemTemplate>
                             <DataTemplate x:DataType="vm:DryRunFileRow">
                                 <Border BorderThickness="0,0,0,1" BorderBrush="{DynamicResource SystemControlBackgroundListLowBrush}"
-                                        Padding="4,6" ToolTip.Tip="{Binding SourcePath}">
+                                        Padding="4,6,16,6" ToolTip.Tip="{Binding SourcePath}"><!-- right inset reserves a gutter for the overlay scrollbar so the status glyphs aren't covered -->
                                     <Grid RowDefinitions="Auto,Auto" ColumnDefinitions="*,Auto">
                                         <!-- line 1: file name (extension preserved on truncation) -->
                                         <ctrl:PathText Grid.Row="0" Grid.Column="0" Text="{Binding FileName}"
@@ -503,7 +506,7 @@
                         <ListBox.ItemTemplate>
                             <DataTemplate x:DataType="vm:DryRunDestinationRow">
                                 <Border BorderThickness="0,0,0,1" BorderBrush="{DynamicResource SystemControlBackgroundListLowBrush}"
-                                        Padding="4,6">
+                                        Padding="4,6,16,6"><!-- right inset reserves a gutter for the overlay scrollbar so the status glyphs aren't covered -->
                                     <!-- Compact 2-row layout mirroring the source row: destination name + status
                                          glyphs (one per distinct kind) on line 1, the first destination's relative
                                          folder + size on line 2. Fan-out targets share the same relative path, so
