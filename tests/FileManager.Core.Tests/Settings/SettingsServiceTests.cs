@@ -74,6 +74,47 @@ public sealed class SettingsServiceTests : IDisposable
     }
 
     [Fact]
+    public void Legacy_manual_worker_pin_migrates_to_max_hash_threads()
+    {
+        // A pre-v2 file: scalar dry-run concurrency, no ScanThreading member.
+        File.WriteAllText(_paths.SettingsFilePath,
+            """
+            {"SchemaVersion":1,"ServiceStartupMode":"StartAndStopWithProgram","DryRunConcurrencyMode":"Manual","DryRunManualWorkers":6,"ThemeMode":"System"}
+            """);
+
+        GlobalSettings loaded = NewService().Current;
+
+        Assert.Equal(6, loaded.ScanThreading.MaxHashThreads.Value);   // pin carried into the hash phase
+        Assert.True(loaded.ScanThreading.MaxScanThreads.IsAuto);      // untouched levels stay auto
+    }
+
+    [Fact]
+    public void A_v2_file_without_a_legacy_pin_is_not_migrated()
+    {
+        NewService().Update(new GlobalSettings());   // writes a canonical v2 file (ScanThreading present)
+        Assert.True(NewService().Current.ScanThreading.MaxHashThreads.IsAuto);
+    }
+
+    [Fact]
+    public void Scan_threading_equality_is_structural_over_the_override_maps()
+    {
+        ScanThreadingSettings a = new()
+        {
+            DriveTypeOverrides = new Dictionary<DriveClass, ThreadBudget> { [DriveClass.Network] = ThreadBudget.Explicit(2) },
+        };
+        ScanThreadingSettings b = new()
+        {
+            DriveTypeOverrides = new Dictionary<DriveClass, ThreadBudget> { [DriveClass.Network] = ThreadBudget.Explicit(2) },
+        };
+
+        Assert.Equal(a, b);   // distinct dictionary instances, equal contents
+        Assert.Equal(a.GetHashCode(), b.GetHashCode());
+
+        // An explicit default collapses so it compares equal to the absent-field default.
+        Assert.Equal(GlobalSettings.Default, new GlobalSettings { ScanThreading = ScanThreadingSettings.Default });
+    }
+
+    [Fact]
     public void Default_startup_mode_is_start_and_stop_with_program()
     {
         Assert.Equal(ServiceStartupMode.StartAndStopWithProgram, NewService().Current.ServiceStartupMode);

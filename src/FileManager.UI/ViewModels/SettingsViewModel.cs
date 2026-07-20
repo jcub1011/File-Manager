@@ -121,16 +121,29 @@ public sealed partial class SettingsViewModel : ViewModelBase
         StatusMessage = null;
         try
         {
+            // Reject duplicate keys rather than silently collapsing them (last-wins), which would drop a
+            // row the user thinks they saved. TryAdd fails on a repeat, so the first conflict aborts.
             Dictionary<DriveClass, ThreadBudget> byType = [];
             foreach (DriveTypeOverrideRowViewModel row in DriveTypeOverrides)
-                byType[row.Class] = ToBudget(row.Auto, row.Value);   // last row wins on a duplicate class
+            {
+                if (!byType.TryAdd(row.Class, ToBudget(row.Auto, row.Value)))
+                {
+                    ErrorMessage = $"Duplicate drive-type override for {row.Class}.";
+                    return;
+                }
+            }
 
             Dictionary<string, ThreadBudget> specific = [];
             foreach (SpecificDriveOverrideRowViewModel row in SpecificDriveOverrides)
             {
                 if (string.IsNullOrWhiteSpace(row.VolumeKey))
                     continue;
-                specific[row.VolumeKey.Trim().ToLowerInvariant()] = ToBudget(row.Auto, row.Value);
+                string key = row.VolumeKey.Trim().ToLowerInvariant();
+                if (!specific.TryAdd(key, ToBudget(row.Auto, row.Value)))
+                {
+                    ErrorMessage = $"Duplicate volume key \"{key}\".";
+                    return;
+                }
             }
 
             GlobalSettings settings = new()

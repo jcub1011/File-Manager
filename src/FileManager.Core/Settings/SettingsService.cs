@@ -85,14 +85,14 @@ public sealed class SettingsService : ISettingsProvider
             if (!File.Exists(file))
                 return GlobalSettings.Default;
 
-            using FileStream stream = File.OpenRead(file);
-            GlobalSettings? loaded = JsonSerializer.Deserialize(stream, FileManagerJsonContext.Default.GlobalSettings);
+            byte[] bytes = File.ReadAllBytes(file);
+            GlobalSettings? loaded = JsonSerializer.Deserialize(bytes, FileManagerJsonContext.Default.GlobalSettings);
             if (loaded is null)
             {
                 _logger.LogWarning("Settings file {File} deserialized to null; using defaults", file);
                 return GlobalSettings.Default;
             }
-            return Normalize(loaded);
+            return Normalize(MigrateLegacy(loaded, bytes));
         }
         catch (Exception ex) when (ex is JsonException or IOException or UnauthorizedAccessException)
         {
@@ -104,6 +104,41 @@ public sealed class SettingsService : ISettingsProvider
             // Last resort: an unexpected exception falls back to defaults rather than faulting startup.
             _logger.LogError(ex, "Loading settings file {File} failed unexpectedly; using defaults", file);
             return GlobalSettings.Default;
+        }
+    }
+
+    // Pre-v2 settings.json had scalar dry-run concurrency (DryRunConcurrencyMode / DryRunManualWorkers)
+    // instead of ScanThreading. Those members no longer bind, so without this a pinned worker count is
+    // silently dropped. A persisted DryRunManualWorkers was only ever written in Manual mode (the old
+    // Normalize dropped it otherwise), so its presence as a positive integer is a Manual pin — carry it
+    // into the evaluation (hash) phase, which that scalar most directly governed. Idempotent: it
+    // re-derives the same value on every load until the next Update rewrites the file in v2 shape.
+    private GlobalSettings MigrateLegacy(GlobalSettings loaded, byte[] rawJson)
+    {
+        try
+        {
+            using JsonDocument doc = JsonDocument.Parse(rawJson);
+            JsonElement root = doc.RootElement;
+            if (root.ValueKind != JsonValueKind.Object || root.TryGetProperty("ScanThreading", out _))
+                return loaded;   // not an object, or already v2-shaped — nothing to migrate
+            if (root.TryGetProperty("DryRunManualWorkers", out JsonElement workers)
+                && workers.ValueKind == JsonValueKind.Number
+                && workers.TryGetInt32(out int n) && n >= 1)
+            {
+                _logger.LogInformation(
+                    "Migrating legacy dry-run manual worker pin ({Workers}) to scan-threading MaxHashThreads", n);
+                return loaded with
+                {
+                    SchemaVersion = 2,
+                    ScanThreading = loaded.ScanThreading with { MaxHashThreads = ThreadBudget.Explicit(n) },
+                };
+            }
+            return loaded;
+        }
+        catch (JsonException)
+        {
+            // The typed load already succeeded; a malformed legacy detail just means no migration.
+            return loaded;
         }
     }
 

@@ -64,4 +64,32 @@ public sealed record ScanThreadingSettings
     private static readonly Dictionary<string, ThreadBudget> EmptySpecificMap = new();
 
     public static ScanThreadingSettings Default { get; } = new();
+
+    // The record's synthesized equality would compare the two Dictionary members by reference, so two
+    // settings with identical override contents (e.g. one loaded from disk, one just built by the UI)
+    // would read as different. Compare the dictionaries by content instead so value-equality is
+    // structural — callers can rely on it for change detection.
+    public bool Equals(ScanThreadingSettings? other) =>
+        other is not null
+        && MaxScanThreads.Equals(other.MaxScanThreads)
+        && MaxHashThreads.Equals(other.MaxHashThreads)
+        && PerDriveDefault.Equals(other.PerDriveDefault)
+        && DictEquals(DriveTypeOverrides, other.DriveTypeOverrides)
+        && DictEquals(SpecificDriveOverrides, other.SpecificDriveOverrides);
+
+    public override int GetHashCode() => HashCode.Combine(
+        MaxScanThreads, MaxHashThreads, PerDriveDefault, DriveTypeOverrides.Count, SpecificDriveOverrides.Count);
+
+    private static bool DictEquals<TKey>(Dictionary<TKey, ThreadBudget> a, Dictionary<TKey, ThreadBudget> b)
+        where TKey : notnull
+    {
+        if (ReferenceEquals(a, b))
+            return true;
+        if (a.Count != b.Count)
+            return false;
+        foreach (KeyValuePair<TKey, ThreadBudget> e in a)
+            if (!b.TryGetValue(e.Key, out ThreadBudget v) || !v.Equals(e.Value))
+                return false;
+        return true;
+    }
 }

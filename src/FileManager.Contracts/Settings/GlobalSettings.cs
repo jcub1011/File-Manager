@@ -21,11 +21,13 @@ public sealed record GlobalSettings
     /// per-drive budget hierarchy. Profiles no longer override concurrency; this is the single source.
     /// Never null: a settings.json predating this field deserializes with no value (the source
     /// generator does not run property initializers for absent members), which the getter reads back
-    /// as <see cref="ScanThreadingSettings.Default"/>.</summary>
+    /// as <see cref="ScanThreadingSettings.Default"/>. The setter collapses an explicit default back to
+    /// the absent (null) representation so that a settings object that omits the field and one that sets
+    /// it to the default compare equal under the record's value-equality.</summary>
     public ScanThreadingSettings ScanThreading
     {
         get => _scanThreading ?? ScanThreadingSettings.Default;
-        init => _scanThreading = value;
+        init => _scanThreading = value == ScanThreadingSettings.Default ? null : value;
     }
 
     /// <summary>The UI theme. Defaults to <see cref="Settings.ThemeMode.System"/> so the app follows the

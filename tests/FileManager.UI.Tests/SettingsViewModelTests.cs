@@ -51,6 +51,34 @@ public sealed class SettingsViewModelTests
     }
 
     [Fact]
+    public async Task Save_rejects_duplicate_drive_type_overrides()
+    {
+        FakeIpcGateway gateway = new();
+        SettingsViewModel vm = new(gateway);
+        vm.DriveTypeOverrides.Add(new DriveTypeOverrideRowViewModel { Class = DriveClass.Network, Value = 2 });
+        vm.DriveTypeOverrides.Add(new DriveTypeOverrideRowViewModel { Class = DriveClass.Network, Value = 4 });
+
+        await vm.SaveCommand.ExecuteAsync(null);
+
+        Assert.Empty(gateway.SaveSettingsCalls);            // save aborted, no data silently dropped
+        Assert.Contains("Duplicate", vm.ErrorMessage);
+    }
+
+    [Fact]
+    public async Task Save_rejects_specific_drive_keys_that_collide_after_normalization()
+    {
+        FakeIpcGateway gateway = new();
+        SettingsViewModel vm = new(gateway);
+        vm.SpecificDriveOverrides.Add(new SpecificDriveOverrideRowViewModel { VolumeKey = "C:", Value = 2 });
+        vm.SpecificDriveOverrides.Add(new SpecificDriveOverrideRowViewModel { VolumeKey = " c: ", Value = 4 });
+
+        await vm.SaveCommand.ExecuteAsync(null);
+
+        Assert.Empty(gateway.SaveSettingsCalls);
+        Assert.Contains("Duplicate", vm.ErrorMessage);
+    }
+
+    [Fact]
     public async Task Save_requests_close_on_success()
     {
         FakeIpcGateway gateway = new();
