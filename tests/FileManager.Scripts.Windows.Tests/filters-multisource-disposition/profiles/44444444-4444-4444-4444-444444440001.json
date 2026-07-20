@@ -1,0 +1,49 @@
+{
+  "SchemaVersion": 2,
+  "ProfileId": "44444444-4444-4444-4444-444444440001",
+  "Name": "Filters + M:1 - MoveToArchive",
+  "Active": true,
+  "SyncMode": "AdditiveArchive",
+  "ScanDestination": false,
+  "TargetLayout": "Flatten",
+  "Triggers": {
+    "ManualShell": true,
+    "Watcher": false
+  },
+  "Sources": [
+    {
+      "Path": "C:\\Users\\Jacob McCormack\\source\\repos\\File-Manager\\tests\\FileManager.Scripts.Windows.Tests\\filters-multisource-disposition\\sourceA"
+    },
+    {
+      "Path": "C:\\Users\\Jacob McCormack\\source\\repos\\File-Manager\\tests\\FileManager.Scripts.Windows.Tests\\filters-multisource-disposition\\sourceB"
+    }
+  ],
+  "Targets": [
+    {
+      "Path": "C:\\Users\\Jacob McCormack\\source\\repos\\File-Manager\\tests\\FileManager.Scripts.Windows.Tests\\filters-multisource-disposition\\targets"
+    }
+  ],
+  "Policies": {
+    "ConflictResolution": "Skip",
+    "OverwriteHandling": "StageOverwrites",
+    "VerificationMethod": "XXH3-128",
+    "OnSuccess": "MoveToArchive",
+    "OnFailure": "AbortRestoreAndClean",
+    "MetadataOnConflict": "WarnAndContinue",
+    "ArchiveFolder": "C:\\Users\\Jacob McCormack\\source\\repos\\File-Manager\\tests\\FileManager.Scripts.Windows.Tests\\filters-multisource-disposition\\archive"
+  },
+  "Logging": {
+    "Verbosity": "FailuresAndSkips",
+    "NotifyOnFailure": true
+  },
+  "Filters": {
+    "Include": [
+      "*.txt"
+    ],
+    "ExcludeGlob": [
+      "*.tmp"
+    ],
+    "MinSizeBytes": 10,
+    "MaxDepth": 2
+  }
+}

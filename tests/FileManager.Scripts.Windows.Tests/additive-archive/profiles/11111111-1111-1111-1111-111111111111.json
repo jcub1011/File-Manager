@@ -1,0 +1,35 @@
+{
+  "SchemaVersion": 2,
+  "ProfileId": "11111111-1111-1111-1111-111111111111",
+  "Name": "AdditiveArchive - Basics",
+  "Active": true,
+  "SyncMode": "AdditiveArchive",
+  "ScanDestination": false,
+  "TargetLayout": "PreserveStructure",
+  "Triggers": {
+    "ManualShell": true,
+    "Watcher": false
+  },
+  "Sources": [
+    {
+      "Path": "C:\\Users\\Jacob McCormack\\source\\repos\\File-Manager\\tests\\FileManager.Scripts.Windows.Tests\\additive-archive\\sources"
+    }
+  ],
+  "Targets": [
+    {
+      "Path": "C:\\Users\\Jacob McCormack\\source\\repos\\File-Manager\\tests\\FileManager.Scripts.Windows.Tests\\additive-archive\\targets"
+    }
+  ],
+  "Policies": {
+    "ConflictResolution": "Skip",
+    "OverwriteHandling": "StageOverwrites",
+    "VerificationMethod": "XXH3-128",
+    "OnSuccess": "KeepSource",
+    "OnFailure": "AbortRestoreAndClean",
+    "MetadataOnConflict": "WarnAndContinue"
+  },
+  "Logging": {
+    "Verbosity": "FailuresAndSkips",
+    "NotifyOnFailure": true
+  }
+}
