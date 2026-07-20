@@ -622,10 +622,26 @@ public sealed partial class DryRunTreeNode : ObservableObject
             foreach (DryRunTreeNode root in roots)
             {
                 if (!root.IsDirectory)
+                {
                     revealed++;   // a file sitting directly at the common root
+                }
                 else
-                    revealed += (root._children?.Count ?? 0)
-                              + (bucketByDir.TryGetValue(root, out List<T>? bucket) ? bucket.Count : 0);
+                {
+                    // Count DISTINCT child names: rows sharing a file name collapse to one leaf on
+                    // expand (BuildLeaves de-dups), so that's what the first expansion actually reveals.
+                    revealed += root._children?.Count ?? 0;
+                    if (bucketByDir.TryGetValue(root, out List<T>? bucket))
+                    {
+                        HashSet<string> names = new(StringComparer.OrdinalIgnoreCase);
+                        foreach (T r in bucket)
+                        {
+                            names.Add(nameSelector(r));
+                            if (revealed + names.Count > AutoExpandChildLimit) break;   // keep the scan ~O(limit)
+                        }
+                        revealed += names.Count;
+                    }
+                }
+                if (revealed > AutoExpandChildLimit) break;   // already too many; stop counting
             }
             if (revealed <= AutoExpandChildLimit)
                 foreach (DryRunTreeNode root in roots)

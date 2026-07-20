@@ -681,6 +681,34 @@ public sealed class DryRunViewModelTests
     }
 
     [Fact]
+    public async Task Tree_stays_expanded_when_many_rows_collapse_to_few_distinct_names()
+    {
+        // One top-level folder holding more direct rows than the limit, but only 3 distinct file names.
+        // Rows sharing a name collapse to one leaf on expand, so the first expansion reveals just 3 rows —
+        // the heuristic counts distinct names, not raw rows, so the tree still auto-expands.
+        const int n = DryRunTreeNode.AutoExpandChildLimit + 1;
+        var sourceFiles = new List<DryRunFile>(n);
+        var sourceOps = new List<DryRunOperation>(n);
+        for (int i = 0; i < n; i++)
+        {
+            string path = $@"C:\r\big\file-{i % 3}.txt";   // only 3 distinct names in the folder
+            sourceFiles.Add(Pf(path, @"C:\r"));
+            sourceOps.Add(SrcOp(i, path, @"C:\r", OperationKind.Processed, OnSuccessAction.KeepSource));
+        }
+        var (viewModel, gateway) = NewViewModel();
+        gateway.DryRunResult = Report(viewModel.ProfileId!.Value, sourceFiles, sourceOps, [], []);
+        await viewModel.RunAsync(CancellationToken.None);
+
+        viewModel.Sources.ShowTree = true;
+        await viewModel.Sources.PendingRebuild;
+
+        DryRunTreeNode top = Assert.Single(viewModel.Sources.Tree);
+        Assert.Equal("big", top.Name);
+        Assert.True(top.HasChildren);
+        Assert.True(top.IsExpanded);   // 3 distinct names ≤ limit → auto-expands despite the row count
+    }
+
+    [Fact]
     public async Task Tree_stays_expanded_for_a_deep_tree_with_few_top_level_children()
     {
         // A single top-level folder with only 3 immediate subfolders — deep, and well over the limit in

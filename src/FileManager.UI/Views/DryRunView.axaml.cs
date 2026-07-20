@@ -109,26 +109,23 @@ namespace FileManager.UI.Views
             else if (CopyNameGesture.Matches(e)) TryExecute(node.CopyNameCommand);
             else if (ToggleFolderGesture.Matches(e))
             {
-                if (node is { IsDirectory: true, HasChildren: true })
-                {
-                    node.IsExpanded = !node.IsExpanded;
-                    RestoreRowFocus(grid, node);
-                }
+                if (node is not { IsDirectory: true, HasChildren: true })
+                    return;   // Enter on a file/childless node isn't ours — let the grid handle it
+                node.IsExpanded = !node.IsExpanded;
+                RestoreRowFocus(grid, node);
             }
             else if (ToggleAllGesture.Matches(e))
             {
-                if (node.IsDirectory)
-                {
-                    TryExecute(node.ToggleExpandCollapseAllCommand);
-                    RestoreRowFocus(grid, node);
-                }
+                if (!node.IsDirectory) return;   // Ctrl+Enter on a file isn't ours
+                TryExecute(node.ToggleExpandCollapseAllCommand);
+                RestoreRowFocus(grid, node);
             }
             else if (RevealGesture.Matches(e))
                 TryExecute(node.IsDirectory ? node.OpenFolderInExplorerCommand : node.RevealInExplorerCommand);
             else if (OpenFileGesture.Matches(e))
             {
-                if (!node.IsDirectory)
-                    TryExecute(node.OpenFileCommand);
+                if (node.IsDirectory) return;   // Shift+Space on a folder isn't ours
+                TryExecute(node.OpenFileCommand);
             }
             else
                 return;
