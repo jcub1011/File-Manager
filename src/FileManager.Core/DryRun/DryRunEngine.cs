@@ -5,6 +5,7 @@ using FileManager.Core.Files;
 using FileManager.Core.Filtering;
 using FileManager.Core.Jobs;
 using FileManager.Core.Placement;
+using FileManager.Core.Scanning;
 using FileManager.Core.Settings;
 using FileManager.Core.Watching;
 using Microsoft.Extensions.Logging;
@@ -169,9 +170,7 @@ public sealed class DryRunEngine(
         // Mirror always sweeps because the sweep is its only source of Deleted-orphan previews.
         bool scanDestinations = profile.EffectiveScanDestination;
         DestinationSweepResult sweep = scanDestinations
-            ? destinationProjector.Sweep(
-                profile, builder.Survivors, truncated,
-                DryRunConcurrency.ResolveManualWorkers(profile, settings.Current), ct)
+            ? destinationProjector.Sweep(profile, builder.Survivors, truncated, ct)
             : new DestinationSweepResult([], []);
         for (int i = 0; i < sweep.Files.Count; i++)
         {
@@ -362,9 +361,6 @@ public sealed class DryRunEngine(
         string? fatalError = null;
         bool scanTruncated = false;
 
-        // The scan honours the same Manual concurrency pin as the evaluation and sweep
-        // (Automatic → the scanner auto-scales to the source medium).
-        int? scanWorkers = DryRunConcurrency.ResolveManualWorkers(profile, settings.Current);
         Stopwatch scanWatch = Stopwatch.StartNew();
 
         Task pump = Task.Run(async () =>
@@ -372,7 +368,7 @@ public sealed class DryRunEngine(
             try
             {
                 int accepted = 0;
-                foreach (var scanned in scanner.Scan(profile, TriggerKind.Cli, scopePath, scanWorkers, linked.Token))
+                foreach (var scanned in scanner.Scan(profile, TriggerKind.Cli, scopePath, linked.Token))
                 {
                     if (scanned.TryGetError(out EnumerationFault fault))
                     {
@@ -415,7 +411,7 @@ public sealed class DryRunEngine(
         {
             await Parallel.ForEachAsync(
                 channel.Reader.ReadAllAsync(linked.Token),
-                new ParallelOptions { MaxDegreeOfParallelism = ResolveWorkers(profile), CancellationToken = linked.Token },
+                new ParallelOptions { MaxDegreeOfParallelism = ResolveWorkers(), CancellationToken = linked.Token },
                 async (payload, token) =>
                 {
                     FileEvaluation? evaluation = await EvaluateFileAsync(
@@ -479,30 +475,10 @@ public sealed class DryRunEngine(
         return filtersBySourceRoot;
     }
 
-    /// <summary>Resolves the evaluation worker count for this run. The profile's own mode wins;
-    /// <see cref="ConcurrencyMode.Inherit"/> defers to the global setting. Every path is clamped to
-    /// at least 1 so <see cref="ParallelOptions.MaxDegreeOfParallelism"/> is always valid.</summary>
-    internal int ResolveWorkers(Profile profile)
-    {
-        ConcurrencyOverride c = profile.Concurrency;
-        return c.Mode switch
-        {
-            ConcurrencyMode.Manual => Math.Max(1, c.ManualWorkers ?? AutoWorkers()),
-            ConcurrencyMode.Automatic => AutoWorkers(),
-            _ => ResolveGlobalWorkers(),   // Inherit
-        };
-    }
-
-    private int ResolveGlobalWorkers()
-    {
-        GlobalSettings global = settings.Current;
-        return global.DryRunConcurrencyMode == ConcurrencyMode.Manual
-            ? Math.Max(1, global.DryRunManualWorkers ?? AutoWorkers())
-            : AutoWorkers();
-    }
-
-    // Evaluation-phase default worker count; see DryRunConcurrency.AutoWorkers for the rationale.
-    private static int AutoWorkers() => DryRunConcurrency.AutoWorkers();
+    /// <summary>Resolves the evaluation (hash) worker count for this run from the global scan-threading
+    /// settings (profiles no longer override concurrency). Clamped to at least 1 so
+    /// <see cref="ParallelOptions.MaxDegreeOfParallelism"/> is always valid.</summary>
+    internal int ResolveWorkers() => ScanThreadResolver.ResolveMaxHashThreads(settings.Current.ScanThreading);
 
     /// <summary>One source file's contribution to the report: the source file node, its source-side
     /// operation (Processed / Skipped + disposition), and the destination files/operations its targets

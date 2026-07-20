@@ -16,43 +16,6 @@ public sealed class ProfileEditorViewModelTests
     }
 
     [Fact]
-    public void New_profile_defaults_concurrency_to_inherit()
-    {
-        var (editor, _) = NewEditor();
-        editor.LoadNew();
-        Assert.Equal(ConcurrencyMode.Inherit, editor.BuildProfile().Concurrency.Mode);
-    }
-
-    [Fact]
-    public void Concurrency_round_trips_through_load_and_build()
-    {
-        var (editor, _) = NewEditor();
-        Profile original = ProfileFactory.Sample() with
-        {
-            Concurrency = new ConcurrencyOverride { Mode = ConcurrencyMode.Manual, ManualWorkers = 6 },
-        };
-
-        editor.Load(original);
-        Assert.Equal(ConcurrencyMode.Manual, editor.ConcurrencyMode);
-        Assert.Equal(6, editor.ConcurrencyWorkers);
-        Assert.True(editor.ShowConcurrencyWorkers);
-
-        Profile rebuilt = editor.BuildProfile();
-        Assert.Equal(ConcurrencyMode.Manual, rebuilt.Concurrency.Mode);
-        Assert.Equal(6, rebuilt.Concurrency.ManualWorkers);
-    }
-
-    [Fact]
-    public void Automatic_concurrency_clears_the_manual_worker_count()
-    {
-        var (editor, _) = NewEditor();
-        editor.LoadNew();
-        editor.ConcurrencyMode = ConcurrencyMode.Automatic;
-        editor.ConcurrencyWorkers = 5;
-        Assert.Null(editor.BuildProfile().Concurrency.ManualWorkers);
-    }
-
-    [Fact]
     public void New_profile_defaults_scan_destination_off_and_editable()
     {
         var (editor, _) = NewEditor();

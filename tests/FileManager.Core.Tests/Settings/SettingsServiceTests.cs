@@ -1,8 +1,8 @@
-using FileManager.Contracts.Profiles;
 using FileManager.Contracts.Settings;
 using FileManager.Core;
 using FileManager.Core.Settings;
 using Microsoft.Extensions.Logging.Abstractions;
+using System.Collections.Generic;
 
 namespace FileManager.Core.Tests.Settings;
 
@@ -34,26 +34,43 @@ public sealed class SettingsServiceTests : IDisposable
         SettingsService service = NewService();
         var result = service.Update(new GlobalSettings
         {
-            DryRunConcurrencyMode = ConcurrencyMode.Manual,
-            DryRunManualWorkers = 6,
+            ScanThreading = new ScanThreadingSettings { MaxScanThreads = ThreadBudget.Explicit(6) },
         });
 
         Assert.True(result.TryGetValue(out GlobalSettings? saved));
-        Assert.Equal(ConcurrencyMode.Manual, saved!.DryRunConcurrencyMode);
-        Assert.Equal(6, saved.DryRunManualWorkers);
+        Assert.Equal(6, saved!.ScanThreading.MaxScanThreads.Value);
         Assert.True(File.Exists(_paths.SettingsFilePath));
 
         GlobalSettings reloaded = NewService().Current;
-        Assert.Equal(ConcurrencyMode.Manual, reloaded.DryRunConcurrencyMode);
-        Assert.Equal(6, reloaded.DryRunManualWorkers);
+        Assert.Equal(6, reloaded.ScanThreading.MaxScanThreads.Value);
     }
 
     [Fact]
-    public void Update_clamps_a_manual_value_below_one()
+    public void Update_clamps_an_explicit_value_below_one()
     {
         SettingsService service = NewService();
-        service.Update(new GlobalSettings { DryRunConcurrencyMode = ConcurrencyMode.Manual, DryRunManualWorkers = 0 });
-        Assert.Equal(1, service.Current.DryRunManualWorkers);
+        service.Update(new GlobalSettings
+        {
+            ScanThreading = new ScanThreadingSettings { MaxScanThreads = ThreadBudget.Explicit(0) },
+        });
+        Assert.Equal(1, service.Current.ScanThreading.MaxScanThreads.Value);
+    }
+
+    [Fact]
+    public void Update_normalizes_and_clamps_per_drive_overrides()
+    {
+        SettingsService service = NewService();
+        service.Update(new GlobalSettings
+        {
+            ScanThreading = new ScanThreadingSettings
+            {
+                SpecificDriveOverrides = new Dictionary<string, ThreadBudget> { ["  C:  "] = ThreadBudget.Explicit(0) },
+            },
+        });
+
+        var overrides = service.Current.ScanThreading.SpecificDriveOverrides;
+        Assert.True(overrides.ContainsKey("c:"));   // trimmed + lower-cased to the volume-key form
+        Assert.Equal(1, overrides["c:"].Value);      // explicit value clamped to >= 1
     }
 
     [Fact]

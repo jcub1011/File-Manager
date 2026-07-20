@@ -33,6 +33,8 @@ internal sealed class FakeVolumeInfoProvider : IVolumeInfoProvider
 
     public bool IsNetworkPath(string path) => Network;
 
+    public DriveClass GetDriveClass(string path) => Network ? DriveClass.Network : DriveClass.Fixed;
+
     public Result<VolumeCapacity, string> GetVolumeCapacity(string path) =>
         new VolumeCapacity(long.MaxValue / 2, Free, 1);
 }

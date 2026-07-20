@@ -13,6 +13,7 @@ using FileManager.Core.Placement;
 using FileManager.Core.Platform;
 using FileManager.Core.Profiles;
 using FileManager.Core.Settings;
+using FileManager.Core.Scanning;
 using FileManager.Core.Watching;
 using FileManager.Platform.Windows;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -46,12 +47,13 @@ public sealed class EndToEndSmokeTests : IAsyncLifetime
         ProfileValidator validator = new(NullLogger<ProfileValidator>.Instance, filterCompiler);
         ProfileStore store = new(NullLogger<ProfileStore>.Instance, paths, validator);
         ProfileCatalog catalog = new(NullLogger<ProfileCatalog>.Instance, store);
-        SourceScanner scanner = new(NullLogger<SourceScanner>.Instance, fileSystem, TimeProvider.System);
         FileHasher hasher = new(NullLogger<FileHasher>.Instance);
         ConflictResolver resolver = new(new(), new(), NullLogger<ConflictResolver>.Instance);
         SettingsService settings = new(NullLogger<SettingsService>.Instance, paths);
         WindowsVolumeInfoProvider volumes = new(NullLogger<WindowsVolumeInfoProvider>.Instance);
-        DestinationProjector destinationProjector = new(NullLogger<DestinationProjector>.Instance, fileSystem, volumes);
+        ScanScheduler scheduler = new(NullLogger<ScanScheduler>.Instance, fileSystem, settings);
+        SourceScanner scanner = new(TimeProvider.System, scheduler, volumes);
+        DestinationProjector destinationProjector = new(NullLogger<DestinationProjector>.Instance, volumes, scheduler);
         DryRunEngine dryRun = new(NullLogger<DryRunEngine>.Instance, scanner, filterCompiler, hasher, resolver, settings, TimeProvider.System, destinationProjector);
 
         IIpcRequestHandler[] handlers =
@@ -161,23 +163,24 @@ public sealed class EndToEndSmokeTests : IAsyncLifetime
             // default before any save
             var initial = await client!.RequestAsync<SettingsResponse>(new GetSettingsRequest());
             Assert.True(initial.TryGetValue(out SettingsResponse? initialResponse));
-            Assert.Equal(ConcurrencyMode.Automatic, initialResponse!.Settings.DryRunConcurrencyMode);
+            Assert.True(initialResponse!.Settings.ScanThreading.MaxScanThreads.IsAuto);
 
             // update → echoed back and written to disk
             var updated = await client.RequestAsync<SettingsResponse>(new UpdateSettingsRequest
             {
-                Settings = new GlobalSettings { DryRunConcurrencyMode = ConcurrencyMode.Manual, DryRunManualWorkers = 3 },
+                Settings = new GlobalSettings
+                {
+                    ScanThreading = new ScanThreadingSettings { MaxScanThreads = ThreadBudget.Explicit(3) },
+                },
             });
             Assert.True(updated.TryGetValue(out SettingsResponse? updatedResponse));
-            Assert.Equal(ConcurrencyMode.Manual, updatedResponse!.Settings.DryRunConcurrencyMode);
-            Assert.Equal(3, updatedResponse.Settings.DryRunManualWorkers);
+            Assert.Equal(3, updatedResponse!.Settings.ScanThreading.MaxScanThreads.Value);
             Assert.True(File.Exists(Path.Combine(_root, "engine", "settings.json")));
 
             // a subsequent read reflects the persisted value
             var reread = await client.RequestAsync<SettingsResponse>(new GetSettingsRequest());
             Assert.True(reread.TryGetValue(out SettingsResponse? rereadResponse));
-            Assert.Equal(ConcurrencyMode.Manual, rereadResponse!.Settings.DryRunConcurrencyMode);
-            Assert.Equal(3, rereadResponse.Settings.DryRunManualWorkers);
+            Assert.Equal(3, rereadResponse!.Settings.ScanThreading.MaxScanThreads.Value);
         }
     }
 

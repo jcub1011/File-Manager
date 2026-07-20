@@ -2,6 +2,7 @@ using BenchmarkDotNet.Attributes;
 using FileManager.Contracts.DryRun;
 using FileManager.Contracts.Primitives;
 using FileManager.Contracts.Profiles;
+using FileManager.Contracts.Settings;
 using FileManager.Core.DryRun;
 using FileManager.Core.Platform;
 
@@ -129,6 +130,7 @@ public class DryRunSpaceEstimatorBenchmarks
     {
         public Result<long, string> GetAvailableFreeBytes(string path) => long.MaxValue / 2;
         public bool IsNetworkPath(string path) => false;
+        public DriveClass GetDriveClass(string path) => DriveClass.Fixed;
 
         public Result<string, string> GetVolumeKey(string path)
         {

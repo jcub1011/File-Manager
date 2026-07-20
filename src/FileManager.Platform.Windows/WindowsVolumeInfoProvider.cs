@@ -1,4 +1,5 @@
 using FileManager.Contracts.Primitives;
+using FileManager.Contracts.Settings;
 using FileManager.Core.Platform;
 using Microsoft.Extensions.Logging;
 using System;
@@ -14,7 +15,11 @@ namespace FileManager.Platform.Windows;
 [SupportedOSPlatform("windows")]
 public sealed partial class WindowsVolumeInfoProvider(ILogger<WindowsVolumeInfoProvider> logger) : IVolumeInfoProvider
 {
-    private const uint DriveRemote = 4;   // DRIVE_REMOTE
+    private const uint DriveRemovable = 2;   // DRIVE_REMOVABLE
+    private const uint DriveFixed = 3;       // DRIVE_FIXED
+    private const uint DriveRemote = 4;      // DRIVE_REMOTE
+    private const uint DriveCdRom = 5;       // DRIVE_CDROM
+    private const uint DriveRamDisk = 6;     // DRIVE_RAMDISK
 
     public Result<long, string> GetAvailableFreeBytes(string path)
     {
@@ -86,24 +91,36 @@ public sealed partial class WindowsVolumeInfoProvider(ILogger<WindowsVolumeInfoP
         }
     }
 
-    public bool IsNetworkPath(string path)
+    public bool IsNetworkPath(string path) => GetDriveClass(path) == DriveClass.Network;
+
+    /// <summary>Maps the Win32 drive type to a <see cref="DriveClass"/>. A UNC share root is Network by
+    /// definition; otherwise the drive-letter root's GetDriveType code is mapped. Any failure yields
+    /// <see cref="DriveClass.Unknown"/> (the caller falls back to the per-drive default budget).</summary>
+    public DriveClass GetDriveClass(string path)
     {
         try
         {
             string full = Path.GetFullPath(path);
             string? root = Path.GetPathRoot(full);
             if (string.IsNullOrEmpty(root))
-                return false;
-            // UNC share root is a network path by definition.
+                return DriveClass.Unknown;
+            // UNC share root is a network path by definition (GetDriveType does not classify UNC).
             if (root.StartsWith(@"\\", StringComparison.Ordinal))
-                return true;
-            // A mapped drive letter reports DRIVE_REMOTE.
-            return GetDriveTypeW(root) == DriveRemote;
+                return DriveClass.Network;
+            return GetDriveTypeW(root) switch
+            {
+                DriveRemovable => DriveClass.Removable,
+                DriveFixed => DriveClass.Fixed,
+                DriveRemote => DriveClass.Network,
+                DriveCdRom => DriveClass.Optical,
+                DriveRamDisk => DriveClass.Ram,
+                _ => DriveClass.Unknown,
+            };
         }
         catch (Exception ex)
         {
-            logger.LogDebug(ex, "Network-path probe failed for {Path}; treating as local", path);
-            return false;
+            logger.LogDebug(ex, "Drive-class probe failed for {Path}; treating as unknown", path);
+            return DriveClass.Unknown;
         }
     }
 

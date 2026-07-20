@@ -1,9 +1,11 @@
 using FileManager.Contracts.DryRun;
 using FileManager.Contracts.Primitives;
 using FileManager.Contracts.Profiles;
+using FileManager.Contracts.Settings;
 using FileManager.Core.DryRun;
 using FileManager.Core.Jobs;
 using FileManager.Core.Files;
+using FileManager.Core.Scanning;
 using FileManager.Core.Tests.TestSupport;
 using Microsoft.Extensions.Logging.Abstractions;
 
@@ -28,10 +30,24 @@ public sealed class DestinationProjectorTests : IDisposable
 
     public void Dispose() => Directory.Delete(_root, recursive: true);
 
-    private static DestinationProjector NewProjector() =>
-        new(NullLogger<DestinationProjector>.Instance,
-            new FileSystemService(NullLogger<FileSystemService>.Instance),
-            new FakeVolumeInfoProvider());   // local temp dirs → not a network path
+    // A projector wired to a scan scheduler over the real file system. maxThreads pins the global and
+    // per-drive scan budgets (1 = serial); null lets them auto-scale. Local temp dirs → not network.
+    private static DestinationProjector NewProjector(int? maxThreads = null)
+    {
+        FileSystemService fs = new(NullLogger<FileSystemService>.Instance);
+        GlobalSettings settings = maxThreads is int n
+            ? new GlobalSettings
+            {
+                ScanThreading = new ScanThreadingSettings
+                {
+                    MaxScanThreads = ThreadBudget.Explicit(n),
+                    PerDriveDefault = ThreadBudget.Explicit(n),
+                },
+            }
+            : GlobalSettings.Default;
+        ScanScheduler scheduler = new(NullLogger<ScanScheduler>.Instance, fs, new FakeSettingsProvider(settings));
+        return new DestinationProjector(NullLogger<DestinationProjector>.Instance, new FakeVolumeInfoProvider(), scheduler);
+    }
 
     private Profile Mirror() => TestProfiles.Valid(_source, _target) with { SyncMode = SyncMode.Mirror };
     private Profile Additive() => TestProfiles.Valid(_source, _target);
@@ -58,7 +74,7 @@ public sealed class DestinationProjectorTests : IDisposable
     private const int Workers = 4;
 
     private DestinationSweepResult Project(Profile profile, params VirtualFileOperation[] destinationOps) =>
-        NewProjector().Project(profile, destinationOps, truncated: false, manualWorkers: Workers, CancellationToken.None);
+        NewProjector(Workers).Project(profile, destinationOps, truncated: false, CancellationToken.None);
 
     [Fact]
     public void Mirror_orphan_is_deleted()
@@ -146,7 +162,7 @@ public sealed class DestinationProjectorTests : IDisposable
     {
         TargetFile("orphan.txt");
 
-        Assert.Empty(NewProjector().Project(Mirror(), [], truncated: true, manualWorkers: Workers, CancellationToken.None).Ops);
+        Assert.Empty(NewProjector(Workers).Project(Mirror(), [], truncated: true, CancellationToken.None).Ops);
     }
 
     [Fact]
@@ -196,10 +212,9 @@ public sealed class DestinationProjectorTests : IDisposable
         for (int i = 0; i < 25; i++)
             TargetFile(Path.Combine($"d{i % 5}", $"f{i}.txt"));
 
-        DestinationProjector projector = NewProjector();
-        DestinationSweepResult one = projector.Project(Mirror(), [], truncated: false, manualWorkers: 1, CancellationToken.None);
-        DestinationSweepResult many = projector.Project(Mirror(), [], truncated: false, manualWorkers: 8, CancellationToken.None);
-        DestinationSweepResult auto = projector.Project(Mirror(), [], truncated: false, manualWorkers: null, CancellationToken.None);
+        DestinationSweepResult one = NewProjector(1).Project(Mirror(), [], truncated: false, CancellationToken.None);
+        DestinationSweepResult many = NewProjector(8).Project(Mirror(), [], truncated: false, CancellationToken.None);
+        DestinationSweepResult auto = NewProjector(null).Project(Mirror(), [], truncated: false, CancellationToken.None);
 
         // The sorted merge makes the output order-stable regardless of how the concurrent walk raced
         // or how many threads the auto (medium-aware) degree of parallelism chose.
@@ -237,15 +252,15 @@ public sealed class DestinationProjectorTests : IDisposable
             TargetFile(Path.Combine($"d{i % 5}", $"f{i}.txt"));
 
         const int budget = 10;
-        DestinationSweepResult result = Sweep(Mirror(), manualWorkers: 8, maxEntries: budget);
+        DestinationSweepResult result = Sweep(Mirror(), maxEntries: budget);
 
         Assert.True(result.Files.Count <= budget);
         Assert.Equal(result.Files.Count, result.Ops.Count);
         Assert.True(result.Truncated);
     }
 
-    private DestinationSweepResult Sweep(Profile profile, int manualWorkers, int maxEntries) =>
-        NewProjector().Sweep(profile, new HashSet<NormalizedPath>(), truncated: false, manualWorkers, CancellationToken.None, maxEntries);
+    private DestinationSweepResult Sweep(Profile profile, int maxEntries) =>
+        NewProjector(8).Sweep(profile, new HashSet<NormalizedPath>(), truncated: false, CancellationToken.None, maxEntries);
 
     // The sweep's per-file hot path wraps each enumerated path with NormalizedPath.FromCanonical
     // (skipping Create's Path.GetFullPath) on the guarantee that a path enumerated beneath an

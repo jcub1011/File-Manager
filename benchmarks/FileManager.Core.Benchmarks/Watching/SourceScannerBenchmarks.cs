@@ -1,7 +1,10 @@
 using BenchmarkDotNet.Attributes;
 using FileManager.Contracts.Primitives;
+using FileManager.Contracts.Settings;
 using FileManager.Core.Files;
 using FileManager.Core.Jobs;
+using FileManager.Core.Scanning;
+using FileManager.Core.Settings;
 using FileManager.Core.Watching;
 using FileManager.Contracts.Profiles;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -34,10 +37,9 @@ public class SourceScannerBenchmarks
         Directory.CreateDirectory(_root);
         BuildTree(_root, FileCount, Depth);
 
-        _scanner = new SourceScanner(
-            NullLogger<SourceScanner>.Instance,
-            new FileSystemService(NullLogger<FileSystemService>.Instance),
-            TimeProvider.System);
+        FileSystemService fs = new(NullLogger<FileSystemService>.Instance);
+        ScanScheduler scheduler = new(NullLogger<ScanScheduler>.Instance, fs, new BenchSettings());
+        _scanner = new SourceScanner(TimeProvider.System, scheduler);
 
         _profile = BaselineProfile(_root);
     }
@@ -62,6 +64,14 @@ public class SourceScannerBenchmarks
         foreach (Result<Payload, EnumerationFault> _ in _scanner.Scan(_profile, TriggerKind.ManualShell))
             count++;   // fully drain the lazy sequence so the whole DFS is measured
         return count;
+    }
+
+    /// <summary>Default settings (auto budgets) for the scan scheduler.</summary>
+    private sealed class BenchSettings : ISettingsProvider
+    {
+        public GlobalSettings Current => GlobalSettings.Default;
+        public Result<GlobalSettings, string> Update(GlobalSettings settings) =>
+            Result<GlobalSettings, string>.Success(settings);
     }
 
     /// <summary>Spreads <paramref name="fileCount"/> files across a balanced tree of the given

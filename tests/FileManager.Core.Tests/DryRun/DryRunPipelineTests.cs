@@ -8,6 +8,7 @@ using FileManager.Core.Files;
 using FileManager.Core.Filtering;
 using FileManager.Core.Jobs;
 using FileManager.Core.Placement;
+using FileManager.Core.Scanning;
 using FileManager.Core.Settings;
 using FileManager.Core.Tests.TestSupport;
 using FileManager.Core.Watching;
@@ -272,14 +273,15 @@ public sealed class DryRunPipelineTests : IDisposable
 
     private async Task<DryRunReport> BuildReport(Profile profile, int manualWorkers, string[] emissionOrder)
     {
-        Profile pinned = profile with
+        // Concurrency is global now: pin the evaluation (hash) worker count via the machine settings.
+        GlobalSettings settings = GlobalSettings.Default with
         {
-            Concurrency = new ConcurrencyOverride { Mode = ConcurrencyMode.Manual, ManualWorkers = manualWorkers },
+            ScanThreading = new ScanThreadingSettings { MaxHashThreads = ThreadBudget.Explicit(manualWorkers) },
         };
         ScriptedScanner scanner = new(() => emissionOrder.Select(n =>
-            (Result<Payload, EnumerationFault>)PayloadFor(pinned, n)));
+            (Result<Payload, EnumerationFault>)PayloadFor(profile, n)));
 
-        var simulated = await NewEngine(scanner).SimulateAsync(pinned, null);
+        var simulated = await NewEngine(scanner, settings: settings).SimulateAsync(profile, null);
         Assert.True(simulated.TryGetValue(out DryRunReport? report));
         return report!;
     }
@@ -294,8 +296,7 @@ public sealed class DryRunPipelineTests : IDisposable
         public bool Disposed { get; private set; }
 
         public IEnumerable<Result<Payload, EnumerationFault>> Scan(
-            Profile profile, TriggerKind trigger, string? scopeRoot = null,
-            int? manualWorkers = null, CancellationToken ct = default)
+            Profile profile, TriggerKind trigger, string? scopeRoot = null, CancellationToken ct = default)
         {
             try
             {
@@ -352,18 +353,20 @@ public sealed class DryRunPipelineTests : IDisposable
     // ----- plumbing -----
 
     private DryRunEngine NewEngine(
-        ISourceScanner scanner, IFileHasher? hasher = null, int? maxBatchCandidates = null)
+        ISourceScanner scanner, IFileHasher? hasher = null, int? maxBatchCandidates = null, GlobalSettings? settings = null)
     {
         FileSystemService fileSystem = new(NullLogger<FileSystemService>.Instance);
+        FakeSettings fakeSettings = new(settings ?? GlobalSettings.Default);
+        ScanScheduler scheduler = new(NullLogger<ScanScheduler>.Instance, fileSystem, fakeSettings);
         return new DryRunEngine(
             NullLogger<DryRunEngine>.Instance,
             scanner,
             new FilterCompiler(NullLogger<FilterCompiler>.Instance, TimeProvider.System),
             hasher ?? new FileHasher(NullLogger<FileHasher>.Instance),
             new ConflictResolver(new(), new(), NullLogger<ConflictResolver>.Instance),
-            new FakeSettings(GlobalSettings.Default),
+            fakeSettings,
             TimeProvider.System,
-            new DestinationProjector(NullLogger<DestinationProjector>.Instance, fileSystem, new FakeVolumeInfoProvider()))
+            new DestinationProjector(NullLogger<DestinationProjector>.Instance, new FakeVolumeInfoProvider(), scheduler))
         { MaxBatchCandidates = maxBatchCandidates ?? DryRunEngine.MaxReportedFiles };
     }
 

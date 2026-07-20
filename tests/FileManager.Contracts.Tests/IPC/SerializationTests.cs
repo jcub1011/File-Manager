@@ -387,22 +387,31 @@ public sealed class SerializationTests
             Settings = new GlobalSettings
             {
                 ServiceStartupMode = ServiceStartupMode.RunOnStartup,
-                DryRunConcurrencyMode = ConcurrencyMode.Manual,
-                DryRunManualWorkers = 6,
                 ThemeMode = ThemeMode.Dark,
+                ScanThreading = new ScanThreadingSettings
+                {
+                    MaxScanThreads = ThreadBudget.Explicit(6),
+                    MaxHashThreads = ThreadBudget.Auto,
+                    PerDriveDefault = ThreadBudget.Explicit(4),
+                    DriveTypeOverrides = new Dictionary<DriveClass, ThreadBudget> { [DriveClass.Network] = ThreadBudget.Explicit(16) },
+                    SpecificDriveOverrides = new Dictionary<string, ThreadBudget> { ["c:"] = ThreadBudget.Explicit(2) },
+                },
             },
         });
         Assert.True(IpcSerializer.DeserializeResponse(wire).TryGetValue(out IpcResponse? reparsed));
         SettingsResponse roundTripped = Assert.IsType<SettingsResponse>(reparsed);
         Assert.Equal(ServiceStartupMode.RunOnStartup, roundTripped.Settings.ServiceStartupMode);
-        Assert.Equal(ConcurrencyMode.Manual, roundTripped.Settings.DryRunConcurrencyMode);
-        Assert.Equal(6, roundTripped.Settings.DryRunManualWorkers);
         Assert.Equal(ThemeMode.Dark, roundTripped.Settings.ThemeMode);
+
+        ScanThreadingSettings st = roundTripped.Settings.ScanThreading;
+        Assert.Equal(6, st.MaxScanThreads.Value);
+        Assert.True(st.MaxHashThreads.IsAuto);
+        Assert.Equal(4, st.PerDriveDefault.Value);
+        Assert.Equal(16, st.DriveTypeOverrides[DriveClass.Network].Value);
+        Assert.Equal(2, st.SpecificDriveOverrides["c:"].Value);
 
         // Enums serialize as strings, consistent with the rest of the wire format.
         using JsonDocument document = JsonDocument.Parse(wire);
-        Assert.Equal("Manual",
-            document.RootElement.GetProperty("Settings").GetProperty("DryRunConcurrencyMode").GetString());
         Assert.Equal("RunOnStartup",
             document.RootElement.GetProperty("Settings").GetProperty("ServiceStartupMode").GetString());
         Assert.Equal("Dark",
@@ -410,19 +419,39 @@ public sealed class SerializationTests
     }
 
     [Fact]
-    public void Profile_without_a_concurrency_field_deserializes_to_the_default()
+    public void GlobalSettings_with_stale_concurrency_fields_still_deserializes()
     {
-        // Mimic a profile file written before the Concurrency field existed: serialize, then strip
-        // the property so it is absent (not null) from the JSON.
+        // A settings.json written before v2 carries the removed DryRunConcurrencyMode/DryRunManualWorkers.
+        // The source-gen deserializer skips unknown members, so no migration pass is needed.
+        JsonObject obj = new()
+        {
+            ["SchemaVersion"] = 1,
+            ["ServiceStartupMode"] = "RunOnStartup",
+            ["DryRunConcurrencyMode"] = "Manual",
+            ["DryRunManualWorkers"] = 3,
+            ["ThemeMode"] = "Dark",
+        };
+
+        GlobalSettings? parsed = JsonSerializer.Deserialize(obj.ToJsonString(), FileManagerJsonContext.Default.GlobalSettings);
+        Assert.NotNull(parsed);
+        Assert.Equal(ServiceStartupMode.RunOnStartup, parsed!.ServiceStartupMode);
+        Assert.Equal(ThemeMode.Dark, parsed.ThemeMode);
+        Assert.True(parsed.ScanThreading.MaxScanThreads.IsAuto);   // the new field defaults to auto
+    }
+
+    [Fact]
+    public void Profile_with_a_stale_concurrency_field_still_deserializes()
+    {
+        // A profile written before the Concurrency field was removed carries an unknown "Concurrency"
+        // object; the deserializer ignores it (no migration needed).
         string json = Encoding.UTF8.GetString(JsonSerializer.SerializeToUtf8Bytes(
             SampleProfile(), FileManagerJsonContext.Default.Profile));
         JsonObject obj = JsonNode.Parse(json)!.AsObject();
-        Assert.True(obj.Remove("Concurrency"));
+        obj["Concurrency"] = new JsonObject { ["Mode"] = "Manual", ["ManualWorkers"] = 4 };
 
         Profile? parsed = JsonSerializer.Deserialize(obj.ToJsonString(), FileManagerJsonContext.Default.Profile);
         Assert.NotNull(parsed);
-        Assert.NotNull(parsed!.Concurrency);                                 // must not be null (the bug)
-        Assert.Equal(ConcurrencyMode.Inherit, parsed.Concurrency.Mode);
+        Assert.Equal(SampleProfile().Name, parsed!.Name);   // the rest parsed fine, stale field dropped
     }
 
     [Fact]

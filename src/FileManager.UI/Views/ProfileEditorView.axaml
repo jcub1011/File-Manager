@@ -217,26 +217,6 @@
                     <CheckBox Grid.Row="1" Grid.Column="1" IsChecked="{Binding NotifyOnFailure}" Margin="0,2" />
                 </Grid>
 
-                <!-- concurrency -->
-                <Border Classes="sectionHeader"><TextBlock Text="Concurrency" /></Border>
-                <Grid ColumnDefinitions="140,*" RowDefinitions="Auto,Auto" Margin="0,0,0,8">
-                    <TextBlock Grid.Row="0" Grid.Column="0" Classes="fieldLabel" Text="Dry-run workers" />
-                    <ComboBox Grid.Row="0" Grid.Column="1" ItemsSource="{Binding ConcurrencyModeOptions}"
-                              SelectedItem="{Binding ConcurrencyMode}" Margin="0,2" MinWidth="220"
-                              ToolTip.Tip="Inherit uses the global Settings value; Manual overrides it for this profile.">
-                        <ComboBox.ItemTemplate>
-                            <DataTemplate x:DataType="prof:ConcurrencyMode">
-                                <TextBlock Text="{Binding Converter={x:Static conv:EnumTitleConverters.ConcurrencyMode}}" />
-                            </DataTemplate>
-                        </ComboBox.ItemTemplate>
-                    </ComboBox>
-                    <TextBlock Grid.Row="1" Grid.Column="0" Classes="fieldLabel" Text="Worker count"
-                               IsVisible="{Binding ShowConcurrencyWorkers}" />
-                    <NumericUpDown Grid.Row="1" Grid.Column="1" Value="{Binding ConcurrencyWorkers}" Minimum="1"
-                                   Width="220" HorizontalAlignment="Left" Margin="0,2" FormatString="0"
-                                   IsVisible="{Binding ShowConcurrencyWorkers}" />
-                </Grid>
-
             </StackPanel>
         </ScrollViewer>
     </DockPanel>

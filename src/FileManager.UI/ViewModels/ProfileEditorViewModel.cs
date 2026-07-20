@@ -63,9 +63,6 @@ public sealed partial class ProfileEditorViewModel : ViewModelBase
         [MetadataOnConflict.WarnAndContinue, MetadataOnConflict.FailJob];
     public IReadOnlyList<LogVerbosity> VerbosityOptions { get; } =
         [LogVerbosity.FailuresOnly, LogVerbosity.FailuresAndSkips, LogVerbosity.All];
-    // Per-profile scope offers Inherit (defer to the global setting) in addition to Automatic/Manual.
-    public IReadOnlyList<ConcurrencyMode> ConcurrencyModeOptions { get; } =
-        [ConcurrencyMode.Inherit, ConcurrencyMode.Automatic, ConcurrencyMode.Manual];
 
     // ----- draft state -----
     [ObservableProperty] public partial bool HasProfile { get; set; }
@@ -83,8 +80,6 @@ public sealed partial class ProfileEditorViewModel : ViewModelBase
     [ObservableProperty] public partial MetadataOnConflict MetadataOnConflict { get; set; } = MetadataOnConflict.WarnAndContinue;
     [ObservableProperty] public partial LogVerbosity Verbosity { get; set; } = LogVerbosity.FailuresAndSkips;
     [ObservableProperty] public partial bool NotifyOnFailure { get; set; } = true;
-    [ObservableProperty] public partial ConcurrencyMode ConcurrencyMode { get; set; } = ConcurrencyMode.Inherit;
-    [ObservableProperty] public partial int ConcurrencyWorkers { get; set; } = 1;
 
     /// <summary>One glob per line.</summary>
     [ObservableProperty] public partial string IncludeGlobsText { get; set; } = "";
@@ -131,13 +126,6 @@ public sealed partial class ProfileEditorViewModel : ViewModelBase
         OnPropertyChanged(nameof(CanEditScanDestination));
     }
 
-    public bool ShowConcurrencyWorkers => ConcurrencyMode == ConcurrencyMode.Manual;
-
-    // Fully-qualified param type: the property is also named ConcurrencyMode, so the unqualified
-    // name would bind to the property, not the enum, in this position.
-    partial void OnConcurrencyModeChanged(global::FileManager.Contracts.Profiles.ConcurrencyMode value) =>
-        OnPropertyChanged(nameof(ShowConcurrencyWorkers));
-
     /// <summary>Editor mutations mark the draft dirty; loads do not.</summary>
     protected override void OnPropertyChanged(PropertyChangedEventArgs e)
     {
@@ -154,7 +142,6 @@ public sealed partial class ProfileEditorViewModel : ViewModelBase
             case nameof(HasProfile):
             case nameof(IsNew):
             case nameof(ShowArchiveFolder):
-            case nameof(ShowConcurrencyWorkers):
                 return;
             default:
                 IsDirty = true;
@@ -182,8 +169,6 @@ public sealed partial class ProfileEditorViewModel : ViewModelBase
         MetadataOnConflict = MetadataOnConflict.WarnAndContinue;
         Verbosity = LogVerbosity.FailuresAndSkips;
         NotifyOnFailure = true;
-        ConcurrencyMode = ConcurrencyMode.Inherit;
-        ConcurrencyWorkers = 1;
         IncludeGlobsText = "";
         ExcludeGlobsText = "";
         MinSizeText = "";
@@ -220,8 +205,6 @@ public sealed partial class ProfileEditorViewModel : ViewModelBase
         MetadataOnConflict = profile.Policies.MetadataOnConflict;
         Verbosity = profile.Logging.Verbosity;
         NotifyOnFailure = profile.Logging.NotifyOnFailure;
-        ConcurrencyMode = profile.Concurrency.Mode;
-        ConcurrencyWorkers = profile.Concurrency.ManualWorkers ?? 1;
         IncludeGlobsText = JoinLines(profile.Filters?.Include);
         ExcludeGlobsText = JoinLines(profile.Filters?.ExcludeGlob);
         MinSizeText = profile.Filters?.MinSizeBytes?.ToString() ?? "";
@@ -300,11 +283,6 @@ public sealed partial class ProfileEditorViewModel : ViewModelBase
             },
             Filters = filters,
             Logging = new LoggingSettings { Verbosity = Verbosity, NotifyOnFailure = NotifyOnFailure },
-            Concurrency = new ConcurrencyOverride
-            {
-                Mode = ConcurrencyMode,
-                ManualWorkers = ConcurrencyMode == ConcurrencyMode.Manual ? ConcurrencyWorkers : null,
-            },
         };
     }
 

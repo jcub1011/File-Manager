@@ -22,7 +22,7 @@ public sealed class RollbackExecutor(IJobJournal journal, TimeProvider time, ILo
 
     /// <summary>Ceiling on concurrent per-target reverts. Each revert is blocking I/O (move/replace/
     /// delete), so beyond a handful the disk — not the CPU — is the bottleneck (the same rationale as
-    /// <see cref="DryRun.DryRunConcurrency.AutoWorkers"/>). A small constant, rather than
+    /// <see cref="Scanning.ScanThreadResolver.ResolveMaxHashThreads"/>). A small constant, rather than
     /// <see cref="Environment.ProcessorCount"/>, deliberately bounds the total when this runs nested
     /// under crash recovery's per-job <c>Parallel.ForEach</c>: the product stays O(cores × 8) instead
     /// of O(cores²) blocking thread-pool work items.</summary>

@@ -7,6 +7,7 @@ using FileManager.Core.DryRun;
 using FileManager.Core.Files;
 using FileManager.Core.IPC.Handlers;
 using FileManager.Core.Profiles;
+using FileManager.Core.Scanning;
 using FileManager.Core.Tests.TestSupport;
 using Microsoft.Extensions.Logging.Abstractions;
 using System.Runtime.CompilerServices;
@@ -67,9 +68,10 @@ public sealed class DryRunStreamHandlerTests
     private static DryRunStreamHandler NewHandler(Profile profile, IDryRunEngine engine, int maxStreamedFiles)
     {
         FileSystemService fileSystem = new(NullLogger<FileSystemService>.Instance);
+        ScanScheduler scheduler = new(NullLogger<ScanScheduler>.Instance, fileSystem, new FakeSettingsProvider());
         return new(NullLogger<DryRunStreamHandler>.Instance, engine, new FakeCatalog(profile), TimeProvider.System,
-            new DestinationProjector(NullLogger<DestinationProjector>.Instance, fileSystem, new FakeVolumeInfoProvider()),
-            new FakeVolumeInfoProvider(), new EngineConfig(), new FakeSettingsProvider())
+            new DestinationProjector(NullLogger<DestinationProjector>.Instance, new FakeVolumeInfoProvider(), scheduler),
+            new FakeVolumeInfoProvider(), new EngineConfig())
         { MaxStreamedFiles = maxStreamedFiles };
     }
 
@@ -88,9 +90,10 @@ public sealed class DryRunStreamHandlerTests
     private static DryRunStreamHandler NewHandlerEmptyCatalog(IDryRunEngine engine, int maxStreamedFiles)
     {
         FileSystemService fileSystem = new(NullLogger<FileSystemService>.Instance);
+        ScanScheduler scheduler = new(NullLogger<ScanScheduler>.Instance, fileSystem, new FakeSettingsProvider());
         return new(NullLogger<DryRunStreamHandler>.Instance, engine, new FakeCatalog(), TimeProvider.System,
-            new DestinationProjector(NullLogger<DestinationProjector>.Instance, fileSystem, new FakeVolumeInfoProvider()),
-            new FakeVolumeInfoProvider(), new EngineConfig(), new FakeSettingsProvider())
+            new DestinationProjector(NullLogger<DestinationProjector>.Instance, new FakeVolumeInfoProvider(), scheduler),
+            new FakeVolumeInfoProvider(), new EngineConfig())
         { MaxStreamedFiles = maxStreamedFiles };
     }
 

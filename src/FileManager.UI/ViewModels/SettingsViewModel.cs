@@ -1,27 +1,23 @@
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using FileManager.Contracts.IPC;
-using FileManager.Contracts.Profiles;
 using FileManager.Contracts.Settings;
 using FileManager.UI.Services;
 using System;
 using System.Collections.Generic;
+using System.Collections.ObjectModel;
 using System.Threading.Tasks;
 
 namespace FileManager.UI.ViewModels;
 
-/// <summary>Edits the machine-level <see cref="GlobalSettings"/> (currently the dry-run evaluation
-/// concurrency). Loads from and saves to the service over IPC. Global scope offers only
-/// Automatic/Manual — Inherit is a per-profile-only mode (there is nothing above the global setting
-/// to inherit from).</summary>
+/// <summary>Edits the machine-level <see cref="GlobalSettings"/> — theme, service startup, and the
+/// scan/hash thread budgets (<see cref="ScanThreadingSettings"/>). Loads from and saves to the service
+/// over IPC. Scan concurrency is global-only now: profiles no longer override it.</summary>
 public sealed partial class SettingsViewModel : ViewModelBase
 {
     private readonly IIpcGateway _gateway;
 
     public SettingsViewModel(IIpcGateway gateway) => _gateway = gateway;
-
-    public IReadOnlyList<ConcurrencyMode> ConcurrencyModeOptions { get; } =
-        [ConcurrencyMode.Automatic, ConcurrencyMode.Manual];
 
     public IReadOnlyList<ServiceStartupMode> ServiceStartupModeOptions { get; } =
         [ServiceStartupMode.RunOnStartup, ServiceStartupMode.StartOnProgramOpen, ServiceStartupMode.StartAndStopWithProgram];
@@ -29,17 +25,41 @@ public sealed partial class SettingsViewModel : ViewModelBase
     public IReadOnlyList<ThemeMode> ThemeModeOptions { get; } =
         [ThemeMode.System, ThemeMode.Light, ThemeMode.Dark];
 
+    // Shadow "explicit" defaults shown when a budget's Auto is unchecked, matching the engine's auto
+    // formulas so the starting number is the value auto would have chosen.
+    private static int ScanAutoDefault => Environment.ProcessorCount * 8;
+    private static int HashAutoDefault => Math.Max(1, Environment.ProcessorCount - 1);
+    private static int PerDriveAutoDefault => Environment.ProcessorCount * 4;
+
     [ObservableProperty] public partial ThemeMode ThemeMode { get; set; } = ThemeMode.System;
     [ObservableProperty] public partial ServiceStartupMode StartupMode { get; set; } = ServiceStartupMode.StartAndStopWithProgram;
-    [ObservableProperty] public partial ConcurrencyMode Mode { get; set; } = ConcurrencyMode.Automatic;
-    [ObservableProperty] public partial int ManualWorkers { get; set; } = 1;
+
+    [ObservableProperty] public partial bool MaxScanThreadsAuto { get; set; } = true;
+    [ObservableProperty] public partial int MaxScanThreadsValue { get; set; } = ScanAutoDefault;
+    [ObservableProperty] public partial bool MaxHashThreadsAuto { get; set; } = true;
+    [ObservableProperty] public partial int MaxHashThreadsValue { get; set; } = HashAutoDefault;
+    [ObservableProperty] public partial bool PerDriveDefaultAuto { get; set; } = true;
+    [ObservableProperty] public partial int PerDriveDefaultValue { get; set; } = PerDriveAutoDefault;
+
     [ObservableProperty] public partial string? StatusMessage { get; set; }
     [ObservableProperty] public partial string? ErrorMessage { get; set; }
     [ObservableProperty] public partial bool IsBusy { get; set; }
 
-    public bool ShowManualWorkers => Mode == ConcurrencyMode.Manual;
+    public bool ShowMaxScanThreadsValue => !MaxScanThreadsAuto;
+    public bool ShowMaxHashThreadsValue => !MaxHashThreadsAuto;
+    public bool ShowPerDriveDefaultValue => !PerDriveDefaultAuto;
 
-    partial void OnModeChanged(ConcurrencyMode value) => OnPropertyChanged(nameof(ShowManualWorkers));
+    partial void OnMaxScanThreadsAutoChanged(bool value) => OnPropertyChanged(nameof(ShowMaxScanThreadsValue));
+    partial void OnMaxHashThreadsAutoChanged(bool value) => OnPropertyChanged(nameof(ShowMaxHashThreadsValue));
+    partial void OnPerDriveDefaultAutoChanged(bool value) => OnPropertyChanged(nameof(ShowPerDriveDefaultValue));
+
+    public ObservableCollection<DriveTypeOverrideRowViewModel> DriveTypeOverrides { get; } = [];
+    public ObservableCollection<SpecificDriveOverrideRowViewModel> SpecificDriveOverrides { get; } = [];
+
+    [RelayCommand] private void AddDriveTypeOverride() => DriveTypeOverrides.Add(new DriveTypeOverrideRowViewModel { Value = PerDriveAutoDefault });
+    [RelayCommand] private void RemoveDriveTypeOverride(DriveTypeOverrideRowViewModel row) => DriveTypeOverrides.Remove(row);
+    [RelayCommand] private void AddSpecificDriveOverride() => SpecificDriveOverrides.Add(new SpecificDriveOverrideRowViewModel { Value = PerDriveAutoDefault });
+    [RelayCommand] private void RemoveSpecificDriveOverride(SpecificDriveOverrideRowViewModel row) => SpecificDriveOverrides.Remove(row);
 
     /// <summary>Set by the host so a successful save can close the dialog. Kept as a callback so the
     /// VM stays window-agnostic (mirrors the folder-picker seam).</summary>
@@ -61,10 +81,25 @@ public sealed partial class SettingsViewModel : ViewModelBase
             result.TryGetValue(out GlobalSettings? settings);
             ThemeMode = settings!.ThemeMode;
             StartupMode = settings.ServiceStartupMode;
-            Mode = settings.DryRunConcurrencyMode == ConcurrencyMode.Manual
-                ? ConcurrencyMode.Manual
-                : ConcurrencyMode.Automatic;
-            ManualWorkers = Math.Max(1, settings.DryRunManualWorkers ?? 1);
+
+            ScanThreadingSettings st = settings.ScanThreading;
+            (MaxScanThreadsAuto, MaxScanThreadsValue) = FromBudget(st.MaxScanThreads, ScanAutoDefault);
+            (MaxHashThreadsAuto, MaxHashThreadsValue) = FromBudget(st.MaxHashThreads, HashAutoDefault);
+            (PerDriveDefaultAuto, PerDriveDefaultValue) = FromBudget(st.PerDriveDefault, PerDriveAutoDefault);
+
+            DriveTypeOverrides.Clear();
+            foreach (KeyValuePair<DriveClass, ThreadBudget> e in st.DriveTypeOverrides)
+            {
+                (bool auto, int value) = FromBudget(e.Value, PerDriveAutoDefault);
+                DriveTypeOverrides.Add(new DriveTypeOverrideRowViewModel { Class = e.Key, Auto = auto, Value = value });
+            }
+
+            SpecificDriveOverrides.Clear();
+            foreach (KeyValuePair<string, ThreadBudget> e in st.SpecificDriveOverrides)
+            {
+                (bool auto, int value) = FromBudget(e.Value, PerDriveAutoDefault);
+                SpecificDriveOverrides.Add(new SpecificDriveOverrideRowViewModel { VolumeKey = e.Key, Auto = auto, Value = value });
+            }
         }
         catch (Exception ex)
         {
@@ -86,12 +121,30 @@ public sealed partial class SettingsViewModel : ViewModelBase
         StatusMessage = null;
         try
         {
+            Dictionary<DriveClass, ThreadBudget> byType = [];
+            foreach (DriveTypeOverrideRowViewModel row in DriveTypeOverrides)
+                byType[row.Class] = ToBudget(row.Auto, row.Value);   // last row wins on a duplicate class
+
+            Dictionary<string, ThreadBudget> specific = [];
+            foreach (SpecificDriveOverrideRowViewModel row in SpecificDriveOverrides)
+            {
+                if (string.IsNullOrWhiteSpace(row.VolumeKey))
+                    continue;
+                specific[row.VolumeKey.Trim().ToLowerInvariant()] = ToBudget(row.Auto, row.Value);
+            }
+
             GlobalSettings settings = new()
             {
                 ThemeMode = ThemeMode,
                 ServiceStartupMode = StartupMode,
-                DryRunConcurrencyMode = Mode,
-                DryRunManualWorkers = Mode == ConcurrencyMode.Manual ? Math.Max(1, ManualWorkers) : null,
+                ScanThreading = new ScanThreadingSettings
+                {
+                    MaxScanThreads = ToBudget(MaxScanThreadsAuto, MaxScanThreadsValue),
+                    MaxHashThreads = ToBudget(MaxHashThreadsAuto, MaxHashThreadsValue),
+                    PerDriveDefault = ToBudget(PerDriveDefaultAuto, PerDriveDefaultValue),
+                    DriveTypeOverrides = byType,
+                    SpecificDriveOverrides = specific,
+                },
             };
             var result = await _gateway.SaveSettingsAsync(settings);
             if (result.TryGetError(out IpcError? error))
@@ -114,4 +167,10 @@ public sealed partial class SettingsViewModel : ViewModelBase
             IsBusy = false;
         }
     }
+
+    private static (bool Auto, int Value) FromBudget(ThreadBudget budget, int autoDefault) =>
+        budget.Value is int v ? (false, v) : (true, autoDefault);
+
+    private static ThreadBudget ToBudget(bool auto, int value) =>
+        auto ? ThreadBudget.Auto : ThreadBudget.Explicit(Math.Max(1, value));
 }

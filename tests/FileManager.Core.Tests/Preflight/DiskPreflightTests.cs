@@ -1,4 +1,5 @@
 using FileManager.Contracts.Primitives;
+using FileManager.Contracts.Settings;
 using FileManager.Core;
 using FileManager.Core.Jobs;
 using FileManager.Core.Platform;
@@ -137,6 +138,8 @@ public sealed class DiskPreflightTests : IDisposable
 
         public bool IsNetworkPath(string path) => false;
 
+        public DriveClass GetDriveClass(string path) => DriveClass.Fixed;
+
         public Result<VolumeCapacity, string> GetVolumeCapacity(string path)
         {
             long free = Match(path) is { } m ? m.Free : long.MaxValue / 2;
@@ -157,6 +160,8 @@ public sealed class DiskPreflightTests : IDisposable
                 : Result<string, string>.Success(Path.GetPathRoot(Path.GetFullPath(path))?.ToLowerInvariant() ?? path);
 
         public bool IsNetworkPath(string path) => false;
+
+        public DriveClass GetDriveClass(string path) => DriveClass.Fixed;
 
         public Result<VolumeCapacity, string> GetVolumeCapacity(string path) =>
             new VolumeCapacity(long.MaxValue / 2, long.MaxValue / 2, 1);

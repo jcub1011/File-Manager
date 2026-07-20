@@ -32,6 +32,12 @@ public sealed class WindowsVolumeInfoProviderTests
     }
 
     [Fact]
+    public void Local_temp_path_is_classified_as_a_fixed_drive()
+    {
+        Assert.Equal(FileManager.Contracts.Settings.DriveClass.Fixed, _provider.GetDriveClass(Path.GetTempPath()));
+    }
+
+    [Fact]
     public void Reports_plausible_capacity_and_cluster_for_the_temp_directory()
     {
         Result<VolumeCapacity, string> result = _provider.GetVolumeCapacity(Path.GetTempPath());

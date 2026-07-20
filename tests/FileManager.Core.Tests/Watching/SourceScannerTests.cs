@@ -1,6 +1,8 @@
 using FileManager.Contracts.Profiles;
+using FileManager.Contracts.Settings;
 using FileManager.Core.Files;
 using FileManager.Core.Jobs;
+using FileManager.Core.Scanning;
 using FileManager.Core.Tests.TestSupport;
 using FileManager.Core.Watching;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -19,10 +21,24 @@ public sealed class SourceScannerTests : IDisposable
 
     public void Dispose() => Directory.Delete(_root, recursive: true);
 
-    private static SourceScanner NewScanner() => new(
-        NullLogger<SourceScanner>.Instance,
-        new FileSystemService(NullLogger<FileSystemService>.Instance),
-        TimeProvider.System);
+    // A scan scheduler backed by the real file system. When maxThreads is given, the global and
+    // per-drive budgets are pinned to it (1 = serial), letting a test compare concurrency levels.
+    private static SourceScanner NewScanner(int? maxThreads = null)
+    {
+        FileSystemService fs = new(NullLogger<FileSystemService>.Instance);
+        GlobalSettings settings = maxThreads is int n
+            ? new GlobalSettings
+            {
+                ScanThreading = new ScanThreadingSettings
+                {
+                    MaxScanThreads = ThreadBudget.Explicit(n),
+                    PerDriveDefault = ThreadBudget.Explicit(n),
+                },
+            }
+            : GlobalSettings.Default;
+        ScanScheduler scheduler = new(NullLogger<ScanScheduler>.Instance, fs, new FakeSettingsProvider(settings));
+        return new SourceScanner(TimeProvider.System, scheduler);
+    }
 
     private Profile ProfileOver(string sourcePath, FilterSet? filters = null) =>
         TestProfiles.Valid(sourcePath: sourcePath, targetPath: Path.Combine(_root, "unused-target"))
@@ -148,8 +164,8 @@ public sealed class SourceScannerTests : IDisposable
                 Touch($"dir{d}", $"sub{f}", $"file{d}_{f}.txt");
 
         var profile = ProfileOver(_root);
-        var (serial, serialFaults) = Collect(NewScanner().Scan(profile, TriggerKind.Cli, manualWorkers: 1));
-        var (parallel, parallelFaults) = Collect(NewScanner().Scan(profile, TriggerKind.Cli, manualWorkers: 8));
+        var (serial, serialFaults) = Collect(NewScanner(maxThreads: 1).Scan(profile, TriggerKind.Cli));
+        var (parallel, parallelFaults) = Collect(NewScanner(maxThreads: 8).Scan(profile, TriggerKind.Cli));
 
         Assert.Empty(serialFaults);
         Assert.Empty(parallelFaults);
@@ -172,7 +188,7 @@ public sealed class SourceScannerTests : IDisposable
         Task<int> scan = Task.Run(() =>
         {
             int seen = 0;
-            foreach (var result in NewScanner().Scan(ProfileOver(_root), TriggerKind.Cli, manualWorkers: 8))
+            foreach (var result in NewScanner(maxThreads: 8).Scan(ProfileOver(_root), TriggerKind.Cli))
             {
                 if (result.TryGetValue(out _) && ++seen >= 3)
                     break;

@@ -20,7 +20,7 @@ public static class EnumTitleConverters
     public static readonly FuncValueConverter<OnSuccessAction, string> OnSuccessAction = new(v => v.GetTitle());
     public static readonly FuncValueConverter<MetadataOnConflict, string> MetadataOnConflict = new(v => v.GetTitle());
     public static readonly FuncValueConverter<LogVerbosity, string> LogVerbosity = new(v => v.GetTitle());
-    public static readonly FuncValueConverter<ConcurrencyMode, string> ConcurrencyMode = new(v => v.GetTitle());
+    public static readonly FuncValueConverter<DriveClass, string> DriveClass = new(v => v.GetTitle());
     public static readonly FuncValueConverter<ServiceStartupMode, string> ServiceStartupMode = new(v => v.GetTitle());
     public static readonly FuncValueConverter<ThemeMode, string> ThemeMode = new(v => v.GetTitle());
 }

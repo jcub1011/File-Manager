@@ -1,44 +1,36 @@
 using FileManager.Contracts.Profiles;
 using FileManager.Contracts.Primitives;
+using FileManager.Contracts.Settings;
 using FileManager.Core.Files;
 using FileManager.Core.Jobs;
 using FileManager.Core.Platform;
-using Microsoft.Extensions.Logging;
+using FileManager.Core.Scanning;
 using System;
-using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Threading;
-using System.Threading.Tasks;
 
 namespace FileManager.Core.Watching;
 
-/// <summary>The single enumeration path turning a profile (or one scoped root/file) into
-/// candidate Payloads (§4.2): a work-stealing DFS over IFileSystemService, honoring the merged
-/// MaxDepth and the unconditional infrastructure exclusions (I-INFRA-EXCLUDED).
+/// <summary>The single enumeration path turning a profile (or one scoped root/file) into candidate
+/// Payloads (§4.2). It is a thin adapter over the process-wide <see cref="IScanScheduler"/>: a serial
+/// pre-pass resolves scope and collects one walk seed per source, then the seeds are submitted to a
+/// scan session and the session's streamed results are mapped to Payloads/faults.
 ///
-/// Enumeration is I/O-bound (each directory read blocks), so — like the dry-run destination sweep
-/// (<see cref="DryRun.DestinationProjector"/>) — every source root is pushed onto one shared queue
-/// drained by dedicated (LongRunning) threads, overlapping the blocking reads rather than issuing
-/// them one at a time, and off the thread pool so a high worker count never starves it. The degree
-/// of parallelism follows the source medium (local volumes are CPU/kernel-bound; network shares are
-/// latency-bound and want heavy oversubscription) unless a Manual worker count is pinned. The
-/// producers feed a bounded <see cref="BlockingCollection{T}"/> that the returned lazy sequence
-/// drains, so the streaming contract is preserved and a huge tree can't balloon memory ahead of the
-/// consumer. Emission order is non-deterministic, which is why every consumer sorts by source path
-/// before use.</summary>
+/// The scheduler owns the traversal mechanics and the global/per-drive thread budgets; this adapter
+/// supplies only policy via the session callbacks — the merged MaxDepth, the unconditional
+/// infrastructure exclusions (I-INFRA-EXCLUDED), and the root-vs-subdirectory fault severity rule.
+/// Emission order is non-deterministic (the walk is concurrent), which is why every consumer sorts by
+/// source path before use.</summary>
 public sealed class SourceScanner(
-    ILogger<SourceScanner> logger, IFileSystemService fileSystem, TimeProvider time,
-    IVolumeInfoProvider? volumes = null) : ISourceScanner
+    TimeProvider time, IScanScheduler scheduler, IVolumeInfoProvider? volumes = null) : ISourceScanner
 {
-    /// <summary>Backpressure bound on the producer→consumer buffer: enough that producers rarely
-    /// block on a keeping-up consumer, small enough that a pathological tree can't buffer unbounded
-    /// payloads ahead of it.</summary>
+    /// <summary>Backpressure bound on the session's output buffer: enough that workers rarely park on a
+    /// keeping-up consumer, small enough that a pathological tree can't buffer unbounded payloads.</summary>
     private const int OutputBufferCapacity = 4096;
 
     public IEnumerable<Result<Payload, EnumerationFault>> Scan(
-        Profile profile, TriggerKind trigger, string? scopeRoot = null,
-        int? manualWorkers = null, CancellationToken ct = default)
+        Profile profile, TriggerKind trigger, string? scopeRoot = null, CancellationToken ct = default)
     {
         NormalizedPath? scope = null;
         if (scopeRoot is not null)
@@ -89,157 +81,73 @@ public sealed class SourceScanner(
         if (seeds.Count == 0)
             yield break;   // nothing to walk (file scope handled inline, or no source matched)
 
-        foreach (Result<Payload, EnumerationFault> result in WalkParallel(profile.Id, trigger, seeds, manualWorkers, ct))
+        foreach (Result<Payload, EnumerationFault> result in WalkScheduled(profile.Id, trigger, seeds, ct))
             yield return result;
     }
 
-    /// <summary>Fans the seeds out across <paramref name="manualWorkers"/> (or an auto-scaled) dedicated
-    /// threads that drain a shared directory queue, and streams their payloads/faults through a bounded
-    /// buffer to the caller. The <c>finally</c> tears the producers down on early break (the batched
-    /// engine stops at its file cap) as well as on natural completion.</summary>
-    private IEnumerable<Result<Payload, EnumerationFault>> WalkParallel(
-        Guid profileId, TriggerKind trigger, List<Seed> seeds, int? manualWorkers, CancellationToken ct)
+    /// <summary>Opens a scan session, submits one work item per seed, and maps the streamed results to
+    /// Payloads/faults. The session is disposed on natural completion AND on early break (the batched
+    /// engine stops at its file cap), tearing this session's work down without disturbing others.</summary>
+    private IEnumerable<Result<Payload, EnumerationFault>> WalkScheduled(
+        Guid profileId, TriggerKind trigger, List<Seed> seeds, CancellationToken ct)
     {
-        int dop = Math.Max(1, manualWorkers ?? AutoScanWorkers(seeds));
+        ScanSessionOptions options = new()
+        {
+            OutputCapacity = OutputBufferCapacity,
+            // Descend into a subdirectory unless it is an infrastructure dir or beyond MaxDepth. A file
+            // directly in the source root is depth 0; contents of a directory whose relative path has k
+            // separators sit at depth k+1. MaxDepth prunes descent, not just matching.
+            OnSubdirectory = static (entry, tag) =>
+            {
+                SourceTag t = (SourceTag)tag!;
+                if (InfrastructurePaths.IsInfrastructureDirectoryName(entry.FileName))
+                    return new ChildDecision(false, null);
+                int contentsDepth = RelativeDepth(t.SourceRoot, entry.FullPath) + 1;
+                if (t.MaxDepth is int limit && contentsDepth > limit)
+                    return new ChildDecision(false, null);
+                return new ChildDecision(true, new SourceTag(t.SourceRoot, t.MaxDepth, IsRoot: false));
+            },
+            OnFile = static (entry, _) => !InfrastructurePaths.IsTempFileName(entry.FileName),
+            // A subdirectory that cannot be opened must not kill the whole scan — downgrade its Fatal to
+            // a Warning so siblings continue; the walk root's own failure stays Fatal (terminal).
+            OnFault = static (fault, tag) =>
+            {
+                SourceTag t = (SourceTag)tag!;
+                if (fault.Severity == EnumerationSeverity.Fatal && !t.IsRoot)
+                    return new EnumerationFault($"subdirectory skipped: {fault.Message}", EnumerationSeverity.Warning);
+                return fault;
+            },
+        };
 
-        // A worker blocked on a bounded Add is unblocked by cancelling this token (the Add throws,
-        // caught in Drain) — the mechanism that stops producers when the consumer breaks early.
-        using CancellationTokenSource linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        ScanState state = new(OutputBufferCapacity);
+        using IScanSession session = scheduler.OpenSession(options, ct);
         foreach (Seed seed in seeds)
-            state.Enqueue(new WorkItem(seed.WalkRoot, seed.SourceRoot, seed.MaxDepth, IsRoot: true));
-
-        // Each thread drains the shared queue: enumerate a directory (the blocking I/O), emit its
-        // files, push its subdirectories back. Termination mirrors the sweep: exit when the stack is
-        // empty AND no peer can still push (outstanding == 0), or when torn down.
-        void Drain()
         {
-            SpinWait spin = default;
-            try
-            {
-                while (!linkedCts.IsCancellationRequested)
-                {
-                    if (state.TryTake(out WorkItem item))
-                    {
-                        try
-                        {
-                            WalkDir(item, state, profileId, trigger, linkedCts.Token);
-                        }
-                        finally
-                        {
-                            state.Done();   // must run even on an unexpected throw, or peers spin forever
-                        }
-                        spin = default;      // found work — reset the idle backoff
-                        continue;
-                    }
-
-                    if (state.AllDrained)
-                        break;
-                    spin.SpinOnce();   // empty for now but a peer may still push; back off (spins → sleeps)
-                }
-            }
-            catch (OperationCanceledException)
-            {
-                // Early break/cancel: a blocked Add threw once the consumer stopped draining. Unwind.
-            }
+            (string key, DriveClass driveClass) = ResolveVolume(seed.WalkRoot);
+            session.Submit(new ScanWorkItem(seed.WalkRoot, key, driveClass, new SourceTag(seed.SourceRoot, seed.MaxDepth, IsRoot: true)));
         }
 
-        Task[] threads = new Task[dop];
-        for (int i = 0; i < dop; i++)
-            threads[i] = Task.Factory.StartNew(
-                Drain, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
-
-        // Complete the buffer once every worker has exited, so the consumer's enumeration terminates.
-        Task completion = Task.Factory.StartNew(
-            () => { try { Task.WaitAll(threads); } finally { state.Output.CompleteAdding(); } },
-            CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
-
-        try
+        foreach (ScanResult result in session.Consume())
         {
-            // Passing the caller's token makes a cancelled scan throw OperationCanceledException from
-            // the enumerator (standard IEnumerable cancellation semantics) even when no payload was
-            // produced yet — rather than silently completing empty.
-            foreach (Result<Payload, EnumerationFault> result in state.Output.GetConsumingEnumerable(ct))
-                yield return result;
+            if (result.Fault is EnumerationFault fault)
+                yield return fault;
+            else if (result.Entry is FileSystemEntry entry)
+                yield return new Payload(
+                    profileId, entry.FullPath, ((SourceTag)result.Tag!).SourceRoot, trigger, time.GetUtcNow(), MetadataFrom(entry));
+        }
 
-            // A cancellation that raced the producers to CompleteAdding leaves the loop above to
-            // finish empty without observing the token (BlockingCollection stops at IsCompleted first).
-            // Surface it deterministically so cancellation never resolves as a normal empty scan.
-            ct.ThrowIfCancellationRequested();
-        }
-        finally
-        {
-            // Runs on natural completion AND on early break/dispose. Cancel so any worker blocked on a
-            // full buffer unblocks, then wait for a clean teardown before disposing the buffer.
-            linkedCts.Cancel();
-            try { completion.Wait(); }
-            catch (Exception ex) { logger.LogDebug(ex, "Source scan producers faulted during teardown"); }
-            state.Output.Dispose();
-        }
+        // A cancelled scan must surface OperationCanceledException from the enumerator (standard
+        // IEnumerable cancellation semantics) rather than resolving as a normal empty scan.
+        ct.ThrowIfCancellationRequested();
     }
 
-    /// <summary>Enumerates one directory (single level): pushes descendable subdirectories back onto
-    /// the queue and emits each classifiable file. Fault handling matches the former serial walk —
-    /// a subdirectory fault is downgraded to a Warning so siblings continue, while the walk root's
-    /// own failure stays Fatal (the consumer treats any Fatal as terminal). Depth convention: a file
-    /// directly in the source root has depth 0; contents of a directory whose relative path has k
-    /// separators sit at depth k+1. MaxDepth prunes descent, not just matching.</summary>
-    private void WalkDir(WorkItem item, ScanState state, Guid profileId, TriggerKind trigger, CancellationToken token)
+    /// <summary>The volume key + drive class for a walk root. When no volume provider was supplied
+    /// (unit/benchmark construction over local temp trees) everything is one synthetic local volume.</summary>
+    private (string Key, DriveClass DriveClass) ResolveVolume(string path)
     {
-        foreach (var entry in fileSystem.EnumerateEntries(item.Dir))
-        {
-            if (entry.TryGetError(out EnumerationFault fault))
-            {
-                if (fault.Severity == EnumerationSeverity.Fatal && !item.IsRoot)
-                {
-                    // A subdirectory that cannot be opened must not kill the whole scan —
-                    // downgrade to Warning and continue with siblings.
-                    state.Output.Add(
-                        new EnumerationFault($"subdirectory skipped: {fault.Message}", EnumerationSeverity.Warning), token);
-                    break;   // Fatal is the enumerator's terminal item for this directory
-                }
-                state.Output.Add(fault, token);
-                if (fault.Severity == EnumerationSeverity.Fatal)
-                    break;   // walk-root failure: terminal for this subtree (its children were never queued)
-                continue;
-            }
-
-            entry.TryGetValue(out FileSystemEntry? fsItem);
-            if (fsItem!.IsDirectory)
-            {
-                if (InfrastructurePaths.IsInfrastructureDirectoryName(fsItem.FileName))
-                {
-                    logger.LogDebug("Skipping infrastructure directory {Path}", fsItem.FullPath);
-                    continue;
-                }
-                int contentsDepth = RelativeDepth(item.SourceRoot, fsItem.FullPath) + 1;
-                if (item.MaxDepth is int limit && contentsDepth > limit)
-                    continue;
-                state.Enqueue(new WorkItem(fsItem.FullPath, item.SourceRoot, item.MaxDepth, IsRoot: false));
-            }
-            else
-            {
-                if (InfrastructurePaths.IsTempFileName(fsItem.FileName))
-                    continue;
-                state.Output.Add(
-                    new Payload(profileId, fsItem.FullPath, item.SourceRoot, trigger, time.GetUtcNow(), MetadataFrom(fsItem)),
-                    token);
-            }
-        }
-    }
-
-    /// <summary>Degree of parallelism for the walk in Automatic mode. Enumeration blocks, so local
-    /// volumes (CPU/kernel-bound) saturate at roughly the core count, while network shares
-    /// (latency-bound) benefit from heavy oversubscription to overlap the round-trips. A single
-    /// shared pool drains all source roots, so size to the most-latent source. When no volume
-    /// provider was supplied (unit/benchmark construction over local temp trees), assume local.</summary>
-    private int AutoScanWorkers(List<Seed> seeds)
-    {
-        if (volumes is not null)
-            foreach (Seed seed in seeds)
-                if (volumes.IsNetworkPath(seed.SourceRoot))
-                    return Math.Clamp(Environment.ProcessorCount * 4, 16, 64);
-        return Math.Max(1, Environment.ProcessorCount);
+        if (volumes is null)
+            return ("local", DriveClass.Fixed);
+        string key = volumes.GetVolumeKey(path).TryGetValue(out string? resolved) ? resolved : "local";
+        return (key, volumes.GetDriveClass(path));
     }
 
     /// <summary>Builds the stat snapshot from the enumeration entry so callers avoid a second
@@ -272,36 +180,8 @@ public sealed class SourceScanner(
     /// measure depth against, and the merged MaxDepth.</summary>
     private readonly record struct Seed(string WalkRoot, string SourceRoot, int? MaxDepth);
 
-    /// <summary>A directory awaiting enumeration, tagged with its source root (for
-    /// <see cref="Payload.SourceRoot"/> + depth) and the merged MaxDepth. <see cref="IsRoot"/>
-    /// distinguishes a seed walk root (whose enumeration failure is Fatal) from a descended
-    /// subdirectory (whose failure is downgraded to a Warning).</summary>
-    private readonly record struct WorkItem(string Dir, string SourceRoot, int? MaxDepth, bool IsRoot);
-
-    /// <summary>Shared state for the work-stealing walk: the directory queue, the outstanding-work
-    /// counter that drives termination, and the bounded output buffer — all mutated concurrently, so
-    /// every mutation is interlocked (mirrors the sweep's SweepState).</summary>
-    private sealed class ScanState
-    {
-        public readonly BlockingCollection<Result<Payload, EnumerationFault>> Output;
-        private readonly ConcurrentStack<WorkItem> _pending = new();
-        // Directories queued OR being processed. Incremented on Enqueue, decremented on Done; a
-        // worker exits only when it sees an empty stack AND this at zero (no peer can still push).
-        private long _outstanding;
-
-        public ScanState(int capacity) =>
-            Output = new BlockingCollection<Result<Payload, EnumerationFault>>(capacity);
-
-        public bool AllDrained => Interlocked.Read(ref _outstanding) == 0;
-
-        public void Enqueue(WorkItem item)
-        {
-            Interlocked.Increment(ref _outstanding);
-            _pending.Push(item);
-        }
-
-        public bool TryTake(out WorkItem item) => _pending.TryPop(out item);
-
-        public void Done() => Interlocked.Decrement(ref _outstanding);
-    }
+    /// <summary>The per-directory scan-session tag: the source root (for <see cref="Payload.SourceRoot"/>
+    /// and depth), the merged MaxDepth, and whether this is a seed walk root (its enumeration failure is
+    /// Fatal) versus a descended subdirectory (whose failure is downgraded to a Warning).</summary>
+    private sealed record SourceTag(string SourceRoot, int? MaxDepth, bool IsRoot);
 }

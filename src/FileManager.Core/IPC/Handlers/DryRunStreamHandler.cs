@@ -25,8 +25,7 @@ namespace FileManager.Core.IPC.Handlers;
 /// frame (matching DryRunHandler's error codes).</summary>
 public sealed class DryRunStreamHandler(
     ILogger<DryRunStreamHandler> logger, IDryRunEngine engine, IProfileCatalog catalog, TimeProvider time,
-    DestinationProjector destinationProjector, IVolumeInfoProvider volumes, EngineConfig config,
-    ISettingsProvider settings)
+    DestinationProjector destinationProjector, IVolumeInfoProvider volumes, EngineConfig config)
     : IIpcStreamingRequestHandler
 {
     /// <summary>Destination sweep entries per streamed frame. Each entry is small (a physical file +
@@ -176,20 +175,17 @@ public sealed class DryRunStreamHandler(
         long engineMs = totalWatch.ElapsedMilliseconds;
         int sweepBudget = Math.Max(0, MaxStreamedFiles - destinationCount);
         Stopwatch sweepWatch = Stopwatch.StartNew();
-        // Resolve a Manual worker pin (profile, or Inherit → global) exactly as the batched engine
-        // does; Automatic leaves it null so the projector auto-scales to the target medium.
-        int? manualWorkers = DryRunConcurrency.ResolveManualWorkers(profile, settings.Current);
-        // The sweep is a blocking call (its walkers join via Task.WaitAll), so hop it to the pool and
-        // keep the stream alive with throttled progress frames while it runs — same polling shape as
-        // the scan phase above. Live counts ride on top of the file phase's destination total so the
-        // figure the user watches never goes backwards.
+        // The sweep is a blocking call (it drains its scan session on this thread), so hop it to the
+        // pool and keep the stream alive with throttled progress frames while it runs — same polling
+        // shape as the scan phase above. Live counts ride on top of the file phase's destination total
+        // so the figure the user watches never goes backwards.
         // AdditiveArchive can skip the sweep when the profile opts out (ScanDestination = false);
         // Mirror always sweeps because the sweep is its only source of Deleted-orphan previews.
         bool scanDestinations = profile.EffectiveScanDestination;
         Task<DestinationSweepResult> sweepTask = scanDestinations
             ? Task.Run(
                 () => destinationProjector.Sweep(
-                    profile, survivors, truncated, manualWorkers, ct, sweepBudget, progressCounters))
+                    profile, survivors, truncated, ct, sweepBudget, progressCounters))
             : Task.FromResult(new DestinationSweepResult([], []));
         long lastDestinations = -1;
         while (!sweepTask.IsCompleted)

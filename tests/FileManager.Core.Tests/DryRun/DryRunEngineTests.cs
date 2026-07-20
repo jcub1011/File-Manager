@@ -7,6 +7,7 @@ using FileManager.Core.Files;
 using FileManager.Core.Filtering;
 using FileManager.Contracts.Settings;
 using FileManager.Core.Placement;
+using FileManager.Core.Scanning;
 using FileManager.Core.Settings;
 using FileManager.Core.Tests.TestSupport;
 using FileManager.Core.Watching;
@@ -31,49 +32,32 @@ public sealed class DryRunEngineTests : IDisposable
 
     public void Dispose() => Directory.Delete(_root, recursive: true);
 
-    // ----- concurrency resolution -----
+    // ----- hash-worker resolution -----
 
-    private static readonly int ExpectedAutoWorkers = Math.Max(1, Math.Min(8, Environment.ProcessorCount - 1));
+    private static readonly int ExpectedAutoHashWorkers = Math.Max(1, Environment.ProcessorCount - 1);
 
-    private Profile ProfileWithConcurrency(ConcurrencyMode mode, int? manualWorkers = null) =>
-        ProfileUnderTest() with { Concurrency = new ConcurrencyOverride { Mode = mode, ManualWorkers = manualWorkers } };
-
-    [Fact]
-    public void ResolveWorkers_profile_manual_overrides_the_global_setting()
-    {
-        DryRunEngine engine = NewEngine(DryRunEngine.MaxReportBytes,
-            GlobalSettings.Default with { DryRunConcurrencyMode = ConcurrencyMode.Manual, DryRunManualWorkers = 3 });
-        Assert.Equal(5, engine.ResolveWorkers(ProfileWithConcurrency(ConcurrencyMode.Manual, 5)));
-    }
+    private static GlobalSettings WithHashThreads(ThreadBudget budget) =>
+        GlobalSettings.Default with { ScanThreading = new ScanThreadingSettings { MaxHashThreads = budget } };
 
     [Fact]
-    public void ResolveWorkers_profile_automatic_uses_the_auto_formula()
-    {
-        DryRunEngine engine = NewEngine(DryRunEngine.MaxReportBytes,
-            GlobalSettings.Default with { DryRunConcurrencyMode = ConcurrencyMode.Manual, DryRunManualWorkers = 3 });
-        Assert.Equal(ExpectedAutoWorkers, engine.ResolveWorkers(ProfileWithConcurrency(ConcurrencyMode.Automatic)));
-    }
-
-    [Fact]
-    public void ResolveWorkers_inherit_uses_the_global_manual_value()
-    {
-        DryRunEngine engine = NewEngine(DryRunEngine.MaxReportBytes,
-            GlobalSettings.Default with { DryRunConcurrencyMode = ConcurrencyMode.Manual, DryRunManualWorkers = 4 });
-        Assert.Equal(4, engine.ResolveWorkers(ProfileWithConcurrency(ConcurrencyMode.Inherit)));
-    }
-
-    [Fact]
-    public void ResolveWorkers_inherit_uses_the_auto_formula_when_global_is_automatic()
-    {
-        DryRunEngine engine = NewEngine(DryRunEngine.MaxReportBytes, GlobalSettings.Default);   // global = Automatic
-        Assert.Equal(ExpectedAutoWorkers, engine.ResolveWorkers(ProfileWithConcurrency(ConcurrencyMode.Inherit)));
-    }
-
-    [Fact]
-    public void ResolveWorkers_clamps_a_manual_value_below_one()
+    public void ResolveWorkers_uses_the_auto_hash_formula_by_default()
     {
         DryRunEngine engine = NewEngine(DryRunEngine.MaxReportBytes, GlobalSettings.Default);
-        Assert.Equal(1, engine.ResolveWorkers(ProfileWithConcurrency(ConcurrencyMode.Manual, 0)));
+        Assert.Equal(ExpectedAutoHashWorkers, engine.ResolveWorkers());
+    }
+
+    [Fact]
+    public void ResolveWorkers_honors_an_explicit_hash_thread_pin()
+    {
+        DryRunEngine engine = NewEngine(DryRunEngine.MaxReportBytes, WithHashThreads(ThreadBudget.Explicit(5)));
+        Assert.Equal(5, engine.ResolveWorkers());
+    }
+
+    [Fact]
+    public void ResolveWorkers_clamps_a_hash_thread_pin_below_one()
+    {
+        DryRunEngine engine = NewEngine(DryRunEngine.MaxReportBytes, WithHashThreads(ThreadBudget.Explicit(0)));
+        Assert.Equal(1, engine.ResolveWorkers());
     }
 
     private static DryRunEngine NewEngine() =>
@@ -92,15 +76,17 @@ public sealed class DryRunEngineTests : IDisposable
         int reportByteBudget, int chunkByteBudget, int maxScannedCandidates, GlobalSettings global)
     {
         FileSystemService fileSystem = new(NullLogger<FileSystemService>.Instance);
+        FakeSettings settings = new(global);
+        ScanScheduler scheduler = new(NullLogger<ScanScheduler>.Instance, fileSystem, settings);
         return new DryRunEngine(
             NullLogger<DryRunEngine>.Instance,
-            new SourceScanner(NullLogger<SourceScanner>.Instance, fileSystem, TimeProvider.System),
+            new SourceScanner(TimeProvider.System, scheduler),
             new FilterCompiler(NullLogger<FilterCompiler>.Instance, TimeProvider.System),
             new FileHasher(NullLogger<FileHasher>.Instance),
             new ConflictResolver(new(), new(), NullLogger<ConflictResolver>.Instance),
-            new FakeSettings(global),
+            settings,
             TimeProvider.System,
-            new DestinationProjector(NullLogger<DestinationProjector>.Instance, fileSystem, new FakeVolumeInfoProvider()))
+            new DestinationProjector(NullLogger<DestinationProjector>.Instance, new FakeVolumeInfoProvider(), scheduler))
         { ReportByteBudget = reportByteBudget, ChunkByteBudget = chunkByteBudget, MaxScannedCandidates = maxScannedCandidates };
     }
 

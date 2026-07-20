@@ -13,6 +13,7 @@ using FileManager.Core.Platform;
 using FileManager.Core.Preflight;
 using FileManager.Core.Profiles;
 using FileManager.Core.Settings;
+using FileManager.Core.Scanning;
 using FileManager.Core.Watching;
 using FileManager.Platform.Windows;
 using Microsoft.Extensions.DependencyInjection;
@@ -67,6 +68,9 @@ internal static class Program
         services.AddSingleton<IProfileStore, ProfileStore>();
         services.AddSingleton<IProfileCatalog, ProfileCatalog>();
         services.AddSingleton<ISettingsProvider, SettingsService>();
+        // The process-wide scan scheduler owns all directory-enumeration worker threads (global +
+        // per-drive budgets), shared by the source scan and the destination sweep.
+        services.AddSingleton<IScanScheduler, ScanScheduler>();
         services.AddSingleton<ISourceScanner, SourceScanner>();
         services.AddSingleton<IFileHasher, FileHasher>();
         services.AddSingleton<IConflictResolver, ConflictResolver>();

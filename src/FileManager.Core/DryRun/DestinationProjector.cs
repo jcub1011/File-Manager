@@ -1,17 +1,17 @@
 using FileManager.Contracts.DryRun;
 using FileManager.Contracts.Primitives;
 using FileManager.Contracts.Profiles;
+using FileManager.Contracts.Settings;
 using FileManager.Core.Files;
 using FileManager.Core.Jobs;
 using FileManager.Core.Platform;
+using FileManager.Core.Scanning;
 using Microsoft.Extensions.Logging;
 using System;
-using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Threading;
-using System.Threading.Tasks;
 
 namespace FileManager.Core.DryRun;
 
@@ -21,24 +21,18 @@ namespace FileManager.Core.DryRun;
 /// (<see cref="OperationKind.Deleted"/>), or a reparse point the sweep declines to judge
 /// (<see cref="OperationKind.Unknown"/>). The per-source-file phase already emits every destination
 /// write (New/Overwrite/Rename/Skip) as an operation, so this only fills the gaps that phase leaves.
-/// Uses only <see cref="IFileSystemService.EnumerateEntries"/> (single-level, non-throwing,
-/// read-only), so it mutates nothing.
 ///
-/// The sweep is I/O-bound (each directory read blocks), so it is walked by dedicated threads sharing
-/// a work-stealing directory queue — overlapping the blocking enumerations rather than issuing them
-/// one at a time, and off the thread pool so a high worker count never starves it. The walk is
-/// metadata-latency-bound, not CPU-bound, so the degree of parallelism oversubscribes the core count
-/// — modestly for local volumes, heavily for latency-bound network shares — unless the profile pins a
-/// Manual worker count.
-/// Results are collected unordered and then sorted by path in a final serial merge, so the output is
-/// deterministic regardless of how the walk interleaved (and regardless of the worker count).
+/// The sweep runs on the shared <see cref="IScanScheduler"/> (which owns the global and per-drive
+/// thread budgets); this class supplies only policy via the session callbacks. Results are collected
+/// unordered on the calling thread and then sorted by path in a final serial merge, so the output is
+/// deterministic regardless of how the walk interleaved.
 ///
 /// The two entry points let the caller choose how survivors are collected: <see cref="Project"/>
 /// takes the full destination-operations list (batched path, unit tests), while
 /// <see cref="AccumulateSurvivors"/> + <see cref="Sweep"/> let a streaming caller feed operation
 /// chunks incrementally and retain only the (small) survivor path set.</summary>
 public sealed class DestinationProjector(
-    ILogger<DestinationProjector> logger, IFileSystemService fileSystem, IVolumeInfoProvider volumes)
+    ILogger<DestinationProjector> logger, IVolumeInfoProvider volumes, IScanScheduler scheduler)
 {
     /// <summary>Adds every resulting destination path a batch of destination operations accounts for
     /// to <paramref name="survivors"/> — so the sweep never re-reports a path a source already writes
@@ -55,31 +49,28 @@ public sealed class DestinationProjector(
     /// <summary>Convenience for the batched path and unit tests: builds the survivor set from the full
     /// destination-operations list, then sweeps.</summary>
     public DestinationSweepResult Project(
-        Profile profile, IReadOnlyList<VirtualFileOperation> destinationOperations, bool truncated, int? manualWorkers, CancellationToken ct)
+        Profile profile, IReadOnlyList<VirtualFileOperation> destinationOperations, bool truncated, CancellationToken ct)
     {
         HashSet<NormalizedPath> survivors = [];
         AccumulateSurvivors(survivors, destinationOperations);
-        return Sweep(profile, survivors, truncated, manualWorkers, ct);
+        return Sweep(profile, survivors, truncated, ct);
     }
 
     /// <summary>Sweeps the profile's target roots and classifies each pre-existing file not in
     /// <paramref name="survivors"/>. Each returned op's <see cref="VirtualFileOperation.SubjectIndex"/>
     /// indexes into the returned <see cref="DestinationSweepResult.Files"/> (op[i] → file[i]); a caller
-    /// merging into a larger report offsets by the destination files already collected. The walk runs
-    /// on dedicated threads whose count follows the target medium, or <paramref name="manualWorkers"/>
-    /// when pinned; the result order is deterministic regardless.</summary>
+    /// merging into a larger report offsets by the destination files already collected. Concurrency and
+    /// per-drive budgets are the scheduler's; the result order is deterministic regardless.</summary>
     /// <param name="truncated">When the source pass was cut short, the survivor set is a prefix, so
     /// every "no source writes here" judgement is untrustworthy — a file we'd call an orphan (or
     /// Untouched) may well be written by an un-evaluated source. In that case we emit NOTHING rather
     /// than fabricate deletions/untouched entries.</param>
-    /// <param name="manualWorkers">A pinned worker count (Manual concurrency), or null to auto-scale
-    /// the degree of parallelism to the target medium (local vs. network).</param>
     /// <param name="maxEntries">Best-effort upper bound on emitted entries — workers stop feeding the
     /// sink once it is crossed and the merge trims to exactly this many, marking the result capped.</param>
     /// <param name="progress">When supplied, its destination counter is incremented per classified
     /// file so a caller can sample it for live progress.</param>
     public DestinationSweepResult Sweep(
-        Profile profile, ISet<NormalizedPath> survivors, bool truncated, int? manualWorkers, CancellationToken ct,
+        Profile profile, ISet<NormalizedPath> survivors, bool truncated, CancellationToken ct,
         int maxEntries = int.MaxValue, DryRunProgressCounters? progress = null)
     {
         ArgumentNullException.ThrowIfNull(profile);
@@ -98,186 +89,110 @@ public sealed class DestinationProjector(
 
         bool mirror = profile.SyncMode == SyncMode.Mirror;
 
-        // Seed the shared work queue with each valid target root (paired with itself so every file
-        // enumerated beneath it records that root). Overlapping roots (one nested under another) may
-        // enqueue a subtree twice; the merge dedups by path — but only needs to when there is more
-        // than one root, since a single root never enumerates the same path twice.
-        SweepState state = new();
-        int rootCount = 0;
+        // Collect target roots (paired with themselves so every file records its root). Overlapping
+        // roots (one nested under another) may enumerate a subtree twice; the merge dedups by path —
+        // but only needs to when there is more than one root.
+        List<NormalizedPath> targetRoots = [];
         foreach (TargetConfig target in profile.Targets)
             if (NormalizedPath.Create(target.Path).TryGetValue(out NormalizedPath targetRoot))
-            {
-                state.Enqueue(new WorkItem(targetRoot.Value, targetRoot));
-                rootCount++;
-            }
+                targetRoots.Add(targetRoot);
 
-        if (state.IsEmpty)
+        if (targetRoots.Count == 0)
             return new DestinationSweepResult([], []);
 
-        // The sweep blocks on directory enumeration, so run it on dedicated (LongRunning) threads
-        // rather than starving the thread pool — essential at the high worker counts network shares
-        // want. A Manual concurrency setting is honoured as-is; Automatic scales to the target medium.
-        int dop = Math.Max(1, manualWorkers ?? AutoSweepWorkers(profile));
-
-        // Each worker classifies into its OWN list — no shared sink, so no per-file contention (a
-        // ConcurrentBag add costs a CAS + thread-local bookkeeping on every one of potentially
-        // hundreds of thousands of survivors). The lists are concatenated by the serial merge, whose
-        // sort already makes the output order independent of which worker found what.
-        var sinks = new List<Candidate>[dop];
-        for (int i = 0; i < dop; i++)
-            sinks[i] = [];
-
-        // Each thread drains the shared queue: enumerate a directory (the blocking I/O), classify its
-        // files into its own sink, push its subdirectories back. Cancellation stays cooperative (no
-        // token wired to the threads → no throw): a cancelled/capped item is drained without
-        // processing, so `outstanding` still reaches zero and every thread exits.
-        void Drain(List<Candidate> sink)
+        SweepBudget budget = new(maxEntries);
+        ScanSessionOptions options = new()
         {
-            SpinWait spin = default;
-            while (true)
+            // Deliberate asymmetries vs. the source scan: (1) NO MaxDepth pruning — a true mirror
+            // deletes deep orphans regardless of the source's depth filter; (2) reparse-point dirs are
+            // never descended (junctions can loop or escape the tree).
+            OnSubdirectory = static (entry, tag) =>
             {
-                if (state.TryTake(out WorkItem item))
-                {
-                    try
-                    {
-                        if (!ct.IsCancellationRequested && !state.Capped)
-                            Walk(item, state, sink, survivors, sourceRoots, mirror, maxEntries, progress);
-                    }
-                    finally
-                    {
-                        state.Done();   // must run even on an unexpected throw, or peers spin forever
-                    }
-                    spin = default;      // found work — reset the idle backoff
-                    continue;
-                }
-
-                if (state.AllDrained)
-                    break;
-                spin.SpinOnce();   // empty for now but a peer may still push; back off (spins → sleeps)
-            }
-        }
+                if (InfrastructurePaths.IsInfrastructureDirectoryName(entry.FileName))
+                    return new ChildDecision(false, null);
+                if ((entry.Attributes & FileAttributes.ReparsePoint) != 0)
+                    return new ChildDecision(false, null);
+                return new ChildDecision(true, tag);
+            },
+            OnFile = (entry, _) =>
+            {
+                if (InfrastructurePaths.IsTempFileName(entry.FileName))
+                    return false;
+                // The enumerated path descends from a GetFullPath-canonicalized target root, so it is
+                // itself canonical — wrap it WITHOUT paying Create's per-file re-canonicalization.
+                NormalizedPath filePath = NormalizedPath.FromCanonical(entry.FullPath);
+                if (survivors.Contains(filePath))
+                    return false;   // a source writes here — already an operation from the file phase
+                if (IsUnderAnySource(filePath, sourceRoots))
+                    return false;   // a source file that happens to live under a target root
+                // Best-effort budget: once crossed, stop emitting (Merge applies the authoritative cap).
+                return budget.TryReserve();
+            },
+            // The sweep never surfaces faults as results (a missing/unopenable target root is simply
+            // "nothing (more) to report there"); the scheduler still treats a Fatal as terminal for
+            // its directory.
+            OnFault = (fault, _) =>
+            {
+                logger.LogDebug("Destination sweep skipped/stopped an entry: {Message}", fault.Message);
+                return null;
+            },
+        };
 
         Stopwatch walkWatch = Stopwatch.StartNew();
-        Task[] threads = new Task[dop];
-        for (int i = 0; i < dop; i++)
+        List<Candidate> collected = [];
+        using (IScanSession session = scheduler.OpenSession(options, ct))
         {
-            List<Candidate> sink = sinks[i];   // capture a distinct list per thread
-            threads[i] = Task.Factory.StartNew(
-                () => Drain(sink), CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+            foreach (NormalizedPath targetRoot in targetRoots)
+            {
+                (string key, DriveClass driveClass) = ResolveVolume(targetRoot.Value);
+                session.Submit(new ScanWorkItem(targetRoot.Value, key, driveClass, targetRoot));
+            }
+
+            foreach (ScanResult result in session.Consume())
+            {
+                if (result.Entry is not FileSystemEntry fsEntry)
+                    continue;
+                NormalizedPath rootTag = (NormalizedPath)result.Tag!;
+                bool isReparse = (fsEntry.Attributes & FileAttributes.ReparsePoint) != 0;
+                NormalizedPath filePath = NormalizedPath.FromCanonical(fsEntry.FullPath);
+                OperationKind kind = isReparse
+                    ? OperationKind.Unknown              // can't judge a reparse point
+                    : mirror
+                        ? OperationKind.Deleted          // orphan a mirror would remove
+                        : OperationKind.Untouched;       // pre-existing, left in place
+                collected.Add(new Candidate(
+                    filePath,
+                    new PhysicalFile
+                    {
+                        Path = fsEntry.FullPath,
+                        Root = rootTag.Value,
+                        Length = fsEntry.Size,
+                        LastWritten = fsEntry.Modified,
+                        IsReparsePoint = isReparse,
+                    },
+                    kind,
+                    isReparse ? "reparse point (symlink/junction)" : null));
+                progress?.DestinationDiscovered();
+            }
         }
-        Task.WaitAll(threads);
         walkWatch.Stop();
 
         Stopwatch mergeWatch = Stopwatch.StartNew();
-        DestinationSweepResult merged = Merge(sinks, state.Capped, maxEntries, dedup: rootCount > 1);
+        DestinationSweepResult merged = Merge(collected, budget.Capped, maxEntries, dedup: targetRoots.Count > 1);
         mergeWatch.Stop();
 
         return merged with { WalkMs = walkWatch.ElapsedMilliseconds, MergeMs = mergeWatch.ElapsedMilliseconds };
     }
 
-    /// <summary>Enumerates one directory (single level): pushes descendable subdirectories back onto
-    /// the queue and adds each classifiable file to the sink. Mirrors the source scanner's walk but
-    /// with two deliberate asymmetries: (1) NO MaxDepth pruning — a true mirror deletes deep orphans
-    /// regardless of the source's depth filter; (2) reparse-point directories are not descended
-    /// (junctions can loop or escape the tree) and reparse-point files are classified Unknown, never
-    /// Deleted.</summary>
-    private void Walk(
-        WorkItem item,
-        SweepState state,
-        List<Candidate> sink,
-        ISet<NormalizedPath> survivors,
-        List<NormalizedPath> sourceRoots,
-        bool mirror,
-        int maxEntries,
-        DryRunProgressCounters? progress)
-    {
-        foreach (Result<FileSystemEntry, EnumerationFault> entry in fileSystem.EnumerateEntries(item.Dir))
-        {
-            if (entry.TryGetError(out EnumerationFault fault))
-            {
-                // A missing/unopenable target root or subdirectory is not a dry-run failure —
-                // there is simply nothing (more) to report there. Log and move on.
-                if (fault.Severity == EnumerationSeverity.Fatal)
-                {
-                    logger.LogDebug(
-                        "Destination sweep stopped enumerating {Directory}: {Message}",
-                        item.Dir, fault.Message);
-                    break;   // Fatal is this directory's terminal item
-                }
-                logger.LogDebug("Destination sweep skipped an entry under {Directory}: {Message}",
-                    item.Dir, fault.Message);
-                continue;
-            }
-
-            entry.TryGetValue(out FileSystemEntry? fsEntry);
-            bool isReparse = (fsEntry!.Attributes & FileAttributes.ReparsePoint) != 0;
-
-            if (fsEntry.IsDirectory)
-            {
-                if (InfrastructurePaths.IsInfrastructureDirectoryName(fsEntry.FileName))
-                    continue;
-                if (isReparse)
-                    continue;   // never descend a junction/symlink dir — loop / escape risk
-                state.Enqueue(new WorkItem(fsEntry.FullPath, item.Root));
-                continue;
-            }
-
-            // Files only — directory/empty-dir deletion is not modeled.
-            if (InfrastructurePaths.IsTempFileName(fsEntry.FileName))
-                continue;
-            // The enumerated path descends from a target root that was already GetFullPath-canonicalized
-            // (see the seeding above), so it is itself canonical — wrap it WITHOUT paying Create's
-            // per-file Path.GetFullPath re-canonicalization. Survivor paths are canonicalized the same
-            // way (via Create on the destination-op paths), so OrdinalIgnoreCase matching is preserved.
-            NormalizedPath filePath = NormalizedPath.FromCanonical(fsEntry.FullPath);
-            if (survivors.Contains(filePath))
-                continue;   // a source writes here — already an operation from the file phase
-            if (IsUnderAnySource(filePath, sourceRoots))
-                continue;   // a source file that happens to live under a target root
-
-            // Best-effort budget: once the sink is full, stop feeding it (peers see Capped and drain
-            // fast). The authoritative cap is applied in Merge, which trims to exactly maxEntries.
-            if (!state.TryReserve(maxEntries))
-                continue;
-
-            OperationKind kind = isReparse
-                ? OperationKind.Unknown              // can't judge a reparse point
-                : mirror
-                    ? OperationKind.Deleted          // orphan a mirror would remove
-                    : OperationKind.Untouched;       // pre-existing, left in place
-
-            sink.Add(new Candidate(
-                filePath,
-                new PhysicalFile
-                {
-                    Path = fsEntry.FullPath,
-                    Root = item.Root.Value,
-                    Length = fsEntry.Size,
-                    LastWritten = fsEntry.Modified,
-                    IsReparsePoint = isReparse,
-                },
-                kind,
-                isReparse ? "reparse point (symlink/junction)" : null));
-            progress?.DestinationDiscovered();
-        }
-    }
-
-    /// <summary>Serial merge of the per-worker candidate lists into the index-paired result:
-    /// concatenates the lists, sorts by path for deterministic output, dedups overlapping roots, and
-    /// assigns each op's <see cref="VirtualFileOperation.SubjectIndex"/> so <c>Ops[i]</c> references
-    /// <c>Files[i]</c>. Applies the authoritative <paramref name="maxEntries"/> cap.</summary>
+    /// <summary>Serial merge of the collected candidates into the index-paired result: sorts by path for
+    /// deterministic output, dedups overlapping roots, and assigns each op's
+    /// <see cref="VirtualFileOperation.SubjectIndex"/> so <c>Ops[i]</c> references <c>Files[i]</c>.
+    /// Applies the authoritative <paramref name="maxEntries"/> cap.</summary>
     /// <param name="dedup">Whether paths can repeat across the walk (only when target roots overlap).
     /// With a single root no path is ever enumerated twice, so the per-path dedup set — a full extra
     /// hash of every survivor — is skipped.</param>
-    private static DestinationSweepResult Merge(List<Candidate>[] sinks, bool cappedDuringWalk, int maxEntries, bool dedup)
+    private static DestinationSweepResult Merge(List<Candidate> collected, bool cappedDuringWalk, int maxEntries, bool dedup)
     {
-        int total = 0;
-        foreach (List<Candidate> sink in sinks)
-            total += sink.Count;
-
-        List<Candidate> collected = new(total);
-        foreach (List<Candidate> sink in sinks)
-            collected.AddRange(sink);
         collected.Sort(static (a, b) =>
             string.Compare(a.Path.Value, b.Path.Value, StringComparison.OrdinalIgnoreCase));
 
@@ -312,20 +227,12 @@ public sealed class DestinationProjector(
         return new DestinationSweepResult(files, ops, capped);
     }
 
-    /// <summary>Degree of parallelism for the walk in Automatic mode. The sweep blocks on directory
-    /// enumeration, so the cost is dominated by per-directory metadata latency, not CPU — even local
-    /// volumes (SSD/NVMe) enumerate a large tree far faster when the core count is oversubscribed, so
-    /// the blocking reads overlap instead of serialising on the workers. Measured on a large local
-    /// tree: ~3.7x faster at 2x cores than at 1x. Network shares are latency-bound to a much greater
-    /// degree and want heavier oversubscription to overlap the round-trips. A single shared pool
-    /// drains all target roots, so size to the most-latent target: any network root pushes the whole
-    /// sweep to the network count.</summary>
-    private int AutoSweepWorkers(Profile profile)
+    /// <summary>The volume key + drive class for a target root, used to size its per-drive scan
+    /// budget. A key that cannot be resolved falls to a single synthetic local volume.</summary>
+    private (string Key, DriveClass DriveClass) ResolveVolume(string path)
     {
-        foreach (TargetConfig target in profile.Targets)
-            if (volumes.IsNetworkPath(target.Path))
-                return Math.Clamp(Environment.ProcessorCount * 8, 32, 128);
-        return Math.Max(2, Environment.ProcessorCount * 2);
+        string key = volumes.GetVolumeKey(path).TryGetValue(out string? resolved) ? resolved : "local";
+        return (key, volumes.GetDriveClass(path));
     }
 
     private static void AddNormalized(ISet<NormalizedPath> set, string path)
@@ -344,44 +251,22 @@ public sealed class DestinationProjector(
         return false;
     }
 
-    /// <summary>A directory awaiting enumeration, tagged with the target root it descends from (so its
-    /// files record the right <see cref="PhysicalFile.Root"/>).</summary>
-    private readonly record struct WorkItem(string Dir, NormalizedPath Root);
-
     /// <summary>A classified survivor awaiting the merge. Holds everything both output records need;
     /// <see cref="VirtualFileOperation.SubjectIndex"/> is assigned only at merge time, so it is absent
     /// here.</summary>
     private readonly record struct Candidate(NormalizedPath Path, PhysicalFile File, OperationKind Kind, string? Detail);
 
-    /// <summary>Shared state for the work-stealing walk. Encapsulates the directory queue, the result
-    /// sink, the outstanding-work counter that drives termination, and the best-effort budget — all
-    /// mutated concurrently, so every mutation is interlocked (mirrors the engine's RunCounters).</summary>
-    private sealed class SweepState
+    /// <summary>The best-effort emission budget shared by the walk's workers: reserves a slot per
+    /// candidate, latching Capped once the reservations exceed the cap. An unbounded budget always
+    /// succeeds.</summary>
+    private sealed class SweepBudget(int maxEntries)
     {
-        private readonly ConcurrentStack<WorkItem> _pending = new();
-        // Directories queued OR being processed. Seeded/incremented on Enqueue, decremented on Done;
-        // a worker exits only when it sees an empty stack AND this at zero (no peer can still push).
-        private long _outstanding;
-        private int _produced;   // survivors reserved against the budget
-        private int _capped;      // 0/1 — budget exhausted (or a peer signalled it)
+        private int _produced;
+        private int _capped;
 
-        public bool IsEmpty => _pending.IsEmpty;
         public bool Capped => Volatile.Read(ref _capped) != 0;
-        public bool AllDrained => Interlocked.Read(ref _outstanding) == 0;
 
-        public void Enqueue(WorkItem item)
-        {
-            Interlocked.Increment(ref _outstanding);
-            _pending.Push(item);
-        }
-
-        public bool TryTake(out WorkItem item) => _pending.TryPop(out item);
-
-        public void Done() => Interlocked.Decrement(ref _outstanding);
-
-        /// <summary>Reserves one budget slot. Returns false (and latches Capped) once the reservations
-        /// exceed <paramref name="maxEntries"/>; an unbounded budget always succeeds.</summary>
-        public bool TryReserve(int maxEntries)
+        public bool TryReserve()
         {
             if (maxEntries == int.MaxValue)
                 return true;

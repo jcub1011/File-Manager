@@ -9,6 +9,7 @@ using FileManager.Core.Placement;
 using FileManager.Core.Platform;
 using FileManager.Core.Profiles;
 using FileManager.Core.Settings;
+using FileManager.Core.Scanning;
 using FileManager.Core.Watching;
 using Microsoft.Extensions.Logging.Abstractions;
 
@@ -90,7 +91,9 @@ public class DryRunEngineBenchmarks
         IFileSystemService scanFileSystem = Latency == SourceLatency.Slow
             ? new SlowFileSystem(fileSystem, TimeSpan.FromMilliseconds(2))
             : fileSystem;
-        var scanner = new SourceScanner(NullLogger<SourceScanner>.Instance, scanFileSystem, TimeProvider.System);
+        FixedSettings settings = new();
+        var scheduler = new ScanScheduler(NullLogger<ScanScheduler>.Instance, scanFileSystem, settings);
+        var scanner = new SourceScanner(TimeProvider.System, scheduler);
 
         _engine = new DryRunEngine(
             NullLogger<DryRunEngine>.Instance,
@@ -98,9 +101,9 @@ public class DryRunEngineBenchmarks
             new FilterCompiler(NullLogger<FilterCompiler>.Instance, TimeProvider.System),
             new FileHasher(NullLogger<FileHasher>.Instance),
             new ConflictResolver(new(), new(), NullLogger<ConflictResolver>.Instance),
-            new FixedSettings(),
+            settings,
             TimeProvider.System,
-            new DestinationProjector(NullLogger<DestinationProjector>.Instance, fileSystem, new LocalVolumes()));
+            new DestinationProjector(NullLogger<DestinationProjector>.Instance, new LocalVolumes(), scheduler));
     }
 
     /// <summary>Injects a per-directory round-trip delay into enumeration only (the delay runs
@@ -124,8 +127,16 @@ public class DryRunEngineBenchmarks
     private sealed class LocalVolumes : IVolumeInfoProvider
     {
         public bool IsNetworkPath(string path) => false;
+        public DriveClass GetDriveClass(string path) => DriveClass.Fixed;
+
+        // The scan scheduler resolves a per-volume budget from the key + class, so both must be real.
+        public Result<string, string> GetVolumeKey(string path)
+        {
+            string root = Path.GetPathRoot(Path.GetFullPath(path)) ?? path;
+            return Result<string, string>.Success(Path.TrimEndingDirectorySeparator(root).ToLowerInvariant());
+        }
+
         public Result<long, string> GetAvailableFreeBytes(string path) => throw new NotSupportedException();
-        public Result<string, string> GetVolumeKey(string path) => throw new NotSupportedException();
         public Result<VolumeCapacity, string> GetVolumeCapacity(string path) => throw new NotSupportedException();
     }
 

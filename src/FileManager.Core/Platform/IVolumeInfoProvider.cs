@@ -1,4 +1,5 @@
 using FileManager.Contracts.Primitives;
+using FileManager.Contracts.Settings;
 
 namespace FileManager.Core.Platform;
 
@@ -10,6 +11,11 @@ public interface IVolumeInfoProvider
     Result<string, string> GetVolumeKey(string path);
 
     bool IsNetworkPath(string path);
+
+    /// <summary>The physical medium behind the volume holding <paramref name="path"/>, used to size the
+    /// per-drive scan-thread budget. Best-effort: returns <see cref="DriveClass.Unknown"/> when the
+    /// class cannot be determined rather than failing.</summary>
+    DriveClass GetDriveClass(string path);
 
     /// <summary>Total capacity, free space, and allocation-unit (cluster) size for the volume holding
     /// <paramref name="path"/>. Powers the dry-run space preview's "used / still free" and the

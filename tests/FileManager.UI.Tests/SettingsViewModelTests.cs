@@ -8,49 +8,46 @@ namespace FileManager.UI.Tests;
 public sealed class SettingsViewModelTests
 {
     [Fact]
-    public async Task Load_reflects_the_backend_manual_setting()
+    public async Task Load_reflects_an_explicit_backend_scan_thread_pin()
     {
         FakeIpcGateway gateway = new()
         {
             GetSettingsResult = new GlobalSettings
             {
-                DryRunConcurrencyMode = ConcurrencyMode.Manual,
-                DryRunManualWorkers = 4,
+                ScanThreading = new ScanThreadingSettings { MaxScanThreads = ThreadBudget.Explicit(4) },
             },
         };
         SettingsViewModel vm = new(gateway);
 
         await vm.LoadAsync();
 
-        Assert.Equal(ConcurrencyMode.Manual, vm.Mode);
-        Assert.Equal(4, vm.ManualWorkers);
-        Assert.True(vm.ShowManualWorkers);
+        Assert.False(vm.MaxScanThreadsAuto);
+        Assert.Equal(4, vm.MaxScanThreadsValue);
+        Assert.True(vm.ShowMaxScanThreadsValue);
     }
 
     [Fact]
-    public async Task Save_sends_the_worker_count_when_manual()
+    public async Task Save_sends_an_explicit_scan_thread_count()
     {
         FakeIpcGateway gateway = new();
-        SettingsViewModel vm = new(gateway) { Mode = ConcurrencyMode.Manual, ManualWorkers = 7 };
+        SettingsViewModel vm = new(gateway) { MaxScanThreadsAuto = false, MaxScanThreadsValue = 7 };
 
         await vm.SaveCommand.ExecuteAsync(null);
 
         GlobalSettings sent = Assert.Single(gateway.SaveSettingsCalls);
-        Assert.Equal(ConcurrencyMode.Manual, sent.DryRunConcurrencyMode);
-        Assert.Equal(7, sent.DryRunManualWorkers);
+        Assert.Equal(7, sent.ScanThreading.MaxScanThreads.Value);
     }
 
     [Fact]
-    public async Task Save_omits_the_worker_count_when_automatic()
+    public async Task Save_sends_auto_when_checked()
     {
         FakeIpcGateway gateway = new();
-        SettingsViewModel vm = new(gateway) { Mode = ConcurrencyMode.Automatic, ManualWorkers = 7 };
+        SettingsViewModel vm = new(gateway) { MaxScanThreadsAuto = true, MaxScanThreadsValue = 7 };
 
         await vm.SaveCommand.ExecuteAsync(null);
 
         GlobalSettings sent = Assert.Single(gateway.SaveSettingsCalls);
-        Assert.Equal(ConcurrencyMode.Automatic, sent.DryRunConcurrencyMode);
-        Assert.Null(sent.DryRunManualWorkers);
+        Assert.True(sent.ScanThreading.MaxScanThreads.IsAuto);
     }
 
     [Fact]

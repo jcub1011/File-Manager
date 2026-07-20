@@ -2,6 +2,7 @@ using FileManager.Contracts.DryRun;
 using FileManager.Contracts.IPC;
 using FileManager.Contracts.Profiles;
 using FileManager.Contracts.Settings;
+using System.Collections.Generic;
 using System.Text.Json.Serialization;
 
 namespace FileManager.Contracts;
@@ -19,4 +20,8 @@ namespace FileManager.Contracts;
 [JsonSerializable(typeof(DryRunOperation))]
 // Also serialized standalone: SettingsService persists it to settings.json.
 [JsonSerializable(typeof(GlobalSettings))]
+[JsonSerializable(typeof(ScanThreadingSettings))]
+[JsonSerializable(typeof(ThreadBudget))]
+[JsonSerializable(typeof(Dictionary<DriveClass, ThreadBudget>))]
+[JsonSerializable(typeof(Dictionary<string, ThreadBudget>))]
 public sealed partial class FileManagerJsonContext : JsonSerializerContext;

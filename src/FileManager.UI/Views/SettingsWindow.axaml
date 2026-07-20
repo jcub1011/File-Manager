@@ -3,10 +3,9 @@
         xmlns:vm="using:FileManager.UI.ViewModels"
         xmlns:conv="using:FileManager.UI.Converters"
         xmlns:settings="using:FileManager.Contracts.Settings"
-        xmlns:prof="using:FileManager.Contracts.Profiles"
         x:Class="FileManager.UI.Views.SettingsWindow"
         x:DataType="vm:SettingsViewModel"
-        Width="520" SizeToContent="Height"
+        Width="560" SizeToContent="Height"
         WindowStartupLocation="CenterOwner"
         FontFamily="{StaticResource AppFontFamily}"
         FontSize="{StaticResource Font.Body}"
@@ -46,26 +45,80 @@
             </ComboBox>
         </Grid>
 
-        <Border Classes="sectionHeader"><TextBlock Text="Dry-run performance" /></Border>
+        <Border Classes="sectionHeader"><TextBlock Text="Scan performance" /></Border>
         <TextBlock TextWrapping="Wrap" Classes="secondary" Margin="0,0,0,8"
-                   Text="How many files a dry run evaluates in parallel. Automatic reserves one core for the system (capped at 8). Individual profiles can override this." />
+                   Text="Thread budgets shared across all profiles. Max scan threads caps total directory-enumeration threads (auto = cores × 8). Per-drive default caps threads on any one drive (auto = cores × 4). Max hash threads caps parallel file hashing in a dry run (auto = cores − 1)." />
 
-        <Grid ColumnDefinitions="140,*" RowDefinitions="Auto,Auto" Margin="0,0,0,4">
-            <TextBlock Grid.Row="0" Grid.Column="0" Classes="fieldLabel" Text="Concurrency" />
-            <ComboBox Grid.Row="0" Grid.Column="1" ItemsSource="{Binding ConcurrencyModeOptions}"
-                      SelectedItem="{Binding Mode}" Margin="0,2" MinWidth="220">
-                <ComboBox.ItemTemplate>
-                    <DataTemplate x:DataType="prof:ConcurrencyMode">
-                        <TextBlock Text="{Binding Converter={x:Static conv:EnumTitleConverters.ConcurrencyMode}}" />
-                    </DataTemplate>
-                </ComboBox.ItemTemplate>
-            </ComboBox>
-            <TextBlock Grid.Row="1" Grid.Column="0" Classes="fieldLabel" Text="Worker count"
-                       IsVisible="{Binding ShowManualWorkers}" />
-            <NumericUpDown Grid.Row="1" Grid.Column="1" Value="{Binding ManualWorkers}" Minimum="1"
-                           Width="220" HorizontalAlignment="Left" Margin="0,2" FormatString="0"
-                           IsVisible="{Binding ShowManualWorkers}" />
+        <Grid ColumnDefinitions="160,Auto,*" RowDefinitions="Auto" Margin="0,0,0,4">
+            <TextBlock Grid.Column="0" Classes="fieldLabel" Text="Max scan threads" />
+            <CheckBox Grid.Column="1" Content="Auto" IsChecked="{Binding MaxScanThreadsAuto}" Margin="0,2,8,2" />
+            <NumericUpDown Grid.Column="2" Value="{Binding MaxScanThreadsValue}" Minimum="1" Width="160"
+                           HorizontalAlignment="Left" Margin="0,2" FormatString="0"
+                           IsVisible="{Binding ShowMaxScanThreadsValue}" />
         </Grid>
+        <Grid ColumnDefinitions="160,Auto,*" RowDefinitions="Auto" Margin="0,0,0,4">
+            <TextBlock Grid.Column="0" Classes="fieldLabel" Text="Per-drive default" />
+            <CheckBox Grid.Column="1" Content="Auto" IsChecked="{Binding PerDriveDefaultAuto}" Margin="0,2,8,2" />
+            <NumericUpDown Grid.Column="2" Value="{Binding PerDriveDefaultValue}" Minimum="1" Width="160"
+                           HorizontalAlignment="Left" Margin="0,2" FormatString="0"
+                           IsVisible="{Binding ShowPerDriveDefaultValue}" />
+        </Grid>
+        <Grid ColumnDefinitions="160,Auto,*" RowDefinitions="Auto" Margin="0,0,0,4">
+            <TextBlock Grid.Column="0" Classes="fieldLabel" Text="Max hash threads" />
+            <CheckBox Grid.Column="1" Content="Auto" IsChecked="{Binding MaxHashThreadsAuto}" Margin="0,2,8,2" />
+            <NumericUpDown Grid.Column="2" Value="{Binding MaxHashThreadsValue}" Minimum="1" Width="160"
+                           HorizontalAlignment="Left" Margin="0,2" FormatString="0"
+                           IsVisible="{Binding ShowMaxHashThreadsValue}" />
+        </Grid>
+
+        <Expander Header="Advanced: per-drive overrides" Margin="0,8,0,0">
+            <StackPanel Spacing="8" Margin="0,8,0,0">
+                <TextBlock Classes="secondary" TextWrapping="Wrap"
+                           Text="Override the per-drive budget for a whole drive type, or for a specific volume key (highest precedence). Precedence: specific drive → drive type → per-drive default." />
+
+                <Border Classes="sectionHeader"><TextBlock Text="Drive-type overrides" /></Border>
+                <ItemsControl ItemsSource="{Binding DriveTypeOverrides}">
+                    <ItemsControl.ItemTemplate>
+                        <DataTemplate x:DataType="vm:DriveTypeOverrideRowViewModel">
+                            <Grid ColumnDefinitions="*,Auto,Auto,Auto" Margin="0,2">
+                                <ComboBox Grid.Column="0" ItemsSource="{Binding Options}" SelectedItem="{Binding Class}" MinWidth="150">
+                                    <ComboBox.ItemTemplate>
+                                        <DataTemplate x:DataType="settings:DriveClass">
+                                            <TextBlock Text="{Binding Converter={x:Static conv:EnumTitleConverters.DriveClass}}" />
+                                        </DataTemplate>
+                                    </ComboBox.ItemTemplate>
+                                </ComboBox>
+                                <CheckBox Grid.Column="1" Content="Auto" IsChecked="{Binding Auto}" Margin="8,0" VerticalAlignment="Center" />
+                                <NumericUpDown Grid.Column="2" Value="{Binding Value}" Minimum="1" Width="120" FormatString="0"
+                                               VerticalAlignment="Center" IsVisible="{Binding ShowValue}" />
+                                <Button Grid.Column="3" Content="Remove" Margin="8,0,0,0" VerticalAlignment="Center"
+                                        Command="{Binding $parent[ItemsControl].((vm:SettingsViewModel)DataContext).RemoveDriveTypeOverrideCommand}"
+                                        CommandParameter="{Binding}" />
+                            </Grid>
+                        </DataTemplate>
+                    </ItemsControl.ItemTemplate>
+                </ItemsControl>
+                <Button Content="Add drive-type override" Command="{Binding AddDriveTypeOverrideCommand}" HorizontalAlignment="Left" />
+
+                <Border Classes="sectionHeader"><TextBlock Text="Specific-drive overrides" /></Border>
+                <ItemsControl ItemsSource="{Binding SpecificDriveOverrides}">
+                    <ItemsControl.ItemTemplate>
+                        <DataTemplate x:DataType="vm:SpecificDriveOverrideRowViewModel">
+                            <Grid ColumnDefinitions="*,Auto,Auto,Auto" Margin="0,2">
+                                <TextBox Grid.Column="0" Text="{Binding VolumeKey}" PlaceholderText="c: or \\server\share" MinWidth="150" />
+                                <CheckBox Grid.Column="1" Content="Auto" IsChecked="{Binding Auto}" Margin="8,0" VerticalAlignment="Center" />
+                                <NumericUpDown Grid.Column="2" Value="{Binding Value}" Minimum="1" Width="120" FormatString="0"
+                                               VerticalAlignment="Center" IsVisible="{Binding ShowValue}" />
+                                <Button Grid.Column="3" Content="Remove" Margin="8,0,0,0" VerticalAlignment="Center"
+                                        Command="{Binding $parent[ItemsControl].((vm:SettingsViewModel)DataContext).RemoveSpecificDriveOverrideCommand}"
+                                        CommandParameter="{Binding}" />
+                            </Grid>
+                        </DataTemplate>
+                    </ItemsControl.ItemTemplate>
+                </ItemsControl>
+                <Button Content="Add drive override" Command="{Binding AddSpecificDriveOverrideCommand}" HorizontalAlignment="Left" />
+            </StackPanel>
+        </Expander>
 
         <Border Classes="infoBar danger" Margin="0,8,0,0"
                 IsVisible="{Binding ErrorMessage, Converter={x:Static ObjectConverters.IsNotNull}}">

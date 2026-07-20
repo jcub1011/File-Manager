@@ -1,9 +1,10 @@
 using FileManager.Contracts;
 using FileManager.Contracts.Primitives;
-using FileManager.Contracts.Profiles;
 using FileManager.Contracts.Settings;
+using FileManager.Core.Scanning;
 using Microsoft.Extensions.Logging;
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Text.Json;
 
@@ -57,8 +58,10 @@ public sealed class SettingsService : ISettingsProvider
             File.Move(tempPath, finalPath, overwrite: true);
 
             _current = normalized;
-            _logger.LogInformation("Saved global settings (dry-run concurrency {Mode}/{Workers})",
-                normalized.DryRunConcurrencyMode, normalized.DryRunManualWorkers);
+            ScanThreadingSettings st = normalized.ScanThreading;
+            _logger.LogInformation(
+                "Saved global settings (scan threads {Scan}, hash threads {Hash}, per-drive default {PerDrive})",
+                Describe(st.MaxScanThreads), Describe(st.MaxHashThreads), Describe(st.PerDriveDefault));
             return Result<GlobalSettings, string>.Success(normalized);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
@@ -104,11 +107,39 @@ public sealed class SettingsService : ISettingsProvider
         }
     }
 
-    // A Manual worker count below 1 is meaningless and would make MaxDegreeOfParallelism throw, so
-    // clamp it here — stored files and incoming IPC values both pass through Load/Update. In
-    // Automatic mode the worker count is unused, so drop it to keep the persisted form canonical.
+    // An explicit thread count below 1 is meaningless (it would make a degree-of-parallelism throw),
+    // so clamp every explicit budget to >= 1; auto budgets are left alone. Stored files and incoming
+    // IPC values both pass through Load/Update. Specific-drive keys are canonicalized to match the
+    // volume-key form the scheduler resolves, and blank keys are dropped.
     private static GlobalSettings Normalize(GlobalSettings settings) =>
-        settings.DryRunConcurrencyMode == ConcurrencyMode.Manual
-            ? settings with { DryRunManualWorkers = Math.Max(1, settings.DryRunManualWorkers ?? 1) }
-            : settings with { DryRunManualWorkers = null };
+        settings with { ScanThreading = NormalizeThreading(settings.ScanThreading) };
+
+    private static ScanThreadingSettings NormalizeThreading(ScanThreadingSettings s)
+    {
+        Dictionary<DriveClass, ThreadBudget> byType = [];
+        foreach (KeyValuePair<DriveClass, ThreadBudget> e in s.DriveTypeOverrides)
+            byType[e.Key] = ClampBudget(e.Value);
+
+        Dictionary<string, ThreadBudget> specific = [];
+        foreach (KeyValuePair<string, ThreadBudget> e in s.SpecificDriveOverrides)
+        {
+            string key = ScanThreadResolver.NormalizeKey(e.Key);
+            if (key.Length != 0)
+                specific[key] = ClampBudget(e.Value);
+        }
+
+        return s with
+        {
+            MaxScanThreads = ClampBudget(s.MaxScanThreads),
+            MaxHashThreads = ClampBudget(s.MaxHashThreads),
+            PerDriveDefault = ClampBudget(s.PerDriveDefault),
+            DriveTypeOverrides = byType,
+            SpecificDriveOverrides = specific,
+        };
+    }
+
+    private static ThreadBudget ClampBudget(ThreadBudget budget) =>
+        budget.Value is int v ? ThreadBudget.Explicit(Math.Max(1, v)) : ThreadBudget.Auto;
+
+    private static string Describe(ThreadBudget budget) => budget.IsAuto ? "auto" : budget.Value!.Value.ToString();
 }
