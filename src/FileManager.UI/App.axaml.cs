@@ -23,6 +23,13 @@ namespace FileManager.UI
         {
             if (ApplicationLifetime is IClassicDesktopStyleApplicationLifetime desktop)
             {
+                // Apply the persisted theme BEFORE the window is shown (below), so the first paint
+                // uses the correct variant instead of App.axaml's "Default" — otherwise the window
+                // flashes light before the theme lands. Read synchronously from settings.json on disk
+                // rather than over IPC: the IPC round-trip may launch the service and is far too slow
+                // for the first frame. The service's value reconciles later in window.Opened.
+                ThemeApplier.Apply(StartupTheme.Read());
+
                 // Manual composition — no DI container; the object graph is four services deep.
                 _gateway = new IpcGateway();
                 MainWindow window = new();
@@ -46,9 +53,9 @@ namespace FileManager.UI
                     try
                     {
                         await viewModel.InitializeAsync();
-                        // Apply the persisted theme once settings can be read. Left until now (rather
-                        // than App.axaml) because it comes from the service over IPC; App.axaml's
-                        // "Default" variant is the correct pre-connect value for ThemeMode.System.
+                        // Reconcile with the service's authoritative settings. The theme was already
+                        // applied synchronously from disk before the window was shown; this re-applies
+                        // from the source of truth in case the on-disk copy was stale or unreadable.
                         var settingsResult = await _gateway.GetSettingsAsync();
                         if (settingsResult.TryGetValue(out FileManager.Contracts.Settings.GlobalSettings? settings))
                             ThemeApplier.Apply(settings.ThemeMode);
