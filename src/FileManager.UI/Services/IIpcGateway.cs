@@ -25,9 +25,13 @@ public interface IIpcGateway
     Task<Result<bool, IpcError>> DeleteProfileAsync(Guid profileId, CancellationToken ct = default);
     /// <summary>Runs a streamed dry run. <paramref name="progress"/> (when supplied) receives
     /// throttled discovery updates as the service reports them; construct the
-    /// <see cref="Progress{T}"/> on the UI thread so reports marshal there automatically.</summary>
+    /// <see cref="Progress{T}"/> on the UI thread so reports marshal there automatically.
+    /// When <paramref name="draft"/> is supplied, the service previews that in-memory profile
+    /// (unsaved edits) directly instead of resolving <paramref name="profileId"/> against the
+    /// persisted catalog.</summary>
     Task<Result<DryRunReport, IpcError>> DryRunAsync(
-        Guid profileId, IProgress<DryRunProgress>? progress = null, CancellationToken ct = default);
+        Guid profileId, IProgress<DryRunProgress>? progress = null, Profile? draft = null,
+        CancellationToken ct = default);
     Task<Result<GlobalSettings, IpcError>> GetSettingsAsync(CancellationToken ct = default);
     Task<Result<GlobalSettings, IpcError>> SaveSettingsAsync(GlobalSettings settings, CancellationToken ct = default);
     /// <summary>Asks the service to shut itself down (StartAndStopWithProgram mode on UI close).</summary>

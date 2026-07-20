@@ -61,7 +61,11 @@ public sealed class DryRunStreamHandler(
         IpcRequest request, [EnumeratorCancellation] CancellationToken ct = default)
     {
         var typed = (DryRunStreamRequest)request;
-        var profile = catalog.All.FirstOrDefault(p => p.Id == typed.ProfileId);
+        // An inline draft (unsaved edits) is previewed directly; otherwise resolve the persisted
+        // catalog. PROFILE_NOT_FOUND is only reachable on the non-inline path. Accepting a
+        // client-supplied profile grants no new authority: the dry run is read-only (I-DRYRUN-RO)
+        // and the service runs at the same trust level as the local UI over the local IPC channel.
+        var profile = typed.InlineProfile ?? catalog.All.FirstOrDefault(p => p.Id == typed.ProfileId);
         if (profile is null)
         {
             logger.LogDebug("DryRunStream: requested profile {ProfileId} not found", typed.ProfileId);
@@ -98,7 +102,7 @@ public sealed class DryRunStreamHandler(
         // frames stay throttled no matter how fast files are found.
         DryRunProgressCounters progressCounters = new();
         await using (IAsyncEnumerator<Result<DryRunChunk, string>> chunks = engine
-            .SimulateStreamAsync(typed.ProfileId, typed.ScopePath, progressCounters, ct)
+            .SimulateStreamAsync(profile, typed.ScopePath, progressCounters, ct)
             .GetAsyncEnumerator(ct))
         {
             // The engine's whole scan+evaluate pipeline runs inside the FIRST MoveNextAsync (no chunk

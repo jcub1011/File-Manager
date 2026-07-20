@@ -94,11 +94,6 @@ public sealed class DryRunEngine(
     public async Task<Result<DryRunReport, string>> SimulateAsync(
         Guid profileId, string? scopePath, CancellationToken ct = default)
     {
-        DateTimeOffset startedAt = time.GetUtcNow();
-        if (logger.IsEnabled(LogLevel.Information))
-            logger.LogInformation("Dry-run started for profile {ProfileId} (scope {Scope})",
-            profileId, scopePath ?? "<all sources>");
-
         Profile? profile = catalog.All.FirstOrDefault(p => p.Id == profileId);
         if (profile is null)
         {
@@ -106,6 +101,19 @@ public sealed class DryRunEngine(
                 logger.LogDebug("Dry-run requested for profile {ProfileId} which was not found", profileId);
             return $"profile {profileId} not found";
         }
+        return await SimulateAsync(profile, scopePath, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>Profile-accepting overload: previews the given profile object directly (e.g. an
+    /// unsaved in-memory draft that is not in the catalog). The Guid overload resolves the catalog
+    /// then delegates here. All collaborators remain read-only (I-DRYRUN-RO).</summary>
+    public async Task<Result<DryRunReport, string>> SimulateAsync(
+        Profile profile, string? scopePath, CancellationToken ct = default)
+    {
+        DateTimeOffset startedAt = time.GetUtcNow();
+        if (logger.IsEnabled(LogLevel.Information))
+            logger.LogInformation("Dry-run started for profile {ProfileId} (scope {Scope})",
+            profile.Id, scopePath ?? "<all sources>");
 
         // One compiled set per source, keyed by the source root the scanner stamps on payloads.
         Result<Dictionary<string, CompiledFilterSet>, string> filtersResult = CompileFilters(profile);
@@ -138,7 +146,7 @@ public sealed class DryRunEngine(
         if (outcome.FatalScanError is not null)
         {
             logger.LogError("Dry-run for profile {ProfileId} failed: scan error: {Message}",
-                profileId, outcome.FatalScanError);
+                profile.Id, outcome.FatalScanError);
             return $"scan failed: {outcome.FatalScanError}";
         }
 
@@ -166,7 +174,7 @@ public sealed class DryRunEngine(
             logger.LogWarning(
                 "Dry-run report for profile {ProfileId} truncated at {FileCount} source files / ~{Bytes:N0} bytes " +
                 "(caps: {ByteCap:N0} bytes, {FileCap} files) — the scan found more",
-                profileId, builder.SourceFiles.Count, builder.ReportBytes, ReportByteBudget, MaxBatchCandidates);
+                profile.Id, builder.SourceFiles.Count, builder.ReportBytes, ReportByteBudget, MaxBatchCandidates);
 
         // Phase 3: destination-only entries (pre-existing Untouched + Mirror orphans). Suppressed
         // entirely when the source pass truncated (the survivor set would be incomplete, so any
@@ -183,7 +191,7 @@ public sealed class DryRunEngine(
                 logger.LogWarning(
                     "Dry-run report for profile {ProfileId} truncated its destination entries " +
                     "(byte cap {ByteCap:N0}) — more pre-existing/orphan files exist",
-                    profileId, ReportByteBudget);
+                    profile.Id, ReportByteBudget);
                 break;
             }
         }
@@ -193,14 +201,14 @@ public sealed class DryRunEngine(
             "Dry-run completed for profile {ProfileId}: {SourceCount} source files, {DestCount} destination files " +
             "in {ElapsedMs}ms{Truncated} (scan {ScanMs}ms within pipeline {EvalMs}ms — the phases overlap; " +
             "{Probes} existence probes, {Stats} existing-target stats, {HashCount} files hashed / {HashBytes:N0} bytes)",
-            profileId, builder.SourceFiles.Count, builder.DestinationFiles.Count,
+            profile.Id, builder.SourceFiles.Count, builder.DestinationFiles.Count,
             (completedAt - startedAt).TotalMilliseconds, truncated ? " (report truncated)" : "",
             outcome.ScanMs, outcome.EvalMs,
             counters.ExistenceProbes, counters.ExistingStats, counters.FilesHashed, counters.BytesHashed);
 
         return new DryRunReport
         {
-            ProfileId = profileId,
+            ProfileId = profile.Id,
             GeneratedAt = completedAt,
             Directories = builder.Directories,
             SourceFiles = builder.SourceFiles,
@@ -223,11 +231,6 @@ public sealed class DryRunEngine(
         Guid profileId, string? scopePath, DryRunProgressCounters? progress = null,
         [EnumeratorCancellation] CancellationToken ct = default)
     {
-        DateTimeOffset startedAt = time.GetUtcNow();
-        if (logger.IsEnabled(LogLevel.Information))
-            logger.LogInformation("Dry-run (stream) started for profile {ProfileId} (scope {Scope})",
-                profileId, scopePath ?? "<all sources>");
-
         Profile? profile = catalog.All.FirstOrDefault(p => p.Id == profileId);
         if (profile is null)
         {
@@ -236,6 +239,23 @@ public sealed class DryRunEngine(
             yield return $"profile {profileId} not found";
             yield break;
         }
+        await foreach (Result<DryRunChunk, string> chunk in
+            SimulateStreamAsync(profile, scopePath, progress, ct).ConfigureAwait(false))
+            yield return chunk;
+    }
+
+    /// <summary>Profile-accepting overload: previews the given profile object directly (e.g. an
+    /// unsaved in-memory draft that is not in the catalog). The Guid overload resolves the catalog
+    /// then delegates here. All collaborators remain read-only (I-DRYRUN-RO); catalog membership was
+    /// never what enforced that.</summary>
+    public async IAsyncEnumerable<Result<DryRunChunk, string>> SimulateStreamAsync(
+        Profile profile, string? scopePath, DryRunProgressCounters? progress = null,
+        [EnumeratorCancellation] CancellationToken ct = default)
+    {
+        DateTimeOffset startedAt = time.GetUtcNow();
+        if (logger.IsEnabled(LogLevel.Information))
+            logger.LogInformation("Dry-run (stream) started for profile {ProfileId} (scope {Scope})",
+                profile.Id, scopePath ?? "<all sources>");
 
         Result<Dictionary<string, CompiledFilterSet>, string> filtersResult = CompileFilters(profile);
         if (filtersResult.TryGetError(out string? compileError))
@@ -262,7 +282,7 @@ public sealed class DryRunEngine(
         if (outcome.FatalScanError is not null)
         {
             logger.LogError("Dry-run (stream) for profile {ProfileId} failed: scan error: {Message}",
-                profileId, outcome.FatalScanError);
+                profile.Id, outcome.FatalScanError);
             yield return $"scan failed: {outcome.FatalScanError}";
             yield break;
         }
@@ -272,7 +292,7 @@ public sealed class DryRunEngine(
             logger.LogWarning(
                 "Dry-run (stream) for profile {ProfileId} hit the {Cap:N0}-candidate safety bound; " +
                 "report truncated — the scan found more",
-                profileId, MaxScannedCandidates);
+                profile.Id, MaxScannedCandidates);
 
         // Fix the output order (source path) and flush a chunk whenever the buffer's upper-bound
         // size crosses the threshold. Indices are global across chunks (tracked by the accumulator)
@@ -310,7 +330,7 @@ public sealed class DryRunEngine(
                 "Dry-run (stream) completed for profile {ProfileId}: {SourceCount} source files in {ElapsedMs}ms " +
                 "(scan {ScanMs}ms within pipeline {EvalMs}ms — the phases overlap; {Probes} existence probes, " +
                 "{Stats} existing-target stats, {HashCount} files hashed / {HashBytes:N0} bytes)",
-                profileId, accumulator.TotalSourceFiles, (completedAt - startedAt).TotalMilliseconds,
+                profile.Id, accumulator.TotalSourceFiles, (completedAt - startedAt).TotalMilliseconds,
                 outcome.ScanMs, outcome.EvalMs,
                 counters.ExistenceProbes, counters.ExistingStats, counters.FilesHashed, counters.BytesHashed);
     }

@@ -5,6 +5,7 @@ using FileManager.Contracts.Primitives;
 using FileManager.Contracts.Profiles;
 using FileManager.UI.Services;
 using FileManager.UI.Tests.Fakes;
+using FileManager.UI.Tests.TestData;
 using FileManager.UI.ViewModels;
 
 namespace FileManager.UI.Tests;
@@ -96,6 +97,53 @@ public sealed class DryRunViewModelTests
             DstOp(OperationKind.Untouched, @"C:\t2\clobber.txt", @"C:\t2", subjectIndex: 1, detail: "kept (an incoming file was renamed around it)"),
             DstOp(OperationKind.SkipUnchanged, @"C:\t\same.txt", @"C:\t", sourceIndex: 3, subjectIndex: 2),
         ]);
+
+    [Fact]
+    public void CanRun_is_true_for_a_new_profile_with_no_persisted_id()
+    {
+        var (viewModel, _) = NewViewModel();
+        viewModel.SetProfile(null, "New Profile");   // never-saved draft: id is null
+
+        Assert.Null(viewModel.ProfileId);
+        Assert.True(viewModel.CanRun);
+    }
+
+    [Fact]
+    public void ClearProfile_disables_the_run()
+    {
+        var (viewModel, _) = NewViewModel();
+        viewModel.ClearProfile();
+
+        Assert.Null(viewModel.ProfileId);
+        Assert.False(viewModel.CanRun);
+    }
+
+    [Fact]
+    public async Task Run_sends_the_editor_draft_inline_when_a_provider_is_attached()
+    {
+        var (viewModel, gateway) = NewViewModel();
+        Profile draft = ProfileFactory.Sample();
+        viewModel.SetProfile(null, "New Profile");           // unsaved draft (no persisted id)
+        viewModel.DraftProvider = () => (draft, null);
+        gateway.DryRunResult = SampleReport(draft.Id);
+
+        await viewModel.RunAsync(CancellationToken.None);
+
+        Assert.Same(draft, Assert.Single(gateway.DryRunDrafts));
+        Assert.Equal(draft.Id, Assert.Single(gateway.DryRunCalls));
+    }
+
+    [Fact]
+    public async Task Run_surfaces_a_draft_parse_error_and_skips_the_gateway()
+    {
+        var (viewModel, gateway) = NewViewModel();
+        viewModel.DraftProvider = () => (null, "Max depth must be a non-negative whole number (or empty).");
+
+        await viewModel.RunAsync(CancellationToken.None);
+
+        Assert.Equal("Max depth must be a non-negative whole number (or empty).", viewModel.ErrorMessage);
+        Assert.Empty(gateway.DryRunCalls);
+    }
 
     [Fact]
     public async Task Blast_radius_banner_reflects_the_report()

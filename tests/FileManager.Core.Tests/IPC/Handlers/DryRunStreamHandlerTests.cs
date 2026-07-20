@@ -31,6 +31,15 @@ public sealed class DryRunStreamHandlerTests
             Guid profileId, string? scopePath, CancellationToken ct = default) =>
             throw new NotSupportedException();
 
+        public Task<Result<DryRunReport, string>> SimulateAsync(
+            Profile profile, string? scopePath, CancellationToken ct = default) =>
+            throw new NotSupportedException();
+
+        public IAsyncEnumerable<Result<DryRunChunk, string>> SimulateStreamAsync(
+            Profile profile, string? scopePath, DryRunProgressCounters? progress = null,
+            CancellationToken ct = default) =>
+            SimulateStreamAsync(profile.Id, scopePath, progress, ct);
+
         public async IAsyncEnumerable<Result<DryRunChunk, string>> SimulateStreamAsync(
             Guid profileId, string? scopePath, DryRunProgressCounters? progress = null,
             [EnumeratorCancellation] CancellationToken ct = default)
@@ -73,12 +82,25 @@ public sealed class DryRunStreamHandlerTests
         { MaxStreamedFiles = maxStreamedFiles };
     }
 
-    private static async Task<List<IpcResponse>> Collect(DryRunStreamHandler handler, Guid profileId)
+    private static async Task<List<IpcResponse>> Collect(DryRunStreamHandler handler, Guid profileId) =>
+        await Collect(handler, new DryRunStreamRequest { ProfileId = profileId });
+
+    private static async Task<List<IpcResponse>> Collect(DryRunStreamHandler handler, DryRunStreamRequest request)
     {
         List<IpcResponse> frames = [];
-        await foreach (IpcResponse frame in handler.HandleStreamAsync(new DryRunStreamRequest { ProfileId = profileId }))
+        await foreach (IpcResponse frame in handler.HandleStreamAsync(request))
             frames.Add(frame);
         return frames;
+    }
+
+    /// <summary>Builds a handler whose catalog is empty, so only an inline profile can drive a run.</summary>
+    private static DryRunStreamHandler NewHandlerEmptyCatalog(IDryRunEngine engine, int maxStreamedFiles)
+    {
+        FileSystemService fileSystem = new(NullLogger<FileSystemService>.Instance);
+        return new(NullLogger<DryRunStreamHandler>.Instance, engine, new FakeCatalog(), TimeProvider.System,
+            new DestinationProjector(NullLogger<DestinationProjector>.Instance, fileSystem, new FakeVolumeInfoProvider()),
+            new FakeVolumeInfoProvider(), new EngineConfig(), new FakeSettingsProvider())
+        { MaxStreamedFiles = maxStreamedFiles };
     }
 
     [Fact]
@@ -120,6 +142,22 @@ public sealed class DryRunStreamHandlerTests
         Assert.Equal("PROFILE_NOT_FOUND", error.Code);
     }
 
+    [Fact]
+    public async Task Inline_profile_previews_a_draft_absent_from_the_catalog()
+    {
+        Profile draft = TestProfiles.Valid();
+        DryRunStreamHandler handler = NewHandlerEmptyCatalog(
+            new FakeStreamEngine(totalFiles: 4, chunkSize: 4), maxStreamedFiles: 500);
+
+        // Empty catalog → the id alone is unknown; the inline draft drives the run instead.
+        List<IpcResponse> frames = await Collect(handler,
+            new DryRunStreamRequest { ProfileId = draft.Id, InlineProfile = draft });
+
+        Assert.DoesNotContain(frames, f => f is ErrorResponse);
+        Assert.IsType<DryRunCompleteResponse>(frames[^1]);
+        Assert.Equal(4, frames.OfType<DryRunChunkResponse>().Sum(c => c.SourceFiles.Count));
+    }
+
     // ── Destination sweep (orphans / scan-truncation / sweep cap) ───────────────────────────────
     // These drive the same HandleStreamAsync but with a scripted engine (so we control ScanTruncated)
     // against a real target root on disk, exercising the handler's post-file-phase destination sweep.
@@ -131,6 +169,15 @@ public sealed class DryRunStreamHandlerTests
         public Task<Result<DryRunReport, string>> SimulateAsync(
             Guid profileId, string? scopePath, CancellationToken ct = default) =>
             throw new NotSupportedException();
+
+        public Task<Result<DryRunReport, string>> SimulateAsync(
+            Profile profile, string? scopePath, CancellationToken ct = default) =>
+            throw new NotSupportedException();
+
+        public IAsyncEnumerable<Result<DryRunChunk, string>> SimulateStreamAsync(
+            Profile profile, string? scopePath, DryRunProgressCounters? progress = null,
+            CancellationToken ct = default) =>
+            SimulateStreamAsync(profile.Id, scopePath, progress, ct);
 
         public async IAsyncEnumerable<Result<DryRunChunk, string>> SimulateStreamAsync(
             Guid profileId, string? scopePath, DryRunProgressCounters? progress = null,
@@ -288,6 +335,15 @@ public sealed class DryRunStreamHandlerTests
         public Task<Result<DryRunReport, string>> SimulateAsync(
             Guid profileId, string? scopePath, CancellationToken ct = default) =>
             throw new NotSupportedException();
+
+        public Task<Result<DryRunReport, string>> SimulateAsync(
+            Profile profile, string? scopePath, CancellationToken ct = default) =>
+            throw new NotSupportedException();
+
+        public IAsyncEnumerable<Result<DryRunChunk, string>> SimulateStreamAsync(
+            Profile profile, string? scopePath, DryRunProgressCounters? progress = null,
+            CancellationToken ct = default) =>
+            SimulateStreamAsync(profile.Id, scopePath, progress, ct);
 
         public async IAsyncEnumerable<Result<DryRunChunk, string>> SimulateStreamAsync(
             Guid profileId, string? scopePath, DryRunProgressCounters? progress = null,

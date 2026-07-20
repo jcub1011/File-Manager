@@ -1,5 +1,6 @@
 using FileManager.Contracts.DryRun;
 using FileManager.Contracts.Primitives;
+using FileManager.Contracts.Profiles;
 using System;
 using System.Collections.Generic;
 using System.Threading;
@@ -12,6 +13,12 @@ public interface IDryRunEngine
     Task<Result<DryRunReport, string>> SimulateAsync(
         Guid profileId, string? scopePath, CancellationToken ct = default);
 
+    /// <summary>Profile-accepting overload of <see cref="SimulateAsync(Guid, string?, CancellationToken)"/>:
+    /// previews the given profile object directly (e.g. an unsaved in-memory draft not in the
+    /// catalog), skipping the catalog lookup. Read-only (I-DRYRUN-RO) like every simulate path.</summary>
+    Task<Result<DryRunReport, string>> SimulateAsync(
+        Profile profile, string? scopePath, CancellationToken ct = default);
+
     /// <summary>Streams the report as chunks (no single-frame size ceiling). Each chunk carries a
     /// slice of the four report collections with <b>globally-assigned</b> indices — the consumer
     /// appends chunks in receive order so an op's SourceIndex/SubjectIndex stays a valid position
@@ -23,6 +30,14 @@ public interface IDryRunEngine
     /// candidate so a caller can sample it for live progress.</summary>
     IAsyncEnumerable<Result<DryRunChunk, string>> SimulateStreamAsync(
         Guid profileId, string? scopePath, DryRunProgressCounters? progress = null,
+        CancellationToken ct = default);
+
+    /// <summary>Profile-accepting overload of
+    /// <see cref="SimulateStreamAsync(Guid, string?, DryRunProgressCounters?, CancellationToken)"/>:
+    /// previews the given profile object directly (e.g. an unsaved in-memory draft not in the
+    /// catalog), skipping the catalog lookup. Read-only (I-DRYRUN-RO) like every simulate path.</summary>
+    IAsyncEnumerable<Result<DryRunChunk, string>> SimulateStreamAsync(
+        Profile profile, string? scopePath, DryRunProgressCounters? progress = null,
         CancellationToken ct = default);
 }
 

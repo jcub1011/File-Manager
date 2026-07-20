@@ -6,6 +6,7 @@ using CommunityToolkit.Mvvm.Input;
 using FileManager.Contracts.DryRun;
 using FileManager.Contracts.IPC;
 using FileManager.Contracts.Primitives;
+using FileManager.Contracts.Profiles;
 using FileManager.UI.Extensions;
 using FileManager.UI.Services;
 using Serilog;
@@ -2209,9 +2210,18 @@ public sealed partial class DryRunViewModel : ViewModelBase
     public DryRunSourcesTab Sources { get; }
     public DryRunDestinationsTab Destinations { get; }
 
+    [ObservableProperty] public partial Guid? ProfileId { get; set; }
+
+    /// <summary>Supplied by the shell: builds the editor's current draft (unsaved edits) for the run,
+    /// or returns a parse error to surface instead. Null in tests that drive ProfileId directly.</summary>
+    public Func<(Profile? profile, string? error)>? DraftProvider { get; set; }
+
+    /// <summary>True whenever a profile is open in the editor — new or existing — so a dry run can be
+    /// launched without first saving. Drives <see cref="CanRun"/> (and the Dry Run tab's enabled
+    /// state) in place of a non-null persisted id.</summary>
     [ObservableProperty]
     [NotifyPropertyChangedFor(nameof(CanRun))]
-    public partial Guid? ProfileId { get; set; }
+    public partial bool HasEditableProfile { get; set; }
     [ObservableProperty] public partial string ProfileName { get; set; } = "";
     [ObservableProperty] public partial bool HasReport { get; set; }
     [ObservableProperty] public partial string? ErrorMessage { get; set; }
@@ -2237,14 +2247,26 @@ public sealed partial class DryRunViewModel : ViewModelBase
     /// visibility to this being non-null.</summary>
     [ObservableProperty] public partial DryRunSpaceViewModel? Space { get; set; }
 
-    public bool CanRun => ProfileId is not null;
+    public bool CanRun => HasEditableProfile;
 
+    /// <summary>Attach the editor's open profile (new or existing). Enables the run and clears any
+    /// prior preview. A null id is valid for a never-saved draft — the run sends the draft inline.</summary>
     public void SetProfile(Guid? profileId, string profileName)
     {
         ProfileId = profileId;
         ProfileName = profileName;
+        HasEditableProfile = true;
         ClearReport();
-        // CanRun re-raises via [NotifyPropertyChangedFor] on ProfileId — no manual notify needed.
+        // CanRun re-raises via [NotifyPropertyChangedFor] on HasEditableProfile — no manual notify.
+    }
+
+    /// <summary>Detach: no profile is open in the editor, so the run is disabled and the preview cleared.</summary>
+    public void ClearProfile()
+    {
+        ProfileId = null;
+        ProfileName = "";
+        HasEditableProfile = false;
+        ClearReport();
     }
 
     /// <summary>Bumped by <see cref="ClearReport"/>. A run captures it before its awaits and must
@@ -2256,7 +2278,22 @@ public sealed partial class DryRunViewModel : ViewModelBase
     [RelayCommand(IncludeCancelCommand = true)]
     public async Task RunAsync(CancellationToken ct)
     {
-        if (ProfileId is not Guid profileId)
+        // Build the editor's current draft (unsaved edits) when a provider is attached, so the run
+        // previews exactly what is on screen. A parse error short-circuits before any work. Without a
+        // provider (unit tests), fall back to the persisted-profile path keyed on ProfileId.
+        Profile? draft = null;
+        if (DraftProvider is not null)
+        {
+            (Profile? built, string? buildError) = DraftProvider();
+            if (buildError is not null)
+            {
+                ErrorMessage = buildError;
+                return;
+            }
+            draft = built;
+        }
+        Guid? runId = draft?.Id ?? ProfileId;
+        if (runId is not Guid profileId)
             return;
         // Release the previous preview's rows and forest now — this is the intentional "fresh run"
         // path, so ClearReport bumps the epoch and nulls both tabs' _all/_visible/VisibleRows/Tree/
@@ -2273,7 +2310,7 @@ public sealed partial class DryRunViewModel : ViewModelBase
 
         try
         {
-            var run = await _gateway.DryRunAsync(profileId, progress, ct);
+            var run = await _gateway.DryRunAsync(profileId, progress, draft, ct);
             if (run.IsCanceled)
             {
                 Log.Debug("Dry run for profile {ProfileId} cancelled by the user", profileId);

@@ -51,6 +51,18 @@ public sealed partial class ProfileListViewModel(IIpcGateway gateway) : ViewMode
     [ObservableProperty]
     public partial ProfileListItem? SelectedProfile { get; set; }
 
+    /// <summary>Id of the profile the editor currently has unsaved edits for, or null. The sidebar
+    /// row matching this id shows an unsaved-changes marker. Set by the shell from the editor's
+    /// dirty state.</summary>
+    [ObservableProperty]
+    public partial Guid? UnsavedProfileId { get; set; }
+
+    /// <summary>True while the editor has unsaved edits (new or existing). Every list row except the
+    /// one being edited locks (becomes unselectable) until the draft is saved or discarded, so the
+    /// user can't appear to navigate away. Set by the shell from the editor's dirty state.</summary>
+    [ObservableProperty]
+    public partial bool HasUnsavedChanges { get; set; }
+
     [ObservableProperty]
     public partial string? ErrorMessage { get; set; }
 

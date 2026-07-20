@@ -477,6 +477,37 @@ public sealed class DryRunEngineTests : IDisposable
     }
 
     [Fact]
+    public async Task Profile_overload_previews_a_draft_absent_from_the_catalog()
+    {
+        SourceFile("a.txt");
+        SourceFile("b.txt");
+        Profile draft = ProfileUnderTest();
+
+        // Empty catalog: the Guid overload would fail "not found"; the Profile overload uses the
+        // object directly, exactly as an unsaved in-memory draft would.
+        var simulated = await NewEngine().SimulateAsync(draft, null);
+
+        Assert.True(simulated.TryGetValue(out DryRunReport? report));
+        Assert.Equal(draft.Id, report!.ProfileId);
+        Assert.Equal(2, report.SourceFiles.Count);
+    }
+
+    [Fact]
+    public async Task Stream_Profile_overload_previews_a_draft_absent_from_the_catalog()
+    {
+        SourceFile("a.txt");
+        Profile draft = ProfileUnderTest();
+
+        int sourceFiles = 0;
+        await foreach (Result<DryRunChunk, string> item in NewEngine().SimulateStreamAsync(draft, null))
+        {
+            Assert.True(item.TryGetValue(out DryRunChunk? chunk));
+            sourceFiles += chunk!.SourceFiles.Count;
+        }
+        Assert.Equal(1, sourceFiles);
+    }
+
+    [Fact]
     public async Task Cancellation_yields_a_Canceled_result_not_an_exception()
     {
         SourceFile("a.txt");

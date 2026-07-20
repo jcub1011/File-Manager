@@ -13,6 +13,9 @@ internal sealed class FakeIpcGateway : IIpcGateway
     public List<(Profile Profile, bool Acknowledge)> SaveCalls { get; } = [];
     public List<Guid> DeleteCalls { get; } = [];
     public List<Guid> DryRunCalls { get; } = [];
+    /// <summary>The inline draft passed to each DryRunAsync call (null when the persisted-profile
+    /// path was used), recorded in lockstep with <see cref="DryRunCalls"/>.</summary>
+    public List<Profile?> DryRunDrafts { get; } = [];
     public List<GlobalSettings> SaveSettingsCalls { get; } = [];
 
     public Result<EngineStatusSnapshot, IpcError> StatusResult { get; set; } =
@@ -79,9 +82,11 @@ internal sealed class FakeIpcGateway : IIpcGateway
     }
 
     public async Task<Result<DryRunReport, IpcError>> DryRunAsync(
-        Guid profileId, IProgress<DryRunProgress>? progress = null, CancellationToken ct = default)
+        Guid profileId, IProgress<DryRunProgress>? progress = null, Profile? draft = null,
+        CancellationToken ct = default)
     {
         DryRunCalls.Add(profileId);
+        DryRunDrafts.Add(draft);
         if (DryRunException is not null)
             throw DryRunException;
         if (ScriptedProgress is not null && progress is not null)

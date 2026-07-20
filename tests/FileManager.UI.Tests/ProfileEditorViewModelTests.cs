@@ -53,6 +53,31 @@ public sealed class ProfileEditorViewModelTests
     }
 
     [Fact]
+    public void TryBuildDraft_returns_the_current_draft_when_fields_parse()
+    {
+        var (editor, _) = NewEditor();
+        editor.LoadNew();
+        editor.ProfileName = "Experiment";
+
+        Assert.True(editor.TryBuildDraft(out Profile? draft, out string? error));
+        Assert.Null(error);
+        Assert.NotNull(draft);
+        Assert.Equal("Experiment", draft!.Name);
+    }
+
+    [Fact]
+    public void TryBuildDraft_fails_fast_on_an_invalid_numeric_field()
+    {
+        var (editor, _) = NewEditor();
+        editor.LoadNew();
+        editor.MaxDepthText = "not-a-number";
+
+        Assert.False(editor.TryBuildDraft(out Profile? draft, out string? error));
+        Assert.Null(draft);
+        Assert.NotNull(error);
+    }
+
+    [Fact]
     public void New_profile_gets_the_spec_defaults()
     {
         var (editor, _) = NewEditor();

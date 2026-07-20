@@ -30,6 +30,29 @@ public sealed partial class MainWindowViewModel : ViewModelBase
         List.NavigationBlocked = () => Editor.ShowUnsavedWarning = true;
         List.SelectionCommitted = item => _ = LoadSelectionSafeAsync(item);
         Editor.Saved = profileId => _ = AfterSaveAsync(profileId);
+
+        // Dry run previews the editor's current draft (unsaved edits), so it can run without saving.
+        // Discard can land on a still-open profile (revert/new) or a cleared editor — mirror that so
+        // the run isn't left enabled against nothing.
+        Editor.Discarded = () =>
+        {
+            if (Editor.HasProfile)
+                DryRun.SetProfile(List.SelectedProfile?.ProfileId, Editor.ProfileName);
+            else
+                DryRun.ClearProfile();
+        };
+        DryRun.DraftProvider = () =>
+            Editor.TryBuildDraft(out Profile? draft, out string? error) ? (draft, null) : ((Profile?)null, error);
+        // Keep the sidebar's unsaved-changes marker and row-locking in step with the editor's dirty
+        // state: while dirty, other rows become unselectable so the user can't appear to navigate away.
+        Editor.PropertyChanged += (_, e) =>
+        {
+            if (e.PropertyName == nameof(ProfileEditorViewModel.IsDirty))
+            {
+                List.HasUnsavedChanges = Editor.IsDirty;
+                List.UnsavedProfileId = Editor.IsDirty ? List.SelectedProfile?.ProfileId : null;
+            }
+        };
     }
 
     public ProfileListViewModel List { get; }
@@ -52,7 +75,7 @@ public sealed partial class MainWindowViewModel : ViewModelBase
         }
         List.SelectedProfile = null;
         Editor.LoadNew();
-        DryRun.SetProfile(null, "");
+        DryRun.SetProfile(null, Editor.ProfileName);   // new/unsaved profile is still dry-runnable
     }
 
     [RelayCommand]
@@ -128,7 +151,7 @@ public sealed partial class MainWindowViewModel : ViewModelBase
             if (item is null)
             {
                 Editor.Clear();
-                DryRun.SetProfile(null, "");
+                DryRun.ClearProfile();
                 return;
             }
             var loaded = await _gateway.GetProfileAsync(item.ProfileId);
@@ -136,7 +159,7 @@ public sealed partial class MainWindowViewModel : ViewModelBase
             {
                 List.ErrorMessage = $"Could not open \"{item.Name}\": {error.Message}";
                 Editor.Clear();
-                DryRun.SetProfile(null, "");
+                DryRun.ClearProfile();
                 return;
             }
             loaded.TryGetValue(out Profile? profile);

@@ -38,6 +38,10 @@ public sealed partial class ProfileEditorViewModel : ViewModelBase
     /// <summary>Invoked after a successful save so the shell can refresh the list.</summary>
     public Action<Guid>? Saved { get; set; }
 
+    /// <summary>Invoked after the draft is discarded so the shell can reset dependent views
+    /// (e.g. clear a dry-run preview generated from the now-discarded edits).</summary>
+    public Action? Discarded { get; set; }
+
     // ----- enum options (static arrays: AOT-safe, no Enum.GetValues reflection) -----
     // Mirror is selectable: the dry run fully previews its deletions. The executor does not yet
     // perform Mirror deletion — that is a follow-up for whoever builds the run pipeline.
@@ -303,6 +307,20 @@ public sealed partial class ProfileEditorViewModel : ViewModelBase
             LoadNew();
         else
             Clear();
+        Discarded?.Invoke();
+    }
+
+    /// <summary>Builds the current draft for a dry run without saving. Parses the local numeric
+    /// fields first (BuildProfile → BuildFilters silently drops parse failures), so an invalid Max
+    /// size/depth surfaces as an error here instead of a half-built draft going to the service.</summary>
+    public bool TryBuildDraft(out Profile? draft, out string? error)
+    {
+        draft = null;
+        if (!TryParseLocalFields(out error))
+            return false;
+        draft = BuildProfile();
+        error = null;
+        return true;
     }
 
     private async Task SaveCoreAsync(bool acknowledgeWarnings)

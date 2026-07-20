@@ -8,9 +8,8 @@
              x:DataType="vm:ProfileEditorViewModel">
 
     <DockPanel>
-        <!-- action bar -->
-        <Border DockPanel.Dock="Bottom" Padding="0,10,0,0" Margin="0,8,0,0"
-                BorderBrush="{DynamicResource Brush.Panel.Border}" BorderThickness="0,1,0,0">
+        <!-- action bar (top): Save/Discard, then the switch-blocked unsaved-changes warning -->
+        <Border DockPanel.Dock="Top" Padding="0,0,0,10" Margin="0,0,0,8">
             <StackPanel Spacing="8">
                 <Border Classes="infoBar danger"
                         IsVisible="{Binding LocalError, Converter={x:Static ObjectConverters.IsNotNull}}">
@@ -19,10 +18,6 @@
                 <Border Classes="infoBar success"
                         IsVisible="{Binding StatusMessage, Converter={x:Static ObjectConverters.IsNotNull}}">
                     <TextBlock Text="{Binding StatusMessage}" TextWrapping="Wrap" />
-                </Border>
-                <Border Classes="infoBar warning" IsVisible="{Binding ShowUnsavedWarning}">
-                    <TextBlock Text="You have unsaved changes — save or discard them before switching profiles."
-                               TextWrapping="Wrap" />
                 </Border>
                 <StackPanel Orientation="Horizontal" Spacing="8">
                     <Button Content="Save" Command="{Binding SaveCommand}" Classes="accent" />
@@ -33,6 +28,10 @@
                     <Button Content="Discard changes" Command="{Binding DiscardCommand}"
                             IsVisible="{Binding IsDirty}" />
                 </StackPanel>
+                <Border Classes="infoBar warning" IsVisible="{Binding ShowUnsavedWarning}">
+                    <TextBlock Text="You have unsaved changes — save or discard them before switching profiles."
+                               TextWrapping="Wrap" />
+                </Border>
             </StackPanel>
         </Border>
 

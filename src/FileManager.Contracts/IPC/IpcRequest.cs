@@ -28,9 +28,10 @@ public abstract record IpcRequest
     /// <summary>The protocol this build speaks. History: 1 — original wire format; 2 — dry-run
     /// chunks normalized against a shared directory table (DryRunDirectory/DryRunFile/
     /// DryRunOperation replace flat path strings); 3 — dry-run streams may interleave
-    /// dry-run-progress frames before the terminator. A mismatched service/UI pair must fail loud
-    /// (IPC_VERSION_MISMATCH), never half-parse.</summary>
-    public const int CurrentProtocolVersion = 3;
+    /// dry-run-progress frames before the terminator; 4 — dry-run requests may carry an inline
+    /// Profile draft (InlineProfile) so unsaved edits can be previewed without a catalog lookup.
+    /// A mismatched service/UI pair must fail loud (IPC_VERSION_MISMATCH), never half-parse.</summary>
+    public const int CurrentProtocolVersion = 4;
 
     public int ProtocolVersion { get; init; } = CurrentProtocolVersion;
 }
@@ -57,6 +58,9 @@ public sealed record DryRunRequest : IpcRequest
 {
     public required Guid ProfileId { get; init; }
     public string? ScopePath { get; init; }
+    /// <summary>When set, the run previews this in-memory draft (unsaved edits) directly instead of
+    /// resolving <see cref="ProfileId"/> against the persisted catalog. Its Id should match ProfileId.</summary>
+    public Profile? InlineProfile { get; init; }
 }
 /// <summary>Same inputs as <see cref="DryRunRequest"/>, but the report streams back as a sequence
 /// of DryRunChunkResponse frames terminated by a DryRunCompleteResponse (see IpcResponse) — so a
@@ -65,6 +69,9 @@ public sealed record DryRunStreamRequest : IpcRequest
 {
     public required Guid ProfileId { get; init; }
     public string? ScopePath { get; init; }
+    /// <summary>When set, the run previews this in-memory draft (unsaved edits) directly instead of
+    /// resolving <see cref="ProfileId"/> against the persisted catalog. Its Id should match ProfileId.</summary>
+    public Profile? InlineProfile { get; init; }
 }
 public sealed record GetRecentJobsRequest : IpcRequest { public int Count { get; init; } = 50; }
 public sealed record GetJobLogRequest : IpcRequest { public required Guid JobId { get; init; } }
