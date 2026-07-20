@@ -7,7 +7,6 @@ using FileManager.Core.Files;
 using FileManager.Core.Filtering;
 using FileManager.Contracts.Settings;
 using FileManager.Core.Placement;
-using FileManager.Core.Profiles;
 using FileManager.Core.Settings;
 using FileManager.Core.Tests.TestSupport;
 using FileManager.Core.Watching;
@@ -31,14 +30,6 @@ public sealed class DryRunEngineTests : IDisposable
     }
 
     public void Dispose() => Directory.Delete(_root, recursive: true);
-
-    private sealed class FakeCatalog(params Profile[] profiles) : IProfileCatalog
-    {
-        public IReadOnlyList<Profile> All { get; } = profiles;
-        public IReadOnlyList<Profile> Active => All.Where(p => p.Active).ToList();
-        public IDisposable Subscribe(Action changeHandler) => throw new NotSupportedException();
-        public Result Reload() => Result.Success();
-    }
 
     // ----- concurrency resolution -----
 
@@ -85,25 +76,24 @@ public sealed class DryRunEngineTests : IDisposable
         Assert.Equal(1, engine.ResolveWorkers(ProfileWithConcurrency(ConcurrencyMode.Manual, 0)));
     }
 
-    private static DryRunEngine NewEngine(params Profile[] profiles) =>
-        NewEngine(DryRunEngine.MaxReportBytes, GlobalSettings.Default, profiles);
+    private static DryRunEngine NewEngine() =>
+        NewEngine(DryRunEngine.MaxReportBytes, GlobalSettings.Default);
 
-    private static DryRunEngine NewEngine(int reportByteBudget, params Profile[] profiles) =>
-        NewEngine(reportByteBudget, GlobalSettings.Default, profiles);
+    private static DryRunEngine NewEngine(int reportByteBudget) =>
+        NewEngine(reportByteBudget, GlobalSettings.Default);
 
-    private static DryRunEngine NewEngine(int reportByteBudget, GlobalSettings global, params Profile[] profiles) =>
-        NewEngine(reportByteBudget, DryRunEngine.ChunkByteThreshold, global, profiles);
+    private static DryRunEngine NewEngine(int reportByteBudget, GlobalSettings global) =>
+        NewEngine(reportByteBudget, DryRunEngine.ChunkByteThreshold, global);
 
-    private static DryRunEngine NewEngine(int reportByteBudget, int chunkByteBudget, GlobalSettings global, params Profile[] profiles) =>
-        NewEngine(reportByteBudget, chunkByteBudget, DryRunEngine.MaxStreamedFiles, global, profiles);
+    private static DryRunEngine NewEngine(int reportByteBudget, int chunkByteBudget, GlobalSettings global) =>
+        NewEngine(reportByteBudget, chunkByteBudget, DryRunEngine.MaxStreamedFiles, global);
 
     private static DryRunEngine NewEngine(
-        int reportByteBudget, int chunkByteBudget, int maxScannedCandidates, GlobalSettings global, params Profile[] profiles)
+        int reportByteBudget, int chunkByteBudget, int maxScannedCandidates, GlobalSettings global)
     {
         FileSystemService fileSystem = new(NullLogger<FileSystemService>.Instance);
         return new DryRunEngine(
             NullLogger<DryRunEngine>.Instance,
-            new FakeCatalog(profiles),
             new SourceScanner(NullLogger<SourceScanner>.Instance, fileSystem, TimeProvider.System),
             new FilterCompiler(NullLogger<FilterCompiler>.Instance, TimeProvider.System),
             new FileHasher(NullLogger<FileHasher>.Instance),
@@ -117,11 +107,11 @@ public sealed class DryRunEngineTests : IDisposable
     /// <summary>Concatenates a stream's source files with their source operations (paired by the
     /// global index — the position in the concatenated list, matching each op's SourceIndex).</summary>
     private static async Task<List<(string SourcePath, OperationKind Kind)>> CollectStream(
-        DryRunEngine engine, Guid profileId, string? scope = null, CancellationToken ct = default)
+        DryRunEngine engine, Profile profile, string? scope = null, CancellationToken ct = default)
     {
         List<PhysicalFile> files = [];
         Dictionary<int, VirtualFileOperation> ops = [];
-        await foreach (Result<DryRunChunk, string> chunk in engine.SimulateStreamAsync(profileId, scope, ct: ct))
+        await foreach (Result<DryRunChunk, string> chunk in engine.SimulateStreamAsync(profile, scope, ct: ct))
         {
             Assert.True(chunk.TryGetValue(out DryRunChunk? c), "stream yielded a failure chunk");
             files.AddRange(c!.SourceFiles);
@@ -158,7 +148,7 @@ public sealed class DryRunEngineTests : IDisposable
 
     private async Task<DryRunReport> Simulate(Profile profile, string? scope = null)
     {
-        var simulated = await NewEngine(profile).SimulateAsync(profile.Id, scope);
+        var simulated = await NewEngine().SimulateAsync(profile, scope);
         Assert.True(simulated.TryGetValue(out DryRunReport? report));
         AssertIndicesValid(report!);
         return report;
@@ -294,7 +284,7 @@ public sealed class DryRunEngineTests : IDisposable
             SourceFile(Path.Combine("nested", "further", $"a-quite-long-file-name résumé ✓ {i:D4}.txt"), $"content {i}");
         Profile profile = ProfileUnderTest();
 
-        var simulated = await NewEngine(budget, profile).SimulateAsync(profile.Id, null);
+        var simulated = await NewEngine(budget).SimulateAsync(profile, null);
         Assert.True(simulated.TryGetValue(out DryRunReport? report));
 
         Assert.True(report!.Truncated);
@@ -336,7 +326,7 @@ public sealed class DryRunEngineTests : IDisposable
 
         // The tight estimator sits close to the true serialized size, so this budget keeps a
         // couple of ~110-char-path bundles (~1.6 KB each) before truncating.
-        var simulated = await NewEngine(4000, profile).SimulateAsync(profile.Id, null);
+        var simulated = await NewEngine(4000).SimulateAsync(profile, null);
         Assert.True(simulated.TryGetValue(out DryRunReport? report));
 
         Assert.True(report!.Truncated);
@@ -469,22 +459,14 @@ public sealed class DryRunEngineTests : IDisposable
     }
 
     [Fact]
-    public async Task Unknown_profile_fails()
-    {
-        var simulated = await NewEngine(ProfileUnderTest()).SimulateAsync(Guid.NewGuid(), null);
-        Assert.True(simulated.TryGetError(out string? error));
-        Assert.Contains("not found", error);
-    }
-
-    [Fact]
     public async Task Profile_overload_previews_a_draft_absent_from_the_catalog()
     {
         SourceFile("a.txt");
         SourceFile("b.txt");
         Profile draft = ProfileUnderTest();
 
-        // Empty catalog: the Guid overload would fail "not found"; the Profile overload uses the
-        // object directly, exactly as an unsaved in-memory draft would.
+        // The engine previews the profile object directly, exactly as an unsaved in-memory draft
+        // (never persisted to the catalog) would.
         var simulated = await NewEngine().SimulateAsync(draft, null);
 
         Assert.True(simulated.TryGetValue(out DryRunReport? report));
@@ -516,7 +498,7 @@ public sealed class DryRunEngineTests : IDisposable
         using CancellationTokenSource cts = new();
         cts.Cancel();
 
-        var simulated = await NewEngine(profile).SimulateAsync(profile.Id, null, cts.Token);
+        var simulated = await NewEngine().SimulateAsync(profile, null, cts.Token);
 
         Assert.True(simulated.IsCanceled);
         Assert.False(simulated.TryGetValue(out _));
@@ -573,10 +555,40 @@ public sealed class DryRunEngineTests : IDisposable
         SourceFile("keep.txt", "content");
         TargetFile("preexisting.txt", "already here");
 
-        DryRunReport report = await Simulate(ProfileUnderTest());   // AdditiveArchive
+        // AdditiveArchive with the destination scan opted in.
+        DryRunReport report = await Simulate(ProfileUnderTest() with { ScanDestination = true });
 
         DryRunOperation entry = Assert.Single(report.DestinationOperations, o => o.Kind == OperationKind.Untouched);
         Assert.EndsWith("preexisting.txt", PathOf(report, entry));
+    }
+
+    [Fact]
+    public async Task Additive_without_scan_skips_the_destination_sweep()
+    {
+        SourceFile("keep.txt", "content");
+        TargetFile("preexisting.txt", "already here");
+
+        // AdditiveArchive with ScanDestination = false (the default): the destination sweep is
+        // skipped, so a pre-existing target-only file produces no Untouched destination row.
+        DryRunReport report = await Simulate(ProfileUnderTest() with { ScanDestination = false });
+
+        Assert.DoesNotContain(report.DestinationOperations, o => o.Kind == OperationKind.Untouched);
+        string[] dirPaths = DryRunDirectoryTable.Materialize(report.Directories);
+        Assert.DoesNotContain(report.DestinationFiles,
+            f => PathOf(dirPaths, f).EndsWith("preexisting.txt", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public async Task Mirror_scans_destinations_even_when_ScanDestination_is_false()
+    {
+        SourceFile("keep.txt", "content");
+        TargetFile("orphan.txt", "stale");
+
+        // Safety net: Mirror needs the sweep to detect deletions, so it scans regardless of the flag.
+        DryRunReport report = await Simulate(
+            ProfileUnderTest() with { SyncMode = SyncMode.Mirror, ScanDestination = false });
+
+        Assert.Single(report.DestinationOperations, o => o.Kind == OperationKind.Deleted);
     }
 
     // ----- referential-integrity invariants -----
@@ -605,7 +617,7 @@ public sealed class DryRunEngineTests : IDisposable
             SourceFile($"{i:D3}.txt", $"content {i}");
         Profile profile = ProfileUnderTest();
 
-        var simulated = await NewEngine(4000, profile).SimulateAsync(profile.Id, null);
+        var simulated = await NewEngine(4000).SimulateAsync(profile, null);
         Assert.True(simulated.TryGetValue(out DryRunReport? report));
 
         Assert.True(report!.Truncated);
@@ -627,8 +639,8 @@ public sealed class DryRunEngineTests : IDisposable
 
         DryRunEngine engine = NewEngine(
             DryRunEngine.MaxReportBytes, DryRunEngine.ChunkByteThreshold, maxScannedCandidates: 5,
-            GlobalSettings.Default, profile);
-        List<(string SourcePath, OperationKind Kind)> streamed = await CollectStream(engine, profile.Id);
+            GlobalSettings.Default);
+        List<(string SourcePath, OperationKind Kind)> streamed = await CollectStream(engine, profile);
 
         Assert.Equal(5, streamed.Count);
     }
@@ -647,7 +659,7 @@ public sealed class DryRunEngineTests : IDisposable
         List<(string, OperationKind)> batchedPairs =
             batched.SourceFiles.Select((f, i) => (PathOf(dirPaths, f), batchedOps[i].Kind)).ToList();
 
-        List<(string SourcePath, OperationKind Kind)> streamed = await CollectStream(NewEngine(profile), profile.Id);
+        List<(string SourcePath, OperationKind Kind)> streamed = await CollectStream(NewEngine(), profile);
 
         Assert.Equal(batchedPairs, streamed);
     }
@@ -661,14 +673,14 @@ public sealed class DryRunEngineTests : IDisposable
             SourceFile($"{i:D3}.txt", $"content {i}");
         Profile profile = ProfileUnderTest();
 
-        var batched = await NewEngine(4000, profile).SimulateAsync(profile.Id, null);
+        var batched = await NewEngine(4000).SimulateAsync(profile, null);
         Assert.True(batched.TryGetValue(out DryRunReport? truncatedReport));
         Assert.True(truncatedReport!.Truncated);
         Assert.InRange(truncatedReport.SourceFiles.Count, 1, 39);
 
         // Same tiny budget as the *chunk* budget — still every file comes back.
         List<(string SourcePath, OperationKind Kind)> streamed =
-            await CollectStream(NewEngine(4000, 4000, GlobalSettings.Default, profile), profile.Id);
+            await CollectStream(NewEngine(4000, 4000, GlobalSettings.Default), profile);
         Assert.Equal(40, streamed.Count);
         Assert.Equal(
             Enumerable.Range(0, 40).Select(i => $"{i:D3}.txt").OrderBy(n => n, StringComparer.OrdinalIgnoreCase).ToList(),
@@ -683,9 +695,9 @@ public sealed class DryRunEngineTests : IDisposable
         Profile profile = ProfileUnderTest();
 
         // A small chunk budget forces several chunks; each stays under the 16 MiB frame cap by design.
-        DryRunEngine engine = NewEngine(DryRunEngine.MaxReportBytes, 512, GlobalSettings.Default, profile);
+        DryRunEngine engine = NewEngine(DryRunEngine.MaxReportBytes, 512, GlobalSettings.Default);
         List<DryRunChunk> chunks = [];
-        await foreach (Result<DryRunChunk, string> chunk in engine.SimulateStreamAsync(profile.Id, null))
+        await foreach (Result<DryRunChunk, string> chunk in engine.SimulateStreamAsync(profile, null))
         {
             Assert.True(chunk.TryGetValue(out DryRunChunk? batch));
             chunks.Add(batch!);
@@ -694,18 +706,6 @@ public sealed class DryRunEngineTests : IDisposable
         Assert.True(chunks.Count > 1, $"expected multiple chunks, got {chunks.Count}");
         Assert.All(chunks, c => Assert.NotEmpty(c.SourceFiles));
         Assert.Equal(30, chunks.Sum(c => c.SourceFiles.Count));
-    }
-
-    [Fact]
-    public async Task Stream_unknown_profile_yields_a_single_failure_item()
-    {
-        List<Result<DryRunChunk, string>> items = [];
-        await foreach (var item in NewEngine(ProfileUnderTest()).SimulateStreamAsync(Guid.NewGuid(), null))
-            items.Add(item);
-
-        Result<DryRunChunk, string> only = Assert.Single(items);
-        Assert.True(only.TryGetError(out string? error));
-        Assert.Contains("not found", error);
     }
 
     [Fact]
@@ -719,7 +719,7 @@ public sealed class DryRunEngineTests : IDisposable
 
         await Assert.ThrowsAnyAsync<OperationCanceledException>(async () =>
         {
-            await foreach (var _ in NewEngine(profile).SimulateStreamAsync(profile.Id, null, ct: cts.Token))
+            await foreach (var _ in NewEngine().SimulateStreamAsync(profile, null, ct: cts.Token))
             {
             }
         });

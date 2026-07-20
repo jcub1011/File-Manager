@@ -52,7 +52,7 @@ public sealed class EndToEndSmokeTests : IAsyncLifetime
         SettingsService settings = new(NullLogger<SettingsService>.Instance, paths);
         WindowsVolumeInfoProvider volumes = new(NullLogger<WindowsVolumeInfoProvider>.Instance);
         DestinationProjector destinationProjector = new(NullLogger<DestinationProjector>.Instance, fileSystem, volumes);
-        DryRunEngine dryRun = new(NullLogger<DryRunEngine>.Instance, catalog, scanner, filterCompiler, hasher, resolver, settings, TimeProvider.System, destinationProjector);
+        DryRunEngine dryRun = new(NullLogger<DryRunEngine>.Instance, scanner, filterCompiler, hasher, resolver, settings, TimeProvider.System, destinationProjector);
 
         IIpcRequestHandler[] handlers =
         [

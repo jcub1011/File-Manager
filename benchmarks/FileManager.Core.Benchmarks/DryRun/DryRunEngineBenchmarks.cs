@@ -52,7 +52,7 @@ public class DryRunEngineBenchmarks
     private const int FileSizeBytes = 4 * 1024;   // config-sized; big enough that a SHA-256 is real work
 
     private DryRunEngine _engine = null!;
-    private Guid _profileId;
+    private Profile _profile = null!;
     private string _sourceRoot = null!;
     private string _targetRoot = null!;
 
@@ -84,7 +84,7 @@ public class DryRunEngineBenchmarks
             CopyTree(_sourceRoot, _targetRoot);
 
         Profile profile = BaselineProfile(_sourceRoot, _targetRoot);
-        _profileId = profile.Id;
+        _profile = profile;
 
         var fileSystem = new FileSystemService(NullLogger<FileSystemService>.Instance);
         IFileSystemService scanFileSystem = Latency == SourceLatency.Slow
@@ -94,7 +94,6 @@ public class DryRunEngineBenchmarks
 
         _engine = new DryRunEngine(
             NullLogger<DryRunEngine>.Instance,
-            new SingleProfileCatalog(profile),
             scanner,
             new FilterCompiler(NullLogger<FilterCompiler>.Instance, TimeProvider.System),
             new FileHasher(NullLogger<FileHasher>.Instance),
@@ -156,7 +155,7 @@ public class DryRunEngineBenchmarks
     [Benchmark]
     public async Task<int> Simulate()
     {
-        var result = await _engine.SimulateAsync(_profileId, scopePath: null);
+        var result = await _engine.SimulateAsync(_profile, scopePath: null);
         result.TryGetValue(out var report);
         return report!.SourceFiles.Count;   // consume so the JIT can't elide the work
     }
@@ -235,19 +234,4 @@ public class DryRunEngineBenchmarks
         Logging = new LoggingSettings { Verbosity = LogVerbosity.FailuresAndSkips, NotifyOnFailure = true },
     };
 
-    /// <summary>The engine only reads <see cref="IProfileCatalog.All"/> to resolve the profile by id;
-    /// a one-entry catalog is all the simulation needs.</summary>
-    private sealed class SingleProfileCatalog(Profile profile) : IProfileCatalog
-    {
-        private readonly IReadOnlyList<Profile> _profiles = [profile];
-        public IReadOnlyList<Profile> All => _profiles;
-        public IReadOnlyList<Profile> Active => _profiles;
-        public IDisposable Subscribe(Action changeHandler) => new Unsubscriber();
-        public Result Reload() => Result.Success();
-
-        private sealed class Unsubscriber : IDisposable
-        {
-            public void Dispose() { }
-        }
-    }
 }

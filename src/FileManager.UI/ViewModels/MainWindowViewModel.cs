@@ -37,7 +37,10 @@ public sealed partial class MainWindowViewModel : ViewModelBase
         Editor.Discarded = () =>
         {
             if (Editor.HasProfile)
+            {
                 DryRun.SetProfile(List.SelectedProfile?.ProfileId, Editor.ProfileName);
+                DryRun.ApplySyncSettings(Editor.SyncMode, Editor.ScanDestination);
+            }
             else
                 DryRun.ClearProfile();
         };
@@ -51,6 +54,13 @@ public sealed partial class MainWindowViewModel : ViewModelBase
             {
                 List.HasUnsavedChanges = Editor.IsDirty;
                 List.UnsavedProfileId = Editor.IsDirty ? List.SelectedProfile?.ProfileId : null;
+            }
+            // Keep the dry-run split button's default scan choice in step with the editor's live
+            // sync mode / ScanDestination (a dropdown override is transient and reset on any change).
+            else if (e.PropertyName is nameof(ProfileEditorViewModel.SyncMode)
+                     or nameof(ProfileEditorViewModel.ScanDestination))
+            {
+                DryRun.ApplySyncSettings(Editor.SyncMode, Editor.ScanDestination);
             }
         };
     }
@@ -76,6 +86,7 @@ public sealed partial class MainWindowViewModel : ViewModelBase
         List.SelectedProfile = null;
         Editor.LoadNew();
         DryRun.SetProfile(null, Editor.ProfileName);   // new/unsaved profile is still dry-runnable
+        DryRun.ApplySyncSettings(Editor.SyncMode, Editor.ScanDestination);
     }
 
     [RelayCommand]
@@ -165,6 +176,7 @@ public sealed partial class MainWindowViewModel : ViewModelBase
             loaded.TryGetValue(out Profile? profile);
             Editor.Load(profile!);
             DryRun.SetProfile(profile!.Id, profile.Name);
+            DryRun.ApplySyncSettings(profile.SyncMode, profile.ScanDestination);
         }
         catch (Exception ex)
         {
@@ -179,6 +191,7 @@ public sealed partial class MainWindowViewModel : ViewModelBase
         {
             await List.RefreshAndSelectAsync(profileId);
             DryRun.SetProfile(profileId, Editor.ProfileName);
+            DryRun.ApplySyncSettings(Editor.SyncMode, Editor.ScanDestination);
         }
         catch (Exception ex)
         {

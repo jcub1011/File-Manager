@@ -5,7 +5,6 @@ using FileManager.Core.Files;
 using FileManager.Core.Filtering;
 using FileManager.Core.Jobs;
 using FileManager.Core.Placement;
-using FileManager.Core.Profiles;
 using FileManager.Core.Settings;
 using FileManager.Core.Watching;
 using Microsoft.Extensions.Logging;
@@ -35,7 +34,6 @@ namespace FileManager.Core.DryRun;
 /// batched reports agree.</summary>
 public sealed class DryRunEngine(
     ILogger<DryRunEngine> logger,
-    IProfileCatalog catalog,
     ISourceScanner scanner,
     IFilterCompiler filterCompiler,
     IFileHasher hasher,
@@ -91,22 +89,9 @@ public sealed class DryRunEngine(
     /// batched file cap is reachable without generating tens of thousands of files.</summary>
     internal int MaxBatchCandidates { get; init; } = MaxReportedFiles;
 
-    public async Task<Result<DryRunReport, string>> SimulateAsync(
-        Guid profileId, string? scopePath, CancellationToken ct = default)
-    {
-        Profile? profile = catalog.All.FirstOrDefault(p => p.Id == profileId);
-        if (profile is null)
-        {
-            if (logger.IsEnabled(LogLevel.Debug))
-                logger.LogDebug("Dry-run requested for profile {ProfileId} which was not found", profileId);
-            return $"profile {profileId} not found";
-        }
-        return await SimulateAsync(profile, scopePath, ct).ConfigureAwait(false);
-    }
-
-    /// <summary>Profile-accepting overload: previews the given profile object directly (e.g. an
-    /// unsaved in-memory draft that is not in the catalog). The Guid overload resolves the catalog
-    /// then delegates here. All collaborators remain read-only (I-DRYRUN-RO).</summary>
+    /// <summary>Previews the given profile object directly (a persisted profile the handler resolved
+    /// from the catalog, or an unsaved in-memory draft). All collaborators remain read-only
+    /// (I-DRYRUN-RO).</summary>
     public async Task<Result<DryRunReport, string>> SimulateAsync(
         Profile profile, string? scopePath, CancellationToken ct = default)
     {
@@ -180,9 +165,14 @@ public sealed class DryRunEngine(
         // entirely when the source pass truncated (the survivor set would be incomplete, so any
         // orphan classification is untrustworthy). Appended only while their size keeps the report
         // under budget; an overflow drops the rest and marks the report truncated.
-        DestinationSweepResult sweep = destinationProjector.Sweep(
-            profile, builder.Survivors, truncated,
-            DryRunConcurrency.ResolveManualWorkers(profile, settings.Current), ct);
+        // AdditiveArchive can skip the sweep when the profile opts out (ScanDestination = false);
+        // Mirror always sweeps because the sweep is its only source of Deleted-orphan previews.
+        bool scanDestinations = profile.EffectiveScanDestination;
+        DestinationSweepResult sweep = scanDestinations
+            ? destinationProjector.Sweep(
+                profile, builder.Survivors, truncated,
+                DryRunConcurrency.ResolveManualWorkers(profile, settings.Current), ct)
+            : new DestinationSweepResult([], []);
         for (int i = 0; i < sweep.Files.Count; i++)
         {
             if (!builder.TryAddSweepEntry(sweep.Files[i], sweep.Ops[i]))
@@ -227,27 +217,9 @@ public sealed class DryRunEngine(
     /// consumer can concatenate them. The destination sweep is left to the handler (which runs it
     /// after the file phase). A fatal setup/scan error is a single failure item that ends the stream;
     /// cancellation surfaces as <see cref="OperationCanceledException"/> from the enumerator.</summary>
-    public async IAsyncEnumerable<Result<DryRunChunk, string>> SimulateStreamAsync(
-        Guid profileId, string? scopePath, DryRunProgressCounters? progress = null,
-        [EnumeratorCancellation] CancellationToken ct = default)
-    {
-        Profile? profile = catalog.All.FirstOrDefault(p => p.Id == profileId);
-        if (profile is null)
-        {
-            if (logger.IsEnabled(LogLevel.Debug))
-                logger.LogDebug("Dry-run requested for profile {ProfileId} which was not found", profileId);
-            yield return $"profile {profileId} not found";
-            yield break;
-        }
-        await foreach (Result<DryRunChunk, string> chunk in
-            SimulateStreamAsync(profile, scopePath, progress, ct).ConfigureAwait(false))
-            yield return chunk;
-    }
-
-    /// <summary>Profile-accepting overload: previews the given profile object directly (e.g. an
-    /// unsaved in-memory draft that is not in the catalog). The Guid overload resolves the catalog
-    /// then delegates here. All collaborators remain read-only (I-DRYRUN-RO); catalog membership was
-    /// never what enforced that.</summary>
+    /// <summary>Previews the given profile object directly (a persisted profile the handler resolved
+    /// from the catalog, or an unsaved in-memory draft). All collaborators remain read-only
+    /// (I-DRYRUN-RO); catalog membership was never what enforced that.</summary>
     public async IAsyncEnumerable<Result<DryRunChunk, string>> SimulateStreamAsync(
         Profile profile, string? scopePath, DryRunProgressCounters? progress = null,
         [EnumeratorCancellation] CancellationToken ct = default)

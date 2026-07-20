@@ -183,9 +183,14 @@ public sealed class DryRunStreamHandler(
         // keep the stream alive with throttled progress frames while it runs — same polling shape as
         // the scan phase above. Live counts ride on top of the file phase's destination total so the
         // figure the user watches never goes backwards.
-        Task<DestinationSweepResult> sweepTask = Task.Run(
-            () => destinationProjector.Sweep(
-                profile, survivors, truncated, manualWorkers, ct, sweepBudget, progressCounters));
+        // AdditiveArchive can skip the sweep when the profile opts out (ScanDestination = false);
+        // Mirror always sweeps because the sweep is its only source of Deleted-orphan previews.
+        bool scanDestinations = profile.EffectiveScanDestination;
+        Task<DestinationSweepResult> sweepTask = scanDestinations
+            ? Task.Run(
+                () => destinationProjector.Sweep(
+                    profile, survivors, truncated, manualWorkers, ct, sweepBudget, progressCounters))
+            : Task.FromResult(new DestinationSweepResult([], []));
         long lastDestinations = -1;
         while (!sweepTask.IsCompleted)
         {

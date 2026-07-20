@@ -8,7 +8,6 @@ using FileManager.Core.Files;
 using FileManager.Core.Filtering;
 using FileManager.Core.Jobs;
 using FileManager.Core.Placement;
-using FileManager.Core.Profiles;
 using FileManager.Core.Settings;
 using FileManager.Core.Tests.TestSupport;
 using FileManager.Core.Watching;
@@ -52,7 +51,7 @@ public sealed class DryRunPipelineTests : IDisposable
         ScriptedScanner scanner = new(() => BlockingScript(profile, released));
         SignalingHasher hasher = new(() => released.TrySetResult());
 
-        var simulated = await NewEngine(scanner, profile, hasher).SimulateAsync(profile.Id, null);
+        var simulated = await NewEngine(scanner, hasher).SimulateAsync(profile, null);
 
         Assert.True(simulated.TryGetValue(out DryRunReport? report));
         Assert.Equal(2, report!.SourceFiles.Count);
@@ -71,7 +70,7 @@ public sealed class DryRunPipelineTests : IDisposable
         SignalingHasher hasher = new(() => released.TrySetResult());
 
         int sourceFiles = 0;
-        await foreach (var item in NewEngine(scanner, profile, hasher).SimulateStreamAsync(profile.Id, null))
+        await foreach (var item in NewEngine(scanner, hasher).SimulateStreamAsync(profile, null))
         {
             Assert.True(item.TryGetValue(out DryRunChunk? chunk));
             sourceFiles += chunk!.SourceFiles.Count;
@@ -104,7 +103,7 @@ public sealed class DryRunPipelineTests : IDisposable
         ScriptedScanner scanner = new(() => emissionOrder.Select(n =>
             (Result<Payload, EnumerationFault>)PayloadFor(profile, n)));
 
-        var simulated = await NewEngine(scanner, profile, maxBatchCandidates: 5).SimulateAsync(profile.Id, null);
+        var simulated = await NewEngine(scanner, maxBatchCandidates: 5).SimulateAsync(profile, null);
 
         Assert.True(simulated.TryGetValue(out DryRunReport? report));
         Assert.True(report!.Truncated);
@@ -126,7 +125,7 @@ public sealed class DryRunPipelineTests : IDisposable
         Profile profile = ProfileUnderTest();
         ScriptedScanner scanner = new(() => FatalScript(profile));
 
-        var simulated = await NewEngine(scanner, profile).SimulateAsync(profile.Id, null);
+        var simulated = await NewEngine(scanner).SimulateAsync(profile, null);
 
         Assert.True(simulated.TryGetError(out string? error));
         Assert.Equal("scan failed: boom", error);
@@ -141,7 +140,7 @@ public sealed class DryRunPipelineTests : IDisposable
         ScriptedScanner scanner = new(() => FatalScript(profile));
 
         List<Result<DryRunChunk, string>> items = [];
-        await foreach (var item in NewEngine(scanner, profile).SimulateStreamAsync(profile.Id, null))
+        await foreach (var item in NewEngine(scanner).SimulateStreamAsync(profile, null))
             items.Add(item);
 
         Result<DryRunChunk, string> only = Assert.Single(items);
@@ -165,7 +164,7 @@ public sealed class DryRunPipelineTests : IDisposable
         Profile profile = ProfileUnderTest();
         ScriptedScanner scanner = new(() => WarningScript(profile));
 
-        var simulated = await NewEngine(scanner, profile).SimulateAsync(profile.Id, null);
+        var simulated = await NewEngine(scanner).SimulateAsync(profile, null);
 
         Assert.True(simulated.TryGetValue(out DryRunReport? report));
         Assert.False(report!.Truncated);
@@ -191,7 +190,7 @@ public sealed class DryRunPipelineTests : IDisposable
         ScriptedScanner scanner = new(() => [PayloadFor(profile, "a.txt")]);
         CancellingHasher hasher = new(cts);
 
-        var simulated = await NewEngine(scanner, profile, hasher).SimulateAsync(profile.Id, null, cts.Token);
+        var simulated = await NewEngine(scanner, hasher).SimulateAsync(profile, null, cts.Token);
 
         Assert.True(simulated.IsCanceled);
         Assert.True(scanner.Disposed);
@@ -209,7 +208,7 @@ public sealed class DryRunPipelineTests : IDisposable
 
         await Assert.ThrowsAnyAsync<OperationCanceledException>(async () =>
         {
-            await foreach (var _ in NewEngine(scanner, profile, hasher).SimulateStreamAsync(profile.Id, null, ct: cts.Token))
+            await foreach (var _ in NewEngine(scanner, hasher).SimulateStreamAsync(profile, null, ct: cts.Token))
             {
             }
         });
@@ -280,7 +279,7 @@ public sealed class DryRunPipelineTests : IDisposable
         ScriptedScanner scanner = new(() => emissionOrder.Select(n =>
             (Result<Payload, EnumerationFault>)PayloadFor(pinned, n)));
 
-        var simulated = await NewEngine(scanner, pinned).SimulateAsync(pinned.Id, null);
+        var simulated = await NewEngine(scanner).SimulateAsync(pinned, null);
         Assert.True(simulated.TryGetValue(out DryRunReport? report));
         return report!;
     }
@@ -343,14 +342,6 @@ public sealed class DryRunPipelineTests : IDisposable
         }
     }
 
-    private sealed class FakeCatalog(params Profile[] profiles) : IProfileCatalog
-    {
-        public IReadOnlyList<Profile> All { get; } = profiles;
-        public IReadOnlyList<Profile> Active => All.Where(p => p.Active).ToList();
-        public IDisposable Subscribe(Action changeHandler) => throw new NotSupportedException();
-        public Result Reload() => Result.Success();
-    }
-
     private sealed class FakeSettings(GlobalSettings current) : ISettingsProvider
     {
         public GlobalSettings Current { get; } = current;
@@ -361,12 +352,11 @@ public sealed class DryRunPipelineTests : IDisposable
     // ----- plumbing -----
 
     private DryRunEngine NewEngine(
-        ISourceScanner scanner, Profile profile, IFileHasher? hasher = null, int? maxBatchCandidates = null)
+        ISourceScanner scanner, IFileHasher? hasher = null, int? maxBatchCandidates = null)
     {
         FileSystemService fileSystem = new(NullLogger<FileSystemService>.Instance);
         return new DryRunEngine(
             NullLogger<DryRunEngine>.Instance,
-            new FakeCatalog(profile),
             scanner,
             new FilterCompiler(NullLogger<FilterCompiler>.Instance, TimeProvider.System),
             hasher ?? new FileHasher(NullLogger<FileHasher>.Instance),

@@ -60,7 +60,7 @@
 
                 <!-- general -->
                 <Border Classes="sectionHeader"><TextBlock Text="General" /></Border>
-                <Grid ColumnDefinitions="140,*" RowDefinitions="Auto,Auto,Auto,Auto" Margin="0,0,0,4">
+                <Grid ColumnDefinitions="140,*" RowDefinitions="Auto,Auto,Auto,Auto,Auto" Margin="0,0,0,4">
                     <TextBlock Grid.Row="0" Grid.Column="0" Classes="fieldLabel" Text="Name" />
                     <TextBox Grid.Row="0" Grid.Column="1" Text="{Binding ProfileName}" Margin="0,2" />
                     <TextBlock Grid.Row="1" Grid.Column="0" Classes="fieldLabel" Text="Active" />
@@ -74,8 +74,12 @@
                             </DataTemplate>
                         </ComboBox.ItemTemplate>
                     </ComboBox>
-                    <TextBlock Grid.Row="3" Grid.Column="0" Classes="fieldLabel" Text="Target layout" />
-                    <ComboBox Grid.Row="3" Grid.Column="1" ItemsSource="{Binding TargetLayoutOptions}"
+                    <TextBlock Grid.Row="3" Grid.Column="0" Classes="fieldLabel" Text="Scan destinations" />
+                    <CheckBox Grid.Row="3" Grid.Column="1" IsChecked="{Binding ScanDestination}"
+                              IsEnabled="{Binding CanEditScanDestination}" Margin="0,2"
+                              ToolTip.Tip="Lists pre-existing destination files in the dry-run preview. Mirror mode always scans (it needs the scan to detect files to delete)." />
+                    <TextBlock Grid.Row="4" Grid.Column="0" Classes="fieldLabel" Text="Target layout" />
+                    <ComboBox Grid.Row="4" Grid.Column="1" ItemsSource="{Binding TargetLayoutOptions}"
                               SelectedItem="{Binding TargetLayout}" Margin="0,2" MinWidth="220">
                         <ComboBox.ItemTemplate>
                             <DataTemplate x:DataType="prof:TargetLayout">

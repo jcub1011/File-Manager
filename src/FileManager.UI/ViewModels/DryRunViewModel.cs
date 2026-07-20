@@ -2265,6 +2265,45 @@ public sealed partial class DryRunViewModel : ViewModelBase
 
     public bool CanRun => HasEditableProfile;
 
+    // ── Destination-scan choice behind the split run button ───────────────────────────────────
+    /// <summary>The scan choice the primary run button will use. Defaults to the profile's
+    /// <c>ScanDestination</c> setting via <see cref="ApplySyncSettings"/>; the dropdown overrides it
+    /// for subsequent run(s) without touching the saved profile. Forced true in Mirror.</summary>
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(RunButtonLabel))]
+    public partial bool RunWithDestinationScan { get; set; }
+
+    /// <summary>False in Mirror, where the destination sweep is mandatory (it is the only source of
+    /// Deleted-orphan previews) — so the "No Destination Scan" dropdown item is disabled.</summary>
+    [ObservableProperty] public partial bool CanChooseNoScan { get; set; } = true;
+
+    /// <summary>The two run-button / dropdown captions, defined once so the split button and its menu
+    /// items can never drift apart.</summary>
+    public string WithScanLabel => "Dry Run (With Destination Scan)";
+    public string NoScanLabel => "Dry Run (No Destination Scan)";
+
+    /// <summary>Primary run-button caption reflecting the current scan choice.</summary>
+    public string RunButtonLabel => RunWithDestinationScan ? WithScanLabel : NoScanLabel;
+
+    /// <summary>Resets the run button's scan choice to the profile's default whenever the editor's
+    /// sync mode or ScanDestination setting changes (and on profile load). Mirror forces the scan on
+    /// and locks out the "No scan" option; AdditiveArchive follows the profile setting.</summary>
+    public void ApplySyncSettings(SyncMode mode, bool profileScanDestination)
+    {
+        CanChooseNoScan = mode != SyncMode.Mirror;
+        RunWithDestinationScan = Profile.ComputeEffectiveScanDestination(mode, profileScanDestination);
+    }
+
+    [RelayCommand]
+    private void SelectWithScan() => RunWithDestinationScan = true;
+
+    [RelayCommand]
+    private void SelectNoScan()
+    {
+        if (CanChooseNoScan)
+            RunWithDestinationScan = false;
+    }
+
     /// <summary>Attach the editor's open profile (new or existing). Enables the run and clears any
     /// prior preview. A null id is valid for a never-saved draft — the run sends the draft inline.</summary>
     public void SetProfile(Guid? profileId, string profileName)
@@ -2306,7 +2345,11 @@ public sealed partial class DryRunViewModel : ViewModelBase
                 ErrorMessage = buildError;
                 return;
             }
-            draft = built;
+            // Apply the split button's per-run scan choice to the ephemeral draft only. The draft is
+            // never saved, so this override does not change the profile's stored ScanDestination.
+            draft = built is not null
+                ? built with { ScanDestination = RunWithDestinationScan }
+                : null;
         }
         Guid? runId = draft?.Id ?? ProfileId;
         if (runId is not Guid profileId)

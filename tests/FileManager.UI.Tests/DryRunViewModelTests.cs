@@ -21,6 +21,44 @@ public sealed class DryRunViewModelTests
         return (viewModel, gateway);
     }
 
+    // ── Split run button: destination-scan choice ───────────────────────────────────────────────
+
+    [Fact]
+    public void ApplySyncSettings_additive_follows_the_profile_default_and_allows_the_no_scan_option()
+    {
+        var (viewModel, _) = NewViewModel();
+
+        viewModel.ApplySyncSettings(SyncMode.AdditiveArchive, profileScanDestination: false);
+        Assert.False(viewModel.RunWithDestinationScan);
+        Assert.True(viewModel.CanChooseNoScan);
+        Assert.Equal("Dry Run (No Destination Scan)", viewModel.RunButtonLabel);
+
+        viewModel.ApplySyncSettings(SyncMode.AdditiveArchive, profileScanDestination: true);
+        Assert.True(viewModel.RunWithDestinationScan);
+        Assert.Equal("Dry Run (With Destination Scan)", viewModel.RunButtonLabel);
+    }
+
+    [Fact]
+    public void ApplySyncSettings_mirror_forces_the_scan_on_and_disables_the_no_scan_option()
+    {
+        var (viewModel, _) = NewViewModel();
+
+        viewModel.ApplySyncSettings(SyncMode.Mirror, profileScanDestination: false);
+        Assert.True(viewModel.RunWithDestinationScan);
+        Assert.False(viewModel.CanChooseNoScan);
+    }
+
+    [Fact]
+    public void SelectNoScan_is_ignored_while_the_no_scan_option_is_disabled()
+    {
+        var (viewModel, _) = NewViewModel();
+        viewModel.ApplySyncSettings(SyncMode.Mirror, profileScanDestination: false);
+
+        viewModel.SelectNoScanCommand.Execute(null);
+
+        Assert.True(viewModel.RunWithDestinationScan);   // Mirror stays scanned
+    }
+
     // ── New-model fixture helpers ──────────────────────────────────────────────────────────────
     // A dry-run report is now a bipartite graph: DryRunFile nodes (SourceFiles / DestinationFiles)
     // plus DryRunOperation edges (SourceOperations / DestinationOperations) that reference files
@@ -129,7 +167,9 @@ public sealed class DryRunViewModelTests
 
         await viewModel.RunAsync(CancellationToken.None);
 
-        Assert.Same(draft, Assert.Single(gateway.DryRunDrafts));
+        // RunAsync sends a copy of the draft with the split button's scan choice applied; with the
+        // default (no-scan) choice matching the sample's ScanDestination, it is value-equal to the draft.
+        Assert.Equal(draft, Assert.Single(gateway.DryRunDrafts));
         Assert.Equal(draft.Id, Assert.Single(gateway.DryRunCalls));
     }
 

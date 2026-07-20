@@ -134,6 +134,48 @@ public sealed class SerializationTests
     }
 
     [Fact]
+    public void ScanDestination_round_trips_and_defaults_to_false_when_absent()
+    {
+        Profile sample = SampleProfile() with { ScanDestination = true };
+        string json = Encoding.UTF8.GetString(JsonSerializer.SerializeToUtf8Bytes(
+            sample, FileManagerJsonContext.Default.Profile));
+
+        Profile? roundTripped = JsonSerializer.Deserialize(json, FileManagerJsonContext.Default.Profile);
+        Assert.NotNull(roundTripped);
+        Assert.True(roundTripped.ScanDestination);
+
+        // Legacy JSON that predates the field must deserialize to false (additive, backward compatible).
+        string legacy = json.Replace(",\"ScanDestination\":true", "");
+        Assert.DoesNotContain("ScanDestination", legacy);
+        Profile? fromLegacy = JsonSerializer.Deserialize(legacy, FileManagerJsonContext.Default.Profile);
+        Assert.NotNull(fromLegacy);
+        Assert.False(fromLegacy.ScanDestination);
+    }
+
+    [Theory]
+    [InlineData(SyncMode.AdditiveArchive, false, false)]   // Additive honors the flag
+    [InlineData(SyncMode.AdditiveArchive, true, true)]
+    [InlineData(SyncMode.Mirror, false, true)]             // Mirror always sweeps, flag or not
+    [InlineData(SyncMode.Mirror, true, true)]
+    public void EffectiveScanDestination_forces_the_sweep_on_in_mirror(
+        SyncMode mode, bool scanDestination, bool expected)
+    {
+        Profile profile = SampleProfile() with { SyncMode = mode, ScanDestination = scanDestination };
+        Assert.Equal(expected, profile.EffectiveScanDestination);
+        Assert.Equal(expected, Profile.ComputeEffectiveScanDestination(mode, scanDestination));
+    }
+
+    [Fact]
+    public void EffectiveScanDestination_is_not_serialized()
+    {
+        // [JsonIgnore] — it is a derived convenience over SyncMode + ScanDestination, never a wire field.
+        Profile sample = SampleProfile() with { SyncMode = SyncMode.Mirror, ScanDestination = false };
+        string json = Encoding.UTF8.GetString(JsonSerializer.SerializeToUtf8Bytes(
+            sample, FileManagerJsonContext.Default.Profile));
+        Assert.DoesNotContain("EffectiveScanDestination", json);
+    }
+
+    [Fact]
     public void DryRunReport_round_trips_all_four_collections_with_indices()
     {
         byte[] wire = IpcSerializer.SerializeResponse(new DryRunResponse { Report = SampleReport() });

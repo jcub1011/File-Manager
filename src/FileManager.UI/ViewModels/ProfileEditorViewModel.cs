@@ -27,6 +27,10 @@ public sealed partial class ProfileEditorViewModel : ViewModelBase
     private Profile? _original;
     private bool _loading;
 
+    /// <summary>The user's AdditiveArchive scan preference, remembered while Mirror forces the flag on
+    /// so switching back to AdditiveArchive restores their choice instead of leaving it stuck checked.</summary>
+    private bool _scanDestinationPreference;
+
     public ProfileEditorViewModel(IIpcGateway gateway, IFolderPicker folderPicker)
     {
         _gateway = gateway;
@@ -69,6 +73,7 @@ public sealed partial class ProfileEditorViewModel : ViewModelBase
     [ObservableProperty] public partial string ProfileName { get; set; } = "";
     [ObservableProperty] public partial bool Active { get; set; } = true;
     [ObservableProperty] public partial SyncMode SyncMode { get; set; } = SyncMode.AdditiveArchive;
+    [ObservableProperty] public partial bool ScanDestination { get; set; }
     [ObservableProperty] public partial TargetLayout TargetLayout { get; set; } = TargetLayout.PreserveStructure;
     [ObservableProperty] public partial ConflictResolution ConflictResolution { get; set; } = ConflictResolution.Skip;
     [ObservableProperty] public partial OverwriteHandling OverwriteHandling { get; set; } = OverwriteHandling.StageOverwrites;
@@ -101,6 +106,30 @@ public sealed partial class ProfileEditorViewModel : ViewModelBase
     public bool ShowArchiveFolder => OnSuccess == OnSuccessAction.MoveToArchive;
 
     partial void OnOnSuccessChanged(OnSuccessAction value) => OnPropertyChanged(nameof(ShowArchiveFolder));
+
+    /// <summary>The destination sweep is optional in AdditiveArchive but mandatory in Mirror (its
+    /// only source of Deleted-orphan previews), so the checkbox is locked on in Mirror.</summary>
+    public bool CanEditScanDestination => SyncMode != SyncMode.Mirror;
+
+    // Fully-qualified param type: the property is also named SyncMode, so the unqualified name would
+    // bind to the property, not the enum, in this position (mirrors OnConcurrencyModeChanged).
+    partial void OnSyncModeChanged(global::FileManager.Contracts.Profiles.SyncMode value)
+    {
+        // Loads set SyncMode and ScanDestination explicitly; only respond to genuine user switches.
+        if (!_loading)
+        {
+            if (value == SyncMode.Mirror)
+            {
+                _scanDestinationPreference = ScanDestination;   // remember the AdditiveArchive choice
+                ScanDestination = true;                          // Mirror forces the sweep on
+            }
+            else
+            {
+                ScanDestination = _scanDestinationPreference;     // restore it when leaving Mirror
+            }
+        }
+        OnPropertyChanged(nameof(CanEditScanDestination));
+    }
 
     public bool ShowConcurrencyWorkers => ConcurrencyMode == ConcurrencyMode.Manual;
 
@@ -142,6 +171,8 @@ public sealed partial class ProfileEditorViewModel : ViewModelBase
         ProfileName = "New Profile";
         Active = true;
         SyncMode = SyncMode.AdditiveArchive;
+        ScanDestination = false;
+        _scanDestinationPreference = false;
         TargetLayout = TargetLayout.PreserveStructure;
         ConflictResolution = ConflictResolution.Skip;              // safest default
         OverwriteHandling = OverwriteHandling.StageOverwrites;
@@ -176,6 +207,10 @@ public sealed partial class ProfileEditorViewModel : ViewModelBase
         ProfileName = profile.Name;
         Active = profile.Active;
         SyncMode = profile.SyncMode;
+        // Mirror always scans; otherwise honor the stored preference. Remember the raw preference so a
+        // later Mirror → AdditiveArchive switch restores it.
+        _scanDestinationPreference = profile.ScanDestination;
+        ScanDestination = profile.EffectiveScanDestination;
         TargetLayout = profile.TargetLayout;
         ConflictResolution = profile.Policies.ConflictResolution;
         OverwriteHandling = profile.Policies.OverwriteHandling;
@@ -239,6 +274,9 @@ public sealed partial class ProfileEditorViewModel : ViewModelBase
             Name = ProfileName.Trim(),
             Active = Active,
             SyncMode = SyncMode,
+            // The observable already reflects the forced state (Mirror → true via OnSyncModeChanged),
+            // and the engine recomputes EffectiveScanDestination, so store the checkbox value as-is.
+            ScanDestination = ScanDestination,
             TargetLayout = TargetLayout,
             Triggers = _original?.Triggers ?? new TriggerSettings { ManualShell = true, Watcher = false, Schedule = null },
             Sources = Sources.Select(s => new SourceConfig

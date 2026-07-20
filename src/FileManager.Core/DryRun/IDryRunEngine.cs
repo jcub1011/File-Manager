@@ -1,7 +1,6 @@
 using FileManager.Contracts.DryRun;
 using FileManager.Contracts.Primitives;
 using FileManager.Contracts.Profiles;
-using System;
 using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
@@ -10,12 +9,9 @@ namespace FileManager.Core.DryRun;
 
 public interface IDryRunEngine
 {
-    Task<Result<DryRunReport, string>> SimulateAsync(
-        Guid profileId, string? scopePath, CancellationToken ct = default);
-
-    /// <summary>Profile-accepting overload of <see cref="SimulateAsync(Guid, string?, CancellationToken)"/>:
-    /// previews the given profile object directly (e.g. an unsaved in-memory draft not in the
-    /// catalog), skipping the catalog lookup. Read-only (I-DRYRUN-RO) like every simulate path.</summary>
+    /// <summary>Previews the given profile object directly (a persisted profile the handler resolved
+    /// from the catalog, or an unsaved in-memory draft). Read-only (I-DRYRUN-RO) like every simulate
+    /// path — catalog membership was never what enforced that.</summary>
     Task<Result<DryRunReport, string>> SimulateAsync(
         Profile profile, string? scopePath, CancellationToken ct = default);
 
@@ -28,14 +24,6 @@ public interface IDryRunEngine
     /// (orphans / untouched) is run by the handler after the file phase. When
     /// <paramref name="progress"/> is supplied, its source counter is incremented per scanned
     /// candidate so a caller can sample it for live progress.</summary>
-    IAsyncEnumerable<Result<DryRunChunk, string>> SimulateStreamAsync(
-        Guid profileId, string? scopePath, DryRunProgressCounters? progress = null,
-        CancellationToken ct = default);
-
-    /// <summary>Profile-accepting overload of
-    /// <see cref="SimulateStreamAsync(Guid, string?, DryRunProgressCounters?, CancellationToken)"/>:
-    /// previews the given profile object directly (e.g. an unsaved in-memory draft not in the
-    /// catalog), skipping the catalog lookup. Read-only (I-DRYRUN-RO) like every simulate path.</summary>
     IAsyncEnumerable<Result<DryRunChunk, string>> SimulateStreamAsync(
         Profile profile, string? scopePath, DryRunProgressCounters? progress = null,
         CancellationToken ct = default);

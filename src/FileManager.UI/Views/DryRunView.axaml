@@ -273,7 +273,29 @@
              flyouts below only narrow the *view*. -->
         <Grid DockPanel.Dock="Top" ColumnDefinitions="Auto,*,Auto" Margin="0,4,0,0">
             <StackPanel Grid.Column="0" Orientation="Horizontal" Spacing="6" VerticalAlignment="Center">
-                <Button Content="Run dry run" Classes="accent" Command="{Binding RunCommand}" />
+                <!-- Split button: the primary press runs the dry run with the currently selected scan
+                     choice; the dropdown changes that choice (checkmark = active). "No Destination
+                     Scan" is disabled in Mirror mode, where the destination sweep is mandatory. -->
+                <SplitButton Classes="accent" Command="{Binding RunCommand}" Content="{Binding RunButtonLabel}">
+                    <SplitButton.Flyout>
+                        <MenuFlyout>
+                            <MenuItem Header="{Binding WithScanLabel}"
+                                      Command="{Binding SelectWithScanCommand}">
+                                <MenuItem.Icon>
+                                    <TextBlock Text="✓" IsVisible="{Binding RunWithDestinationScan}" />
+                                </MenuItem.Icon>
+                            </MenuItem>
+                            <MenuItem Header="{Binding NoScanLabel}"
+                                      Command="{Binding SelectNoScanCommand}"
+                                      IsEnabled="{Binding CanChooseNoScan}"
+                                      ToolTip.Tip="Mirror mode always scans the destinations to detect files to delete.">
+                                <MenuItem.Icon>
+                                    <TextBlock Text="✓" IsVisible="{Binding !RunWithDestinationScan}" />
+                                </MenuItem.Icon>
+                            </MenuItem>
+                        </MenuFlyout>
+                    </SplitButton.Flyout>
+                </SplitButton>
                 <Button Content="Cancel" Command="{Binding RunCancelCommand}"
                         IsVisible="{Binding RunCommand.IsRunning}" />
             </StackPanel>

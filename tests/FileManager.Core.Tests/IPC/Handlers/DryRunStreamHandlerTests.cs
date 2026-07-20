@@ -28,20 +28,11 @@ public sealed class DryRunStreamHandlerTests
     private sealed class FakeStreamEngine(int totalFiles, int chunkSize) : IDryRunEngine
     {
         public Task<Result<DryRunReport, string>> SimulateAsync(
-            Guid profileId, string? scopePath, CancellationToken ct = default) =>
-            throw new NotSupportedException();
-
-        public Task<Result<DryRunReport, string>> SimulateAsync(
             Profile profile, string? scopePath, CancellationToken ct = default) =>
             throw new NotSupportedException();
 
-        public IAsyncEnumerable<Result<DryRunChunk, string>> SimulateStreamAsync(
-            Profile profile, string? scopePath, DryRunProgressCounters? progress = null,
-            CancellationToken ct = default) =>
-            SimulateStreamAsync(profile.Id, scopePath, progress, ct);
-
         public async IAsyncEnumerable<Result<DryRunChunk, string>> SimulateStreamAsync(
-            Guid profileId, string? scopePath, DryRunProgressCounters? progress = null,
+            Profile profile, string? scopePath, DryRunProgressCounters? progress = null,
             [EnumeratorCancellation] CancellationToken ct = default)
         {
             for (int emitted = 0; emitted < totalFiles;)
@@ -167,20 +158,11 @@ public sealed class DryRunStreamHandlerTests
     private sealed class ScriptedStreamEngine(params DryRunChunk[] chunks) : IDryRunEngine
     {
         public Task<Result<DryRunReport, string>> SimulateAsync(
-            Guid profileId, string? scopePath, CancellationToken ct = default) =>
-            throw new NotSupportedException();
-
-        public Task<Result<DryRunReport, string>> SimulateAsync(
             Profile profile, string? scopePath, CancellationToken ct = default) =>
             throw new NotSupportedException();
 
-        public IAsyncEnumerable<Result<DryRunChunk, string>> SimulateStreamAsync(
-            Profile profile, string? scopePath, DryRunProgressCounters? progress = null,
-            CancellationToken ct = default) =>
-            SimulateStreamAsync(profile.Id, scopePath, progress, ct);
-
         public async IAsyncEnumerable<Result<DryRunChunk, string>> SimulateStreamAsync(
-            Guid profileId, string? scopePath, DryRunProgressCounters? progress = null,
+            Profile profile, string? scopePath, DryRunProgressCounters? progress = null,
             [EnumeratorCancellation] CancellationToken ct = default)
         {
             foreach (DryRunChunk chunk in chunks)
@@ -244,6 +226,48 @@ public sealed class DryRunStreamHandlerTests
 
             DryRunCompleteResponse complete = Assert.IsType<DryRunCompleteResponse>(frames[^1]);
             Assert.False(complete.Truncated);
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task Additive_sweep_is_gated_on_the_profile_scan_flag()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "fm-drs-" + Guid.NewGuid().ToString("N"));
+        string source = Path.Combine(root, "source");
+        string target = Path.Combine(root, "target");
+        Directory.CreateDirectory(source);
+        Directory.CreateDirectory(target);
+        try
+        {
+            // A pre-existing target-only file: swept as Untouched in Additive only when scanning is on.
+            File.WriteAllText(Path.Combine(target, "preexisting.txt"), "x");
+
+            string written = Path.Combine(target, "written.txt");   // a survivor
+            DryRunChunk Chunk() => new(
+                SourceFiles: [Phys(@"C:\src\a.dat", @"C:\src")],
+                DestinationFiles: [Phys(written, target)],
+                SourceOperations: [Op(@"C:\src\a.dat", @"C:\src", OperationKind.Processed, 0)],
+                DestinationOperations: [Op(written, target, OperationKind.New, 0)]);
+
+            // Scan off (the default): no destination-only Untouched row despite the file on disk.
+            Profile off = TestProfiles.Valid(source, target);   // AdditiveArchive, ScanDestination = false
+            List<IpcResponse> offFrames = await Collect(
+                NewHandler(off, new ScriptedStreamEngine(Chunk()), maxStreamedFiles: 500), off.Id);
+            Assert.DoesNotContain(
+                offFrames.OfType<DryRunChunkResponse>().SelectMany(f => f.DestinationOperations),
+                o => o.Kind == OperationKind.Untouched);
+
+            // Scan on: the sweep runs and surfaces the pre-existing file as Untouched.
+            Profile on = off with { ScanDestination = true };
+            List<IpcResponse> onFrames = await Collect(
+                NewHandler(on, new ScriptedStreamEngine(Chunk()), maxStreamedFiles: 500), on.Id);
+            Assert.Contains(
+                onFrames.OfType<DryRunChunkResponse>().SelectMany(f => f.DestinationOperations),
+                o => o.Kind == OperationKind.Untouched && o.FileName.Contains("preexisting"));
         }
         finally
         {
@@ -333,20 +357,11 @@ public sealed class DryRunStreamHandlerTests
     private sealed class SlowScanEngine : IDryRunEngine
     {
         public Task<Result<DryRunReport, string>> SimulateAsync(
-            Guid profileId, string? scopePath, CancellationToken ct = default) =>
-            throw new NotSupportedException();
-
-        public Task<Result<DryRunReport, string>> SimulateAsync(
             Profile profile, string? scopePath, CancellationToken ct = default) =>
             throw new NotSupportedException();
 
-        public IAsyncEnumerable<Result<DryRunChunk, string>> SimulateStreamAsync(
-            Profile profile, string? scopePath, DryRunProgressCounters? progress = null,
-            CancellationToken ct = default) =>
-            SimulateStreamAsync(profile.Id, scopePath, progress, ct);
-
         public async IAsyncEnumerable<Result<DryRunChunk, string>> SimulateStreamAsync(
-            Guid profileId, string? scopePath, DryRunProgressCounters? progress = null,
+            Profile profile, string? scopePath, DryRunProgressCounters? progress = null,
             [EnumeratorCancellation] CancellationToken ct = default)
         {
             for (int i = 0; i < 3; i++)

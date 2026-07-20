@@ -20,6 +20,22 @@ public sealed record Profile
     public required string Name { get; init; }
     public required bool Active { get; init; }
     public required SyncMode SyncMode { get; init; }
+
+    /// <summary>Dry-run preview only: when true, destination roots are swept to list pre-existing
+    /// files (Untouched in AdditiveArchive, Deleted orphans in Mirror). Mirror always sweeps
+    /// regardless of this flag. Optional/additive: absent in legacy JSON deserializes to false.</summary>
+    public bool ScanDestination { get; init; }
+
+    /// <summary>The single source of truth for "does a dry run sweep the destination roots": Mirror
+    /// always sweeps (its only source of Deleted-orphan previews), AdditiveArchive honors
+    /// <see cref="ScanDestination"/>. Consumed by the engine and both dry-run handlers; the static
+    /// form lets UI layers apply the same rule to transient (not-yet-saved) editor state.</summary>
+    public static bool ComputeEffectiveScanDestination(SyncMode mode, bool scanDestination) =>
+        mode == SyncMode.Mirror || scanDestination;
+
+    [JsonIgnore]
+    public bool EffectiveScanDestination => ComputeEffectiveScanDestination(SyncMode, ScanDestination);
+
     public required TargetLayout TargetLayout { get; init; }
     public required TriggerSettings Triggers { get; init; }
     public required IReadOnlyList<SourceConfig> Sources { get; init; }

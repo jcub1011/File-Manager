@@ -53,6 +53,75 @@ public sealed class ProfileEditorViewModelTests
     }
 
     [Fact]
+    public void New_profile_defaults_scan_destination_off_and_editable()
+    {
+        var (editor, _) = NewEditor();
+        editor.LoadNew();
+        Assert.False(editor.ScanDestination);
+        Assert.True(editor.CanEditScanDestination);
+        Assert.False(editor.BuildProfile().ScanDestination);
+    }
+
+    [Fact]
+    public void Mirror_forces_scan_destination_on_and_locks_the_field()
+    {
+        var (editor, _) = NewEditor();
+        editor.LoadNew();
+        editor.SyncMode = SyncMode.Mirror;
+
+        Assert.True(editor.ScanDestination);
+        Assert.False(editor.CanEditScanDestination);
+        Assert.True(editor.BuildProfile().ScanDestination);
+    }
+
+    [Fact]
+    public void Switching_mirror_back_to_additive_restores_the_scan_destination_preference()
+    {
+        var (editor, _) = NewEditor();
+        editor.LoadNew();                       // AdditiveArchive, scan off
+
+        // Mirror forces the sweep on and locks the field...
+        editor.SyncMode = SyncMode.Mirror;
+        Assert.True(editor.ScanDestination);
+
+        // ...and switching back must NOT leave it stuck on — the AdditiveArchive preference (off) returns.
+        editor.SyncMode = SyncMode.AdditiveArchive;
+        Assert.False(editor.ScanDestination);
+        Assert.True(editor.CanEditScanDestination);
+        Assert.False(editor.BuildProfile().ScanDestination);
+    }
+
+    [Fact]
+    public void Switching_mirror_back_to_additive_preserves_an_explicit_scan_on_preference()
+    {
+        var (editor, _) = NewEditor();
+        editor.LoadNew();
+        editor.ScanDestination = true;          // the user opted the AdditiveArchive sweep on
+
+        editor.SyncMode = SyncMode.Mirror;      // forced on either way
+        Assert.True(editor.ScanDestination);
+
+        editor.SyncMode = SyncMode.AdditiveArchive;
+        Assert.True(editor.ScanDestination);    // their explicit choice is restored, not cleared
+    }
+
+    [Fact]
+    public void Scan_destination_round_trips_through_load_and_build_in_additive()
+    {
+        var (editor, _) = NewEditor();
+        Profile original = ProfileFactory.Sample() with
+        {
+            SyncMode = SyncMode.AdditiveArchive,
+            ScanDestination = true,
+        };
+
+        editor.Load(original);
+        Assert.True(editor.ScanDestination);
+        Assert.True(editor.CanEditScanDestination);
+        Assert.True(editor.BuildProfile().ScanDestination);
+    }
+
+    [Fact]
     public void TryBuildDraft_returns_the_current_draft_when_fields_parse()
     {
         var (editor, _) = NewEditor();
