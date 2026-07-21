@@ -19,14 +19,13 @@
                         IsVisible="{Binding StatusMessage, Converter={x:Static ObjectConverters.IsNotNull}}">
                     <TextBlock Text="{Binding StatusMessage}" TextWrapping="Wrap" />
                 </Border>
-                <StackPanel Orientation="Horizontal" Spacing="8">
-                    <Button Content="Save" Command="{Binding SaveCommand}" Classes="accent" />
+                <!-- Save / Discard now live on the tab-header row (MainWindow.axaml). This bar keeps
+                     the blocking-validation "save anyway" acknowledgement beside its warning. -->
+                <StackPanel Orientation="Horizontal" Spacing="8"
+                            IsVisible="{Binding CanAcknowledgeAndSave}">
                     <Button Content="I understand the risk — save anyway"
                             Command="{Binding AcknowledgeAndSaveCommand}"
-                            Classes="danger"
-                            IsVisible="{Binding CanAcknowledgeAndSave}" />
-                    <Button Content="Discard changes" Command="{Binding DiscardCommand}"
-                            IsVisible="{Binding IsDirty}" />
+                            Classes="danger" />
                 </StackPanel>
                 <Border Classes="infoBar warning" IsVisible="{Binding ShowUnsavedWarning}">
                     <TextBlock Text="You have unsaved changes — save or discard them before switching profiles."

@@ -91,15 +91,61 @@
 
             <GridSplitter Grid.Column="1" Background="Transparent" ResizeDirection="Columns" />
 
-            <TabControl Grid.Column="2" Classes="documents" Margin="8,6,10,8"
-                        IsVisible="{Binding Editor.HasProfile}">
-                <TabItem Header="Profile">
-                    <v:ProfileEditorView DataContext="{Binding Editor}" />
-                </TabItem>
-                <TabItem Header="Dry Run" IsEnabled="{Binding DryRun.CanRun}">
-                    <v:DryRunView DataContext="{Binding DryRun}" />
-                </TabItem>
-            </TabControl>
+            <!-- Document area: tabs, with each tab's primary action buttons overlaid at the
+                 right of the header strip (context-switched by the active tab's IsSelected). -->
+            <Grid Grid.Column="2" Margin="8,6,10,8" IsVisible="{Binding Editor.HasProfile}">
+                <TabControl Classes="documents">
+                    <TabItem x:Name="ProfileTab" Header="Profile">
+                        <v:ProfileEditorView DataContext="{Binding Editor}" />
+                    </TabItem>
+                    <TabItem x:Name="DryRunTab" Header="Dry Run" IsEnabled="{Binding DryRun.CanRun}">
+                        <v:DryRunView DataContext="{Binding DryRun}" />
+                    </TabItem>
+                </TabControl>
+
+                <!-- Action buttons on the tab-header row (right side). Each sub-group re-typed for
+                     compiled bindings and shown only while its tab is active. -->
+                <StackPanel HorizontalAlignment="Right" VerticalAlignment="Top"
+                            Orientation="Horizontal" Spacing="8" Margin="0,6,0,0">
+                    <StackPanel Orientation="Horizontal" Spacing="8"
+                                DataContext="{Binding Editor}" x:DataType="vm:ProfileEditorViewModel"
+                                IsVisible="{Binding #ProfileTab.IsSelected}">
+                        <Button Content="Save" Command="{Binding SaveCommand}" Classes="accent" />
+                        <Button Content="Discard changes" Command="{Binding DiscardCommand}"
+                                IsVisible="{Binding IsDirty}" />
+                    </StackPanel>
+
+                    <StackPanel Orientation="Horizontal" Spacing="6"
+                                DataContext="{Binding DryRun}" x:DataType="vm:DryRunViewModel"
+                                IsVisible="{Binding #DryRunTab.IsSelected}">
+                        <!-- Split button: the primary press runs the dry run with the currently selected scan
+                             choice; the dropdown changes that choice (checkmark = active). "No Destination
+                             Scan" is disabled in Mirror mode, where the destination sweep is mandatory. -->
+                        <SplitButton Classes="accent" Command="{Binding RunCommand}" Content="{Binding RunButtonLabel}">
+                            <SplitButton.Flyout>
+                                <MenuFlyout>
+                                    <MenuItem Header="{Binding WithScanLabel}"
+                                              Command="{Binding SelectWithScanCommand}">
+                                        <MenuItem.Icon>
+                                            <TextBlock Text="✓" IsVisible="{Binding RunWithDestinationScan}" />
+                                        </MenuItem.Icon>
+                                    </MenuItem>
+                                    <MenuItem Header="{Binding NoScanLabel}"
+                                              Command="{Binding SelectNoScanCommand}"
+                                              IsEnabled="{Binding CanChooseNoScan}"
+                                              ToolTip.Tip="Mirror mode always scans the destinations to detect files to delete.">
+                                        <MenuItem.Icon>
+                                            <TextBlock Text="✓" IsVisible="{Binding !RunWithDestinationScan}" />
+                                        </MenuItem.Icon>
+                                    </MenuItem>
+                                </MenuFlyout>
+                            </SplitButton.Flyout>
+                        </SplitButton>
+                        <Button Content="Cancel" Command="{Binding RunCancelCommand}"
+                                IsVisible="{Binding RunCommand.IsRunning}" />
+                    </StackPanel>
+                </StackPanel>
+            </Grid>
         </Grid>
     </DockPanel>
 
