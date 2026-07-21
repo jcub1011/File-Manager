@@ -112,6 +112,7 @@ internal static class Program
         services.AddSingleton<DryRunStreamHandler>();
         services.AddSingleton<GetSettingsHandler>();
         services.AddSingleton<UpdateSettingsHandler>();
+        services.AddSingleton<RelocateProfilesHandler>();
         services.AddSingleton<ShutdownHandler>();
         services.AddSingleton<IReadOnlyDictionary<string, IIpcRequestHandler>>(provider =>
         {
@@ -127,6 +128,7 @@ internal static class Program
                 provider.GetRequiredService<DryRunStreamHandler>(),
                 provider.GetRequiredService<GetSettingsHandler>(),
                 provider.GetRequiredService<UpdateSettingsHandler>(),
+                provider.GetRequiredService<RelocateProfilesHandler>(),
                 provider.GetRequiredService<ShutdownHandler>(),
             ];
             Dictionary<string, IIpcRequestHandler> table = new(StringComparer.Ordinal);

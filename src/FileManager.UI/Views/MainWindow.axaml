@@ -37,6 +37,14 @@
 
             <StackPanel Grid.Column="2" Orientation="Horizontal">
                 <Button Classes="iconButton" chrome:WindowDecorationProperties.ElementRole="User"
+                        Command="{Binding ImportProfilesCommand}" ToolTip.Tip="Import profiles">
+                    <PathIcon Data="{StaticResource IconImport}" Width="16" Height="16" />
+                </Button>
+                <Button Classes="iconButton" chrome:WindowDecorationProperties.ElementRole="User"
+                        Command="{Binding ExportProfilesCommand}" ToolTip.Tip="Export profiles">
+                    <PathIcon Data="{StaticResource IconExport}" Width="16" Height="16" />
+                </Button>
+                <Button Classes="iconButton" chrome:WindowDecorationProperties.ElementRole="User"
                         Command="{Binding OpenLogFolderCommand}" ToolTip.Tip="Open log folder">
                     <PathIcon Data="{StaticResource IconFolder}" Width="16" Height="16" />
                 </Button>
@@ -163,6 +171,27 @@
                     </StackPanel>
                 </StackPanel>
             </Grid>
+
+            <!-- Empty state: shown whenever no profile is loaded in the editor. The message switches
+                 on whether any profiles exist at all (List.HasProfiles): none → create one; some →
+                 pick one. Text-only; the actionable "+" lives in the sidebar. -->
+            <StackPanel Grid.Column="2" VerticalAlignment="Center" HorizontalAlignment="Center"
+                        Spacing="8" MaxWidth="360" IsVisible="{Binding !Editor.HasProfile}">
+                <PathIcon Data="{StaticResource IconFolder}" Width="40" Height="40"
+                          HorizontalAlignment="Center" Foreground="{DynamicResource Brush.Text.Secondary}" />
+                <StackPanel Spacing="4" IsVisible="{Binding List.HasProfiles}">
+                    <TextBlock Text="No profile selected" Classes="panelHeader" HorizontalAlignment="Center" />
+                    <TextBlock Text="Select a profile in the sidebar to get started."
+                               Foreground="{DynamicResource Brush.Text.Secondary}"
+                               TextWrapping="Wrap" TextAlignment="Center" />
+                </StackPanel>
+                <StackPanel Spacing="4" IsVisible="{Binding !List.HasProfiles}">
+                    <TextBlock Text="No profiles yet" Classes="panelHeader" HorizontalAlignment="Center" />
+                    <TextBlock Text="Create a profile using the + in the sidebar to get started."
+                               Foreground="{DynamicResource Brush.Text.Secondary}"
+                               TextWrapping="Wrap" TextAlignment="Center" />
+                </StackPanel>
+            </StackPanel>
         </Grid>
     </DockPanel>
 

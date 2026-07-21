@@ -1,0 +1,54 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="using:FileManager.UI.ViewModels"
+        x:Class="FileManager.UI.Views.ExportProfilesWindow"
+        x:DataType="vm:ExportProfilesViewModel"
+        Width="460" Height="520"
+        WindowStartupLocation="CenterOwner"
+        FontFamily="{StaticResource AppFontFamily}"
+        FontSize="{StaticResource Font.Body}"
+        Background="{DynamicResource Brush.Window.Background}"
+        Title="Export profiles">
+
+    <DockPanel Margin="16">
+        <Border DockPanel.Dock="Top" Classes="sectionHeader" Margin="0,0,0,8">
+            <TextBlock Text="Export profiles" />
+        </Border>
+        <TextBlock DockPanel.Dock="Top" TextWrapping="Wrap" Classes="secondary" Margin="0,0,0,8"
+                   Text="Select the profiles to export, then choose a destination folder. Each profile is written as its own .json file that can be re-imported later." />
+
+        <StackPanel DockPanel.Dock="Top" Orientation="Horizontal" Spacing="8" Margin="0,0,0,8">
+            <Button Content="Select all / none" Command="{Binding SelectAllCommand}" IsEnabled="{Binding HasProfiles}" />
+        </StackPanel>
+
+        <StackPanel DockPanel.Dock="Bottom" Spacing="8" Margin="0,8,0,0">
+            <Border Classes="infoBar danger"
+                    IsVisible="{Binding ErrorMessage, Converter={x:Static ObjectConverters.IsNotNull}}">
+                <TextBlock Text="{Binding ErrorMessage}" TextWrapping="Wrap" />
+            </Border>
+            <Border Classes="infoBar success"
+                    IsVisible="{Binding StatusMessage, Converter={x:Static ObjectConverters.IsNotNull}}">
+                <TextBlock Text="{Binding StatusMessage}" TextWrapping="Wrap" />
+            </Border>
+            <StackPanel Orientation="Horizontal" Spacing="8" HorizontalAlignment="Right">
+                <Button Content="Export…" Command="{Binding ExportCommand}" Classes="accent"
+                        IsEnabled="{Binding CanExport}" />
+                <Button Content="Close" Click="OnCloseClick" />
+            </StackPanel>
+        </StackPanel>
+
+        <TextBlock IsVisible="{Binding !HasProfiles}" Classes="secondary"
+                   Text="No profiles to export." VerticalAlignment="Top" />
+
+        <ScrollViewer IsVisible="{Binding HasProfiles}">
+            <ItemsControl ItemsSource="{Binding Profiles}">
+                <ItemsControl.ItemTemplate>
+                    <DataTemplate x:DataType="vm:ExportProfileRow">
+                        <CheckBox Content="{Binding Name}" IsChecked="{Binding IsSelected}" Margin="0,2" />
+                    </DataTemplate>
+                </ItemsControl.ItemTemplate>
+            </ItemsControl>
+        </ScrollViewer>
+    </DockPanel>
+
+</Window>

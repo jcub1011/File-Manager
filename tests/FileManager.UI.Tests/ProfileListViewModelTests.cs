@@ -35,6 +35,20 @@ public sealed class ProfileListViewModelTests
     }
 
     [Fact]
+    public async Task HasProfiles_tracks_whether_any_profiles_exist()
+    {
+        var (list, gateway) = NewList();
+        Assert.False(list.HasProfiles);            // nothing loaded yet
+
+        await list.RefreshAsync();
+        Assert.True(list.HasProfiles);             // two profiles present
+
+        gateway.ListResult = Result<IReadOnlyList<ProfileSummary>, IpcError>.Success([]);
+        await list.RefreshAsync();
+        Assert.False(list.HasProfiles);            // now empty
+    }
+
+    [Fact]
     public async Task Refresh_failure_surfaces_and_keeps_old_rows()
     {
         var (list, gateway) = NewList();

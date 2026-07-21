@@ -2,6 +2,7 @@ using FileManager.Contracts;
 using FileManager.Contracts.IPC;
 using FileManager.Contracts.Primitives;
 using FileManager.Contracts.Profiles;
+using FileManager.Core.Settings;
 using Microsoft.Extensions.Logging;
 using System;
 using System.Collections.Generic;
@@ -17,17 +18,21 @@ namespace FileManager.Core.Profiles;
 /// Error is present and no BlockingWarning is present without acknowledgeWarnings — callers
 /// re-derive "saved" from the severities. The failure string is reserved for I/O and
 /// serialization faults.</summary>
-public sealed class ProfileStore(ILogger<ProfileStore> logger, EnginePaths paths, IProfileValidator validator) : IProfileStore
+public sealed class ProfileStore(ILogger<ProfileStore> logger, ISettingsProvider settings, IProfileValidator validator) : IProfileStore
 {
+    // Resolved live from settings so a relocation (RelocateProfilesRequest) takes effect on the next
+    // read without reconstructing the store. The default matches EnginePaths.ProfilesDirectory.
+    private string ProfilesDirectory => settings.Current.ProfilesDirectory;
+
     public Result<IReadOnlyList<Profile>, string> LoadAll()
     {
         try
         {
-            if (!Directory.Exists(paths.ProfilesDirectory))
+            if (!Directory.Exists(ProfilesDirectory))
                 return Array.Empty<Profile>();
 
             List<Profile> profiles = [];
-            foreach (string file in Directory.EnumerateFiles(paths.ProfilesDirectory, "*.json"))
+            foreach (string file in Directory.EnumerateFiles(ProfilesDirectory, "*.json"))
             {
                 // Simplification of §2.4's "load as inactive with a surfaced issue": a corrupt
                 // profile file is skipped with a logged warning. Forward-safe — the catalog
@@ -55,12 +60,12 @@ public sealed class ProfileStore(ILogger<ProfileStore> logger, EnginePaths paths
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
-            logger.LogError(ex, "Could not enumerate profiles in {Directory}", paths.ProfilesDirectory);
+            logger.LogError(ex, "Could not enumerate profiles in {Directory}", ProfilesDirectory);
             return $"could not enumerate profiles: {ex.Message}";
         }
         catch (Exception ex)
         {
-            logger.LogError(ex, "Enumerating profiles in {Directory} failed unexpectedly", paths.ProfilesDirectory);
+            logger.LogError(ex, "Enumerating profiles in {Directory} failed unexpectedly", ProfilesDirectory);
             return $"could not enumerate profiles: {ex.GetType().Name}: {ex.Message}";
         }
     }
@@ -114,7 +119,7 @@ public sealed class ProfileStore(ILogger<ProfileStore> logger, EnginePaths paths
 
         try
         {
-            Directory.CreateDirectory(paths.ProfilesDirectory);
+            Directory.CreateDirectory(ProfilesDirectory);
             string finalPath = ProfileFilePath(profile.Id);
             string tempPath = finalPath + ".tmp";
 
@@ -163,5 +168,5 @@ public sealed class ProfileStore(ILogger<ProfileStore> logger, EnginePaths paths
     }
 
     private string ProfileFilePath(Guid profileId) =>
-        Path.Combine(paths.ProfilesDirectory, profileId.ToString("D") + ".json");
+        Path.Combine(ProfilesDirectory, profileId.ToString("D") + ".json");
 }

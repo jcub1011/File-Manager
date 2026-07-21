@@ -41,6 +41,17 @@ namespace FileManager.UI
                 {
                     SettingsWindow dialog = new() { DataContext = settings };
                     settings.RequestClose = dialog.Close;
+                    // The move-profiles prompt is modal on the settings dialog and defaults to No
+                    // (the ConfirmWindow's No button is IsDefault).
+                    settings.ConfirmMoveProfiles = async message =>
+                        await new ConfirmWindow(message, "Move profiles", "Don't move", confirmIsDanger: false)
+                            .ShowDialog<bool>(dialog);
+                    await dialog.ShowDialog(window);
+                };
+                viewModel.ShowExportDialog = async export =>
+                {
+                    ExportProfilesWindow dialog = new() { DataContext = export };
+                    export.RequestClose = dialog.Close;
                     await dialog.ShowDialog(window);
                 };
                 viewModel.ConfirmClose = async message =>

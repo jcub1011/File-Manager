@@ -301,6 +301,7 @@ public sealed class ScanScheduler : IScanScheduler, IDisposable
         private readonly ScanScheduler _sched;
         private readonly ScanThreadingSettings _threading;
         private readonly Channel<ScanResult> _channel;
+        private readonly int _capacity;
         private readonly CancellationTokenRegistration _ctReg;
 
         // Per-volume DFS stacks + a rotation over them for cross-volume fairness within the session.
@@ -321,7 +322,8 @@ public sealed class ScanScheduler : IScanScheduler, IDisposable
             _sched = sched;
             Options = options;
             _threading = threading;
-            _channel = Channel.CreateBounded<ScanResult>(new BoundedChannelOptions(Math.Max(1, options.OutputCapacity))
+            _capacity = Math.Max(1, options.OutputCapacity);
+            _channel = Channel.CreateBounded<ScanResult>(new BoundedChannelOptions(_capacity)
             {
                 SingleReader = true,
                 SingleWriter = false,
@@ -408,6 +410,14 @@ public sealed class ScanScheduler : IScanScheduler, IDisposable
                 else
                 {
                     _parked.Add(work);
+                    // Lost-wake-up guard: the worker parks because a TryWrite found the buffer full, but
+                    // the consumer may have drained that buffer between the failed write and this lock.
+                    // If space is now free, no future OnConsumed is guaranteed (the consumer may already
+                    // be parked in WaitToRead on an empty buffer), so re-arm here. When the buffer is
+                    // still full the pending reads will re-arm via OnConsumed, so leaving it parked (the
+                    // desired behavior for a genuinely stalled, unconsumed session) is safe.
+                    if (_channel.Reader.CanCount && _channel.Reader.Count < _capacity)
+                        RearmParkedLocked();
                 }
                 Monitor.PulseAll(_sched._lock);
             }
@@ -418,23 +428,29 @@ public sealed class ScanScheduler : IScanScheduler, IDisposable
         private void OnConsumed()
         {
             lock (_sched._lock)
+                RearmParkedLocked();
+        }
+
+        // Move any parked work back to the pending stacks so workers resume it, and wake/spawn workers.
+        // Caller holds _sched._lock. Used both when the consumer frees buffer space and, to close a
+        // lost-wake-up, when a worker parks into a buffer the consumer has already drained.
+        private void RearmParkedLocked()
+        {
+            if (_cancelled || _parked.Count == 0)
+                return;
+            foreach (ScanWorkState w in _parked)
             {
-                if (_cancelled || _parked.Count == 0)
-                    return;
-                foreach (ScanWorkState w in _parked)
+                if (!_pending.TryGetValue(w.VolumeKey, out Stack<ScanWorkState>? stack))
                 {
-                    if (!_pending.TryGetValue(w.VolumeKey, out Stack<ScanWorkState>? stack))
-                    {
-                        stack = new Stack<ScanWorkState>();
-                        _pending[w.VolumeKey] = stack;
-                        _volumeOrder.Add(w.VolumeKey);
-                    }
-                    stack.Push(w);
+                    stack = new Stack<ScanWorkState>();
+                    _pending[w.VolumeKey] = stack;
+                    _volumeOrder.Add(w.VolumeKey);
                 }
-                _parked.Clear();
-                Monitor.PulseAll(_sched._lock);
-                _sched.MaybeSpawnWorkerLocked();
+                stack.Push(w);
             }
+            _parked.Clear();
+            Monitor.PulseAll(_sched._lock);
+            _sched.MaybeSpawnWorkerLocked();
         }
 
         // Caller holds _sched._lock.

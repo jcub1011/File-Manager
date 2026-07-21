@@ -1,11 +1,16 @@
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
+using FileManager.Contracts;
 using FileManager.Contracts.IPC;
 using FileManager.Contracts.Profiles;
 using FileManager.Contracts.Settings;
 using FileManager.UI.Services;
 using Serilog;
 using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Text.Json;
 using System.Threading.Tasks;
 
 namespace FileManager.UI.ViewModels;
@@ -37,6 +42,8 @@ public sealed partial class MainWindowViewModel : ViewModelBase
         DryRun = new DryRunViewModel(gateway, dryRunActions);
         StatusBar = new StatusBarViewModel(gateway);
 
+        List.CreateProfileCommand = NewProfileCommand;
+        List.ExportProfileCommand = ExportProfileCommand;
         List.CanNavigate = () => !Editor.IsDirty;
         List.NavigationBlocked = () => Editor.ShowUnsavedWarning = true;
         List.SelectionCommitted = item => _ = LoadSelectionSafeAsync(item);
@@ -182,9 +189,128 @@ public sealed partial class MainWindowViewModel : ViewModelBase
     {
         if (ShowSettingsDialog is null)
             return;
-        SettingsViewModel settings = new(_gateway, _folderPicker);
+        SettingsViewModel settings = new(_gateway, _folderPicker)
+        {
+            // A relocation changes which profiles the service serves, so refresh the list to reflect
+            // the new directory's contents without waiting for the user to hit refresh.
+            ProfilesRelocated = () => List.RefreshAsync(),
+        };
         await settings.LoadAsync();
         await ShowSettingsDialog(settings);
+    }
+
+    /// <summary>Exports a single profile (the right-clicked row) to a chosen folder as one .json file.</summary>
+    [RelayCommand]
+    private async Task ExportProfile(ProfileListItem? item)
+    {
+        if (item is null)
+            return;
+        try
+        {
+            string? folder = await _folderPicker.PickFolderAsync($"Choose a folder to export \"{item.Name}\"");
+            if (folder is null)
+                return;
+
+            var loaded = await _gateway.GetProfileAsync(item.ProfileId);
+            if (loaded.TryGetError(out IpcError? error))
+            {
+                List.ErrorMessage = $"Could not export \"{item.Name}\": {error.Message}";
+                return;
+            }
+            loaded.TryGetValue(out Profile? profile);
+
+            string fileName = ProfileExport.Sanitize(profile!.Name) + ".json";
+            ProfileExport.WriteAtomic(Path.Combine(folder, fileName), profile);
+            List.ErrorMessage = null;
+        }
+        catch (Exception ex)
+        {
+            Log.Error(ex, "Exporting profile {ProfileId} failed unexpectedly", item.ProfileId);
+            List.ErrorMessage = $"Could not export \"{item.Name}\": {ex.Message}";
+        }
+    }
+
+    /// <summary>Set by the composition root to show the modal export dialog for a prepared VM.
+    /// Kept as a callback so the shell VM stays window-agnostic (mirrors the settings seam).</summary>
+    public Func<ExportProfilesViewModel, Task>? ShowExportDialog { get; set; }
+
+    [RelayCommand]
+    public async Task ExportProfiles()
+    {
+        if (ShowExportDialog is null)
+            return;
+        ExportProfilesViewModel export = new(_gateway, _folderPicker);
+        await export.LoadAsync();
+        await ShowExportDialog(export);
+    }
+
+    /// <summary>Imports profile files as new copies: each keeps its settings but gets a fresh id and a
+    /// "(imported)" name, and comes in inactive so it never silently starts syncing or collides with an
+    /// active profile on import. Collisions with existing ids are therefore impossible.</summary>
+    [RelayCommand]
+    public async Task ImportProfiles()
+    {
+        try
+        {
+            IReadOnlyList<string> files = await _folderPicker.PickFilesAsync("Choose profile files to import");
+            if (files.Count == 0)
+                return;
+
+            int imported = 0;
+            List<string> problems = [];
+            foreach (string file in files)
+            {
+                Profile? profile;
+                try
+                {
+                    using FileStream stream = File.OpenRead(file);
+                    profile = JsonSerializer.Deserialize(stream, FileManagerJsonContext.Default.Profile);
+                }
+                catch (Exception ex) when (ex is IOException or JsonException)
+                {
+                    problems.Add($"{Path.GetFileName(file)}: {ex.Message}");
+                    continue;
+                }
+                if (profile is null)
+                {
+                    problems.Add($"{Path.GetFileName(file)}: not a valid profile file");
+                    continue;
+                }
+
+                Profile copy = profile with
+                {
+                    Id = Guid.NewGuid(),
+                    Name = profile.Name + " (imported)",
+                    Active = false,
+                };
+                var saved = await _gateway.SaveProfileAsync(copy, acknowledgeWarnings: false);
+                if (saved.TryGetError(out IpcError? error))
+                {
+                    problems.Add($"{Path.GetFileName(file)}: {error.Message}");
+                    continue;
+                }
+                saved.TryGetValue(out SaveOutcome? outcome);
+                if (!outcome!.Saved)
+                {
+                    string codes = string.Join(", ", outcome.Issues.Select(i => i.Code));
+                    problems.Add($"{Path.GetFileName(file)}: not imported ({codes})");
+                    continue;
+                }
+                imported++;
+            }
+
+            await List.RefreshAsync();
+            // The list banner is danger-styled, so only raise it when something needs the user's
+            // attention; a clean import is evident from the new rows appearing in the list.
+            List.ErrorMessage = problems.Count > 0
+                ? $"Imported {imported} of {files.Count} file(s). Not imported: {string.Join("; ", problems)}"
+                : null;
+        }
+        catch (Exception ex)
+        {
+            Log.Error(ex, "Importing profiles failed unexpectedly");
+            List.ErrorMessage = $"Import failed unexpectedly: {ex.Message}";
+        }
     }
 
     private async Task LoadSelectionSafeAsync(ProfileListItem? item)

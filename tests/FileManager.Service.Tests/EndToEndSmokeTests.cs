@@ -45,11 +45,14 @@ public sealed class EndToEndSmokeTests : IAsyncLifetime
         FileSystemService fileSystem = new(NullLogger<FileSystemService>.Instance);
         FilterCompiler filterCompiler = new(NullLogger<FilterCompiler>.Instance, TimeProvider.System);
         ProfileValidator validator = new(NullLogger<ProfileValidator>.Instance, filterCompiler);
-        ProfileStore store = new(NullLogger<ProfileStore>.Instance, paths, validator);
+        SettingsService settings = new(NullLogger<SettingsService>.Instance, paths);
+        // The store resolves its directory from settings; pin it under the temp engine root so the
+        // smoke test never touches the real %LOCALAPPDATA% profiles directory.
+        settings.Update(settings.Current with { ProfilesDirectory = Path.Combine(paths.Root, "profiles") });
+        ProfileStore store = new(NullLogger<ProfileStore>.Instance, settings, validator);
         ProfileCatalog catalog = new(NullLogger<ProfileCatalog>.Instance, store);
         FileHasher hasher = new(NullLogger<FileHasher>.Instance);
         ConflictResolver resolver = new(new(), new(), NullLogger<ConflictResolver>.Instance);
-        SettingsService settings = new(NullLogger<SettingsService>.Instance, paths);
         WindowsVolumeInfoProvider volumes = new(NullLogger<WindowsVolumeInfoProvider>.Instance);
         ScanScheduler scheduler = new(NullLogger<ScanScheduler>.Instance, fileSystem, settings);
         SourceScanner scanner = new(TimeProvider.System, scheduler, volumes);

@@ -82,6 +82,17 @@
                     Command="{Binding BrowseScratchDirectoryCommand}" />
         </Grid>
 
+        <Border Classes="sectionHeader" Margin="0,8,0,0"><TextBlock Text="Profiles storage" /></Border>
+        <TextBlock TextWrapping="Wrap" Classes="secondary" Margin="0,0,0,8"
+                   Text="Where profile files are stored. Change… applies immediately: it asks whether to move the existing profiles into the new folder (defaulting to no), then switches the service to it." />
+
+        <Grid ColumnDefinitions="140,*,Auto" RowDefinitions="Auto" Margin="0,0,0,4">
+            <TextBlock Grid.Column="0" Classes="fieldLabel" Text="Location" />
+            <TextBox Grid.Column="1" Text="{Binding ProfilesDirectory}" Margin="0,2" IsReadOnly="True" />
+            <Button Grid.Column="2" Content="Change…" Margin="8,2,0,2"
+                    Command="{Binding ChangeProfilesDirectoryCommand}" IsEnabled="{Binding !IsBusy}" />
+        </Grid>
+
         <Expander Header="Advanced: per-drive overrides" Margin="0,8,0,0">
             <StackPanel Spacing="8" Margin="0,8,0,0">
                 <TextBlock Classes="secondary" TextWrapping="Wrap"

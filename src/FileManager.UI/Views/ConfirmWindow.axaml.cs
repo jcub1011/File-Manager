@@ -17,6 +17,18 @@ namespace FileManager.UI.Views
             MessageText.Text = message;
         }
 
+        /// <summary>Yes/No confirmation with custom button labels. <paramref name="confirmIsDanger"/>
+        /// keeps the destructive red styling on the confirm button (true for close-time warnings);
+        /// pass false for a neutral choice such as relocating profiles.</summary>
+        public ConfirmWindow(string message, string yesText, string noText, bool confirmIsDanger = true) : this()
+        {
+            MessageText.Text = message;
+            YesButton.Content = yesText;
+            NoButton.Content = noText;
+            if (!confirmIsDanger)
+                YesButton.Classes.Remove("danger");
+        }
+
         private void OnYesClick(object? sender, RoutedEventArgs e) => Close(true);
 
         private void OnNoClick(object? sender, RoutedEventArgs e) => Close(false);

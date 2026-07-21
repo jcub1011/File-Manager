@@ -8,6 +8,7 @@ using System.Collections.ObjectModel;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Windows.Input;
 
 namespace FileManager.UI.ViewModels;
 
@@ -18,6 +19,12 @@ public sealed record ProfileListItem(Guid ProfileId, string Name, bool Active, s
 
     /// <summary>Two-letter badge shown in the collapsed sidebar rail (see <see cref="ProfileAcronym"/>).</summary>
     public string Acronym => ProfileAcronym.From(Name);
+
+    /// <summary>Bound by the row's right-click "Export" menu item in both the list and the collapsed
+    /// rail. Stamped onto every row from <see cref="ProfileListViewModel.ExportProfileCommand"/> when
+    /// the list is built, so the popup binds directly to its own DataContext (no cross-namescope
+    /// ancestor lookup). Takes this row as its parameter.</summary>
+    public ICommand? ExportCommand { get; init; }
 }
 
 public sealed partial class ProfileListViewModel(IIpcGateway gateway) : ViewModelBase
@@ -41,6 +48,21 @@ public sealed partial class ProfileListViewModel(IIpcGateway gateway) : ViewMode
     /// <see cref="SearchText"/>, plus the currently selected profile (so filtering never drops the
     /// active selection out from under the editor).</summary>
     public ObservableCollection<ProfileListItem> FilteredProfiles { get; } = [];
+
+    /// <summary>Set by the shell to the "new profile" command. Bound by the collapsed rail's add
+    /// tile so it can start a new profile without the rail needing the shell view model in scope.</summary>
+    public IRelayCommand? CreateProfileCommand { get; set; }
+
+    /// <summary>Set by the shell to its single-profile export command (takes a <see cref="ProfileListItem"/>).
+    /// Stamped onto every row's <see cref="ProfileListItem.ExportCommand"/> in <see cref="RefreshAsync"/>
+    /// so the right-click "Export" menu works in both the list and the collapsed rail.</summary>
+    public ICommand? ExportProfileCommand { get; set; }
+
+    /// <summary>Whether any profiles exist at all (independent of the search filter). Drives the
+    /// content-area empty state: false → "no profiles yet, create one"; true → "select a profile".
+    /// Maintained by <see cref="RefreshAsync"/>, the sole mutation point of <see cref="Profiles"/>.</summary>
+    [ObservableProperty]
+    public partial bool HasProfiles { get; set; }
 
     /// <summary>Asked before honoring a selection change; false (dirty editor) reverts it.</summary>
     public Func<bool>? CanNavigate { get; set; }
@@ -180,7 +202,11 @@ public sealed partial class ProfileListViewModel(IIpcGateway gateway) : ViewMode
             _revertingSelection = true;   // a refresh is not a user navigation
             Profiles.Clear();
             foreach (ProfileSummary summary in summaries!.OrderBy(s => s.Name, StringComparer.OrdinalIgnoreCase))
-                Profiles.Add(new ProfileListItem(summary.ProfileId, summary.Name, summary.Active, summary.TriggerSummary));
+                Profiles.Add(new ProfileListItem(summary.ProfileId, summary.Name, summary.Active, summary.TriggerSummary)
+                {
+                    ExportCommand = ExportProfileCommand,
+                });
+            HasProfiles = Profiles.Count > 0;
             RebuildFiltered(selectedId);   // build the filtered view before re-selecting into it
             SelectedProfile = Profiles.FirstOrDefault(p => p.ProfileId == selectedId);
             _revertingSelection = false;

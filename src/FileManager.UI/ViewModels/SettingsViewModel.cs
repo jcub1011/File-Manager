@@ -49,6 +49,8 @@ public sealed partial class SettingsViewModel : ViewModelBase
 
     [ObservableProperty] public partial string ScratchDirectory { get; set; } = GlobalSettings.DefaultScratchDirectory;
 
+    [ObservableProperty] public partial string ProfilesDirectory { get; set; } = GlobalSettings.DefaultProfilesDirectory;
+
     [ObservableProperty] public partial string? StatusMessage { get; set; }
     [ObservableProperty] public partial string? ErrorMessage { get; set; }
     [ObservableProperty] public partial bool IsBusy { get; set; }
@@ -70,6 +72,62 @@ public sealed partial class SettingsViewModel : ViewModelBase
         string? picked = await _folderPicker.PickFolderAsync("Choose the dry-run scratch directory");
         if (picked is not null)
             ScratchDirectory = picked;
+    }
+
+    /// <summary>Set by the host to ask (modal Yes/No, defaulting to No) whether the existing profiles
+    /// should be moved into the newly chosen folder. Kept as a callback so the VM stays
+    /// window-agnostic (mirrors <see cref="RequestClose"/>).</summary>
+    public Func<string, Task<bool>>? ConfirmMoveProfiles { get; set; }
+
+    /// <summary>Set by the host to refresh the profile list after a successful relocation (the service
+    /// now serves a different directory). Kept as a callback so the VM stays shell-agnostic.</summary>
+    public Func<Task>? ProfilesRelocated { get; set; }
+
+    /// <summary>Changes the profiles storage folder. Applied immediately (and transactionally) on the
+    /// service via a dedicated IPC call — independent of the Save button — because it moves files and
+    /// reloads the catalog. The generic Save just re-persists the resulting path.</summary>
+    [RelayCommand]
+    private async Task ChangeProfilesDirectory()
+    {
+        ErrorMessage = null;
+        StatusMessage = null;
+
+        string? picked = await _folderPicker.PickFolderAsync("Choose the profiles storage folder");
+        if (picked is null)
+            return;
+        if (string.Equals(Path.TrimEndingDirectorySeparator(Path.GetFullPath(picked)),
+                Path.TrimEndingDirectorySeparator(Path.GetFullPath(ProfilesDirectory)),
+                StringComparison.OrdinalIgnoreCase))
+            return;   // same folder — nothing to do
+
+        bool move = ConfirmMoveProfiles is not null
+            && await ConfirmMoveProfiles(
+                $"Move the existing profiles into \"{picked}\"? Choose No to start fresh there and leave the current profiles where they are.");
+
+        IsBusy = true;
+        try
+        {
+            var result = await _gateway.RelocateProfilesAsync(picked, move);
+            if (result.TryGetError(out IpcError? error))
+            {
+                ErrorMessage = $"Could not change the profiles folder: {error.Message}";
+                return;
+            }
+            result.TryGetValue(out GlobalSettings? saved);
+            ProfilesDirectory = saved!.ProfilesDirectory;
+            StatusMessage = move ? "Profiles folder changed and existing profiles moved." : "Profiles folder changed.";
+            if (ProfilesRelocated is not null)
+                await ProfilesRelocated();
+        }
+        catch (Exception ex)
+        {
+            Serilog.Log.Error(ex, "Changing the profiles folder failed unexpectedly");
+            ErrorMessage = $"Could not change the profiles folder: {ex.Message}";
+        }
+        finally
+        {
+            IsBusy = false;
+        }
     }
 
     [RelayCommand] private void AddDriveTypeOverride() => DriveTypeOverrides.Add(new DriveTypeOverrideRowViewModel { Value = PerDriveAutoDefault });
@@ -98,6 +156,7 @@ public sealed partial class SettingsViewModel : ViewModelBase
             ThemeMode = settings!.ThemeMode;
             StartupMode = settings.ServiceStartupMode;
             ScratchDirectory = settings.ScratchDirectory;
+            ProfilesDirectory = settings.ProfilesDirectory;
 
             ScanThreadingSettings st = settings.ScanThreading;
             (MaxScanThreadsAuto, MaxScanThreadsValue) = FromBudget(st.MaxScanThreads, ScanAutoDefault);
@@ -180,6 +239,9 @@ public sealed partial class SettingsViewModel : ViewModelBase
                 ThemeMode = ThemeMode,
                 ServiceStartupMode = StartupMode,
                 ScratchDirectory = scratch,
+                // The profiles directory is changed transactionally via ChangeProfilesDirectory; carry
+                // the current value through so a generic Save never resets it to the default.
+                ProfilesDirectory = ProfilesDirectory,
                 ScanThreading = new ScanThreadingSettings
                 {
                     MaxScanThreads = ToBudget(MaxScanThreadsAuto, MaxScanThreadsValue),

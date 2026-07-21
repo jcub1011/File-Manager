@@ -17,6 +17,7 @@ internal sealed class FakeIpcGateway : IIpcGateway
     /// path was used), recorded in lockstep with <see cref="DryRunCalls"/>.</summary>
     public List<Profile?> DryRunDrafts { get; } = [];
     public List<GlobalSettings> SaveSettingsCalls { get; } = [];
+    public List<(string NewDirectory, bool MoveExisting)> RelocateCalls { get; } = [];
 
     public Result<EngineStatusSnapshot, IpcError> StatusResult { get; set; } =
         new EngineStatusSnapshot(false, 0, 0, 0, null);
@@ -46,6 +47,7 @@ internal sealed class FakeIpcGateway : IIpcGateway
 
     public Result<GlobalSettings, IpcError> GetSettingsResult { get; set; } = GlobalSettings.Default;
     public Result<GlobalSettings, IpcError> SaveSettingsResult { get; set; } = GlobalSettings.Default;
+    public Result<GlobalSettings, IpcError> RelocateResult { get; set; } = GlobalSettings.Default;
     public Result<bool, IpcError> ShutdownResult { get; set; } = true;
     public int ShutdownCalls { get; private set; }
 
@@ -116,6 +118,13 @@ internal sealed class FakeIpcGateway : IIpcGateway
         return Task.FromResult(SaveSettingsResult);
     }
 
+    public Task<Result<GlobalSettings, IpcError>> RelocateProfilesAsync(
+        string newDirectory, bool moveExisting, CancellationToken ct = default)
+    {
+        RelocateCalls.Add((newDirectory, moveExisting));
+        return Task.FromResult(RelocateResult);
+    }
+
     public Task<Result<bool, IpcError>> ShutdownServiceAsync(CancellationToken ct = default)
     {
         ShutdownCalls++;
@@ -125,5 +134,10 @@ internal sealed class FakeIpcGateway : IIpcGateway
 
 internal sealed class FakeFolderPicker(string? result = null) : IFolderPicker
 {
+    /// <summary>Files returned by <see cref="PickFilesAsync"/> (empty = user cancelled).</summary>
+    public IReadOnlyList<string> FilesResult { get; set; } = [];
+
     public Task<string?> PickFolderAsync(string title) => Task.FromResult(result);
+
+    public Task<IReadOnlyList<string>> PickFilesAsync(string title) => Task.FromResult(FilesResult);
 }

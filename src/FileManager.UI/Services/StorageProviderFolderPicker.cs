@@ -27,4 +27,30 @@ public sealed class StorageProviderFolderPicker(Window window) : IFolderPicker
             return null;
         }
     }
+
+    public async Task<IReadOnlyList<string>> PickFilesAsync(string title)
+    {
+        try
+        {
+            FilePickerFileType jsonFiles = new("Profile files") { Patterns = ["*.json"] };
+            IReadOnlyList<IStorageFile> files = await window.StorageProvider.OpenFilePickerAsync(
+                new FilePickerOpenOptions { Title = title, AllowMultiple = true, FileTypeFilter = [jsonFiles] });
+
+            List<string> paths = [];
+            foreach (IStorageFile file in files)
+            {
+                string? path = file.TryGetLocalPath();
+                if (path is not null)
+                    paths.Add(path);
+            }
+            return paths;
+        }
+        catch (Exception ex)
+        {
+            // Last resort: a failed native picker reads as "nothing picked" — logged so it is
+            // traceable — instead of faulting the Import command unobserved.
+            Log.Error(ex, "File picker failed unexpectedly");
+            return [];
+        }
+    }
 }

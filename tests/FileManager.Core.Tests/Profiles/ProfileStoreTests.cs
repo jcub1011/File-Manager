@@ -1,5 +1,6 @@
 using FileManager.Contracts.IPC;
 using FileManager.Contracts.Profiles;
+using FileManager.Contracts.Settings;
 using FileManager.Core.Filtering;
 using FileManager.Core.Profiles;
 using FileManager.Core.Tests.TestSupport;
@@ -17,7 +18,9 @@ public sealed class ProfileStoreTests : IDisposable
         _root = Path.Combine(Path.GetTempPath(), "fm-store-" + Guid.NewGuid().ToString("N"));
         _store = new ProfileStore(
             NullLogger<ProfileStore>.Instance,
-            new Core.EnginePaths { Root = _root },
+            // The store now resolves its directory from settings; point it at <root>\profiles so the
+            // tests' expectations (and the temp-dir cleanup) are unchanged.
+            new FakeSettingsProvider(GlobalSettings.Default with { ProfilesDirectory = Path.Combine(_root, "profiles") }),
             new ProfileValidator(
                 NullLogger<ProfileValidator>.Instance,
                 new FilterCompiler(NullLogger<FilterCompiler>.Instance, TimeProvider.System)));

@@ -1,4 +1,5 @@
 using FileManager.Contracts.Profiles;
+using System;
 using System.IO;
 
 namespace FileManager.Contracts.Settings;
@@ -9,8 +10,8 @@ public sealed record GlobalSettings
 {
     /// <summary>Independent of <see cref="Profile.SchemaVersion"/>; versions this settings file only.
     /// v2 replaced the dry-run concurrency scalars with <see cref="ScanThreading"/>. v3 added
-    /// <see cref="ScratchDirectory"/>.</summary>
-    public int SchemaVersion { get; init; } = 3;
+    /// <see cref="ScratchDirectory"/>. v4 added <see cref="ProfilesDirectory"/>.</summary>
+    public int SchemaVersion { get; init; } = 4;
 
     /// <summary>When the worker service is started and stopped relative to the UI. Defaults to
     /// <see cref="Settings.ServiceStartupMode.StartAndStopWithProgram"/> so the service does not
@@ -55,6 +56,28 @@ public sealed record GlobalSettings
     /// <summary>The default scratch location: a <c>scratch</c> folder in the current working directory.
     /// Resolved on read so it reflects the process that loaded the settings (the service).</summary>
     public static string DefaultScratchDirectory => Path.Combine(Directory.GetCurrentDirectory(), "scratch");
+
+    private readonly string? _profilesDirectory;
+
+    /// <summary>Where profile *.json files live — user-selectable so profiles can be kept on a synced
+    /// or shared folder. The service resolves its profile store against this on every read, so a change
+    /// takes effect without a restart. Never null: a settings.json predating this field deserializes
+    /// with no value (the source generator does not run property initializers for absent members),
+    /// which the getter reads back as <see cref="DefaultProfilesDirectory"/>. The setter collapses that
+    /// same default back to the absent (null) representation so record value-equality is unaffected by
+    /// the choice of representation.</summary>
+    public string ProfilesDirectory
+    {
+        get => _profilesDirectory ?? DefaultProfilesDirectory;
+        init => _profilesDirectory = value == DefaultProfilesDirectory ? null : value;
+    }
+
+    /// <summary>The default profiles location: <c>%LOCALAPPDATA%\FileManager\profiles</c>. This MUST
+    /// match <c>EnginePaths.Default().ProfilesDirectory</c> so an install predating this setting keeps
+    /// finding its profiles with no migration.</summary>
+    public static string DefaultProfilesDirectory => Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "FileManager", "profiles");
 
     public static GlobalSettings Default { get; } = new();
 }

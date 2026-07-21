@@ -22,6 +22,7 @@ namespace FileManager.Contracts.IPC;
 [JsonDerivedType(typeof(SubscribeEventsRequest), "subscribe")]
 [JsonDerivedType(typeof(GetSettingsRequest), "get-settings")]
 [JsonDerivedType(typeof(UpdateSettingsRequest), "update-settings")]
+[JsonDerivedType(typeof(RelocateProfilesRequest), "relocate-profiles")]
 [JsonDerivedType(typeof(ShutdownRequest), "shutdown")]
 public abstract record IpcRequest
 {
@@ -78,5 +79,15 @@ public sealed record GetJobLogRequest : IpcRequest { public required Guid JobId 
 public sealed record SubscribeEventsRequest : IpcRequest;
 public sealed record GetSettingsRequest : IpcRequest;
 public sealed record UpdateSettingsRequest : IpcRequest { public required GlobalSettings Settings { get; init; } }
+/// <summary>Relocates the profiles storage directory (persisted in settings). When
+/// <see cref="MoveExisting"/> is set, the service moves the existing profile files into the new
+/// directory before switching; otherwise it starts using the new (possibly empty) directory and
+/// leaves the old files in place. Answered with a <see cref="SettingsResponse"/> carrying the
+/// persisted settings (their <c>ProfilesDirectory</c> reflects the new, normalized location).</summary>
+public sealed record RelocateProfilesRequest : IpcRequest
+{
+    public required string NewDirectory { get; init; }
+    public bool MoveExisting { get; init; }
+}
 /// <summary>Asks the service to shut itself down gracefully (StartAndStopWithProgram mode on UI close).</summary>
 public sealed record ShutdownRequest : IpcRequest;
