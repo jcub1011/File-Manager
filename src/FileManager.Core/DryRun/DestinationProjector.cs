@@ -147,6 +147,10 @@ public sealed class DestinationProjector(
                 (string key, DriveClass driveClass) = ResolveVolume(targetRoot.Value);
                 session.Submit(new ScanWorkItem(targetRoot.Value, key, driveClass, targetRoot));
             }
+            // Roots are all in: without this the session would finalize the instant outstanding
+            // touches zero — e.g. an empty first target root finishing while ResolveVolume blocks
+            // on the second — silently dropping every remaining root from the sweep.
+            session.CompleteSubmissions();
 
             foreach (ScanResult result in session.Consume())
             {

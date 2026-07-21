@@ -2,6 +2,7 @@ using FileManager.Contracts.DryRun;
 using FileManager.Contracts.Profiles;
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Text.Json;
 
 namespace FileManager.Core.DryRun;
@@ -168,8 +169,18 @@ internal static class DryRunSnapshotFormat
         e.SourceOp.Path = e.SourceFile.Path;
         e.SourceOp.Root = e.SourceFile.Root;
         foreach (PooledFileOperation o in e.DestinationOps)
+        {
             if (o.Path is null)
+            {
+                // Bounds-checked: a corrupted record with an omitted Path and a bad SubjectIndex
+                // must fail as the descriptive IOException the replay converts to a failure item,
+                // not an ArgumentOutOfRangeException from the list indexer.
+                if (o.SubjectIndex < 0 || o.SubjectIndex >= e.DestinationFiles.Count)
+                    throw new IOException(
+                        $"the dry-run snapshot has a destination op whose SubjectIndex ({o.SubjectIndex}) does not resolve; the file is corrupt");
                 o.Path = e.DestinationFiles[o.SubjectIndex].Path;
+            }
+        }
 
         return e;
     }

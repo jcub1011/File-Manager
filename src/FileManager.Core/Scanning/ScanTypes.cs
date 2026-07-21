@@ -67,6 +67,13 @@ public interface IScanSession : IDisposable
     /// call it to push discovered subdirectories).</summary>
     void Submit(ScanWorkItem item);
 
+    /// <summary>Declares that no further ROOT work will be submitted (workers still push discovered
+    /// subdirectories from in-flight directories). The session completes only after this AND all
+    /// outstanding work drains — without the signal, a fast worker finishing the first root while
+    /// the caller is still resolving the second root's volume would finalize the session early and
+    /// silently drop every later-submitted root. Call after the root-submission loop, before consuming.</summary>
+    void CompleteSubmissions();
+
     /// <summary>Lazily yields this session's results until it completes naturally or is cancelled.
     /// Blocks the calling thread while awaiting more. Breaking out early tears the session down.</summary>
     IEnumerable<ScanResult> Consume();

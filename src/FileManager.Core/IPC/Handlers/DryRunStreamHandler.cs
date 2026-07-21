@@ -114,6 +114,11 @@ public sealed class DryRunStreamHandler(
             {
                 while (!moveNext.IsCompleted)
                 {
+                    // Once ct fires, Task.Delay(…, ct) completes instantly and this poll would spin
+                    // a core until the engine finishes unwinding — just await the phase task (it
+                    // observes ct) instead of polling for progress nobody will see.
+                    if (ct.IsCancellationRequested)
+                        break;
                     await Task.WhenAny(moveNext, Task.Delay(ProgressInterval, ct)).ConfigureAwait(false);
                     if (!moveNext.IsCompleted && progressCounters.Sources != lastSources)
                     {
@@ -190,6 +195,10 @@ public sealed class DryRunStreamHandler(
         long lastDestinations = -1;
         while (!sweepTask.IsCompleted)
         {
+            // Same anti-spin guard as the scan phase: a cancelled token makes Task.Delay(…, ct)
+            // complete instantly, so stop polling and just await the sweep's unwind below.
+            if (ct.IsCancellationRequested)
+                break;
             await Task.WhenAny(sweepTask, Task.Delay(ProgressInterval, ct)).ConfigureAwait(false);
             if (!sweepTask.IsCompleted && progressCounters.Destinations != lastDestinations)
             {

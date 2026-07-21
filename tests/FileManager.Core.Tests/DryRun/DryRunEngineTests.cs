@@ -815,6 +815,54 @@ public sealed class DryRunEngineTests : IDisposable
         });
     }
 
+    [Fact]
+    public async Task Read_side_spool_fault_is_a_single_failure_item_not_a_torn_stream()
+    {
+        // The write side already converts spool faults to a failure item; a corrupted snapshot
+        // discovered on the REPLAY (read) side must surface the same way — never a raw IOException
+        // tearing the streaming enumerator.
+        SourceFile("a.txt");
+        Profile profile = ProfileUnderTest();
+        DryRunEngine engine = BuildEngine(GlobalSettings.Default, chunkByteBudget: 1 << 20,
+            spillThresholdBytes: DryRunEngine.ChunkByteThreshold,
+            spoolFactory: new ReadFaultingSpoolFactory(), pool: null);
+
+        List<Result<DryRunChunk, string>> items = [];
+        await foreach (Result<DryRunChunk, string> item in engine.SimulateStreamAsync(profile, null))
+            items.Add(item);
+
+        Result<DryRunChunk, string> only = Assert.Single(items);
+        Assert.True(only.TryGetError(out string? error));
+        Assert.Contains("spool failed", error);
+        Assert.Contains("truncated length prefix", error);
+    }
+
+    private sealed class ReadFaultingSpoolFactory : IDryRunSpoolFactory
+    {
+        public IDryRunSpool Create(EvaluationCarrierPool pool) => new ReadFaultingSpool();
+    }
+
+    /// <summary>Accepts writes normally, then fails the replay the way a corrupted on-disk snapshot
+    /// does (<see cref="FileDryRunSpool"/> throws IOException on a truncated/implausible record).</summary>
+    private sealed class ReadFaultingSpool : IDryRunSpool
+    {
+        private readonly bool _corrupt = true;
+
+        public ValueTask WriteAsync(FileEvaluation evaluation, CancellationToken ct) => ValueTask.CompletedTask;
+        public ValueTask CompleteWritingAsync() => ValueTask.CompletedTask;
+
+        public async IAsyncEnumerable<IEvaluationView> ReadAllAsync(
+            [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct)
+        {
+            await Task.Yield();
+            if (_corrupt)
+                throw new IOException("the dry-run snapshot ended mid-record (truncated length prefix)");
+            yield break;
+        }
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
+
     // ----- spill/pooling harness -----
 
     /// <summary>An engine whose streamed path spills to <paramref name="scratch"/> immediately

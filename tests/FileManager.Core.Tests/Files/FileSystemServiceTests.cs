@@ -117,11 +117,11 @@ public class FileSystemServiceTests
         }
     }
 
-    /// <summary>Characterizes the directory quirk: only Modified is filled (local offset);
-    /// Created stays default and Attributes stays 0. Downstream attribute checks rely on
-    /// directories NOT carrying attributes, so a reimplementation must not silently enrich.</summary>
+    /// <summary>Characterizes the directory contract: Modified (local offset) AND Attributes are
+    /// filled — the scanners' OnSubdirectory reparse-point guards (junction cycles / root escape)
+    /// are dead code without the attribute flags. Only Created stays default for directories.</summary>
     [Fact]
-    public void EnumerateEntries_DirectoryEntry_HasOnlyModified()
+    public void EnumerateEntries_DirectoryEntry_CarriesModifiedAndAttributes()
     {
         string root = Directory.CreateTempSubdirectory("fm-enum-").FullName;
         try
@@ -137,7 +137,7 @@ public class FileSystemServiceTests
             Assert.Equal(0, dir.Size);
             Assert.Equal(Directory.GetLastWriteTimeUtc(sub), dir.Modified.ToUniversalTime().UtcDateTime);
             Assert.Equal(default, dir.Created);
-            Assert.Equal((FileAttributes)0, dir.Attributes);
+            Assert.True((dir.Attributes & FileAttributes.Directory) != 0);
         }
         finally
         {

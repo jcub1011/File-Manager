@@ -36,5 +36,9 @@ internal interface IDryRunSpool : System.IAsyncDisposable
 /// use an in-memory spool while the service wires the disk-backed one.</summary>
 internal interface IDryRunSpoolFactory
 {
-    IDryRunSpool Create();
+    /// <summary>Creates the run's spool over the run's carrier <paramref name="pool"/> — the same
+    /// pool the engine recycles consumed chunks into. A disk-backed spool MUST rent its spilled
+    /// read-back from this pool (a private pool would silently break the engine's rented==returned
+    /// accounting); an in-memory spool replays original records and ignores it.</summary>
+    IDryRunSpool Create(EvaluationCarrierPool pool);
 }

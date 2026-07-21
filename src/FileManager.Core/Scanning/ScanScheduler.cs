@@ -258,8 +258,31 @@ public sealed class ScanScheduler : IScanScheduler, IDisposable
         }
         catch (Exception ex)
         {
-            _logger.LogDebug(ex, "Scan worker faulted enumerating {Directory}", work.Directory);
+            // Last-resort catch-all (directive): everything not yet emitted from this directory is
+            // being dropped — that must be visible at production log levels AND in the report, so
+            // surface it as an enumeration-fault result like any other unreadable directory.
+            _logger.LogWarning(ex, "Scan worker faulted enumerating {Directory}; its remaining entries are skipped", work.Directory);
+            TryEmitWorkerFault(session, work, ex);
             session.Complete(work);
+        }
+    }
+
+    /// <summary>Best-effort: maps a worker fault through the adapter's OnFault (which may itself be
+    /// the thing that threw, hence its own guard) and writes it to the session's output. A full
+    /// buffer drops the fault result — the Warning log above is the guaranteed trace.</summary>
+    private void TryEmitWorkerFault(ScanSession session, ScanWorkState work, Exception ex)
+    {
+        try
+        {
+            var fault = new EnumerationFault(
+                $"enumerating \"{work.Directory}\" failed unexpectedly: {ex.Message}", EnumerationSeverity.Warning);
+            EnumerationFault? mapped = session.Options.OnFault is null ? fault : session.Options.OnFault(fault, work.Tag);
+            if (mapped is EnumerationFault emit)
+                session.TryWrite(new ScanResult(null, emit, work.Tag));
+        }
+        catch (Exception mapEx)
+        {
+            _logger.LogWarning(mapEx, "Could not surface the worker fault for {Directory} to the session", work.Directory);
         }
     }
 
@@ -312,6 +335,7 @@ public sealed class ScanScheduler : IScanScheduler, IDisposable
 
         private long _outstanding;   // submitted but not yet completed (includes in-flight + parked)
         private int _active;         // workers currently in this session (bounded by MaxConcurrency)
+        private bool _submissionsDone;   // no further ROOT submissions; guarded by _sched._lock
         private volatile bool _cancelled;
 
         public ScanSessionOptions Options { get; }
@@ -339,6 +363,13 @@ public sealed class ScanScheduler : IScanScheduler, IDisposable
             {
                 if (_cancelled)
                     return;
+                // After CompleteSubmissions, new work may only arrive from a worker descending out
+                // of an in-flight directory (outstanding > 0 covers the parent). A root submission
+                // landing after the drain would push onto a finalized, removed session and vanish
+                // silently — fail loud instead.
+                if (_submissionsDone && _outstanding == 0)
+                    throw new InvalidOperationException(
+                        "Submit after CompleteSubmissions on a fully drained session — the work would be silently lost");
                 _sched.EnsureVolumeLocked(key, item.DriveClass, _threading);
                 if (!_pending.TryGetValue(key, out Stack<ScanWorkState>? stack))
                 {
@@ -453,10 +484,23 @@ public sealed class ScanScheduler : IScanScheduler, IDisposable
             _sched.MaybeSpawnWorkerLocked();
         }
 
-        // Caller holds _sched._lock.
+        public void CompleteSubmissions()
+        {
+            lock (_sched._lock)
+            {
+                if (_submissionsDone || _cancelled)
+                    return;
+                _submissionsDone = true;
+                FinalizeIfDrainedLocked();   // all roots may already have drained
+            }
+        }
+
+        // Caller holds _sched._lock. Finalizing requires BOTH conditions: outstanding can touch
+        // zero transiently while the submitter is still between roots (I/O such as volume
+        // resolution runs between Submits) — completing then would drop every later root.
         private void FinalizeIfDrainedLocked()
         {
-            if (_outstanding == 0)
+            if (_submissionsDone && _outstanding == 0)
             {
                 _channel.Writer.TryComplete();
                 _sched.RemoveSessionLocked(this);

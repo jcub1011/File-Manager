@@ -27,6 +27,7 @@ public sealed class ScanSchedulerTests
         IScanSession session = scheduler.OpenSession(EmitEverything(), CancellationToken.None);
         for (int i = 0; i < roots; i++)
             session.Submit(new ScanWorkItem($"v:\\d{i}", "v:", DriveClass.Fixed, null));
+        session.CompleteSubmissions();
 
         List<ScanResult> results = [];
         Task consumer = Task.Run(() =>
@@ -64,9 +65,11 @@ public sealed class ScanSchedulerTests
         // parks. Session B must still complete despite A hogging nothing but its own parked buffer.
         using IScanSession a = scheduler.OpenSession(EmitEverything() with { OutputCapacity = 2 }, CancellationToken.None);
         a.Submit(new ScanWorkItem("a:\\dir", "a:", DriveClass.Fixed, null));
+        a.CompleteSubmissions();
 
         using IScanSession b = scheduler.OpenSession(EmitEverything(), CancellationToken.None);
         b.Submit(new ScanWorkItem("b:\\dir", "b:", DriveClass.Fixed, null));
+        b.CompleteSubmissions();
 
         // Drain B fully WITHOUT touching A. If A's full buffer stalled shared workers, this would hang.
         List<ScanResult> bResults = [];
@@ -94,14 +97,67 @@ public sealed class ScanSchedulerTests
         using CancellationTokenSource cts = new();
         IScanSession a = scheduler.OpenSession(EmitEverything(), cts.Token);
         a.Submit(new ScanWorkItem("missing-in-tree:\\dir", "x:", DriveClass.Fixed, null));
+        a.CompleteSubmissions();
         cts.Cancel();   // cancel A: its Consume must terminate
 
         List<ScanResult> aResults = [.. a.Consume()];   // completes (empty or partial), does not hang
 
         using IScanSession b = scheduler.OpenSession(EmitEverything(), CancellationToken.None);
         b.Submit(new ScanWorkItem("b:\\dir", "b:", DriveClass.Fixed, null));
+        b.CompleteSubmissions();
         List<ScanResult> bResults = [.. b.Consume()];
         Assert.Equal(5, bResults.Count);   // B is unaffected by A's cancellation
+    }
+
+    [Fact]
+    public void A_root_submitted_after_an_earlier_root_drains_is_not_dropped()
+    {
+        // The drain race: adapters submit roots with I/O between the Submits (volume resolution),
+        // so an empty/fast first root can fully complete while the second is still on its way. The
+        // session must not finalize until CompleteSubmissions — finalizing on outstanding==0 alone
+        // silently drops every later root from the scan.
+        using ManualResetEventSlim open = new(initialState: true);
+        Dictionary<string, FileSystemEntry[]> tree = new()
+        {
+            // "a:\\empty" is deliberately absent: enumerating it yields nothing, completing instantly.
+            ["b:\\dir"] = [.. Enumerable.Range(0, 5).Select(i => FileEntry($"b:\\dir\\f{i}.txt"))],
+        };
+        BlockingFileSystem fs = new(tree, open);
+        using ScanScheduler scheduler = new(
+            NullLogger<ScanScheduler>.Instance, fs, Settings(maxScan: 32, perDrive: 32));
+
+        using IScanSession session = scheduler.OpenSession(EmitEverything(), CancellationToken.None);
+        session.Submit(new ScanWorkItem("a:\\empty", "a:", DriveClass.Fixed, null));
+        // Force the race shape: the first root has been fully enumerated and its worker has gone
+        // idle before the second root is submitted.
+        Assert.True(SpinWait.SpinUntil(() => fs.EnumeratedPaths.Contains("a:\\empty") && fs.Live == 0,
+            TimeSpan.FromSeconds(5)), "first root never enumerated");
+        Thread.Sleep(150);   // let the worker's Complete() bookkeeping land (outstanding → 0)
+
+        session.Submit(new ScanWorkItem("b:\\dir", "b:", DriveClass.Fixed, null));
+        session.CompleteSubmissions();
+
+        List<ScanResult> results = [.. session.Consume()];
+        Assert.Equal(5, results.Count);   // the late root's files all arrive
+    }
+
+    [Fact]
+    public void Submitting_a_root_after_the_session_drained_fails_loud()
+    {
+        using ManualResetEventSlim open = new(initialState: true);
+        BlockingFileSystem fs = new(new Dictionary<string, FileSystemEntry[]>(), open);
+        using ScanScheduler scheduler = new(
+            NullLogger<ScanScheduler>.Instance, fs, Settings(maxScan: 32, perDrive: 32));
+
+        using IScanSession session = scheduler.OpenSession(EmitEverything(), CancellationToken.None);
+        session.Submit(new ScanWorkItem("a:\\empty", "a:", DriveClass.Fixed, null));
+        session.CompleteSubmissions();
+        List<ScanResult> results = [.. session.Consume()];   // drains: session is finalized
+        Assert.Empty(results);
+
+        // A root pushed now would land on a removed session and vanish — it must throw instead.
+        Assert.Throws<InvalidOperationException>(() =>
+            session.Submit(new ScanWorkItem("b:\\late", "b:", DriveClass.Fixed, null)));
     }
 
     private static ScanSessionOptions EmitEverything() => new()
@@ -131,9 +187,11 @@ public sealed class ScanSchedulerTests
 
         public int Live => Volatile.Read(ref _live);
         public int MaxConcurrent => Volatile.Read(ref _max);
+        public System.Collections.Concurrent.ConcurrentBag<string> EnumeratedPaths { get; } = [];
 
         public IEnumerable<Result<FileSystemEntry, EnumerationFault>> EnumerateEntries(string path)
         {
+            EnumeratedPaths.Add(path);
             int now = Interlocked.Increment(ref _live);
             try
             {

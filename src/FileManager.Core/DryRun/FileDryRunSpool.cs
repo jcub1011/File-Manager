@@ -239,6 +239,6 @@ internal sealed class FileDryRunSpool : IDryRunSpool
 internal sealed class FileDryRunSpoolFactory(
     Func<string> scratchDirectoryProvider, long spillThresholdBytes, ILogger logger) : IDryRunSpoolFactory
 {
-    public IDryRunSpool Create() =>
-        new FileDryRunSpool(scratchDirectoryProvider(), spillThresholdBytes, new EvaluationCarrierPool(), logger);
+    public IDryRunSpool Create(EvaluationCarrierPool pool) =>
+        new FileDryRunSpool(scratchDirectoryProvider(), spillThresholdBytes, pool, logger);
 }

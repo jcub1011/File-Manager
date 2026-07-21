@@ -124,6 +124,52 @@ public sealed class SourceScannerTests : IDisposable
     }
 
     [Fact]
+    public void A_directory_junction_is_never_descended()
+    {
+        // A junction inside the source can cycle back into an ancestor (unbounded re-walk) or reach
+        // files OUTSIDE the source root, which would become disposition candidates far beyond the
+        // tree the profile configured. The scan must not follow it.
+        Touch("keep.txt");
+        string outside = Path.Combine(Path.GetTempPath(), "fm-scanner-out-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(outside);
+        try
+        {
+            File.WriteAllText(Path.Combine(outside, "escape.txt"), "x");
+            string junction = Path.Combine(_root, "jump");
+            // mklink /J needs no elevation; if the environment still refuses, skip rather than fail.
+            var mklink = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = "cmd.exe",
+                Arguments = $"/c mklink /J \"{junction}\" \"{outside}\"",
+                CreateNoWindow = true,
+                UseShellExecute = false,
+            })!;
+            mklink.WaitForExit();
+            if (mklink.ExitCode != 0 || !Directory.Exists(junction))
+                return;   // junction creation unavailable here — nothing to assert
+
+            try
+            {
+                var (payloads, faults) = Collect(NewScanner().Scan(ProfileOver(_root), TriggerKind.Cli));
+
+                Assert.Empty(faults);
+                Assert.Single(payloads);
+                Assert.EndsWith("keep.txt", payloads[0].SourcePath);   // escape.txt never reached
+            }
+            finally
+            {
+                // Remove the junction itself before the fixture's recursive delete of _root — a
+                // (soon-dangling) junction in the tree breaks Directory.Delete(recursive).
+                Directory.Delete(junction, recursive: false);
+            }
+        }
+        finally
+        {
+            Directory.Delete(outside, recursive: true);
+        }
+    }
+
+    [Fact]
     public void File_scope_yields_exactly_that_file()
     {
         string file = Touch("only.txt");

@@ -102,6 +102,12 @@ public sealed class SourceScanner(
                 SourceTag t = (SourceTag)tag!;
                 if (InfrastructurePaths.IsInfrastructureDirectoryName(entry.FileName))
                     return new ChildDecision(false, null);
+                // Never descend a reparse point (same rule as the destination sweep): a junction
+                // can cycle back into an ancestor (unbounded re-walk), and files reached through
+                // one live OUTSIDE the source root — they would become disposition candidates far
+                // beyond the tree the profile actually configured.
+                if ((entry.Attributes & FileAttributes.ReparsePoint) != 0)
+                    return new ChildDecision(false, null);
                 int contentsDepth = RelativeDepth(t.SourceRoot, entry.FullPath) + 1;
                 if (t.MaxDepth is int limit && contentsDepth > limit)
                     return new ChildDecision(false, null);
@@ -125,6 +131,10 @@ public sealed class SourceScanner(
             (string key, DriveClass driveClass) = ResolveVolume(seed.WalkRoot);
             session.Submit(new ScanWorkItem(seed.WalkRoot, key, driveClass, new SourceTag(seed.SourceRoot, seed.MaxDepth, IsRoot: true)));
         }
+        // Roots are all in: without this the session would finalize the instant outstanding touches
+        // zero — e.g. an empty first root finishing while ResolveVolume blocks on the second —
+        // silently dropping every remaining root from the scan.
+        session.CompleteSubmissions();
 
         foreach (ScanResult result in session.Consume())
         {

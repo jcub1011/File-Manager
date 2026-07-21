@@ -37,9 +37,25 @@ public static class InfrastructurePaths
     }
 
     /// <summary>True when a file name carries the transient temp-file marker (a half-written
-    /// pipeline artifact), which a walk must skip.</summary>
-    public static bool IsTempFileName(string fileName) =>
-        fileName.Contains(TempFileMarker, StringComparison.OrdinalIgnoreCase);
+    /// pipeline artifact), which a walk must skip. Anchored to the placer's actual shape —
+    /// <c>&lt;finalName&gt;.fmtmp-&lt;hex job suffix&gt;</c> at the END of the name — so a user file that merely
+    /// contains the marker mid-name (e.g. <c>notes.fmtmp-backup.txt</c>) is not silently invisible
+    /// to every scan.</summary>
+    public static bool IsTempFileName(string fileName)
+    {
+        int marker = fileName.LastIndexOf(TempFileMarker, StringComparison.OrdinalIgnoreCase);
+        if (marker < 0)
+            return false;
+        int suffixStart = marker + TempFileMarker.Length;
+        if (suffixStart >= fileName.Length)
+            return false;
+        for (int i = suffixStart; i < fileName.Length; i++)
+        {
+            if (!Uri.IsHexDigit(fileName[i]))
+                return false;
+        }
+        return true;
+    }
 
     /// <summary>True when any segment of <paramref name="path"/> is an infrastructure directory or
     /// its file name is a temp-file marker.</summary>

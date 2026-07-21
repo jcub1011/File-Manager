@@ -113,7 +113,7 @@ public sealed class DryRunEngine(
     /// run's <paramref name="pool"/> so its spilled read-back fills recycled carriers; an injected
     /// factory (tests use the in-memory spool) ignores the pool and replays original records.</summary>
     private IDryRunSpool CreateSpool(EvaluationCarrierPool pool) =>
-        SpoolFactory?.Create()
+        SpoolFactory?.Create(pool)
         ?? new FileDryRunSpool(settings.Current.ScratchDirectory, SpillThresholdBytes, pool, logger);
 
     /// <summary>Previews the given profile object directly (a persisted profile the handler resolved
@@ -338,19 +338,51 @@ public sealed class DryRunEngine(
         // client concatenates the chunks, then sorts them for display.
         StreamAccumulator accumulator = new();
         bool anyEmitted = false;
-        await foreach (IEvaluationView evaluation in spool.ReadAllAsync(ct).ConfigureAwait(false))
+        // Manual enumeration (not await foreach): a read-side snapshot fault — truncated length
+        // prefix, implausible record, corrupted payload — must become the same single failure item
+        // the write side produces, never a torn stream. yield cannot live inside a catch, so the
+        // MoveNext runs in a try and the yields stay outside it.
+        string? replayError = null;
+        await using (IAsyncEnumerator<IEvaluationView> replay = spool.ReadAllAsync(ct).GetAsyncEnumerator(ct))
         {
-            accumulator.Add(evaluation);
-            if (accumulator.Bytes >= ChunkByteBudget)
+            while (true)
             {
-                (DryRunChunk chunk, List<IEvaluationView> recyclables) = accumulator.Flush();
-                yield return Result<DryRunChunk, string>.Success(chunk with { ScanTruncated = scanTruncated });
-                // I-POOL-RECYCLE: the yield has resumed, so the handler has fully consumed this chunk
-                // (frames serialize synchronously before the next MoveNext) — its carriers are safe to
-                // return. A no-op for original records; recycles carriers for a spilled run.
-                Recycle(recyclables);
-                anyEmitted = true;
+                IEvaluationView evaluation;
+                try
+                {
+                    if (!await replay.MoveNextAsync().ConfigureAwait(false))
+                        break;
+                    evaluation = replay.Current;
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;   // cancellation keeps its enumerator contract
+                }
+                catch (Exception ex)
+                {
+                    logger.LogError(ex, "Dry-run (stream) for profile {ProfileId} failed: snapshot replay error: {Message}",
+                        profile.Id, ex.Message);
+                    replayError = ex.Message;
+                    break;
+                }
+
+                accumulator.Add(evaluation);
+                if (accumulator.Bytes >= ChunkByteBudget)
+                {
+                    (DryRunChunk chunk, List<IEvaluationView> recyclables) = accumulator.Flush();
+                    yield return Result<DryRunChunk, string>.Success(chunk with { ScanTruncated = scanTruncated });
+                    // I-POOL-RECYCLE: the yield has resumed, so the handler has fully consumed this chunk
+                    // (frames serialize synchronously before the next MoveNext) — its carriers are safe to
+                    // return. A no-op for original records; recycles carriers for a spilled run.
+                    Recycle(recyclables);
+                    anyEmitted = true;
+                }
             }
+        }
+        if (replayError is not null)
+        {
+            yield return $"dry-run spool failed: {replayError}";
+            yield break;
         }
         if (accumulator.HasData)
         {
@@ -473,6 +505,19 @@ public sealed class DryRunEngine(
                     accepted++;
                     progress?.SourceDiscovered();
                 }
+            }
+            catch (OperationCanceledException)
+            {
+                throw;   // teardown — the join disambiguates cancellation from a fatal fault
+            }
+            catch (Exception ex)
+            {
+                // Last-resort catch-all at this task boundary (directive): an unexpected throw from
+                // the scan iterator (outside its Result protocol) must become the documented single
+                // failure item, not a raw exception tearing the streaming enumerator.
+                logger.LogError(ex, "Dry-run scan pump failed unexpectedly for profile {ProfileId}", profile.Id);
+                fatalError = $"unexpected scan error: {ex.Message}";
+                linked.Cancel();
             }
             finally
             {

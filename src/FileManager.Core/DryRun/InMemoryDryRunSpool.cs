@@ -42,8 +42,9 @@ internal sealed class InMemoryDryRunSpool : IDryRunSpool
     }
 }
 
-/// <summary>Hands out <see cref="InMemoryDryRunSpool"/>s. The engine's default factory.</summary>
+/// <summary>Hands out <see cref="InMemoryDryRunSpool"/>s. The engine's default factory. Ignores the
+/// run's carrier pool: the in-memory spool replays original records, renting nothing.</summary>
 internal sealed class InMemoryDryRunSpoolFactory : IDryRunSpoolFactory
 {
-    public IDryRunSpool Create() => new InMemoryDryRunSpool();
+    public IDryRunSpool Create(EvaluationCarrierPool pool) => new InMemoryDryRunSpool();
 }

@@ -134,10 +134,12 @@ public sealed class FileSystemService(ILogger<FileSystemService> logger) : IFile
                 // All of Length/CreationTimeUtc/Attributes are served from the find-data snapshot
                 // (no per-entry stat), so the scanner can build a full FileMetadata for free.
                 // Contract (characterized in FileSystemServiceTests): Modified carries the LOCAL
-                // offset, Created is UTC, and directories carry only Modified — no enrichment.
+                // offset, Created is UTC. Directories carry Modified AND Attributes — the
+                // OnSubdirectory reparse-point guards (junction cycles / root escape) are dead code
+                // without the attribute flags; only Created stays unenriched for them.
                 return entry.IsDirectory
                     ? new FileSystemEntry(entry.FileName.ToString(), entry.ToFullPath(), true, 0,
-                        entry.LastWriteTimeUtc.ToLocalTime())
+                        entry.LastWriteTimeUtc.ToLocalTime(), default, entry.Attributes)
                     : new FileSystemEntry(entry.FileName.ToString(), entry.ToFullPath(), false, entry.Length,
                         entry.LastWriteTimeUtc.ToLocalTime(), entry.CreationTimeUtc, entry.Attributes);
             }
