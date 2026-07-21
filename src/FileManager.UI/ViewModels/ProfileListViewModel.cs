@@ -15,6 +15,9 @@ namespace FileManager.UI.ViewModels;
 public sealed record ProfileListItem(Guid ProfileId, string Name, bool Active, string TriggerSummary)
 {
     public string ActiveText => Active ? "Active" : "Inactive";
+
+    /// <summary>Two-letter badge shown in the collapsed sidebar rail (see <see cref="ProfileAcronym"/>).</summary>
+    public string Acronym => ProfileAcronym.From(Name);
 }
 
 public sealed partial class ProfileListViewModel(IIpcGateway gateway) : ViewModelBase

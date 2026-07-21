@@ -1,5 +1,6 @@
 using Avalonia;
 using Avalonia.Controls;
+using Avalonia.Input;
 using Avalonia.Interactivity;
 using Avalonia.Media;
 using FileManager.UI.ViewModels;
@@ -18,10 +19,63 @@ namespace FileManager.UI.Views
         // otherwise re-enter with _closeConfirmed still false and fire a second service shutdown.
         private bool _closing;
 
+        // The resizable profile sidebar column (column 0 of the content grid).
+        private ColumnDefinition ProfilePanelColumn => ContentGrid.ColumnDefinitions[0];
+
         public MainWindow()
         {
             InitializeComponent();
             UpdateMaximizeGlyph();
+
+            // Double-click the splitter to toggle the collapsed sidebar. GridSplitter marks pointer
+            // input handled for dragging, so DoubleTapped may never fire — subscribe to PointerPressed
+            // with handledEventsToo and detect the double via ClickCount.
+            SidebarSplitter.AddHandler(PointerPressedEvent, OnSplitterPointerPressed,
+                RoutingStrategies.Bubble, handledEventsToo: true);
+        }
+
+        // Apply the persisted sidebar layout once the template + DataContext are in place.
+        protected override void OnLoaded(RoutedEventArgs e)
+        {
+            base.OnLoaded(e);
+            if (DataContext is MainWindowViewModel vm)
+                ApplyCollapseState(vm.SidebarCollapsed, vm);
+        }
+
+        private void OnSplitterPointerPressed(object? sender, PointerPressedEventArgs e)
+        {
+            if (e.ClickCount == 2 && DataContext is MainWindowViewModel vm)
+            {
+                bool collapsing = !vm.SidebarCollapsed;
+                // Remember the width we're leaving so expanding restores it.
+                if (collapsing)
+                    vm.SidebarExpandedWidth = ProfilePanelColumn.Width.Value;
+
+                vm.SidebarCollapsed = collapsing;
+                ApplyCollapseState(collapsing, vm);
+                vm.SaveSidebarState();
+                e.Handled = true;
+            }
+        }
+
+        // Drive the sidebar column geometry from the collapsed flag. Collapsing pins the column to the
+        // rail width (Min == Max) so the still-visible splitter's drag is a no-op; expanding restores
+        // the resizable range and the last expanded width. Does not itself capture the current width —
+        // callers do that before flipping so this stays safe to call on load.
+        private void ApplyCollapseState(bool collapsed, MainWindowViewModel vm)
+        {
+            if (collapsed)
+            {
+                ProfilePanelColumn.MinWidth = MainWindowViewModel.CollapsedSidebarWidth;
+                ProfilePanelColumn.MaxWidth = MainWindowViewModel.CollapsedSidebarWidth;
+                ProfilePanelColumn.Width = new GridLength(MainWindowViewModel.CollapsedSidebarWidth);
+            }
+            else
+            {
+                ProfilePanelColumn.MinWidth = MainWindowViewModel.MinExpandedSidebarWidth;
+                ProfilePanelColumn.MaxWidth = double.PositiveInfinity;
+                ProfilePanelColumn.Width = new GridLength(vm.SidebarExpandedWidth);
+            }
         }
 
         // WindowDecorations="None" means we draw the caption buttons, so their actions are wired here
@@ -64,6 +118,14 @@ namespace FileManager.UI.Views
         {
             try
             {
+                // Persist the latest expanded width the user dragged to (the splitter mutates the
+                // column directly, so read it back here). Harmless to repeat on the confirmed pass.
+                if (DataContext is MainWindowViewModel sidebarVm && !sidebarVm.SidebarCollapsed)
+                {
+                    sidebarVm.SidebarExpandedWidth = ProfilePanelColumn.Width.Value;
+                    sidebarVm.SaveSidebarState();
+                }
+
                 if (_closeConfirmed)
                 {
                     base.OnClosing(e);

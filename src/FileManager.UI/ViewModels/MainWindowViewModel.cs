@@ -1,3 +1,4 @@
+using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using FileManager.Contracts.IPC;
 using FileManager.Contracts.Profiles;
@@ -13,6 +14,13 @@ namespace FileManager.UI.ViewModels;
 /// save → list refresh, and the unsaved-changes navigation guard.</summary>
 public sealed partial class MainWindowViewModel : ViewModelBase
 {
+    /// <summary>Fixed width of the collapsed profile rail (icon avatars + padding). Shared with the
+    /// view, which pins the sidebar column to this width so the splitter can no longer resize it.</summary>
+    public const double CollapsedSidebarWidth = 56;
+
+    /// <summary>Smallest width the expanded sidebar may be dragged/restored to.</summary>
+    public const double MinExpandedSidebarWidth = 180;
+
     private readonly IIpcGateway _gateway;
     private readonly ILogFolderService _logFolder;
 
@@ -63,12 +71,33 @@ public sealed partial class MainWindowViewModel : ViewModelBase
                 DryRun.ApplySyncSettings(Editor.SyncMode, Editor.ScanDestination);
             }
         };
+
+        // Restore the persisted sidebar layout (collapsed state + expanded width). The view applies
+        // the column geometry from these once its template is loaded.
+        UiState ui = UiStateStore.Read();
+        SidebarCollapsed = ui.SidebarCollapsed;
+        SidebarExpandedWidth = Math.Max(MinExpandedSidebarWidth, ui.SidebarWidth);
     }
 
     public ProfileListViewModel List { get; }
     public ProfileEditorViewModel Editor { get; }
     public DryRunViewModel DryRun { get; }
     public StatusBarViewModel StatusBar { get; }
+
+    /// <summary>Whether the profile sidebar is collapsed to the narrow icon rail. The view toggles
+    /// this (double-tap on the splitter) and switches the sidebar content off it.</summary>
+    [ObservableProperty]
+    public partial bool SidebarCollapsed { get; set; }
+
+    /// <summary>The expanded sidebar width to restore when un-collapsing. The view keeps this in step
+    /// with the live column width (on collapse and on close) and persists it via
+    /// <see cref="SaveSidebarState"/>.</summary>
+    public double SidebarExpandedWidth { get; set; } = 280;
+
+    /// <summary>Persist the current sidebar layout. Single entry point called by the view whenever the
+    /// collapsed state or expanded width changes.</summary>
+    public void SaveSidebarState() =>
+        UiStateStore.Write(new UiState(SidebarCollapsed, SidebarExpandedWidth));
 
     public async Task InitializeAsync()
     {

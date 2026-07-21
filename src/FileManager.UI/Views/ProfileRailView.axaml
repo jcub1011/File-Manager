@@ -1,0 +1,37 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:vm="using:FileManager.UI.ViewModels"
+             xmlns:conv="using:FileManager.UI.Converters"
+             x:Class="FileManager.UI.Views.ProfileRailView"
+             x:DataType="vm:ProfileListViewModel">
+
+    <!-- Collapsed sidebar: profiles as two-letter acronym avatars. Bound to the SAME
+         ProfileListViewModel as the expanded ProfileListView, so switching, the unsaved-changes
+         navigation guard, and row-locking are reused verbatim (nothing extra is wired here). -->
+    <ListBox Classes="profilesRail" ItemsSource="{Binding FilteredProfiles}" SelectedItem="{Binding SelectedProfile}">
+        <ListBox.Styles>
+            <!-- Identical to ProfileListView: while the editor has unsaved edits, lock every row
+                 except the one being edited so the user can't appear to navigate away. -->
+            <Style Selector="ListBoxItem">
+                <Setter Property="IsEnabled">
+                    <MultiBinding Converter="{x:Static conv:MultiValueConverters.RowSelectable}">
+                        <Binding Path="((vm:ProfileListViewModel)DataContext).HasUnsavedChanges"
+                                 RelativeSource="{RelativeSource AncestorType=ListBox}" />
+                        <Binding Path="((vm:ProfileListItem)DataContext).ProfileId"
+                                 RelativeSource="{RelativeSource Self}" />
+                        <Binding Path="((vm:ProfileListViewModel)DataContext).UnsavedProfileId"
+                                 RelativeSource="{RelativeSource AncestorType=ListBox}" />
+                    </MultiBinding>
+                </Setter>
+            </Style>
+        </ListBox.Styles>
+        <ListBox.ItemTemplate>
+            <DataTemplate x:DataType="vm:ProfileListItem">
+                <Border Classes="avatar" ToolTip.Tip="{Binding Name}">
+                    <TextBlock Text="{Binding Acronym}" />
+                </Border>
+            </DataTemplate>
+        </ListBox.ItemTemplate>
+    </ListBox>
+
+</UserControl>

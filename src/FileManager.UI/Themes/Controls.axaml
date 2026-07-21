@@ -233,6 +233,61 @@
         <Setter Property="CornerRadius" Value="{StaticResource Radius.Control}" />
     </Style>
 
+    <!-- ====================== Collapsed profile rail ======================
+         The collapsed sidebar: one acronym avatar per profile, centred. Selection and hover are
+         drawn on the avatar Border itself (not the default ListBoxItem chrome), so we blank the
+         Fluent selection background/pipe and let the avatar carry the accent. Disabled (locked)
+         rows keep Fluent's reduced opacity as the "switch blocked" cue. -->
+    <Style Selector="ListBox.profilesRail">
+        <Setter Property="Background" Value="Transparent" />
+        <Setter Property="BorderThickness" Value="0" />
+        <Setter Property="Padding" Value="0" />
+    </Style>
+    <Style Selector="ListBox.profilesRail ListBoxItem">
+        <Setter Property="Padding" Value="0" />
+        <Setter Property="Margin" Value="0" />
+        <Setter Property="HorizontalContentAlignment" Value="Center" />
+    </Style>
+    <!-- Suppress the default row selection chrome; the avatar handles all visuals. -->
+    <Style Selector="ListBox.profilesRail ListBoxItem:pointerover /template/ Border#PART_LayoutRoot">
+        <Setter Property="Background" Value="Transparent" />
+    </Style>
+    <Style Selector="ListBox.profilesRail ListBoxItem:selected /template/ Border#PART_LayoutRoot">
+        <Setter Property="Background" Value="Transparent" />
+    </Style>
+    <Style Selector="ListBox.profilesRail ListBoxItem:selected /template/ Border#PART_SelectedPipe">
+        <Setter Property="IsVisible" Value="False" />
+    </Style>
+
+    <Style Selector="ListBox.profilesRail Border.avatar">
+        <Setter Property="Width" Value="40" />
+        <Setter Property="Height" Value="40" />
+        <!-- Spacing between avatars lives on the avatar itself, not on the list/items. -->
+        <Setter Property="Margin" Value="0,3" />
+        <Setter Property="HorizontalAlignment" Value="Center" />
+        <Setter Property="CornerRadius" Value="{StaticResource Radius.Control}" />
+        <Setter Property="Background" Value="{DynamicResource Brush.Control.Background}" />
+        <Setter Property="BorderBrush" Value="{DynamicResource Brush.Control.Border}" />
+        <Setter Property="BorderThickness" Value="1" />
+    </Style>
+    <Style Selector="ListBox.profilesRail Border.avatar > TextBlock">
+        <Setter Property="HorizontalAlignment" Value="Center" />
+        <Setter Property="VerticalAlignment" Value="Center" />
+        <Setter Property="FontWeight" Value="SemiBold" />
+        <Setter Property="Foreground" Value="{DynamicResource Brush.Text.Primary}" />
+    </Style>
+    <Style Selector="ListBox.profilesRail ListBoxItem:pointerover Border.avatar">
+        <Setter Property="Background" Value="{DynamicResource Brush.Item.Hover}" />
+        <Setter Property="BorderBrush" Value="{DynamicResource Brush.Control.BorderHover}" />
+    </Style>
+    <Style Selector="ListBox.profilesRail ListBoxItem:selected Border.avatar">
+        <Setter Property="Background" Value="{DynamicResource Brush.Accent}" />
+        <Setter Property="BorderBrush" Value="{DynamicResource Brush.Accent}" />
+    </Style>
+    <Style Selector="ListBox.profilesRail ListBoxItem:selected Border.avatar > TextBlock">
+        <Setter Property="Foreground" Value="{DynamicResource Brush.Accent.Foreground}" />
+    </Style>
+
     <!-- ============================ Document tabs ============================
          The Profile / Dry Run switch is a primary navigation control, so give it real presence:
          larger type, generous hit target, a divider rule beneath the strip, and a bold accent

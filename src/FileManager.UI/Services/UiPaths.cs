@@ -18,4 +18,9 @@ internal static class UiPaths
     /// <c>EnginePaths.Default().SettingsFilePath</c>; read at startup to apply the persisted theme
     /// before the first paint (avoids the IPC-latency theme flash).</summary>
     public static string SettingsFilePath { get; } = Path.Combine(Root, "settings.json");
+
+    /// <summary>Client-side UI layout state (sidebar collapsed/width). Owned entirely by the UI —
+    /// it never touches the service's <c>GlobalSettings</c> — and read/written via
+    /// <see cref="UiStateStore"/>.</summary>
+    public static string UiStateFilePath { get; } = Path.Combine(Root, "ui-state.json");
 }
