@@ -1,5 +1,6 @@
 using FileManager.Contracts.Primitives;
 using FileManager.Contracts.Profiles;
+using FileManager.Core.Files;
 using FileManager.Core.Jobs;
 using FileManager.Core.Journal;
 using FileManager.Core.Locking;
@@ -28,7 +29,6 @@ public sealed class AtomicPlacer(
 {
     private const int CopyBufferSize = 1024 * 1024;
     private const string TempSuffix = ".fmtmp-";
-    private const string StagingDirName = ".fm_staging";
 
     /// <summary>Timestamp comparison tolerance for the VerificationMethod.None unchanged-check —
     /// FAT/exFAT round last-write times to ~2 s, so an exact-tick compare would never short-circuit.</summary>
@@ -118,7 +118,7 @@ public sealed class AtomicPlacer(
         string finalPath = request.FinalPath;
         string targetDir = Path.GetDirectoryName(finalPath) ?? throw new ArgumentException("final path has no directory", nameof(request));
         string tempPath = finalPath + TempSuffix + jobShort;
-        string stagedPath = Path.Combine(tp.Plan.TargetRoot, StagingDirName, jobId.ToString("N"), Path.GetFileName(finalPath));
+        string stagedPath = InfrastructurePaths.StagedPathFor(tp.Plan.TargetRoot, jobId, index, Path.GetFileName(finalPath));
 
         SuppressionToken? tempTok = null, finalTok = null, stagedTok = null;
         try
@@ -237,6 +237,12 @@ public sealed class AtomicPlacer(
         {
             return new JobError { Code = JobErrorCode.TargetWriteFailed, Message = $"could not write temp \"{tempPath}\": {ex.Message}", Path = tempPath };
         }
+        catch (Exception ex)
+        {
+            // Last-resort catch-all (directive): surface as a JobError, never an unlogged throw.
+            logger.LogError(ex, "Unexpected error writing temp \"{Temp}\"", tempPath);
+            return new JobError { Code = JobErrorCode.TargetWriteFailed, Message = $"could not write temp \"{tempPath}\": {ex.GetType().Name}: {ex.Message}", Path = tempPath };
+        }
     }
 
     private async Task<Result<bool, JobError>> VerifyAsync(string tempPath, SealedOutput output, VerificationMethod method, int index, CancellationToken ct)
@@ -306,6 +312,18 @@ public sealed class AtomicPlacer(
             {
                 Code = JobErrorCode.PlacementFailed,
                 Message = $"could not place \"{finalPath}\": {ex.Message}",
+                Path = finalPath,
+                TargetIndex = request.TargetIndex,
+            });
+        }
+        catch (Exception ex)
+        {
+            // Last-resort catch-all (directive): surface as a JobError, never an unlogged throw.
+            logger.LogError(ex, "Unexpected error placing \"{Final}\"", finalPath);
+            return Task.FromResult<Result<bool, JobError>>(new JobError
+            {
+                Code = JobErrorCode.PlacementFailed,
+                Message = $"could not place \"{finalPath}\": {ex.GetType().Name}: {ex.Message}",
                 Path = finalPath,
                 TargetIndex = request.TargetIndex,
             });

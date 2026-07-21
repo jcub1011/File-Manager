@@ -44,7 +44,26 @@ public sealed class TransientRetryPolicy(TimeProvider time, ILogger<TransientRet
         for (int attempt = 1; attempt <= MaxAttempts; attempt++)
         {
             ct.ThrowIfCancellationRequested();
-            result = await operation(ct).ConfigureAwait(false);
+            try
+            {
+                result = await operation(ct).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;   // cancellation keeps its existing throw-out contract
+            }
+            catch (Exception ex)
+            {
+                // Last-resort catch-all at this task boundary (directive): the delegate is arbitrary
+                // caller code; an unexpected throw becomes a logged, deterministic (non-retried)
+                // failure value rather than an exception two frames up.
+                logger.LogError(ex, "Operation \"{Operation}\" threw unexpectedly (attempt {Attempt}/{Max})", operationName, attempt, MaxAttempts);
+                return new JobError
+                {
+                    Code = JobErrorCode.PlacementFailed,
+                    Message = $"\"{operationName}\" failed unexpectedly: {ex.GetType().Name}: {ex.Message}",
+                };
+            }
 
             if (result.IsSuccess || result.IsCanceled)
                 return result;

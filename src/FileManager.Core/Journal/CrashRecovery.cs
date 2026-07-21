@@ -32,7 +32,6 @@ public sealed class CrashRecovery(
     ILogger<CrashRecovery> logger) : ICrashRecovery
 {
     private const int CopyBufferSize = 1024 * 1024;
-    private const string StagingDirName = ".fm_staging";
     private static readonly TimeSpan OrphanAge = TimeSpan.FromHours(24);
 
     public Result<RecoveryReport, JobError> Recover(CancellationToken ct = default)
@@ -132,7 +131,7 @@ public sealed class CrashRecovery(
         // Row J — crashed rollback: resume the sweep for targets lacking a target-rolledback record.
         if (rollbackBegun)
         {
-            RollBack(jobId, opened, targets.Where(t => !t.RolledBack).ToArray(), "recovery: resume crashed rollback");
+            RollBack(jobId, opened, seal, targets.Where(t => !t.RolledBack).ToArray(), "recovery: resume crashed rollback");
             return RecoveryOutcome.RolledBack;
         }
 
@@ -142,18 +141,18 @@ public sealed class CrashRecovery(
         bool anyStagedOrPlaced = targets.Any(t => t.State is TargetState.Staged or TargetState.Placed);
         if (!sealedPresent || !anyStagedOrPlaced)
         {
-            RollBack(jobId, opened, targets, "recovery: pre-placement cleanup");
+            RollBack(jobId, opened, seal, targets, "recovery: pre-placement cleanup");
             return RecoveryOutcome.CleanedPrePlacement;
         }
 
         // Rows E–H — mid-placement: forward-completion gate (§7.3).
         if (ForwardCompletionAllowed(opened, seal, targets))
         {
-            CompleteForward(jobId, opened, seal!, targets);
+            CompleteForward(jobId, opened, seal!, targets, quarantined);
             return RecoveryOutcome.CompletedForward;
         }
 
-        RollBack(jobId, opened, targets, "recovery: mid-placement rollback (forward gate failed)");
+        RollBack(jobId, opened, seal, targets, "recovery: mid-placement rollback (forward gate failed)");
         return RecoveryOutcome.RolledBack;
     }
 
@@ -219,7 +218,7 @@ public sealed class CrashRecovery(
         return true;
     }
 
-    private void CompleteForward(Guid jobId, JobOpenedRecord opened, OutputSealedRecord seal, TargetRecovery[] targets)
+    private void CompleteForward(Guid jobId, JobOpenedRecord opened, OutputSealedRecord seal, TargetRecovery[] targets, ConcurrentBag<string> quarantined)
     {
         // The forward gate (ForwardCompletionAllowed) has already verified that every placed target
         // is intact and every not-yet-placed target has resolvable paths, so placement below cannot
@@ -229,15 +228,22 @@ public sealed class CrashRecovery(
             if (t.State is TargetState.Placed or TargetState.SatisfiedUnchanged or TargetState.SkippedConflict)
                 continue;
 
-            ForwardPlaceTarget(jobId, opened, seal, t);
+            ForwardPlaceTarget(jobId, opened, seal, t, quarantined);
         }
 
-        // All targets placed → commit → disposition → close Succeeded.
-        Journal(new JobCommittedRecord { JobId = jobId, Seq = 0, AtUtc = time.GetUtcNow() });
+        // Commit point (I-DISPOSE): job-committed MUST be durable before the source is disposed.
+        // If the append fails, throwing leaves the job OPEN with every placed copy intact — the next
+        // startup re-runs the gate (all placed targets now hash-match) and retries the commit.
+        // Disposing on a failed append would let a later rollback delete the copies of an
+        // already-deleted source: total loss.
+        if (!Journal(new JobCommittedRecord { JobId = jobId, Seq = 0, AtUtc = time.GetUtcNow() }))
+            throw new InvalidOperationException(
+                $"could not journal job-committed for job {jobId}; leaving the job open (source not disposed)");
+
         ReattemptDisposition(jobId, opened, targets, alreadyCommitted: true);
     }
 
-    private void ForwardPlaceTarget(Guid jobId, JobOpenedRecord opened, OutputSealedRecord seal, TargetRecovery t)
+    private void ForwardPlaceTarget(Guid jobId, JobOpenedRecord opened, OutputSealedRecord seal, TargetRecovery t, ConcurrentBag<string> quarantined)
     {
         if (t.FinalPath is null || t.TempPath is null)
             // Unreachable: the forward-completion gate rejects any job with such a target. Throwing
@@ -267,12 +273,43 @@ public sealed class CrashRecovery(
             Directory.CreateDirectory(Path.GetDirectoryName(staged)!);
             Replace(t.TempPath, t.FinalPath, staged);
         }
-        else
+        else if (opened.Policies.OverwriteHandling == OverwriteHandling.DirectOverwrite && t.FinalExisted)
         {
+            // The job's own pre-crash intent was to clobber this name (the live path does the same
+            // atomic replace), so completing that overwrite honours the journaled plan.
             File.Move(t.TempPath, t.FinalPath, overwrite: true);
         }
+        else
+        {
+            // External interference: the job recorded FinalExisted=false, yet a file with foreign
+            // content now sits at the final name (it appeared between the crash and this startup).
+            // The live path refuses to clobber it (AtomicPlacer places fresh files overwrite:false);
+            // recovery must not either — quarantine it, then place. If the quarantine move fails,
+            // the throw leaves the job for the next startup, nothing destroyed.
+            string quarantinePath = QuarantinePath(jobId, t);
+            Directory.CreateDirectory(Path.GetDirectoryName(quarantinePath)!);
+            File.Move(t.FinalPath, quarantinePath, overwrite: false);
+            quarantined.Add(quarantinePath);
+            logger.LogWarning(
+                "Recovery: external file appeared at \"{Final}\" after the crash of job {JobId}; quarantined it to \"{Quarantine}\" before placing",
+                t.FinalPath, jobId, quarantinePath);
+            File.Move(t.TempPath, t.FinalPath, overwrite: false);
+        }
 
+        // Best-effort by design: if this append fails, the worst case is a re-place of an identical,
+        // hash-verified file on the next startup (idempotent) — never data loss.
         Journal(new TargetPlacedRecord { JobId = jobId, Seq = 0, AtUtc = time.GetUtcNow(), TargetIndex = t.TargetIndex });
+    }
+
+    /// <summary>A collision-free spot under the engine's quarantine root for a foreign file found at
+    /// a final path recovery needs to place into. Keyed by job + target; a leftover from an earlier
+    /// interrupted recovery of the same job gets a random disambiguator rather than a failure.</summary>
+    private string QuarantinePath(Guid jobId, TargetRecovery t)
+    {
+        string candidate = Path.Combine(paths.QuarantineDirectory, jobId.ToString("N"), $"{t.TargetIndex}-{Path.GetFileName(t.FinalPath!)}");
+        if (File.Exists(candidate))
+            candidate = $"{candidate}.{Guid.NewGuid():N}";
+        return candidate;
     }
 
     private void ReattemptDisposition(Guid jobId, JobOpenedRecord opened, TargetRecovery[] targets, bool alreadyCommitted = false)
@@ -290,7 +327,7 @@ public sealed class CrashRecovery(
         });
     }
 
-    private void RollBack(Guid jobId, JobOpenedRecord opened, TargetRecovery[] targets, string reason)
+    private void RollBack(Guid jobId, JobOpenedRecord opened, OutputSealedRecord? seal, TargetRecovery[] targets, string reason)
     {
         var items = targets.Select(t => new TargetRollbackItem
         {
@@ -309,6 +346,10 @@ public sealed class CrashRecovery(
             Targets = items,
             WorkspaceDir = opened.WorkspaceDir,
             OverwriteHandling = opened.Policies.OverwriteHandling,
+            // The rollback hash gate: lets the executor recognize a placed file that was modified
+            // externally between the crash and this startup, and leave it rather than destroy it.
+            ExpectedContentHash = seal?.ContentHash,
+            Verification = opened.Policies.Verification,
         };
         rollback.Rollback(context);
     }
@@ -364,11 +405,11 @@ public sealed class CrashRecovery(
 
     private static bool InRange(int index, TargetRecovery[] targets) => index >= 0 && index < targets.Length;
 
-    private string StagedPath(JobOpenedRecord opened, Guid jobId, TargetRecovery t)
+    private static string StagedPath(JobOpenedRecord opened, Guid jobId, TargetRecovery t)
     {
         TargetPlan plan = opened.Targets[t.TargetIndex];
         string finalName = Path.GetFileName(t.FinalPath ?? plan.ProspectiveFinalPath);
-        return Path.Combine(plan.TargetRoot, StagingDirName, jobId.ToString("N"), finalName);
+        return Files.InfrastructurePaths.StagedPathFor(plan.TargetRoot, jobId, t.TargetIndex, finalName);
     }
 
     private void SweepOrphans(HashSet<Guid> knownJobs, List<string> quarantined)
@@ -426,28 +467,51 @@ public sealed class CrashRecovery(
         dst.Flush(flushToDisk: true);
     }
 
-    private static void Replace(string temp, string final, string staged)
+    private void Replace(string temp, string final, string staged)
     {
         try { File.Replace(temp, final, staged, ignoreMetadataErrors: true); }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or PlatformNotSupportedException)
         {
+            logger.LogWarning(ex, "File.Replace rejected for \"{Final}\" during recovery; falling back to two-step move", final);
             File.Move(final, staged);
             File.Move(temp, final);
         }
+        catch (Exception ex)
+        {
+            // Last-resort catch-all (directive): log before the throw reaches RecoverJob's
+            // leave-for-next-startup handler, so the specific replace that failed is on record.
+            logger.LogError(ex, "Staged replace of \"{Final}\" failed unexpectedly during recovery", final);
+            throw;
+        }
     }
 
-    private static void SafeDelete(string path)
+    private void SafeDelete(string path)
     {
         try { if (File.Exists(path)) File.Delete(path); }
-        catch (IOException) { /* best-effort */ }
-        catch (UnauthorizedAccessException) { /* best-effort */ }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // Best-effort by contract (a leftover temp is harmless and infra-excluded from scans),
+            // but never silent (directive).
+            logger.LogDebug(ex, "Best-effort delete of \"{Path}\" failed", path);
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "Best-effort delete of \"{Path}\" failed unexpectedly", path);
+        }
     }
 
-    private void Journal(JournalRecord record)
+    /// <summary>Appends and reports success. Callers decide per record whether a failed append is
+    /// fatal (job-committed — disposing without it risks total loss) or best-effort (target-placed /
+    /// job-closed — replay is idempotent, the next startup re-resolves the job).</summary>
+    private bool Journal(JournalRecord record)
     {
         Result result = journal.Append(record);
         if (result.TryGetError(out string? error))
+        {
             logger.LogError("Recovery journal append failed ({Type}): {Error}", record.GetType().Name, error);
+            return false;
+        }
+        return true;
     }
 
     private sealed class TargetRecovery

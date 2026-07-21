@@ -10,8 +10,17 @@ namespace FileManager.Core.Files;
 /// is "the tool's own plumbing" rather than user content.</summary>
 public static class InfrastructurePaths
 {
-    private static readonly string[] Directories = [".pipeline_tmp", ".fm_staging"];
+    public const string StagingDirectoryName = ".fm_staging";
+    private static readonly string[] Directories = [".pipeline_tmp", StagingDirectoryName];
     private const string TempFileMarker = ".fmtmp-";
+
+    /// <summary>The single definition of a target's staged-prior path, shared by the placer and
+    /// crash recovery so the two can never disagree. Keyed by job AND target index: one job may have
+    /// two targets under the same root whose layouts resolve to the same file NAME in different
+    /// directories — without the index they would collide and the second stage would destroy the
+    /// first target's prior version.</summary>
+    public static string StagedPathFor(string targetRoot, Guid jobId, int targetIndex, string finalFileName)
+        => Path.Combine(targetRoot, StagingDirectoryName, jobId.ToString("N"), $"{targetIndex}-{finalFileName}");
 
     /// <summary>True when a directory name is one of the tool's own infrastructure directories,
     /// which a walk must never descend into or report.</summary>

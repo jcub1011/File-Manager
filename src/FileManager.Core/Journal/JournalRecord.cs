@@ -90,7 +90,11 @@ public sealed record RollbackBeginRecord : JournalRecord
 public enum RollbackAction
 {
     None, RemovedTemp, RestoredStagedBeforePlacement,
-    UnplacedAndRestored, UnplacedNoPrior, LeftInPlaceUnrecoverable
+    UnplacedAndRestored, UnplacedNoPrior, LeftInPlaceUnrecoverable,
+    // Appended (journal wire contract — records serialize enums as integers; never reorder).
+    /// <summary>The placed final no longer matched the job's own output hash: someone modified it
+    /// after placement, so rollback left it (and any staged prior) untouched.</summary>
+    LeftInPlaceModified,
 }
 
 public sealed record TargetRolledBackRecord : JournalRecord

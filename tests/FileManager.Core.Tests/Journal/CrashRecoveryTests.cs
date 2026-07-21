@@ -33,7 +33,7 @@ public sealed class CrashRecoveryTests : IDisposable
         var config = new EngineConfig { TempRoot = Path.Combine(_root, "work") };
         _journal = new JobJournal(_paths, config, NullLogger<JobJournal>.Instance);
         var hasher = new FileHasher(NullLogger<FileHasher>.Instance);
-        var rollback = new RollbackExecutor(_journal, time, NullLogger<RollbackExecutor>.Instance);
+        var rollback = new RollbackExecutor(_journal, hasher, time, NullLogger<RollbackExecutor>.Instance);
         _trash = new FakeTrashService(Path.Combine(_root, "bin"));
         var disposition = new SourceDispositionService(_trash, new DispositionAuditLog(_paths, NullLogger<DispositionAuditLog>.Instance), time, NullLogger<SourceDispositionService>.Instance);
         _recovery = new CrashRecovery(_journal, hasher, rollback, disposition, _paths, config, time, NullLogger<CrashRecovery>.Instance);
@@ -343,5 +343,164 @@ public sealed class CrashRecoveryTests : IDisposable
         Assert.Equal(1, report.RolledBack);
         Assert.False(File.Exists(temp));            // resumed sweep removed the leftover temp
         Assert.False(Directory.Exists(workspace));  // and deleted the workspace
+    }
+
+    [Fact]
+    public void External_file_at_unplaced_final_is_quarantined_not_overwritten()
+    {
+        // Two-target job: target 0 already Placed (so the job classifies as mid-placement and the
+        // gate can pass), target 1 journaled FinalExisted=false and crashed before its rename. An
+        // external program then created a file at target 1's final name. Forward completion must
+        // quarantine that file — never File.Move(overwrite:true) over content the journal cannot
+        // prove is ours.
+        var job = Guid.NewGuid();
+        var jobId = new JobId(job);
+        const string content = "the verified payload";
+        string workspace = Path.Combine(_root, "work", ".pipeline_tmp", job.ToString("N"));
+        Directory.CreateDirectory(workspace);
+        string output = Path.Combine(workspace, "output");
+        File.WriteAllText(output, content);
+        string targetRoot = Path.Combine(_root, "target");
+        Directory.CreateDirectory(Path.Combine(targetRoot, "a"));
+        Directory.CreateDirectory(Path.Combine(targetRoot, "b"));
+        string final0 = Path.Combine(targetRoot, "a", "out.dat");
+        string final1 = Path.Combine(targetRoot, "b", "out.dat");
+        File.WriteAllText(final0, content);                        // target 0: placed and intact
+        string temp1 = final1 + ".fmtmp-" + jobId.Short;
+        File.WriteAllText(temp1, content);                         // target 1: verified temp awaiting rename
+        File.WriteAllText(final1, "EXTERNAL FILE - someone else's data");
+
+        _journal.Append(Open2(job, Path.Combine(_root, "src.dat"), final0, final1, targetRoot, workspace, VerificationMethod.Sha256, OnSuccessAction.KeepSource));
+        _journal.Append(new OutputSealedRecord { JobId = job, Seq = 0, AtUtc = DateTimeOffset.UnixEpoch, OutputPath = output, SizeBytes = content.Length, ContentHash = Sha(content) });
+        _journal.Append(new TargetWriteBeginRecord { JobId = job, Seq = 0, AtUtc = DateTimeOffset.UnixEpoch, TargetIndex = 0, TempPath = final0 + ".fmtmp-" + jobId.Short, FinalPath = final0, FinalExisted = false });
+        _journal.Append(new TargetVerifiedRecord { JobId = job, Seq = 0, AtUtc = DateTimeOffset.UnixEpoch, TargetIndex = 0 });
+        _journal.Append(new TargetPlacedRecord { JobId = job, Seq = 0, AtUtc = DateTimeOffset.UnixEpoch, TargetIndex = 0 });
+        _journal.Append(new TargetWriteBeginRecord { JobId = job, Seq = 0, AtUtc = DateTimeOffset.UnixEpoch, TargetIndex = 1, TempPath = temp1, FinalPath = final1, FinalExisted = false });
+        _journal.Append(new TargetVerifiedRecord { JobId = job, Seq = 0, AtUtc = DateTimeOffset.UnixEpoch, TargetIndex = 1 });
+
+        Result<RecoveryReport, JobError> result = _recovery.Recover();
+
+        Assert.True(result.TryGetValue(out RecoveryReport? report));
+        Assert.Equal(1, report.CompletedForward);
+        Assert.Equal(content, File.ReadAllText(final1));           // job output placed
+        string quarantinePath = Assert.Single(report.QuarantinedPaths, p => p.Contains(job.ToString("N")));
+        Assert.Equal("EXTERNAL FILE - someone else's data", File.ReadAllText(quarantinePath));   // foreign file preserved
+        Assert.StartsWith(_paths.QuarantineDirectory, quarantinePath);
+    }
+
+    [Fact]
+    public void Modified_placed_file_is_left_in_place_by_recovery_rollback()
+    {
+        // A fresh file was placed (state Placed journaled), the job crashed before commit, and the
+        // user edited the placed file. The gate refuses forward (hash mismatch) — and the rollback
+        // it falls through to must NOT delete the edited file (it no longer holds the job's bytes).
+        var job = Guid.NewGuid();
+        var jobId = new JobId(job);
+        const string content = "the verified payload";
+        string source = Path.Combine(_root, "src.dat");
+        File.WriteAllText(source, "the irreplaceable source");
+        string workspace = Path.Combine(_root, "work", ".pipeline_tmp", job.ToString("N"));
+        Directory.CreateDirectory(workspace);
+        string output = Path.Combine(workspace, "output");
+        File.WriteAllText(output, content);
+        string targetRoot = Path.Combine(_root, "target");
+        Directory.CreateDirectory(targetRoot);
+        string final = Path.Combine(targetRoot, "out.dat");
+        string temp = final + ".fmtmp-" + jobId.Short;
+        File.WriteAllText(final, "USER EDITS after placement");   // placed, then modified externally
+
+        _journal.Append(Open(job, source, final, targetRoot, workspace, VerificationMethod.Sha256, OnSuccessAction.MoveToTrash));
+        _journal.Append(new OutputSealedRecord { JobId = job, Seq = 0, AtUtc = DateTimeOffset.UnixEpoch, OutputPath = output, SizeBytes = content.Length, ContentHash = Sha(content) });
+        _journal.Append(new TargetWriteBeginRecord { JobId = job, Seq = 0, AtUtc = DateTimeOffset.UnixEpoch, TargetIndex = 0, TempPath = temp, FinalPath = final, FinalExisted = false });
+        _journal.Append(new TargetVerifiedRecord { JobId = job, Seq = 0, AtUtc = DateTimeOffset.UnixEpoch, TargetIndex = 0 });
+        _journal.Append(new TargetPlacedRecord { JobId = job, Seq = 0, AtUtc = DateTimeOffset.UnixEpoch, TargetIndex = 0 });
+
+        // Post-recovery rotation drops CLOSED jobs' records, so observe the rollback's appends live.
+        var spy = new RecordingJournal(_journal);
+        CrashRecovery recovery = BuildRecovery(spy);
+
+        Result<RecoveryReport, JobError> result = recovery.Recover();
+
+        Assert.True(result.TryGetValue(out RecoveryReport? report));
+        Assert.Equal(1, report.RolledBack);
+        Assert.Equal(0, report.CompletedForward);
+        Assert.True(File.Exists(final));
+        Assert.Equal("USER EDITS after placement", File.ReadAllText(final));   // never deleted
+        Assert.True(File.Exists(source));                                      // source never disposed
+        Assert.DoesNotContain(source, _trash.Trashed);
+        Assert.Contains(spy.Appended, r => r is TargetRolledBackRecord { Action: RollbackAction.LeftInPlaceModified });
+    }
+
+    [Fact]
+    public void Failed_commit_append_leaves_the_job_open_and_the_source_undisposed()
+    {
+        // job-committed is THE commit point: if its append fails, recovery must not dispose the
+        // source — the job stays OPEN (copies intact) and the next startup retries. Target state
+        // Placed makes the job mid-placement with a passing gate, so recovery reaches the commit.
+        var job = Guid.NewGuid();
+        var jobId = new JobId(job);
+        const string content = "the verified payload";
+        string source = Path.Combine(_root, "src.dat");
+        File.WriteAllText(source, "the irreplaceable source");
+        string workspace = Path.Combine(_root, "work", ".pipeline_tmp", job.ToString("N"));
+        Directory.CreateDirectory(workspace);
+        string output = Path.Combine(workspace, "output");
+        File.WriteAllText(output, content);
+        string targetRoot = Path.Combine(_root, "target");
+        Directory.CreateDirectory(targetRoot);
+        string final = Path.Combine(targetRoot, "out.dat");
+        string temp = final + ".fmtmp-" + jobId.Short;
+        File.WriteAllText(final, content);                        // placed and intact
+
+        _journal.Append(Open(job, source, final, targetRoot, workspace, VerificationMethod.Sha256, OnSuccessAction.MoveToTrash));
+        _journal.Append(new OutputSealedRecord { JobId = job, Seq = 0, AtUtc = DateTimeOffset.UnixEpoch, OutputPath = output, SizeBytes = content.Length, ContentHash = Sha(content) });
+        _journal.Append(new TargetWriteBeginRecord { JobId = job, Seq = 0, AtUtc = DateTimeOffset.UnixEpoch, TargetIndex = 0, TempPath = temp, FinalPath = final, FinalExisted = false });
+        _journal.Append(new TargetVerifiedRecord { JobId = job, Seq = 0, AtUtc = DateTimeOffset.UnixEpoch, TargetIndex = 0 });
+        _journal.Append(new TargetPlacedRecord { JobId = job, Seq = 0, AtUtc = DateTimeOffset.UnixEpoch, TargetIndex = 0 });
+
+        CrashRecovery recovery = BuildRecovery(new CommitAppendFailingJournal(_journal));
+
+        Result<RecoveryReport, JobError> result = recovery.Recover();
+
+        Assert.True(result.TryGetValue(out RecoveryReport? report));
+        Assert.Equal(0, report.JobsRecovered);                    // left for the next startup
+        Assert.True(File.Exists(source));                         // source never disposed
+        Assert.DoesNotContain(source, _trash.Trashed);
+        Assert.Equal(content, File.ReadAllText(final));           // placed copy intact
+        Assert.True(_journal.ReadAll().TryGetValue(out IReadOnlyList<JournalRecord>? records));
+        Assert.DoesNotContain(records!, r => r is JobCommittedRecord);   // commit never persisted
+        Assert.DoesNotContain(records!, r => r is JobClosedRecord);      // job still OPEN
+    }
+
+    /// <summary>A recovery built over <paramref name="journal"/> with the same collaborators as the
+    /// fixture's default instance.</summary>
+    private CrashRecovery BuildRecovery(IJobJournal journal)
+    {
+        var time = new FakeTimeProvider();
+        var hasher = new FileHasher(NullLogger<FileHasher>.Instance);
+        var rollback = new RollbackExecutor(journal, hasher, time, NullLogger<RollbackExecutor>.Instance);
+        var disposition = new SourceDispositionService(_trash, new DispositionAuditLog(_paths, NullLogger<DispositionAuditLog>.Instance), time, NullLogger<SourceDispositionService>.Instance);
+        return new CrashRecovery(journal, hasher, rollback, disposition, _paths,
+            new EngineConfig { TempRoot = Path.Combine(_root, "work") }, time, NullLogger<CrashRecovery>.Instance);
+    }
+
+    /// <summary>Delegates to the real journal but fails every <see cref="JobCommittedRecord"/>
+    /// append — the disk-full-at-the-commit-point fault.</summary>
+    private sealed class CommitAppendFailingJournal(IJobJournal inner) : IJobJournal
+    {
+        public Result Append(JournalRecord record) =>
+            record is JobCommittedRecord ? Result.Failure("injected: commit append failed") : inner.Append(record);
+        public Result<IReadOnlyList<JournalRecord>, JobError> ReadAll() => inner.ReadAll();
+        public Result Rotate() => inner.Rotate();
+    }
+
+    /// <summary>Delegates to the real journal and records every append — post-recovery rotation
+    /// drops CLOSED jobs' records, so assertions about rollback rows must observe them live.</summary>
+    private sealed class RecordingJournal(IJobJournal inner) : IJobJournal
+    {
+        public List<JournalRecord> Appended { get; } = [];
+        public Result Append(JournalRecord record) { lock (Appended) Appended.Add(record); return inner.Append(record); }
+        public Result<IReadOnlyList<JournalRecord>, JobError> ReadAll() => inner.ReadAll();
+        public Result Rotate() => inner.Rotate();
     }
 }

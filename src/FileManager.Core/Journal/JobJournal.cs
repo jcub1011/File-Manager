@@ -180,6 +180,34 @@ public sealed class JobJournal : IJobJournal, IDisposable
         }
 
         _active?.Dispose();
+
+        // Reacquire the active handle BEFORE deleting the old segments: if this reopen fails with
+        // _active already disposed and the old segments gone, every subsequent Append would fail
+        // (JournalWriteFailed → all live jobs roll back, and rollback's own appends fail too) until
+        // restart. Failing here instead leaves the old segments intact and _active restorable.
+        FileStream newActive;
+        try
+        {
+            newActive = OpenAppend(newPath);
+        }
+        catch (Exception reopenEx)
+        {
+            try
+            {
+                _active = OpenAppend(SegmentPath(_activeNumber));
+                _logger.LogWarning(reopenEx, "Could not reopen the new journal segment after rotation; continuing on segment {Number}", _activeNumber);
+            }
+            catch (Exception restoreEx)
+            {
+                // Both handles are gone — the journal is wedged until the next successful Append
+                // re-initializes or the process restarts. Loud, per the no-silent-failure directive.
+                _logger.LogError(restoreEx, "Journal wedged: could not reopen either the new or the previous segment after rotation");
+                _active = null;
+                _initialized = false;   // force EnsureInitialized to retry from disk on the next Append
+            }
+            throw;
+        }
+
         foreach ((int number, string path) in segments)
         {
             if (number < newNumber)
@@ -187,7 +215,7 @@ public sealed class JobJournal : IJobJournal, IDisposable
         }
 
         _activeNumber = newNumber;
-        _active = OpenAppend(newPath);
+        _active = newActive;
     }
 
     private void ReadSegment(string path, bool isLastSegment, List<JournalRecord> into)
@@ -300,6 +328,12 @@ public sealed class JobJournal : IJobJournal, IDisposable
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
             _logger.LogWarning(ex, "Could not delete old journal segment {Path}", path);
+        }
+        catch (Exception ex)
+        {
+            // Last-resort catch-all (directive): a leftover segment is duplicate-tolerated by
+            // recovery, so even an unexpected failure stays best-effort — but never silent.
+            _logger.LogWarning(ex, "Could not delete old journal segment {Path} (unexpected)", path);
         }
     }
 

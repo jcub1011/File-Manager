@@ -19,6 +19,14 @@ public sealed record RollbackContext
     public required IReadOnlyList<TargetRollbackItem> Targets { get; init; }
     public required string WorkspaceDir { get; init; }
     public required OverwriteHandling OverwriteHandling { get; init; }
+
+    /// <summary>The job's sealed output hash (from <c>output-sealed</c>), when one exists. Lets the
+    /// executor verify a placed final still holds the job's own bytes before deleting or replacing
+    /// it — a mismatch means someone modified it after placement, and rollback must leave it.
+    /// Null (or a non-hash <see cref="Verification"/>) disables the gate: reverts proceed as before,
+    /// which is only reachable live (revert immediately follows placement, no external window).</summary>
+    public string? ExpectedContentHash { get; init; }
+    public VerificationMethod Verification { get; init; } = VerificationMethod.None;
 }
 
 public sealed record TargetRollbackItem

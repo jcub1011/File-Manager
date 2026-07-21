@@ -1,6 +1,7 @@
 using FileManager.Contracts.Primitives;
 using FileManager.Contracts.Profiles;
 using FileManager.Core.Jobs;
+using FileManager.Core.Placement;
 using Microsoft.Extensions.Logging;
 using System;
 using System.Collections.Generic;
@@ -16,7 +17,7 @@ namespace FileManager.Core.Journal;
 /// record (§4.7 step 4). The <see cref="IRollbackExecutor"/> surface is synchronous, so each I/O
 /// step uses an inline 3-attempt best-effort retry (the equivalent of the async
 /// <see cref="Placement.ITransientRetryPolicy"/> the live write path uses).</summary>
-public sealed class RollbackExecutor(IJobJournal journal, TimeProvider time, ILogger<RollbackExecutor> logger) : IRollbackExecutor
+public sealed class RollbackExecutor(IJobJournal journal, IFileHasher hasher, TimeProvider time, ILogger<RollbackExecutor> logger) : IRollbackExecutor
 {
     private const int MaxAttempts = 3;
 
@@ -75,13 +76,13 @@ public sealed class RollbackExecutor(IJobJournal journal, TimeProvider time, ILo
         var reverts = new (RollbackAction Action, string? Error)[targets.Count];
         if (targets.Count == 1)
         {
-            reverts[0] = RevertTarget(targets[0], context.OverwriteHandling);
+            reverts[0] = RevertTarget(targets[0], context);
         }
         else if (targets.Count > 1)
         {
             Parallel.For(0, targets.Count,
                 new ParallelOptions { MaxDegreeOfParallelism = Math.Min(MaxTargetParallelism, targets.Count) },
-                i => reverts[i] = RevertTarget(targets[i], context.OverwriteHandling));
+                i => reverts[i] = RevertTarget(targets[i], context));
         }
 
         for (int i = 0; i < targets.Count; i++)
@@ -134,7 +135,7 @@ public sealed class RollbackExecutor(IJobJournal journal, TimeProvider time, ILo
         return new RollbackResult { Complete = complete, ResidualPaths = residuals };
     }
 
-    private (RollbackAction Action, string? Error) RevertTarget(TargetRollbackItem target, OverwriteHandling overwrite)
+    private (RollbackAction Action, string? Error) RevertTarget(TargetRollbackItem target, RollbackContext context)
     {
         switch (target.State)
         {
@@ -151,23 +152,65 @@ public sealed class RollbackExecutor(IJobJournal journal, TimeProvider time, ILo
                 return (RollbackAction.RemovedTemp, TryDeleteFile(target.TempPath));
 
             case TargetState.Staged:
-                // Prior moved out, rename not yet done (two-step fallback): final is absent, a plain
-                // move restores it; then remove the temp.
-                string? stageError = TryMove(target.StagedPath, target.FinalPath, overwrite: false)
-                    ?? TryDeleteFile(target.TempPath);
-                return (RollbackAction.RestoredStagedBeforePlacement, stageError);
+                return RevertStaged(target, context);
 
             case TargetState.Placed:
-                return RevertPlaced(target, overwrite);
+                return RevertPlaced(target, context);
 
             default:
                 return (RollbackAction.None, $"unknown target state {target.State}");
         }
     }
 
-    private (RollbackAction Action, string? Error) RevertPlaced(TargetRollbackItem target, OverwriteHandling overwrite)
+    private (RollbackAction Action, string? Error) RevertStaged(TargetRollbackItem target, RollbackContext context)
     {
-        if (overwrite == OverwriteHandling.StageOverwrites && target.FinalExistedBeforeJob)
+        // The placer journals target-staged and sets Staged BEFORE the replace executes, so this
+        // state covers three on-disk shapes:
+        bool stagedExists = target.StagedPath is not null && File.Exists(target.StagedPath);
+        bool finalExists = target.FinalPath is not null && File.Exists(target.FinalPath);
+
+        if (!stagedExists && finalExists)
+        {
+            // The replace never ran (crash/failure right after the journal row): the prior still
+            // sits untouched at the final name — nothing to restore, just drop the temp.
+            return (RollbackAction.RemovedTemp, TryDeleteFile(target.TempPath));
+        }
+
+        if (stagedExists && finalExists)
+        {
+            // The replace fully happened but target-placed was lost: final holds the new content,
+            // staged holds the prior. Restore the prior — unless the final no longer matches the
+            // job's own output (modified after the crash); then leave both (I-STAGING-KEEP).
+            if (IsModifiedExternally(target.FinalPath, context))
+            {
+                logger.LogWarning("Leaving placed file \"{Path}\" — modified externally after placement; its staged prior version is kept", target.FinalPath);
+                return (RollbackAction.LeftInPlaceModified,
+                    $"placed file \"{target.FinalPath}\" was modified externally after placement; left in place (staged prior kept)");
+            }
+            string? replaceError = TryReplace(target.StagedPath, target.FinalPath)
+                ?? TryDeleteFile(target.TempPath);
+            return (RollbackAction.UnplacedAndRestored, replaceError);
+        }
+
+        // Two-step fallback crashed between its moves: prior moved out, rename not yet done — the
+        // final is absent, a plain move restores it; then remove the temp.
+        string? stageError = TryMove(target.StagedPath, target.FinalPath, overwrite: false)
+            ?? TryDeleteFile(target.TempPath);
+        return (RollbackAction.RestoredStagedBeforePlacement, stageError);
+    }
+
+    private (RollbackAction Action, string? Error) RevertPlaced(TargetRollbackItem target, RollbackContext context)
+    {
+        // Hash gate: a placed final that no longer holds the job's own bytes was modified after
+        // placement — the mismatch is exactly the evidence it must not be deleted or replaced.
+        if (IsModifiedExternally(target.FinalPath, context))
+        {
+            logger.LogWarning("Leaving placed file \"{Path}\" — modified externally after placement; rollback will not destroy it", target.FinalPath);
+            return (RollbackAction.LeftInPlaceModified,
+                $"placed file \"{target.FinalPath}\" was modified externally after placement; left in place");
+        }
+
+        if (context.OverwriteHandling == OverwriteHandling.StageOverwrites && target.FinalExistedBeforeJob)
         {
             // Atomic restore of the prior version, no absent-window.
             string? error = TryReplace(target.StagedPath, target.FinalPath);
@@ -182,6 +225,36 @@ public sealed class RollbackExecutor(IJobJournal journal, TimeProvider time, ILo
         // definition; deleting the new file too would destroy the only content at that name.
         logger.LogWarning("Leaving placed file \"{Path}\" — DirectOverwrite rollback cannot restore the overwritten prior version", target.FinalPath);
         return (RollbackAction.LeftInPlaceUnrecoverable, null);
+    }
+
+    /// <summary>True when the gate is armed (a sealed hash + hash-based method are present), the
+    /// final exists, and its current content does NOT match the job's output. Unreadable counts as
+    /// modified: destroying a file we cannot verify is the one unrecoverable mistake.</summary>
+    private bool IsModifiedExternally(string? finalPath, RollbackContext context)
+    {
+        if (context.ExpectedContentHash is null
+            || context.Verification is not (VerificationMethod.Sha256 or VerificationMethod.XxHash128)
+            || finalPath is null
+            || !File.Exists(finalPath))
+            return false;
+
+        try
+        {
+            Result<string, JobError> hashed = hasher.HashFileAsync(finalPath, context.Verification).GetAwaiter().GetResult();
+            if (!hashed.TryGetValue(out string? actual))
+            {
+                logger.LogWarning("Could not re-hash \"{Path}\" during rollback; treating it as modified (left in place)", finalPath);
+                return true;
+            }
+            return !string.Equals(actual, context.ExpectedContentHash, StringComparison.OrdinalIgnoreCase);
+        }
+        catch (Exception ex)
+        {
+            // Last-resort catch-all (directive): an unexpected hashing fault must not abort the
+            // sweep — and an unverifiable file is left in place, never destroyed.
+            logger.LogWarning(ex, "Re-hash of \"{Path}\" failed unexpectedly during rollback; treating it as modified (left in place)", finalPath);
+            return true;
+        }
     }
 
     // --- best-effort I/O with an inline 3-attempt retry; returns null on success, a message on final failure ---

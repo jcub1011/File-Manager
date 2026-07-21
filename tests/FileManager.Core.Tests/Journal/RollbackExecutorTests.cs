@@ -3,6 +3,7 @@ using FileManager.Contracts.Profiles;
 using FileManager.Core;
 using FileManager.Core.Jobs;
 using FileManager.Core.Journal;
+using FileManager.Core.Placement;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Time.Testing;
 
@@ -20,7 +21,7 @@ public sealed class RollbackExecutorTests : IDisposable
         Directory.CreateDirectory(_root);
         var paths = new EnginePaths { Root = Path.Combine(_root, "engine") };
         _journal = new JobJournal(paths, new EngineConfig(), NullLogger<JobJournal>.Instance);
-        _rollback = new RollbackExecutor(_journal, new FakeTimeProvider(), NullLogger<RollbackExecutor>.Instance);
+        _rollback = new RollbackExecutor(_journal, new FileHasher(NullLogger<FileHasher>.Instance), new FakeTimeProvider(), NullLogger<RollbackExecutor>.Instance);
     }
 
     public void Dispose()
@@ -136,7 +137,7 @@ public sealed class RollbackExecutorTests : IDisposable
 
     // A rollback executor with the inter-attempt backoff disabled so retry paths don't Thread.Sleep.
     private RollbackExecutor ZeroDelay() =>
-        new(_journal, new FakeTimeProvider(), NullLogger<RollbackExecutor>.Instance) { RetryDelay = TimeSpan.Zero };
+        new(_journal, new FileHasher(NullLogger<FileHasher>.Instance), new FakeTimeProvider(), NullLogger<RollbackExecutor>.Instance) { RetryDelay = TimeSpan.Zero };
 
     [Fact]
     public void Staged_two_step_restore_restores_the_prior_file()
@@ -204,6 +205,99 @@ public sealed class RollbackExecutorTests : IDisposable
         Assert.True(Directory.Exists(stagingDir));   // kept: it still holds an unrestored file
         Assert.True(File.Exists(staged));            // the unrestored file survives for later quarantine
     }
+
+    [Fact]
+    public void Staged_record_with_replace_never_run_deletes_temp_only()
+    {
+        // The placer journals target-staged BEFORE the replace executes; if the replace never ran,
+        // the staged file is absent and the prior sits untouched at the final name. Rollback must
+        // recognize "nothing moved yet" — delete the temp, touch nothing else, report no residual.
+        string final = Path.Combine(_root, "doc.txt");
+        File.WriteAllText(final, "PRIOR (untouched)");
+        string staged = Path.Combine(_root, "staging", "doc.txt");   // never created
+        string temp = Path.Combine(_root, "doc.fmtmp");
+        File.WriteAllText(temp, "new bytes");
+
+        var result = ZeroDelay().Rollback(Context(OverwriteHandling.StageOverwrites, new TargetRollbackItem
+        {
+            TargetIndex = 0, State = TargetState.Staged, TempPath = temp, FinalPath = final, StagedPath = staged, FinalExistedBeforeJob = true,
+        }));
+
+        Assert.True(result.TryGetValue(out RollbackResult? r) && r.Complete);   // no false RollbackFailed
+        Assert.Equal("PRIOR (untouched)", File.ReadAllText(final));
+        Assert.False(File.Exists(temp));                                        // temp not leaked
+        Assert.Contains(ReadJournal(), x => x is TargetRolledBackRecord { Action: RollbackAction.RemovedTemp, Error: null });
+    }
+
+    [Fact]
+    public void Staged_with_completed_replace_restores_the_prior_when_the_final_is_ours()
+    {
+        // File.Replace fully happened (staged holds the prior, final holds the job's output) but the
+        // crash lost target-placed. With the hash gate confirming the final is the job's own bytes,
+        // rollback restores the prior instead of reporting a residual.
+        const string newContent = "job output bytes";
+        string final = Path.Combine(_root, "doc.txt");
+        File.WriteAllText(final, newContent);
+        string staged = Path.Combine(_root, "staging", "doc.txt");
+        Directory.CreateDirectory(Path.GetDirectoryName(staged)!);
+        File.WriteAllText(staged, "PRIOR (good)");
+
+        var result = ZeroDelay().Rollback(HashGatedContext(newContent, new TargetRollbackItem
+        {
+            TargetIndex = 0, State = TargetState.Staged, TempPath = null, FinalPath = final, StagedPath = staged, FinalExistedBeforeJob = true,
+        }));
+
+        Assert.True(result.TryGetValue(out RollbackResult? r) && r.Complete);
+        Assert.Equal("PRIOR (good)", File.ReadAllText(final));   // prior restored
+        Assert.Contains(ReadJournal(), x => x is TargetRolledBackRecord { Action: RollbackAction.UnplacedAndRestored });
+    }
+
+    [Fact]
+    public void Placed_final_modified_externally_is_left_in_place()
+    {
+        // The hash gate: a placed fresh file that no longer matches the job's output hash was
+        // modified after placement — rollback must leave it, record a residual, and close RollbackFailed.
+        string final = Path.Combine(_root, "fresh.txt");
+        File.WriteAllText(final, "USER EDITS after placement");
+
+        var result = ZeroDelay().Rollback(HashGatedContext("the job's original output", new TargetRollbackItem
+        {
+            TargetIndex = 0, State = TargetState.Placed, TempPath = null, FinalPath = final, StagedPath = null, FinalExistedBeforeJob = false,
+        }));
+
+        Assert.True(result.TryGetValue(out RollbackResult? r));
+        Assert.False(r.Complete);
+        Assert.Contains(final, r.ResidualPaths);
+        Assert.Equal("USER EDITS after placement", File.ReadAllText(final));   // never deleted
+        Assert.Contains(ReadJournal(), x => x is TargetRolledBackRecord { Action: RollbackAction.LeftInPlaceModified });
+    }
+
+    [Fact]
+    public void Placed_final_matching_the_job_output_is_still_deleted()
+    {
+        // The gate must not change the normal revert: a fresh placed file that still holds the
+        // job's own bytes is deleted as before.
+        const string content = "the job's output";
+        string final = Path.Combine(_root, "fresh.txt");
+        File.WriteAllText(final, content);
+
+        var result = ZeroDelay().Rollback(HashGatedContext(content, new TargetRollbackItem
+        {
+            TargetIndex = 0, State = TargetState.Placed, TempPath = null, FinalPath = final, StagedPath = null, FinalExistedBeforeJob = false,
+        }));
+
+        Assert.True(result.TryGetValue(out RollbackResult? r) && r.Complete);
+        Assert.False(File.Exists(final));
+        Assert.Contains(ReadJournal(), x => x is TargetRolledBackRecord { Action: RollbackAction.UnplacedNoPrior });
+    }
+
+    /// <summary>A context whose hash gate is armed with the SHA-256 of <paramref name="jobOutputContent"/>.</summary>
+    private RollbackContext HashGatedContext(string jobOutputContent, params TargetRollbackItem[] targets) =>
+        Context(OverwriteHandling.StageOverwrites, targets) with
+        {
+            ExpectedContentHash = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(jobOutputContent))),
+            Verification = VerificationMethod.Sha256,
+        };
 
     private IReadOnlyList<JournalRecord> ReadJournal()
     {
