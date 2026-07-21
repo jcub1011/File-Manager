@@ -36,8 +36,9 @@ public interface IIpcGateway
     Task<Result<GlobalSettings, IpcError>> SaveSettingsAsync(GlobalSettings settings, CancellationToken ct = default);
     /// <summary>Relocates the profiles storage directory, optionally moving the existing files.
     /// Returns the persisted settings (their <see cref="GlobalSettings.ProfilesDirectory"/> reflects
-    /// the new, normalized location).</summary>
-    Task<Result<GlobalSettings, IpcError>> RelocateProfilesAsync(
+    /// the new, normalized location) plus the moved/skipped file outcome — skipped files mean a
+    /// same-name copy already at the destination won, which the caller must surface.</summary>
+    Task<Result<RelocateProfilesResponse, IpcError>> RelocateProfilesAsync(
         string newDirectory, bool moveExisting, CancellationToken ct = default);
     /// <summary>Asks the service to shut itself down (StartAndStopWithProgram mode on UI close).</summary>
     Task<Result<bool, IpcError>> ShutdownServiceAsync(CancellationToken ct = default);

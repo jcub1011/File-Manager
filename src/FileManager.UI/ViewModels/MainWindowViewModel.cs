@@ -30,13 +30,17 @@ public sealed partial class MainWindowViewModel : ViewModelBase
     private readonly IIpcGateway _gateway;
     private readonly IFolderPicker _folderPicker;
     private readonly ILogFolderService _logFolder;
+    private readonly string _uiStatePath;
 
     public MainWindowViewModel(IIpcGateway gateway, IFolderPicker folderPicker, ILogFolderService logFolder,
-        IDryRunItemActions dryRunActions)
+        IDryRunItemActions dryRunActions, string? uiStatePath = null)
     {
         _gateway = gateway;
         _folderPicker = folderPicker;
         _logFolder = logFolder;
+        // Test seam: tests pass an isolated path so constructing the shell VM never reads or writes
+        // the developer's real %LOCALAPPDATA% ui-state file.
+        _uiStatePath = uiStatePath ?? UiPaths.UiStateFilePath;
         List = new ProfileListViewModel(gateway);
         Editor = new ProfileEditorViewModel(gateway, folderPicker);
         DryRun = new DryRunViewModel(gateway, dryRunActions);
@@ -84,7 +88,7 @@ public sealed partial class MainWindowViewModel : ViewModelBase
 
         // Restore the persisted sidebar layout (collapsed state + expanded width). The view applies
         // the column geometry from these once its template is loaded.
-        UiState ui = UiStateStore.Read();
+        UiState ui = UiStateStore.Read(_uiStatePath);
         SidebarCollapsed = ui.SidebarCollapsed;
         SidebarExpandedWidth = Math.Max(MinExpandedSidebarWidth, ui.SidebarWidth);
     }
@@ -107,7 +111,7 @@ public sealed partial class MainWindowViewModel : ViewModelBase
     /// <summary>Persist the current sidebar layout. Single entry point called by the view whenever the
     /// collapsed state or expanded width changes.</summary>
     public void SaveSidebarState() =>
-        UiStateStore.Write(new UiState(SidebarCollapsed, SidebarExpandedWidth));
+        UiStateStore.Write(_uiStatePath, new UiState(SidebarCollapsed, SidebarExpandedWidth));
 
     public async Task InitializeAsync()
     {
@@ -187,16 +191,25 @@ public sealed partial class MainWindowViewModel : ViewModelBase
     [RelayCommand]
     public async Task OpenSettings()
     {
-        if (ShowSettingsDialog is null)
-            return;
-        SettingsViewModel settings = new(_gateway, _folderPicker)
+        try
         {
-            // A relocation changes which profiles the service serves, so refresh the list to reflect
-            // the new directory's contents without waiting for the user to hit refresh.
-            ProfilesRelocated = () => List.RefreshAsync(),
-        };
-        await settings.LoadAsync();
-        await ShowSettingsDialog(settings);
+            if (ShowSettingsDialog is null)
+                return;
+            SettingsViewModel settings = new(_gateway, _folderPicker)
+            {
+                // A relocation changes which profiles the service serves, so refresh the list to reflect
+                // the new directory's contents without waiting for the user to hit refresh.
+                ProfilesRelocated = () => List.RefreshAsync(),
+            };
+            await settings.LoadAsync();
+            await ShowSettingsDialog(settings);
+        }
+        catch (Exception ex)
+        {
+            // Last resort: a dialog failure must be logged, never an unhandled UI-thread crash.
+            Log.Error(ex, "Opening the settings dialog failed unexpectedly");
+            List.ErrorMessage = $"Could not open settings: {ex.Message}";
+        }
     }
 
     /// <summary>Exports a single profile (the right-clicked row) to a chosen folder as one .json file.</summary>
@@ -219,7 +232,8 @@ public sealed partial class MainWindowViewModel : ViewModelBase
             }
             loaded.TryGetValue(out Profile? profile);
 
-            string fileName = ProfileExport.Sanitize(profile!.Name) + ".json";
+            string fileName = ProfileExport.UniqueFileName(
+                profile!.Name, folder, new HashSet<string>(StringComparer.OrdinalIgnoreCase));
             ProfileExport.WriteAtomic(Path.Combine(folder, fileName), profile);
             List.ErrorMessage = null;
         }
@@ -237,11 +251,20 @@ public sealed partial class MainWindowViewModel : ViewModelBase
     [RelayCommand]
     public async Task ExportProfiles()
     {
-        if (ShowExportDialog is null)
-            return;
-        ExportProfilesViewModel export = new(_gateway, _folderPicker);
-        await export.LoadAsync();
-        await ShowExportDialog(export);
+        try
+        {
+            if (ShowExportDialog is null)
+                return;
+            ExportProfilesViewModel export = new(_gateway, _folderPicker);
+            await export.LoadAsync();
+            await ShowExportDialog(export);
+        }
+        catch (Exception ex)
+        {
+            // Last resort: a dialog failure must be logged, never an unhandled UI-thread crash.
+            Log.Error(ex, "Opening the export dialog failed unexpectedly");
+            List.ErrorMessage = $"Could not open the export dialog: {ex.Message}";
+        }
     }
 
     /// <summary>Imports profile files as new copies: each keeps its settings but gets a fresh id and a
@@ -266,9 +289,16 @@ public sealed partial class MainWindowViewModel : ViewModelBase
                     using FileStream stream = File.OpenRead(file);
                     profile = JsonSerializer.Deserialize(stream, FileManagerJsonContext.Default.Profile);
                 }
-                catch (Exception ex) when (ex is IOException or JsonException)
+                catch (Exception ex) when (ex is IOException or JsonException or UnauthorizedAccessException)
                 {
                     problems.Add($"{Path.GetFileName(file)}: {ex.Message}");
+                    continue;
+                }
+                catch (Exception ex)
+                {
+                    // Last resort: one unreadable file must not abort the rest of the batch.
+                    Log.Error(ex, "Importing {File} failed unexpectedly", file);
+                    problems.Add($"{Path.GetFileName(file)}: {ex.GetType().Name}: {ex.Message}");
                     continue;
                 }
                 if (profile is null)

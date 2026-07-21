@@ -30,9 +30,10 @@ public abstract record IpcRequest
     /// chunks normalized against a shared directory table (DryRunDirectory/DryRunFile/
     /// DryRunOperation replace flat path strings); 3 — dry-run streams may interleave
     /// dry-run-progress frames before the terminator; 4 — dry-run requests may carry an inline
-    /// Profile draft (InlineProfile) so unsaved edits can be previewed without a catalog lookup.
+    /// Profile draft (InlineProfile) so unsaved edits can be previewed without a catalog lookup;
+    /// 5 — relocate-profiles request added, answered with a relocate-profiles-result frame.
     /// A mismatched service/UI pair must fail loud (IPC_VERSION_MISMATCH), never half-parse.</summary>
-    public const int CurrentProtocolVersion = 4;
+    public const int CurrentProtocolVersion = 5;
 
     public int ProtocolVersion { get; init; } = CurrentProtocolVersion;
 }
@@ -82,8 +83,9 @@ public sealed record UpdateSettingsRequest : IpcRequest { public required Global
 /// <summary>Relocates the profiles storage directory (persisted in settings). When
 /// <see cref="MoveExisting"/> is set, the service moves the existing profile files into the new
 /// directory before switching; otherwise it starts using the new (possibly empty) directory and
-/// leaves the old files in place. Answered with a <see cref="SettingsResponse"/> carrying the
-/// persisted settings (their <c>ProfilesDirectory</c> reflects the new, normalized location).</summary>
+/// leaves the old files in place. Answered with a <see cref="RelocateProfilesResponse"/> carrying
+/// the persisted settings (their <c>ProfilesDirectory</c> reflects the new, normalized location)
+/// plus what happened to the existing files.</summary>
 public sealed record RelocateProfilesRequest : IpcRequest
 {
     public required string NewDirectory { get; init; }

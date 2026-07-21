@@ -178,6 +178,10 @@ internal static class DryRunSnapshotFormat
     // so the caller's next Read() advances to the following property / array element.
     private static void ReadFile(ref Utf8JsonReader reader, PooledPhysicalFile f, RootInterner roots)
     {
+        // Reset EVERY field: a rented carrier keeps its previous record's values, and a malformed
+        // record must never silently inherit another file's identity.
+        f.Path = "";
+        f.Root = "";
         f.Length = 0;
         f.IsReparsePoint = false;
         f.LastWritten = default;

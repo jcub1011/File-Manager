@@ -1,4 +1,6 @@
 using FileManager.UI.Services;
+using FileManager.UI.Tests.Fakes;
+using FileManager.UI.ViewModels;
 
 namespace FileManager.UI.Tests;
 
@@ -33,6 +35,36 @@ public sealed class UiStateStoreTests
         string missing = Path.Combine(Path.GetTempPath(), "fm-uistate-" + Guid.NewGuid().ToString("N"), "ui-state.json");
 
         Assert.Equal(UiState.Default, UiStateStore.Read(missing));
+    }
+
+    [Fact]
+    public void Shell_vm_restores_the_persisted_sidebar_layout_and_saves_through_the_same_path()
+    {
+        string dir = Path.Combine(Path.GetTempPath(), "fm-uistate-" + Guid.NewGuid().ToString("N"));
+        string file = Path.Combine(dir, "ui-state.json");
+        try
+        {
+            UiStateStore.Write(file, new UiState(SidebarCollapsed: true, SidebarWidth: 321));
+
+            MainWindowViewModel vm = new(
+                new FakeIpcGateway(), new FakeFolderPicker(), new FakeLogFolder(), new FakeDryRunItemActions(),
+                uiStatePath: file);
+
+            Assert.True(vm.SidebarCollapsed);
+            Assert.Equal(321, vm.SidebarExpandedWidth);
+
+            vm.SidebarCollapsed = false;
+            vm.SidebarExpandedWidth = 400;
+            vm.SaveSidebarState();
+
+            UiState persisted = UiStateStore.Read(file);
+            Assert.False(persisted.SidebarCollapsed);
+            Assert.Equal(400, persisted.SidebarWidth);
+        }
+        finally
+        {
+            Directory.Delete(dir, recursive: true);
+        }
     }
 
     [Fact]

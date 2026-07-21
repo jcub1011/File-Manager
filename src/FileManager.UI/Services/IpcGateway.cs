@@ -62,11 +62,11 @@ public sealed class IpcGateway : IIpcGateway, IAsyncDisposable
         RequestAsync<SettingsResponse, GlobalSettings>(
             new UpdateSettingsRequest { Settings = settings }, static r => r.Settings, ct);
 
-    public Task<Result<GlobalSettings, IpcError>> RelocateProfilesAsync(
+    public Task<Result<RelocateProfilesResponse, IpcError>> RelocateProfilesAsync(
         string newDirectory, bool moveExisting, CancellationToken ct = default) =>
-        RequestAsync<SettingsResponse, GlobalSettings>(
+        RequestAsync<RelocateProfilesResponse, RelocateProfilesResponse>(
             new RelocateProfilesRequest { NewDirectory = newDirectory, MoveExisting = moveExisting },
-            static r => r.Settings, ct);
+            static r => r, ct);
 
     public Task<Result<bool, IpcError>> ShutdownServiceAsync(CancellationToken ct = default) =>
         RequestAsync<OkResponse, bool>(

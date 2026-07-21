@@ -461,15 +461,37 @@ public sealed partial class DryRunTreeNode : ObservableObject
 
     // The Ctrl+Enter keyboard toggle: this folder and everything under it — expand the whole
     // subtree when the folder is collapsed, collapse it (resetting every descendant) when open. Both
-    // directions go through the source so the grid's rows and the models stay in sync; the recursive
-    // collapse resets descendants correctly (see HierarchicalRows.ExpandCollapseRecursive).
+    // directions go through the source so the grid's rows and the models stay in sync. The collapse
+    // ALSO resets the descendant models directly: the source's row-entry recursion collapses the
+    // entry row before visiting its children, which releases the child rows, so off-screen
+    // descendants would keep a stale expanded flag and spring back open the next time just this
+    // folder is opened (the whole-tree CollapseAll does not have this problem — its root overload
+    // recurses children first).
     [RelayCommand]
     private void ToggleExpandCollapseAll()
     {
         bool expand = !IsExpanded;
         if (_controller?.Source is { } source && FindRow(source, this) is { } row)
             source.ExpandCollapseRecursive(row, _ => expand);
+        if (!expand)
+            CollapseDescendantModels(this);
         IsExpanded = expand;
+    }
+
+    /// <summary>Clears the expand flag on every materialized descendant directory model. Uses the
+    /// <c>_children</c> field, never the <see cref="Children"/> getter — a collapse must not force
+    /// lazy leaf realization (an unrealized subtree has nothing expanded to reset).</summary>
+    private static void CollapseDescendantModels(DryRunTreeNode node)
+    {
+        if (node._children is not { } children)
+            return;
+        foreach (DryRunTreeNode child in children)
+        {
+            if (!child.IsDirectory)
+                continue;
+            child.IsExpanded = false;
+            CollapseDescendantModels(child);
+        }
     }
 
     // Clipboard / shell right-click commands, on files and folders alike (the node menu gates which

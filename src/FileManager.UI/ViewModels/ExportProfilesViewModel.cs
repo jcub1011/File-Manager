@@ -119,7 +119,7 @@ public sealed partial class ExportProfilesViewModel : ViewModelBase
 
                 try
                 {
-                    string fileName = ProfileExport.UniqueFileName(profile!.Name, usedNames);
+                    string fileName = ProfileExport.UniqueFileName(profile!.Name, folder, usedNames);
                     ProfileExport.WriteAtomic(Path.Combine(folder, fileName), profile);
                     exported++;
                 }
@@ -129,11 +129,15 @@ public sealed partial class ExportProfilesViewModel : ViewModelBase
                 }
             }
 
-            StatusMessage = failures.Count == 0
-                ? $"Exported {exported} profile(s)."
-                : $"Exported {exported} profile(s); {failures.Count} failed: {string.Join("; ", failures)}";
             if (failures.Count == 0)
-                RequestClose?.Invoke();
+            {
+                RequestClose?.Invoke();   // clean export: the dialog closes; the files are the feedback
+            }
+            else
+            {
+                // Partial failure stays on the danger-styled bar (StatusMessage renders success-styled).
+                ErrorMessage = $"Exported {exported} profile(s); {failures.Count} failed: {string.Join("; ", failures)}";
+            }
         }
         catch (Exception ex)
         {

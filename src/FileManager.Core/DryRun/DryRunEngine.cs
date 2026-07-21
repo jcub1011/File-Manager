@@ -285,12 +285,24 @@ public sealed class DryRunEngine(
         // assert borrowed == returned.
         EvaluationCarrierPool pool = StreamCarrierPool ?? new();
         await using IDryRunSpool spool = CreateSpool(pool);
-        PipelineOutcome outcome = await ScanAndEvaluateAsync(
-            profile, scopePath, filtersBySourceRoot!, hasTransformers, MaxScannedCandidates, counters,
-            progress, (evaluation, token) => spool.WriteAsync(evaluation, token), ct)
-            .ConfigureAwait(false);
+        PipelineOutcome? outcome = null;
+        string? spoolError = null;
+        try
+        {
+            outcome = await ScanAndEvaluateAsync(
+                profile, scopePath, filtersBySourceRoot!, hasTransformers, MaxScannedCandidates, counters,
+                progress, (evaluation, token) => spool.WriteAsync(evaluation, token), ct)
+                .ConfigureAwait(false);
+        }
+        catch (ChannelClosedException ex)
+        {
+            // The spool writer faulted (disk full, unwritable scratch directory) and failed its
+            // channel to unblock the workers; the root cause rides in as the inner exception. A fatal
+            // stream error is reported as a failure item (like scan faults), never a torn stream.
+            spoolError = (ex.InnerException ?? ex).Message;
+        }
 
-        if (outcome.FatalScanError is not null)
+        if (spoolError is null && outcome!.FatalScanError is not null)
         {
             logger.LogError("Dry-run (stream) for profile {ProfileId} failed: scan error: {Message}",
                 profile.Id, outcome.FatalScanError);
@@ -298,14 +310,28 @@ public sealed class DryRunEngine(
             yield break;
         }
 
-        bool scanTruncated = outcome.ScanTruncated;
+        bool scanTruncated = outcome?.ScanTruncated ?? false;
         if (scanTruncated)
             logger.LogWarning(
                 "Dry-run (stream) for profile {ProfileId} hit the {Cap:N0}-candidate safety bound; " +
                 "report truncated — the scan found more",
                 profile.Id, MaxScannedCandidates);
 
-        await spool.CompleteWritingAsync().ConfigureAwait(false);
+        if (spoolError is null)
+        {
+            // Surfaces a writer fault the pipeline outran (small run: nothing ever blocked on the
+            // failed channel, so ScanAndEvaluateAsync completed normally).
+            try { await spool.CompleteWritingAsync().ConfigureAwait(false); }
+            catch (IOException ex) { spoolError = ex.Message; }
+        }
+
+        if (spoolError is not null)
+        {
+            logger.LogError("Dry-run (stream) for profile {ProfileId} failed: snapshot spool error: {Message}",
+                profile.Id, spoolError);
+            yield return $"dry-run spool failed: {spoolError}";
+            yield break;
+        }
 
         // Replay the spool in discovery order, flushing a chunk whenever the buffer's upper-bound size
         // crosses the threshold. Indices are global across chunks (tracked by the accumulator) so the
@@ -347,7 +373,7 @@ public sealed class DryRunEngine(
                 "(scan {ScanMs}ms within pipeline {EvalMs}ms — the phases overlap; {Probes} existence probes, " +
                 "{Stats} existing-target stats, {HashCount} files hashed / {HashBytes:N0} bytes)",
                 profile.Id, accumulator.TotalSourceFiles, (completedAt - startedAt).TotalMilliseconds,
-                outcome.ScanMs, outcome.EvalMs,
+                outcome!.ScanMs, outcome.EvalMs,
                 counters.ExistenceProbes, counters.ExistingStats, counters.FilesHashed, counters.BytesHashed);
     }
 

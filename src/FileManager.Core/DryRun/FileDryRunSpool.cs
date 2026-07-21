@@ -26,6 +26,9 @@ internal sealed class FileDryRunSpool : IDryRunSpool
 {
     private const int ChannelCapacity = 1024;
     private const int FileBufferSize = 64 * 1024;
+    // A single record is one file's evaluation (paths + a few ops) — far below the 16 MiB IPC frame
+    // cap. A larger prefix means a corrupt/truncated snapshot; failing here beats a ~2 GB pool rent.
+    private const int MaxRecordBytes = 16 * 1024 * 1024;
 
     private readonly string _scratchDirectory;
     private readonly long _spillThresholdBytes;
@@ -93,8 +96,8 @@ internal sealed class FileDryRunSpool : IDryRunSpool
             if (read < 4)
                 throw new IOException("the dry-run snapshot ended mid-record (truncated length prefix)");
             int length = BinaryPrimitives.ReadInt32LittleEndian(lengthBuffer);
-            if (length < 0)
-                throw new IOException($"the dry-run snapshot has a negative record length ({length})");
+            if (length < 0 || length > MaxRecordBytes)
+                throw new IOException($"the dry-run snapshot has an implausible record length ({length}); the file is corrupt");
 
             PooledEvaluation entry;
             byte[] rented = ArrayPool<byte>.Shared.Rent(length);
@@ -148,8 +151,14 @@ internal sealed class FileDryRunSpool : IDryRunSpool
         }
         catch (Exception ex)
         {
-            // Surfaced from CompleteWritingAsync; the channel drains so writers do not deadlock.
+            // Record the fault for CompleteWritingAsync AND fail the channel: the drain loop is dead,
+            // so blocked/future writers must get ChannelClosedException instead of waiting forever on
+            // a bounded channel nobody reads (the engine converts that into a failed stream). Logged
+            // here because the cancel/abandon path never reaches CompleteWritingAsync — this may be
+            // the only trace of the root cause.
             _writerError = ex;
+            _channel.Writer.TryComplete(ex);
+            _logger.LogError(ex, "Dry-run snapshot writer failed; failing the spool channel to unblock evaluation workers");
         }
         finally
         {
@@ -182,7 +191,9 @@ internal sealed class FileDryRunSpool : IDryRunSpool
 
     /// <summary>A cheap over-estimate of a record's serialized size, used only to decide when to spill
     /// (an overestimate spills marginally early, never late). Mirrors the shape of the engine's
-    /// upper-bound accounting without depending on it.</summary>
+    /// upper-bound accounting without depending on it. Non-ASCII strings count 6 bytes per char —
+    /// the default JSON encoder escapes them to <c>\uXXXX</c> — so CJK/Cyrillic trees keep the
+    /// "never late" guarantee instead of buffering ~6x the threshold.</summary>
     private static long EstimateBytes(FileEvaluation entry)
     {
         long bytes = FileBytes(entry.SourceFile) + OpBytes(entry.SourceOp);
@@ -192,9 +203,10 @@ internal sealed class FileDryRunSpool : IDryRunSpool
             bytes += OpBytes(op);
         return bytes;
 
-        static long FileBytes(Contracts.DryRun.PhysicalFile f) => 96 + f.Path.Length + f.Root.Length;
+        static long FileBytes(Contracts.DryRun.PhysicalFile f) => 96 + StringBytes(f.Path) + StringBytes(f.Root);
         static long OpBytes(Contracts.DryRun.VirtualFileOperation o) =>
-            128 + o.Path.Length + o.Root.Length + (o.Detail?.Length ?? 0);
+            128 + StringBytes(o.Path) + StringBytes(o.Root) + (o.Detail is null ? 0 : StringBytes(o.Detail));
+        static long StringBytes(string s) => System.Text.Ascii.IsValid(s) ? s.Length : (long)s.Length * 6;
     }
 
     public async ValueTask DisposeAsync()
@@ -203,7 +215,12 @@ internal sealed class FileDryRunSpool : IDryRunSpool
         // cancel-mid-run path where CompleteWritingAsync was never called.
         _channel.Writer.TryComplete();
         try { await _writerTask.ConfigureAwait(false); }
-        catch { /* a writer fault is reported via CompleteWritingAsync; disposal must not throw */ }
+        catch (Exception ex)
+        {
+            // Disposal must not throw. DrainAsync catches and logs its own faults, so anything
+            // surfacing from the join itself is unexpected — log it rather than lose it.
+            _logger.LogError(ex, "Joining the dry-run snapshot writer during disposal failed");
+        }
 
         if (_filePath is not null)
         {

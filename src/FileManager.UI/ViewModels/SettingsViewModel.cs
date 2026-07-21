@@ -92,30 +92,40 @@ public sealed partial class SettingsViewModel : ViewModelBase
         ErrorMessage = null;
         StatusMessage = null;
 
-        string? picked = await _folderPicker.PickFolderAsync("Choose the profiles storage folder");
-        if (picked is null)
-            return;
-        if (string.Equals(Path.TrimEndingDirectorySeparator(Path.GetFullPath(picked)),
-                Path.TrimEndingDirectorySeparator(Path.GetFullPath(ProfilesDirectory)),
-                StringComparison.OrdinalIgnoreCase))
-            return;   // same folder — nothing to do
-
-        bool move = ConfirmMoveProfiles is not null
-            && await ConfirmMoveProfiles(
-                $"Move the existing profiles into \"{picked}\"? Choose No to start fresh there and leave the current profiles where they are.");
-
-        IsBusy = true;
+        // The whole body is guarded: even Path.GetFullPath can throw (corrupt settings can hand us
+        // an empty ProfilesDirectory), and an escape from the command boundary would take down the
+        // UI thread unlogged.
         try
         {
+            string? picked = await _folderPicker.PickFolderAsync("Choose the profiles storage folder");
+            if (picked is null)
+                return;
+            if (IsSameFolder(picked, ProfilesDirectory))
+                return;   // same folder — nothing to do
+
+            bool move = ConfirmMoveProfiles is not null
+                && await ConfirmMoveProfiles(
+                    $"Move the existing profiles into \"{picked}\"? Choose No to start fresh there and leave the current profiles where they are.");
+
+            IsBusy = true;
             var result = await _gateway.RelocateProfilesAsync(picked, move);
             if (result.TryGetError(out IpcError? error))
             {
                 ErrorMessage = $"Could not change the profiles folder: {error.Message}";
                 return;
             }
-            result.TryGetValue(out GlobalSettings? saved);
-            ProfilesDirectory = saved!.ProfilesDirectory;
-            StatusMessage = move ? "Profiles folder changed and existing profiles moved." : "Profiles folder changed.";
+            result.TryGetValue(out RelocateProfilesResponse? outcome);
+            ProfilesDirectory = outcome!.Settings.ProfilesDirectory;
+            if (outcome.SkippedFiles.Count > 0)
+                // Never report a clean success over a collision: the new folder's pre-existing
+                // (possibly stale) copies are the ones in use now.
+                ErrorMessage =
+                    $"Profiles folder changed, but {outcome.SkippedFiles.Count} profile file(s) stayed in the old folder " +
+                    "because the new folder already had files with the same names — those pre-existing copies are the ones in use.";
+            else
+                StatusMessage = move
+                    ? $"Profiles folder changed; {outcome.MovedCount} profile file(s) moved."
+                    : "Profiles folder changed.";
             if (ProfilesRelocated is not null)
                 await ProfilesRelocated();
         }
@@ -128,6 +138,18 @@ public sealed partial class SettingsViewModel : ViewModelBase
         {
             IsBusy = false;
         }
+    }
+
+    /// <summary>Same-location check tolerant of bad current state: an empty/invalid current
+    /// directory never matches (the relocation proceeds and the service validates).</summary>
+    private static bool IsSameFolder(string picked, string current)
+    {
+        if (string.IsNullOrWhiteSpace(current))
+            return false;
+        return string.Equals(
+            Path.TrimEndingDirectorySeparator(Path.GetFullPath(picked)),
+            Path.TrimEndingDirectorySeparator(Path.GetFullPath(current)),
+            StringComparison.OrdinalIgnoreCase);
     }
 
     [RelayCommand] private void AddDriveTypeOverride() => DriveTypeOverrides.Add(new DriveTypeOverrideRowViewModel { Value = PerDriveAutoDefault });

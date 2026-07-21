@@ -54,9 +54,11 @@ public sealed class RelocateProfilesHandlerTests : IDisposable
         string newDir = Path.Combine(_root, "new");
         var response = await _handler.HandleAsync(new RelocateProfilesRequest { NewDirectory = newDir, MoveExisting = true });
 
-        SettingsResponse settings = Assert.IsType<SettingsResponse>(response);
-        Assert.Equal(Full(newDir), Full(settings.Settings.ProfilesDirectory));
+        RelocateProfilesResponse relocated = Assert.IsType<RelocateProfilesResponse>(response);
+        Assert.Equal(Full(newDir), Full(relocated.Settings.ProfilesDirectory));
         Assert.Equal(Full(newDir), Full(_settings.Current.ProfilesDirectory));
+        Assert.Equal(1, relocated.MovedCount);
+        Assert.Empty(relocated.SkippedFiles);
 
         Assert.True(File.Exists(Path.Combine(newDir, profile.Id.ToString("D") + ".json")));
         Assert.Empty(Directory.GetFiles(_oldDir, "*.json"));
@@ -74,7 +76,7 @@ public sealed class RelocateProfilesHandlerTests : IDisposable
         string newDir = Path.Combine(_root, "new");
         var response = await _handler.HandleAsync(new RelocateProfilesRequest { NewDirectory = newDir, MoveExisting = false });
 
-        Assert.IsType<SettingsResponse>(response);
+        Assert.IsType<RelocateProfilesResponse>(response);
         Assert.Equal(Full(newDir), Full(_settings.Current.ProfilesDirectory));
 
         Assert.True(File.Exists(Path.Combine(_oldDir, profile.Id.ToString("D") + ".json")));   // original stays
@@ -97,8 +99,75 @@ public sealed class RelocateProfilesHandlerTests : IDisposable
     {
         var response = await _handler.HandleAsync(new RelocateProfilesRequest { NewDirectory = _oldDir, MoveExisting = true });
 
-        SettingsResponse settings = Assert.IsType<SettingsResponse>(response);
-        Assert.Equal(Full(_oldDir), Full(settings.Settings.ProfilesDirectory));
+        RelocateProfilesResponse relocated = Assert.IsType<RelocateProfilesResponse>(response);
+        Assert.Equal(Full(_oldDir), Full(relocated.Settings.ProfilesDirectory));
+    }
+
+    [Fact]
+    public async Task A_destination_collision_is_skipped_and_reported_never_overwritten()
+    {
+        Profile profile = TestProfiles.Valid();
+        Assert.True(_store.Save(profile, acknowledgeWarnings: false).IsSuccess);
+        string fileName = profile.Id.ToString("D") + ".json";
+
+        // The destination already holds a (stale) copy under the same name.
+        string newDir = Path.Combine(_root, "new");
+        Directory.CreateDirectory(newDir);
+        File.WriteAllText(Path.Combine(newDir, fileName), "{ \"stale\": true }");
+
+        var response = await _handler.HandleAsync(new RelocateProfilesRequest { NewDirectory = newDir, MoveExisting = true });
+
+        RelocateProfilesResponse relocated = Assert.IsType<RelocateProfilesResponse>(response);
+        Assert.Equal(0, relocated.MovedCount);
+        string skipped = Assert.Single(relocated.SkippedFiles);   // the collision is surfaced, not silent
+        Assert.Equal(fileName, skipped);
+
+        Assert.Equal("{ \"stale\": true }", File.ReadAllText(Path.Combine(newDir, fileName)));   // never overwritten
+        Assert.True(File.Exists(Path.Combine(_oldDir, fileName)));                               // original left in place
+    }
+
+    [Fact]
+    public async Task A_failed_move_rolls_back_and_leaves_the_old_state_intact()
+    {
+        Profile first = TestProfiles.Valid();
+        Profile second = TestProfiles.Valid() with { Id = Guid.NewGuid(), Name = "Second" };
+        Assert.True(_store.Save(first, acknowledgeWarnings: false).IsSuccess);
+        Assert.True(_store.Save(second, acknowledgeWarnings: false).IsSuccess);
+        _catalog.Reload();
+        Assert.Equal(2, _catalog.All.Count);
+
+        string newDir = Path.Combine(_root, "new");
+        // Hold one profile file exclusively so its copy fails mid-relocation.
+        string lockedPath = Path.Combine(_oldDir, second.Id.ToString("D") + ".json");
+        using (new FileStream(lockedPath, FileMode.Open, FileAccess.Read, FileShare.None))
+        {
+            var response = await _handler.HandleAsync(new RelocateProfilesRequest { NewDirectory = newDir, MoveExisting = true });
+
+            ErrorResponse error = Assert.IsType<ErrorResponse>(response);
+            Assert.Equal("PROFILES_RELOCATE_FAILED", error.Code);
+        }
+
+        Assert.Equal(Full(_oldDir), Full(_settings.Current.ProfilesDirectory));   // commit never happened
+        Assert.Equal(2, Directory.GetFiles(_oldDir, "*.json").Length);            // originals all in place
+        Assert.Empty(Directory.GetFiles(newDir, "*.json"));                       // partial copies rolled back
+        Assert.Equal(2, _catalog.All.Count);                                      // catalog untouched
+    }
+
+    [Fact]
+    public async Task The_move_only_sweeps_profile_files_not_other_json()
+    {
+        Profile profile = TestProfiles.Valid();
+        Assert.True(_store.Save(profile, acknowledgeWarnings: false).IsSuccess);
+        string strayPath = Path.Combine(_oldDir, "settings.json");
+        File.WriteAllText(strayPath, "{}");
+
+        string newDir = Path.Combine(_root, "new");
+        var response = await _handler.HandleAsync(new RelocateProfilesRequest { NewDirectory = newDir, MoveExisting = true });
+
+        RelocateProfilesResponse relocated = Assert.IsType<RelocateProfilesResponse>(response);
+        Assert.Equal(1, relocated.MovedCount);
+        Assert.True(File.Exists(strayPath), "a non-profile json file must never be swept along");
+        Assert.False(File.Exists(Path.Combine(newDir, "settings.json")));
     }
 
     private static string Full(string path) => Path.TrimEndingDirectorySeparator(Path.GetFullPath(path));

@@ -88,7 +88,7 @@ public sealed class ProfileImportExportTests : IDisposable
     {
         Guid id = Guid.NewGuid();
         FakeIpcGateway gateway = new() { GetResult = Sample("My Profile", id) };
-        MainWindowViewModel vm = new(gateway, new FakeFolderPicker(_dir), new FakeLogFolder(), new FakeDryRunItemActions());
+        MainWindowViewModel vm = new(gateway, new FakeFolderPicker(_dir), new FakeLogFolder(), new FakeDryRunItemActions(), uiStatePath: Path.Combine(_dir, "ui-state.json"));
         ProfileListItem row = new(id, "My Profile", true, "Manual");
 
         await vm.ExportProfileCommand.ExecuteAsync(row);
@@ -101,7 +101,7 @@ public sealed class ProfileImportExportTests : IDisposable
     public async Task Single_export_does_nothing_when_the_folder_picker_is_cancelled()
     {
         FakeIpcGateway gateway = new() { GetResult = Sample("Alpha") };
-        MainWindowViewModel vm = new(gateway, new FakeFolderPicker(result: null), new FakeLogFolder(), new FakeDryRunItemActions());
+        MainWindowViewModel vm = new(gateway, new FakeFolderPicker(result: null), new FakeLogFolder(), new FakeDryRunItemActions(), uiStatePath: Path.Combine(_dir, "ui-state.json"));
 
         await vm.ExportProfileCommand.ExecuteAsync(new ProfileListItem(Guid.NewGuid(), "Alpha", true, "Manual"));
 
@@ -116,12 +116,72 @@ public sealed class ProfileImportExportTests : IDisposable
             ListResult = Result<IReadOnlyList<ProfileSummary>, IpcError>.Success(
                 [new ProfileSummary(Guid.NewGuid(), "Alpha", true, "Manual")]),
         };
-        MainWindowViewModel shell = new(gateway, new FakeFolderPicker(_dir), new FakeLogFolder(), new FakeDryRunItemActions());
+        MainWindowViewModel shell = new(gateway, new FakeFolderPicker(_dir), new FakeLogFolder(), new FakeDryRunItemActions(), uiStatePath: Path.Combine(_dir, "ui-state.json"));
 
         await shell.List.RefreshAsync();
 
         // Every row exposes the shell's single-export command so the right-click menu (list + rail) binds.
         Assert.Same(shell.ExportProfileCommand, shell.List.Profiles[0].ExportCommand);
+    }
+
+    [Fact]
+    public async Task Export_never_overwrites_an_existing_file_in_the_destination()
+    {
+        string existing = Path.Combine(_dir, "Alpha.json");
+        await File.WriteAllTextAsync(existing, "precious earlier export");
+
+        FakeIpcGateway gateway = new()
+        {
+            ListResult = Result<IReadOnlyList<ProfileSummary>, IpcError>.Success(
+                [new ProfileSummary(Guid.NewGuid(), "Alpha", true, "Manual")]),
+            GetResult = Sample("Alpha"),
+        };
+        ExportProfilesViewModel vm = new(gateway, new FakeFolderPicker(_dir));
+        await vm.LoadAsync();
+        vm.SelectAllCommand.Execute(null);
+
+        await vm.ExportCommand.ExecuteAsync(null);
+
+        Assert.Equal("precious earlier export", await File.ReadAllTextAsync(existing));   // untouched
+        Assert.True(File.Exists(Path.Combine(_dir, "Alpha (2).json")), "the new export must dedupe against disk");
+    }
+
+    [Fact]
+    public async Task Single_export_dedupes_against_an_existing_file()
+    {
+        string existing = Path.Combine(_dir, "My Profile.json");
+        await File.WriteAllTextAsync(existing, "precious earlier export");
+
+        Guid id = Guid.NewGuid();
+        FakeIpcGateway gateway = new() { GetResult = Sample("My Profile", id) };
+        MainWindowViewModel vm = new(gateway, new FakeFolderPicker(_dir), new FakeLogFolder(), new FakeDryRunItemActions(), uiStatePath: Path.Combine(_dir, "ui-state.json"));
+
+        await vm.ExportProfileCommand.ExecuteAsync(new ProfileListItem(id, "My Profile", true, "Manual"));
+
+        Assert.Equal("precious earlier export", await File.ReadAllTextAsync(existing));   // untouched
+        Assert.True(File.Exists(Path.Combine(_dir, "My Profile (2).json")));
+    }
+
+    [Fact]
+    public async Task Export_partial_failure_reports_on_the_error_bar_and_keeps_the_dialog_open()
+    {
+        FakeIpcGateway gateway = new()
+        {
+            ListResult = Result<IReadOnlyList<ProfileSummary>, IpcError>.Success(
+                [new ProfileSummary(Guid.NewGuid(), "Alpha", true, "Manual")]),
+            GetResult = new IpcError("PROFILE_NOT_FOUND", "gone"),
+        };
+        bool closed = false;
+        ExportProfilesViewModel vm = new(gateway, new FakeFolderPicker(_dir)) { RequestClose = () => closed = true };
+        await vm.LoadAsync();
+        vm.SelectAllCommand.Execute(null);
+
+        await vm.ExportCommand.ExecuteAsync(null);
+
+        Assert.False(closed);                    // a failure must stay visible, not vanish with the dialog
+        Assert.NotNull(vm.ErrorMessage);         // danger-styled bar, not the success-styled status bar
+        Assert.Null(vm.StatusMessage);
+        Assert.Contains("gone", vm.ErrorMessage);
     }
 
     [Fact]
@@ -134,7 +194,7 @@ public sealed class ProfileImportExportTests : IDisposable
 
         FakeIpcGateway gateway = new();   // SaveResult defaults to saved
         FakeFolderPicker picker = new() { FilesResult = [file] };
-        MainWindowViewModel vm = new(gateway, picker, new FakeLogFolder(), new FakeDryRunItemActions());
+        MainWindowViewModel vm = new(gateway, picker, new FakeLogFolder(), new FakeDryRunItemActions(), uiStatePath: Path.Combine(_dir, "ui-state.json"));
 
         await vm.ImportProfilesCommand.ExecuteAsync(null);
 
@@ -153,7 +213,7 @@ public sealed class ProfileImportExportTests : IDisposable
 
         FakeIpcGateway gateway = new();
         FakeFolderPicker picker = new() { FilesResult = [file] };
-        MainWindowViewModel vm = new(gateway, picker, new FakeLogFolder(), new FakeDryRunItemActions());
+        MainWindowViewModel vm = new(gateway, picker, new FakeLogFolder(), new FakeDryRunItemActions(), uiStatePath: Path.Combine(_dir, "ui-state.json"));
 
         await vm.ImportProfilesCommand.ExecuteAsync(null);
 

@@ -47,7 +47,8 @@ internal sealed class FakeIpcGateway : IIpcGateway
 
     public Result<GlobalSettings, IpcError> GetSettingsResult { get; set; } = GlobalSettings.Default;
     public Result<GlobalSettings, IpcError> SaveSettingsResult { get; set; } = GlobalSettings.Default;
-    public Result<GlobalSettings, IpcError> RelocateResult { get; set; } = GlobalSettings.Default;
+    public Result<RelocateProfilesResponse, IpcError> RelocateResult { get; set; } =
+        new RelocateProfilesResponse { Settings = GlobalSettings.Default };
     public Result<bool, IpcError> ShutdownResult { get; set; } = true;
     public int ShutdownCalls { get; private set; }
 
@@ -118,7 +119,7 @@ internal sealed class FakeIpcGateway : IIpcGateway
         return Task.FromResult(SaveSettingsResult);
     }
 
-    public Task<Result<GlobalSettings, IpcError>> RelocateProfilesAsync(
+    public Task<Result<RelocateProfilesResponse, IpcError>> RelocateProfilesAsync(
         string newDirectory, bool moveExisting, CancellationToken ct = default)
     {
         RelocateCalls.Add((newDirectory, moveExisting));

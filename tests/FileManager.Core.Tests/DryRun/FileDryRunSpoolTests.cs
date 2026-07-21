@@ -1,6 +1,7 @@
 using FileManager.Contracts.DryRun;
 using FileManager.Core.DryRun;
 using Microsoft.Extensions.Logging.Abstractions;
+using System.Threading.Channels;
 
 namespace FileManager.Core.Tests.DryRun;
 
@@ -11,6 +12,7 @@ public sealed class FileDryRunSpoolTests : IDisposable
     public void Dispose()
     {
         try { Directory.Delete(_scratch, recursive: true); } catch { /* best effort */ }
+        try { File.Delete(_scratch); } catch { /* best effort — some tests plant a file at the scratch path */ }
     }
 
     private static FileEvaluation Entry(int i)
@@ -133,11 +135,45 @@ public sealed class FileDryRunSpoolTests : IDisposable
         FileDryRunSpool spool = new(_scratch, spillThresholdBytes: 8, new EvaluationCarrierPool(), NullLogger.Instance);
         foreach (FileEvaluation e in Enumerable.Range(0, 50).Select(Entry))
             await spool.WriteAsync(e, default);
-        await spool.CompleteWritingAsync();
-        Assert.True(Directory.EnumerateFiles(_scratch, "*.snapshot").Any());
 
-        // Abandon mid-run (the cancel path): disposal must still purge the file.
+        // CompleteWritingAsync is deliberately NOT called — this is the abandon/cancel path. The
+        // writer drains asynchronously, so wait for the spill to hit disk before disposing.
+        DateTime deadline = DateTime.UtcNow.AddSeconds(30);
+        while (!Directory.Exists(_scratch) || !Directory.EnumerateFiles(_scratch, "*.snapshot").Any())
+        {
+            Assert.True(DateTime.UtcNow < deadline, "the spill never produced a snapshot file");
+            await Task.Delay(10);
+        }
+
+        // Abandon mid-run: disposal must join the writer and still purge the file.
         await spool.DisposeAsync();
         Assert.Empty(Directory.EnumerateFiles(_scratch, "*.snapshot"));
+    }
+
+    [Fact]
+    public async Task Writer_failure_unblocks_producers_and_surfaces_from_CompleteWritingAsync()
+    {
+        // A *file* at the scratch path makes the spill's Directory.CreateDirectory throw, so the
+        // writer faults on the first record. The fault must fail the channel: before the fix the
+        // bounded channel (capacity 1024) filled with nobody draining and every producer blocked
+        // forever in WriteAsync — this test deadlocked instead of finishing.
+        File.WriteAllText(_scratch, "not a directory");
+        await using FileDryRunSpool spool = new(_scratch, spillThresholdBytes: 1, new EvaluationCarrierPool(), NullLogger.Instance);
+
+        // Far more writes than the channel capacity. Writes are accepted until the writer faults,
+        // then throw ChannelClosedException carrying the root cause.
+        ChannelClosedException? closed = null;
+        await Task.Run(async () =>
+        {
+            for (int i = 0; i < 3000 && closed is null; i++)
+            {
+                try { await spool.WriteAsync(Entry(i), default); }
+                catch (ChannelClosedException ex) { closed = ex; }
+            }
+        }).WaitAsync(TimeSpan.FromSeconds(30));
+
+        Assert.NotNull(closed);   // producers get the fault, not a hang
+        IOException surfaced = await Assert.ThrowsAsync<IOException>(async () => await spool.CompleteWritingAsync());
+        Assert.NotNull(surfaced.InnerException);   // the root cause is preserved
     }
 }

@@ -21,6 +21,7 @@ namespace FileManager.Contracts.IPC;
 [JsonDerivedType(typeof(RecentJobsResponse), "recent-jobs")]
 [JsonDerivedType(typeof(JobLogResponse), "job-log")]
 [JsonDerivedType(typeof(SettingsResponse), "settings")]
+[JsonDerivedType(typeof(RelocateProfilesResponse), "relocate-profiles-result")]
 public abstract record IpcResponse;
 
 public sealed record OkResponse : IpcResponse;
@@ -82,3 +83,16 @@ public sealed record DryRunCompleteResponse : IpcResponse
 public sealed record RecentJobsResponse : IpcResponse { public required IReadOnlyList<JobSummaryDto> Jobs { get; init; } }
 public sealed record JobLogResponse : IpcResponse { public required IReadOnlyList<string> Lines { get; init; } }
 public sealed record SettingsResponse : IpcResponse { public required GlobalSettings Settings { get; init; } }
+/// <summary>Answer to RelocateProfilesRequest: the persisted settings plus what happened to the
+/// existing profile files. <see cref="SkippedFiles"/> lists file names left in the OLD directory
+/// because the destination already had a file with that name — the destination's (possibly stale)
+/// copy wins after the switch, so callers must surface these to the user, never report a clean
+/// success over them.</summary>
+public sealed record RelocateProfilesResponse : IpcResponse
+{
+    public required GlobalSettings Settings { get; init; }
+    /// <summary>Profile files moved into the new directory (0 when MoveExisting was false).</summary>
+    public int MovedCount { get; init; }
+    /// <summary>File names (not full paths) left behind due to a same-name collision at the destination.</summary>
+    public IReadOnlyList<string> SkippedFiles { get; init; } = [];
+}

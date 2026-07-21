@@ -115,6 +115,47 @@ public sealed class SettingsServiceTests : IDisposable
     }
 
     [Fact]
+    public void Default_scratch_directory_is_anchored_at_local_app_data_not_the_cwd()
+    {
+        // The service's cwd is Program Files (unwritable) or System32 (Run-key launch); the default
+        // must never derive from it.
+        string localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        Assert.StartsWith(localAppData, GlobalSettings.DefaultScratchDirectory, StringComparison.OrdinalIgnoreCase);
+        Assert.StartsWith(localAppData, GlobalSettings.DefaultProfilesDirectory, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void Unset_directories_stay_absent_through_an_update_round_trip()
+    {
+        // Saving defaults must NOT pin the resolved default paths into settings.json — a pinned
+        // absolute default would stick forever even if the machine's default location changes.
+        NewService().Update(new GlobalSettings());
+
+        using var doc = System.Text.Json.JsonDocument.Parse(File.ReadAllText(_paths.SettingsFilePath));
+        foreach (string key in new[] { "ScratchDirectory", "ProfilesDirectory" })
+            Assert.True(
+                !doc.RootElement.TryGetProperty(key, out var el) || el.ValueKind == System.Text.Json.JsonValueKind.Null,
+                $"{key} must stay absent (null) in settings.json when unset");
+
+        Assert.Equal(GlobalSettings.Default, NewService().Current);
+    }
+
+    [Fact]
+    public void Explicit_directories_round_trip_and_a_default_valued_write_collapses()
+    {
+        string scratch = Path.Combine(_root, "my-scratch");
+        NewService().Update(new GlobalSettings { ScratchDirectory = scratch, ProfilesDirectory = Path.Combine(_root, "my-profiles") });
+
+        GlobalSettings reloaded = NewService().Current;
+        Assert.Equal(scratch, reloaded.ScratchDirectory);
+        Assert.Equal(Path.Combine(_root, "my-profiles"), reloaded.ProfilesDirectory);
+
+        // Writing the default value (even with different casing) collapses back to absent.
+        NewService().Update(new GlobalSettings { ScratchDirectory = GlobalSettings.DefaultScratchDirectory.ToUpperInvariant() });
+        Assert.Equal(GlobalSettings.Default.ScratchDirectory, NewService().Current.ScratchDirectory);
+    }
+
+    [Fact]
     public void Default_startup_mode_is_start_and_stop_with_program()
     {
         Assert.Equal(ServiceStartupMode.StartAndStopWithProgram, NewService().Current.ServiceStartupMode);

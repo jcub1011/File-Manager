@@ -772,6 +772,33 @@ public sealed class DryRunEngineTests : IDisposable
     }
 
     [Fact]
+    public async Task Stream_reports_a_spool_write_failure_as_a_failure_item()
+    {
+        for (int i = 0; i < 40; i++)
+            SourceFile($"{i:D3}.txt", $"content {i}");
+        Profile profile = ProfileUnderTest();
+
+        // A *file* at the scratch path makes the spill's Directory.CreateDirectory throw, faulting
+        // the spool writer on the first record. The stream must end with a single failure item —
+        // not hang with workers blocked on the dead spool channel, and not tear the enumerator with
+        // a raw exception.
+        string scratch = Path.Combine(_root, "scratch-is-a-file");
+        File.WriteAllText(scratch, "not a directory");
+
+        DryRunEngine engine = SpillingEngine(scratch, chunkByteBudget: 4000, pool: null);
+        List<Result<DryRunChunk, string>> items = [];
+        await Task.Run(async () =>
+        {
+            await foreach (Result<DryRunChunk, string> item in engine.SimulateStreamAsync(profile, null))
+                items.Add(item);
+        }).WaitAsync(TimeSpan.FromSeconds(30));
+
+        Result<DryRunChunk, string> only = Assert.Single(items);
+        Assert.True(only.TryGetError(out string? error));
+        Assert.Contains("spool failed", error);
+    }
+
+    [Fact]
     public async Task Stream_cancellation_throws_from_the_enumerator()
     {
         SourceFile("a.txt");

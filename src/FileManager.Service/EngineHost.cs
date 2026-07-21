@@ -140,13 +140,13 @@ internal sealed class EngineHost(
                 try { File.Delete(leftover); }
                 catch (Exception ex)
                 {
-                    logger.LogWarning("Could not purge leftover dry-run snapshot {Path}: {Error}", leftover, ex.Message);
+                    logger.LogWarning(ex, "Could not purge leftover dry-run snapshot {Path}", leftover);
                 }
             }
         }
         catch (Exception ex)
         {
-            logger.LogWarning("Could not prepare the dry-run scratch directory: {Error}", ex.Message);
+            logger.LogWarning(ex, "Could not prepare the dry-run scratch directory");
         }
     }
 

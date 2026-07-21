@@ -145,9 +145,30 @@ public sealed class SettingsService : ISettingsProvider
     // An explicit thread count below 1 is meaningless (it would make a degree-of-parallelism throw),
     // so clamp every explicit budget to >= 1; auto budgets are left alone. Stored files and incoming
     // IPC values both pass through Load/Update. Specific-drive keys are canonicalized to match the
-    // volume-key form the scheduler resolves, and blank keys are dropped.
-    private static GlobalSettings Normalize(GlobalSettings settings) =>
-        settings with { ScanThreading = NormalizeThreading(settings.ScanThreading) };
+    // volume-key form the scheduler resolves, and blank keys are dropped. Directory settings must be
+    // absolute: an empty or relative value (a hand-edited file, or a plain update-settings that
+    // bypassed the relocate handler's validation) would silently empty the profile catalog, so it
+    // falls back to the default instead of persisting.
+    private GlobalSettings Normalize(GlobalSettings settings) =>
+        settings with
+        {
+            ScanThreading = NormalizeThreading(settings.ScanThreading),
+            ScratchDirectory = NormalizeDirectory(settings.ScratchDirectory, GlobalSettings.DefaultScratchDirectory, "ScratchDirectory"),
+            ProfilesDirectory = NormalizeDirectory(settings.ProfilesDirectory, GlobalSettings.DefaultProfilesDirectory, "ProfilesDirectory"),
+        };
+
+    private string NormalizeDirectory(string value, string fallback, string name)
+    {
+        string trimmed = value?.Trim() ?? "";
+        if (trimmed.Length == 0 || !Path.IsPathFullyQualified(trimmed))
+        {
+            _logger.LogWarning(
+                "Settings {Setting} value \"{Value}\" is not an absolute path; using the default {Default}",
+                name, value, fallback);
+            return fallback;
+        }
+        return trimmed;
+    }
 
     private static ScanThreadingSettings NormalizeThreading(ScanThreadingSettings s)
     {

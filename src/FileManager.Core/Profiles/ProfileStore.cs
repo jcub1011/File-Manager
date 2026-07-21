@@ -119,8 +119,11 @@ public sealed class ProfileStore(ILogger<ProfileStore> logger, ISettingsProvider
 
         try
         {
-            Directory.CreateDirectory(ProfilesDirectory);
-            string finalPath = ProfileFilePath(profile.Id);
+            // Resolve the live directory ONCE for the whole write: a concurrent relocation must not
+            // tear this operation across the old and new directories mid-save.
+            string directory = ProfilesDirectory;
+            Directory.CreateDirectory(directory);
+            string finalPath = Path.Combine(directory, profile.Id.ToString("D") + ".json");
             string tempPath = finalPath + ".tmp";
 
             using (FileStream stream = new(tempPath, FileMode.Create, FileAccess.Write, FileShare.None))

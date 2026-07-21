@@ -1,3 +1,4 @@
+using FileManager.Contracts.IPC;
 using FileManager.Contracts.Profiles;
 using FileManager.Contracts.Settings;
 using FileManager.UI.Tests.Fakes;
@@ -144,7 +145,11 @@ public sealed class SettingsViewModelTests
     {
         FakeIpcGateway gateway = new()
         {
-            RelocateResult = new GlobalSettings { ProfilesDirectory = @"E:\moved" },
+            RelocateResult = new RelocateProfilesResponse
+            {
+                Settings = new GlobalSettings { ProfilesDirectory = @"E:\moved" },
+                MovedCount = 1,
+            },
         };
         FakeFolderPicker picker = new(@"E:\moved");
         SettingsViewModel vm = new(gateway, picker) { ConfirmMoveProfiles = _ => Task.FromResult(true) };
@@ -162,7 +167,10 @@ public sealed class SettingsViewModelTests
     {
         FakeIpcGateway gateway = new()
         {
-            RelocateResult = new GlobalSettings { ProfilesDirectory = @"E:\moved" },
+            RelocateResult = new RelocateProfilesResponse
+            {
+                Settings = new GlobalSettings { ProfilesDirectory = @"E:\moved" },
+            },
         };
         bool refreshed = false;
         SettingsViewModel vm = new(gateway, new FakeFolderPicker(@"E:\moved"))
@@ -181,7 +189,10 @@ public sealed class SettingsViewModelTests
     {
         FakeIpcGateway gateway = new()
         {
-            RelocateResult = new GlobalSettings { ProfilesDirectory = @"E:\fresh" },
+            RelocateResult = new RelocateProfilesResponse
+            {
+                Settings = new GlobalSettings { ProfilesDirectory = @"E:\fresh" },
+            },
         };
         FakeFolderPicker picker = new(@"E:\fresh");
         SettingsViewModel vm = new(gateway, picker) { ConfirmMoveProfiles = _ => Task.FromResult(false) };
@@ -190,6 +201,52 @@ public sealed class SettingsViewModelTests
 
         (_, bool move) = Assert.Single(gateway.RelocateCalls);
         Assert.False(move);
+    }
+
+    [Fact]
+    public async Task Change_profiles_directory_surfaces_skipped_collisions_instead_of_clean_success()
+    {
+        FakeIpcGateway gateway = new()
+        {
+            RelocateResult = new RelocateProfilesResponse
+            {
+                Settings = new GlobalSettings { ProfilesDirectory = @"E:\moved" },
+                MovedCount = 2,
+                SkippedFiles = ["aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa.json"],
+            },
+        };
+        SettingsViewModel vm = new(gateway, new FakeFolderPicker(@"E:\moved"))
+        {
+            ConfirmMoveProfiles = _ => Task.FromResult(true),
+        };
+
+        await vm.ChangeProfilesDirectoryCommand.ExecuteAsync(null);
+
+        Assert.Equal(@"E:\moved", vm.ProfilesDirectory);   // the switch itself succeeded
+        Assert.Null(vm.StatusMessage);                     // ...but it is not reported as a clean success
+        Assert.NotNull(vm.ErrorMessage);
+        Assert.Contains("stayed in the old folder", vm.ErrorMessage);
+    }
+
+    [Fact]
+    public async Task Change_profiles_directory_survives_a_corrupt_empty_current_path()
+    {
+        FakeIpcGateway gateway = new()
+        {
+            RelocateResult = new RelocateProfilesResponse
+            {
+                Settings = new GlobalSettings { ProfilesDirectory = @"E:\recovered" },
+            },
+        };
+        SettingsViewModel vm = new(gateway, new FakeFolderPicker(@"E:\recovered")) { ProfilesDirectory = "" };
+
+        // Corrupt settings hand the VM an empty current path; the command must relocate, not throw
+        // out of the command boundary (Path.GetFullPath("") is an ArgumentException).
+        await vm.ChangeProfilesDirectoryCommand.ExecuteAsync(null);
+
+        Assert.Single(gateway.RelocateCalls);
+        Assert.Equal(@"E:\recovered", vm.ProfilesDirectory);
+        Assert.Null(vm.ErrorMessage);
     }
 
     [Fact]
