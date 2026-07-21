@@ -6,6 +6,7 @@ using FileManager.UI.Services;
 using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
+using System.IO;
 using System.Threading.Tasks;
 
 namespace FileManager.UI.ViewModels;
@@ -16,8 +17,13 @@ namespace FileManager.UI.ViewModels;
 public sealed partial class SettingsViewModel : ViewModelBase
 {
     private readonly IIpcGateway _gateway;
+    private readonly IFolderPicker _folderPicker;
 
-    public SettingsViewModel(IIpcGateway gateway) => _gateway = gateway;
+    public SettingsViewModel(IIpcGateway gateway, IFolderPicker folderPicker)
+    {
+        _gateway = gateway;
+        _folderPicker = folderPicker;
+    }
 
     public IReadOnlyList<ServiceStartupMode> ServiceStartupModeOptions { get; } =
         [ServiceStartupMode.RunOnStartup, ServiceStartupMode.StartOnProgramOpen, ServiceStartupMode.StartAndStopWithProgram];
@@ -41,6 +47,8 @@ public sealed partial class SettingsViewModel : ViewModelBase
     [ObservableProperty] public partial bool PerDriveDefaultAuto { get; set; } = true;
     [ObservableProperty] public partial int PerDriveDefaultValue { get; set; } = PerDriveAutoDefault;
 
+    [ObservableProperty] public partial string ScratchDirectory { get; set; } = GlobalSettings.DefaultScratchDirectory;
+
     [ObservableProperty] public partial string? StatusMessage { get; set; }
     [ObservableProperty] public partial string? ErrorMessage { get; set; }
     [ObservableProperty] public partial bool IsBusy { get; set; }
@@ -55,6 +63,14 @@ public sealed partial class SettingsViewModel : ViewModelBase
 
     public ObservableCollection<DriveTypeOverrideRowViewModel> DriveTypeOverrides { get; } = [];
     public ObservableCollection<SpecificDriveOverrideRowViewModel> SpecificDriveOverrides { get; } = [];
+
+    [RelayCommand]
+    private async Task BrowseScratchDirectory()
+    {
+        string? picked = await _folderPicker.PickFolderAsync("Choose the dry-run scratch directory");
+        if (picked is not null)
+            ScratchDirectory = picked;
+    }
 
     [RelayCommand] private void AddDriveTypeOverride() => DriveTypeOverrides.Add(new DriveTypeOverrideRowViewModel { Value = PerDriveAutoDefault });
     [RelayCommand] private void RemoveDriveTypeOverride(DriveTypeOverrideRowViewModel row) => DriveTypeOverrides.Remove(row);
@@ -81,6 +97,7 @@ public sealed partial class SettingsViewModel : ViewModelBase
             result.TryGetValue(out GlobalSettings? settings);
             ThemeMode = settings!.ThemeMode;
             StartupMode = settings.ServiceStartupMode;
+            ScratchDirectory = settings.ScratchDirectory;
 
             ScanThreadingSettings st = settings.ScanThreading;
             (MaxScanThreadsAuto, MaxScanThreadsValue) = FromBudget(st.MaxScanThreads, ScanAutoDefault);
@@ -146,10 +163,23 @@ public sealed partial class SettingsViewModel : ViewModelBase
                 }
             }
 
+            string scratch = ScratchDirectory?.Trim() ?? "";
+            if (scratch.Length == 0)
+            {
+                ErrorMessage = "The scratch directory cannot be empty.";
+                return;
+            }
+            if (!Path.IsPathFullyQualified(scratch))
+            {
+                ErrorMessage = "The scratch directory must be an absolute path.";
+                return;
+            }
+
             GlobalSettings settings = new()
             {
                 ThemeMode = ThemeMode,
                 ServiceStartupMode = StartupMode,
+                ScratchDirectory = scratch,
                 ScanThreading = new ScanThreadingSettings
                 {
                     MaxScanThreads = ToBudget(MaxScanThreadsAuto, MaxScanThreadsValue),

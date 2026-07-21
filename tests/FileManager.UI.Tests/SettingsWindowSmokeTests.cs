@@ -23,7 +23,7 @@ public sealed class SettingsWindowSmokeTests(HeadlessSessionFixture headless)
                     ThemeMode = ThemeMode.Dark,
                 },
             };
-            SettingsViewModel vm = new(gateway);
+            SettingsViewModel vm = new(gateway, new FakeFolderPicker());
             await vm.LoadAsync();
 
             SettingsWindow window = new() { DataContext = vm };

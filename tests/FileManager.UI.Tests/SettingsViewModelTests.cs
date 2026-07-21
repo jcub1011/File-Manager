@@ -17,7 +17,7 @@ public sealed class SettingsViewModelTests
                 ScanThreading = new ScanThreadingSettings { MaxScanThreads = ThreadBudget.Explicit(4) },
             },
         };
-        SettingsViewModel vm = new(gateway);
+        SettingsViewModel vm = new(gateway, new FakeFolderPicker());
 
         await vm.LoadAsync();
 
@@ -30,7 +30,7 @@ public sealed class SettingsViewModelTests
     public async Task Save_sends_an_explicit_scan_thread_count()
     {
         FakeIpcGateway gateway = new();
-        SettingsViewModel vm = new(gateway) { MaxScanThreadsAuto = false, MaxScanThreadsValue = 7 };
+        SettingsViewModel vm = new(gateway, new FakeFolderPicker()) { MaxScanThreadsAuto = false, MaxScanThreadsValue = 7 };
 
         await vm.SaveCommand.ExecuteAsync(null);
 
@@ -42,7 +42,7 @@ public sealed class SettingsViewModelTests
     public async Task Save_sends_auto_when_checked()
     {
         FakeIpcGateway gateway = new();
-        SettingsViewModel vm = new(gateway) { MaxScanThreadsAuto = true, MaxScanThreadsValue = 7 };
+        SettingsViewModel vm = new(gateway, new FakeFolderPicker()) { MaxScanThreadsAuto = true, MaxScanThreadsValue = 7 };
 
         await vm.SaveCommand.ExecuteAsync(null);
 
@@ -54,7 +54,7 @@ public sealed class SettingsViewModelTests
     public async Task Save_rejects_duplicate_drive_type_overrides()
     {
         FakeIpcGateway gateway = new();
-        SettingsViewModel vm = new(gateway);
+        SettingsViewModel vm = new(gateway, new FakeFolderPicker());
         vm.DriveTypeOverrides.Add(new DriveTypeOverrideRowViewModel { Class = DriveClass.Network, Value = 2 });
         vm.DriveTypeOverrides.Add(new DriveTypeOverrideRowViewModel { Class = DriveClass.Network, Value = 4 });
 
@@ -68,7 +68,7 @@ public sealed class SettingsViewModelTests
     public async Task Save_rejects_specific_drive_keys_that_collide_after_normalization()
     {
         FakeIpcGateway gateway = new();
-        SettingsViewModel vm = new(gateway);
+        SettingsViewModel vm = new(gateway, new FakeFolderPicker());
         vm.SpecificDriveOverrides.Add(new SpecificDriveOverrideRowViewModel { VolumeKey = "C:", Value = 2 });
         vm.SpecificDriveOverrides.Add(new SpecificDriveOverrideRowViewModel { VolumeKey = " c: ", Value = 4 });
 
@@ -83,7 +83,7 @@ public sealed class SettingsViewModelTests
     {
         FakeIpcGateway gateway = new();
         bool closed = false;
-        SettingsViewModel vm = new(gateway) { RequestClose = () => closed = true };
+        SettingsViewModel vm = new(gateway, new FakeFolderPicker()) { RequestClose = () => closed = true };
 
         await vm.SaveCommand.ExecuteAsync(null);
 
@@ -97,7 +97,7 @@ public sealed class SettingsViewModelTests
         {
             GetSettingsResult = new GlobalSettings { ThemeMode = ThemeMode.Dark },
         };
-        SettingsViewModel vm = new(gateway);
+        SettingsViewModel vm = new(gateway, new FakeFolderPicker());
 
         await vm.LoadAsync();
         Assert.Equal(ThemeMode.Dark, vm.ThemeMode);
@@ -116,7 +116,7 @@ public sealed class SettingsViewModelTests
         {
             GetSettingsResult = new GlobalSettings { ServiceStartupMode = ServiceStartupMode.RunOnStartup },
         };
-        SettingsViewModel vm = new(gateway);
+        SettingsViewModel vm = new(gateway, new FakeFolderPicker());
 
         await vm.LoadAsync();
         Assert.Equal(ServiceStartupMode.RunOnStartup, vm.StartupMode);

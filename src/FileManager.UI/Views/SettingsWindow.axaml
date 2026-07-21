@@ -71,6 +71,17 @@
                            IsVisible="{Binding ShowMaxHashThreadsValue}" />
         </Grid>
 
+        <Border Classes="sectionHeader" Margin="0,8,0,0"><TextBlock Text="Dry-run scratch directory" /></Border>
+        <TextBlock TextWrapping="Wrap" Classes="secondary" Margin="0,0,0,8"
+                   Text="Where the service spills a large dry run's findings to disk before streaming them to this window. Small runs stay in memory and never touch it. Defaults to a 'scratch' folder in the service's working directory. Leftover snapshots are purged on service startup." />
+
+        <Grid ColumnDefinitions="140,*,Auto" RowDefinitions="Auto" Margin="0,0,0,4">
+            <TextBlock Grid.Column="0" Classes="fieldLabel" Text="Location" />
+            <TextBox Grid.Column="1" Text="{Binding ScratchDirectory}" Margin="0,2" />
+            <Button Grid.Column="2" Content="Browse…" Margin="8,2,0,2"
+                    Command="{Binding BrowseScratchDirectoryCommand}" />
+        </Grid>
+
         <Expander Header="Advanced: per-drive overrides" Margin="0,8,0,0">
             <StackPanel Spacing="8" Margin="0,8,0,0">
                 <TextBlock Classes="secondary" TextWrapping="Wrap"

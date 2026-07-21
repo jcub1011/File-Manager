@@ -71,6 +71,12 @@ internal sealed class EngineHost(
         Directory.CreateDirectory(paths.WorkDirectory);
         Directory.CreateDirectory(paths.QuarantineDirectory);
 
+        // 2a. Dry-run scratch snapshots (spool spill-over): create the configured directory and purge
+        //     any *.snapshot left by a crash. Each run deletes its own on completion, so this is only a
+        //     backstop. Non-fatal — a scratch issue must not stop the service; the spool degrades to
+        //     its in-memory fast path if it cannot write.
+        PurgeScratchDirectory();
+
         // 3. Load profiles into the catalog.
         Result reload = catalog.Reload();
         if (reload.TryGetError(out string? reloadError))
@@ -121,6 +127,27 @@ internal sealed class EngineHost(
         }
 
         await ipcServer.StopAsync(CancellationToken.None);
+    }
+
+    private void PurgeScratchDirectory()
+    {
+        try
+        {
+            string scratch = settings.Current.ScratchDirectory;
+            Directory.CreateDirectory(scratch);
+            foreach (string leftover in Directory.EnumerateFiles(scratch, "*.snapshot"))
+            {
+                try { File.Delete(leftover); }
+                catch (Exception ex)
+                {
+                    logger.LogWarning("Could not purge leftover dry-run snapshot {Path}: {Error}", leftover, ex.Message);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning("Could not prepare the dry-run scratch directory: {Error}", ex.Message);
+        }
     }
 
     public override void Dispose()

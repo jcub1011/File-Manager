@@ -632,7 +632,7 @@ public sealed class DryRunEngineTests : IDisposable
     }
 
     [Fact]
-    public async Task Stream_yields_the_same_results_in_the_same_order_as_the_batched_report()
+    public async Task Stream_yields_the_same_results_as_the_batched_report_regardless_of_order()
     {
         string[] names = ["m.txt", "a.txt", "z.txt", "c.txt", "b.txt", "y.txt", "d.txt", "n.txt"];
         foreach (string name in names)
@@ -647,7 +647,12 @@ public sealed class DryRunEngineTests : IDisposable
 
         List<(string SourcePath, OperationKind Kind)> streamed = await CollectStream(NewEngine(), profile);
 
-        Assert.Equal(batchedPairs, streamed);
+        // The streamed path emits in discovery (completion) order and leaves sorting to the client,
+        // so it agrees with the batched report as a SET — same files, same verdicts — not in row order.
+        Assert.Equal(
+            batchedPairs.OrderBy(p => p.Item1, StringComparer.OrdinalIgnoreCase).ToList(),
+            streamed.OrderBy(p => p.SourcePath, StringComparer.OrdinalIgnoreCase)
+                .Select(p => (p.SourcePath, p.Kind)).ToList());
     }
 
     [Fact]
@@ -668,9 +673,10 @@ public sealed class DryRunEngineTests : IDisposable
         List<(string SourcePath, OperationKind Kind)> streamed =
             await CollectStream(NewEngine(4000, 4000, GlobalSettings.Default), profile);
         Assert.Equal(40, streamed.Count);
+        // Discovery order — sort the streamed names before comparing to the full expected set.
         Assert.Equal(
             Enumerable.Range(0, 40).Select(i => $"{i:D3}.txt").OrderBy(n => n, StringComparer.OrdinalIgnoreCase).ToList(),
-            streamed.Select(f => Path.GetFileName(f.SourcePath)).ToList());
+            streamed.Select(f => Path.GetFileName(f.SourcePath)).OrderBy(n => n, StringComparer.OrdinalIgnoreCase).ToList());
     }
 
     [Fact]

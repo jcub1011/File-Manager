@@ -30,9 +30,12 @@ namespace FileManager.Core.DryRun;
 /// collaborator here is read-only (scan, stat, hash, existence probes). Produces a bipartite plan
 /// graph: the source/destination <see cref="PhysicalFile"/> lists are the ground-truth nodes, and
 /// the source/destination <see cref="VirtualFileOperation"/> lists are the plan, referencing files
-/// by integer index. Index assignment is deterministic (candidates are sorted by source path, then
-/// bundles are appended in that order), so a truncated report is a valid prefix and the streamed and
-/// batched reports agree.</summary>
+/// by integer index. The two simulate paths differ in ordering: <see cref="SimulateAsync"/> (batched,
+/// CLI) sorts candidates by source path so a source file's index is its sorted position and a
+/// truncated report is a valid path-ordered prefix; <see cref="SimulateStreamAsync"/> (the GUI) emits
+/// findings in discovery order via a spool and leaves the sort to the client, so it never buffers or
+/// sorts the whole set. In both, op indices are valid positions into the assembled lists (the global
+/// invariant), so the streamed report differs from the batched one only in row order.</summary>
 public sealed class DryRunEngine(
     ILogger<DryRunEngine> logger,
     ISourceScanner scanner,
@@ -90,6 +93,22 @@ public sealed class DryRunEngine(
     /// batched file cap is reachable without generating tens of thousands of files.</summary>
     internal int MaxBatchCandidates { get; init; } = MaxReportedFiles;
 
+    /// <summary>Test seam: the spool the streamed path writes findings to. Null (production) builds a
+    /// disk-backed <see cref="FileDryRunSpool"/> from the current scratch-directory setting; tests set
+    /// an <see cref="InMemoryDryRunSpoolFactory"/> to stay off disk.</summary>
+    internal IDryRunSpoolFactory? SpoolFactory { get; init; }
+
+    /// <summary>Test seam: bytes buffered in memory before the disk-backed spool spills to a file.
+    /// Production uses <see cref="ChunkByteThreshold"/>; tests shrink it to force a spill.</summary>
+    internal long SpillThresholdBytes { get; init; } = ChunkByteThreshold;
+
+    /// <summary>The per-run spool for the streamed path: the injected test factory, else a disk-backed
+    /// spool that spills to <see cref="GlobalSettings.ScratchDirectory"/> past
+    /// <see cref="SpillThresholdBytes"/> (small runs stay in memory).</summary>
+    private IDryRunSpool CreateSpool() =>
+        SpoolFactory?.Create()
+        ?? new FileDryRunSpool(settings.Current.ScratchDirectory, SpillThresholdBytes, logger);
+
     /// <summary>Previews the given profile object directly (a persisted profile the handler resolved
     /// from the catalog, or an unsaved in-memory draft). All collaborators remain read-only
     /// (I-DRYRUN-RO).</summary>
@@ -116,12 +135,17 @@ public sealed class DryRunEngine(
         // work. A hash or target loop cut short by cancellation returns a partial/placeholder result;
         // cancellation turns the whole run into Canceled rather than a misleading partial report.
         RunCounters counters = new();
+        // The batched path collects the whole evaluated set, then sorts by source path (below): a
+        // source file's index is its sorted position, so a byte-truncated report stays a valid
+        // path-ordered prefix. The streamed path instead spools findings in discovery order and lets
+        // the client sort (see SimulateStreamAsync).
+        ConcurrentQueue<FileEvaluation> results = new();
         PipelineOutcome outcome;
         try
         {
             outcome = await ScanAndEvaluateAsync(
                 profile, scopePath, filtersBySourceRoot!, hasTransformers, MaxBatchCandidates, counters,
-                progress: null, ct)
+                progress: null, (evaluation, _) => { results.Enqueue(evaluation); return ValueTask.CompletedTask; }, ct)
                 .ConfigureAwait(false);
         }
         catch (OperationCanceledException)
@@ -143,7 +167,7 @@ public sealed class DryRunEngine(
         // references a dropped file. The byte budget can only be applied here (assembly needs the
         // sorted order), so a byte-truncated report has over-evaluated its dropped tail — bounded by
         // the file cap, and accepted as the price of the scan/eval overlap.
-        List<FileEvaluation> evaluations = outcome.Evaluations;
+        List<FileEvaluation> evaluations = [.. results];
         evaluations.Sort(static (a, b) =>
             string.Compare(a.SourceFile.Path, b.SourceFile.Path, StringComparison.OrdinalIgnoreCase));
 
@@ -210,12 +234,14 @@ public sealed class DryRunEngine(
 
     /// <summary>Streaming counterpart to <see cref="SimulateAsync"/> (spec §8): yields the per-source-file
     /// phase as a sequence of chunks instead of one bounded, truncatable report, so a run larger than
-    /// the single-frame budget reports every file. Reuses the same scan → sort → batched read-only
-    /// evaluation; results are buffered into a chunk and flushed once its cheap upper-bound size
-    /// crosses <see cref="ChunkByteThreshold"/>. Indices are assigned globally across chunks so the
-    /// consumer can concatenate them. The destination sweep is left to the handler (which runs it
-    /// after the file phase). A fatal setup/scan error is a single failure item that ends the stream;
-    /// cancellation surfaces as <see cref="OperationCanceledException"/> from the enumerator.</summary>
+    /// the single-frame budget reports every file. Reuses the same fused scan+evaluate pipeline, but
+    /// spools each finding in discovery (completion) order — no global sort — so the whole evaluated
+    /// set is never buffered (the spool spills to disk past a threshold); the replay is buffered into a
+    /// chunk and flushed once its cheap upper-bound size crosses <see cref="ChunkByteThreshold"/>.
+    /// Indices are assigned globally across chunks so the consumer can concatenate them; the client
+    /// sorts the concatenated report for display. The destination sweep is left to the handler (which
+    /// runs it after the file phase). A fatal setup/scan error is a single failure item that ends the
+    /// stream; cancellation surfaces as <see cref="OperationCanceledException"/> from the enumerator.</summary>
     /// <summary>Previews the given profile object directly (a persisted profile the handler resolved
     /// from the catalog, or an unsaved in-memory draft). All collaborators remain read-only
     /// (I-DRYRUN-RO); catalog membership was never what enforced that.</summary>
@@ -239,15 +265,18 @@ public sealed class DryRunEngine(
         bool hasTransformers = profile.Transformers is { Count: > 0 };
 
         // Phases 1+2 are fused (see ScanAndEvaluateAsync): the scan streams payloads into a bounded
-        // buffer while a worker pool evaluates them as they arrive. Chunks cannot be yielded before
-        // the pipeline completes — output order is fixed by the sort below, so the first chunk needs
-        // the full evaluated set regardless; the win is the scan/eval overlap, not first-chunk
-        // latency. A fatal fault ends the stream with a failure; cancellation propagates as an
+        // buffer while a worker pool evaluates them as they arrive. Each finding is spooled in
+        // discovery (completion) order as it is produced — NO global sort — so the whole evaluated set
+        // is never held in memory at once (the spool spills to disk past a threshold) and the scan can
+        // finish and release its filesystem handles before the client has consumed anything. The
+        // client sorts for display (DryRunViewModel), which is the only place the order matters. A
+        // fatal fault ends the stream with a failure; cancellation propagates as an
         // OperationCanceledException from the enumerator, exactly as before.
         RunCounters counters = new();
+        await using IDryRunSpool spool = CreateSpool();
         PipelineOutcome outcome = await ScanAndEvaluateAsync(
             profile, scopePath, filtersBySourceRoot!, hasTransformers, MaxScannedCandidates, counters,
-            progress, ct)
+            progress, (evaluation, token) => spool.WriteAsync(evaluation, token), ct)
             .ConfigureAwait(false);
 
         if (outcome.FatalScanError is not null)
@@ -265,16 +294,14 @@ public sealed class DryRunEngine(
                 "report truncated — the scan found more",
                 profile.Id, MaxScannedCandidates);
 
-        // Fix the output order (source path) and flush a chunk whenever the buffer's upper-bound
-        // size crosses the threshold. Indices are global across chunks (tracked by the accumulator)
-        // so the client simply concatenates.
-        List<FileEvaluation> evaluations = outcome.Evaluations;
-        evaluations.Sort(static (a, b) =>
-            string.Compare(a.SourceFile.Path, b.SourceFile.Path, StringComparison.OrdinalIgnoreCase));
+        await spool.CompleteWritingAsync().ConfigureAwait(false);
 
+        // Replay the spool in discovery order, flushing a chunk whenever the buffer's upper-bound size
+        // crosses the threshold. Indices are global across chunks (tracked by the accumulator) so the
+        // client concatenates the chunks, then sorts them for display.
         StreamAccumulator accumulator = new();
         bool anyEmitted = false;
-        foreach (FileEvaluation evaluation in evaluations)
+        await foreach (FileEvaluation evaluation in spool.ReadAllAsync(ct).ConfigureAwait(false))
         {
             accumulator.Add(evaluation);
             if (accumulator.Bytes >= ChunkByteBudget)
@@ -306,14 +333,13 @@ public sealed class DryRunEngine(
                 counters.ExistenceProbes, counters.ExistingStats, counters.FilesHashed, counters.BytesHashed);
     }
 
-    /// <summary>The fused scan+evaluation pipeline's result. <see cref="Evaluations"/> is UNSORTED
-    /// (completion order — the parallel scan's emission order is already non-deterministic); the
-    /// caller sorts by source path before assembly, which is where index assignment happens. A
-    /// fatal scan fault is carried as a value in <see cref="FatalScanError"/>, never thrown.
+    /// <summary>The fused scan+evaluation pipeline's outcome (metadata only). Each evaluated finding
+    /// was handed to the caller's sink as it completed — in the parallel scan's non-deterministic
+    /// completion order — so the batched path collects+sorts them and the streamed path spools them.
+    /// A fatal scan fault is carried as a value in <see cref="FatalScanError"/>, never thrown.
     /// <see cref="ScanMs"/> is the pump's span within the <see cref="EvalMs"/> pipeline wall time —
     /// the two overlap by design.</summary>
     private sealed record PipelineOutcome(
-        List<FileEvaluation> Evaluations,
         bool ScanTruncated,
         string? FatalScanError,
         long ScanMs,
@@ -346,6 +372,7 @@ public sealed class DryRunEngine(
         int candidateCap,
         RunCounters counters,
         DryRunProgressCounters? progress,
+        Func<FileEvaluation, CancellationToken, ValueTask> sink,
         CancellationToken ct)
     {
         using CancellationTokenSource linked = CancellationTokenSource.CreateLinkedTokenSource(ct);
@@ -404,7 +431,6 @@ public sealed class DryRunEngine(
             }
         });
 
-        ConcurrentQueue<FileEvaluation> results = new();
         Stopwatch evalWatch = Stopwatch.StartNew();
         Exception? consumerError = null;
         try
@@ -418,7 +444,7 @@ public sealed class DryRunEngine(
                         profile, payload, filtersBySourceRoot, hasTransformers, counters, token)
                         .ConfigureAwait(false);
                     if (evaluation is not null)
-                        results.Enqueue(evaluation);
+                        await sink(evaluation, token).ConfigureAwait(false);
                 }).ConfigureAwait(false);
         }
         catch (OperationCanceledException)
@@ -443,13 +469,13 @@ public sealed class DryRunEngine(
         }
 
         if (fatalError is not null)
-            return new PipelineOutcome([], false, fatalError, scanWatch.ElapsedMilliseconds, evalWatch.ElapsedMilliseconds);
+            return new PipelineOutcome(false, fatalError, scanWatch.ElapsedMilliseconds, evalWatch.ElapsedMilliseconds);
         if (consumerError is not null)
             ExceptionDispatchInfo.Capture(consumerError).Throw();
         ct.ThrowIfCancellationRequested();
 
         return new PipelineOutcome(
-            [.. results], scanTruncated, null, scanWatch.ElapsedMilliseconds, evalWatch.ElapsedMilliseconds);
+            scanTruncated, null, scanWatch.ElapsedMilliseconds, evalWatch.ElapsedMilliseconds);
     }
 
     /// <summary>Compiles one filter set per source, keyed by the source root the scanner stamps on
@@ -479,18 +505,6 @@ public sealed class DryRunEngine(
     /// settings (profiles no longer override concurrency). Clamped to at least 1 so
     /// <see cref="ParallelOptions.MaxDegreeOfParallelism"/> is always valid.</summary>
     internal int ResolveWorkers() => ScanThreadResolver.ResolveMaxHashThreads(settings.Current.ScanThreading);
-
-    /// <summary>One source file's contribution to the report: the source file node, its source-side
-    /// operation (Processed / Skipped + disposition), and the destination files/operations its targets
-    /// produce. Indices are bundle-local: a destination op's <c>SourceIndex == 0</c> means "this
-    /// bundle's source file" (else <c>-1</c>), and its <c>SubjectIndex</c> is a 0-based position into
-    /// this bundle's <see cref="DestinationFiles"/> (else <c>-1</c>). The report builders remap these
-    /// to global positions on append.</summary>
-    private sealed record FileEvaluation(
-        PhysicalFile SourceFile,
-        VirtualFileOperation SourceOp,
-        IReadOnlyList<PhysicalFile> DestinationFiles,
-        IReadOnlyList<VirtualFileOperation> DestinationOps);
 
     /// <summary>Per-run I/O accounting for the evaluation phase, surfaced in the completion log so a
     /// slow run attributes its time to a phase without a profiler. Incremented under

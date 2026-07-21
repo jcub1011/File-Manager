@@ -23,12 +23,14 @@ public sealed partial class MainWindowViewModel : ViewModelBase
     public const double MinExpandedSidebarWidth = 180;
 
     private readonly IIpcGateway _gateway;
+    private readonly IFolderPicker _folderPicker;
     private readonly ILogFolderService _logFolder;
 
     public MainWindowViewModel(IIpcGateway gateway, IFolderPicker folderPicker, ILogFolderService logFolder,
         IDryRunItemActions dryRunActions)
     {
         _gateway = gateway;
+        _folderPicker = folderPicker;
         _logFolder = logFolder;
         List = new ProfileListViewModel(gateway);
         Editor = new ProfileEditorViewModel(gateway, folderPicker);
@@ -180,7 +182,7 @@ public sealed partial class MainWindowViewModel : ViewModelBase
     {
         if (ShowSettingsDialog is null)
             return;
-        SettingsViewModel settings = new(_gateway);
+        SettingsViewModel settings = new(_gateway, _folderPicker);
         await settings.LoadAsync();
         await ShowSettingsDialog(settings);
     }
