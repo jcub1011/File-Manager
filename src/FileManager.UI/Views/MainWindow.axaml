@@ -65,9 +65,10 @@
 
         <Grid x:Name="ContentGrid">
             <Grid.ColumnDefinitions>
-                <!-- Width/MinWidth/MaxWidth are driven from code-behind (MainWindow.axaml.cs):
-                     collapsing pins the column to the rail width so the splitter can't resize it. -->
-                <ColumnDefinition Width="280" MinWidth="180" />
+                <!-- Width is driven from code-behind (MainWindow.axaml.cs); the column stays freely
+                     draggable down to the rail width, and the current width decides collapsed vs
+                     expanded (dragging across the 180px threshold switches modes). -->
+                <ColumnDefinition Width="280" MinWidth="58" />
                 <ColumnDefinition Width="4" />
                 <ColumnDefinition Width="*" />
             </Grid.ColumnDefinitions>

@@ -241,7 +241,10 @@
     <Style Selector="ListBox.profilesRail">
         <Setter Property="Background" Value="Transparent" />
         <Setter Property="BorderThickness" Value="0" />
-        <Setter Property="Padding" Value="0" />
+        <!-- Vertical spacing comes from the list: top/bottom padding + inter-item gap (ItemsPanel
+             Spacing in ProfileRailView). Horizontal spacing comes from the collapsed column width
+             centring the avatar. -->
+        <Setter Property="Padding" Value="0,8" />
     </Style>
     <Style Selector="ListBox.profilesRail ListBoxItem">
         <Setter Property="Padding" Value="0" />
@@ -262,8 +265,6 @@
     <Style Selector="ListBox.profilesRail Border.avatar">
         <Setter Property="Width" Value="40" />
         <Setter Property="Height" Value="40" />
-        <!-- Spacing between avatars lives on the avatar itself, not on the list/items. -->
-        <Setter Property="Margin" Value="0,3" />
         <Setter Property="HorizontalAlignment" Value="Center" />
         <Setter Property="CornerRadius" Value="{StaticResource Radius.Control}" />
         <Setter Property="Background" Value="{DynamicResource Brush.Control.Background}" />

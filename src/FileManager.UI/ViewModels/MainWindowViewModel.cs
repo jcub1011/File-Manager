@@ -14,9 +14,10 @@ namespace FileManager.UI.ViewModels;
 /// save → list refresh, and the unsaved-changes navigation guard.</summary>
 public sealed partial class MainWindowViewModel : ViewModelBase
 {
-    /// <summary>Fixed width of the collapsed profile rail (icon avatars + padding). Shared with the
-    /// view, which pins the sidebar column to this width so the splitter can no longer resize it.</summary>
-    public const double CollapsedSidebarWidth = 56;
+    /// <summary>Fixed width of the collapsed profile rail. Sized so the 40px avatar centres with a
+    /// uniform ~8px gap on each side (40 + 8 + 8 + the 1px panel divider). Shared with the view, which
+    /// snaps the sidebar column to this width when collapsed.</summary>
+    public const double CollapsedSidebarWidth = 57;
 
     /// <summary>Smallest width the expanded sidebar may be dragged/restored to.</summary>
     public const double MinExpandedSidebarWidth = 180;

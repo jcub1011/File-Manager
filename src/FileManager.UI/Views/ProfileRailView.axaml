@@ -9,6 +9,12 @@
          ProfileListViewModel as the expanded ProfileListView, so switching, the unsaved-changes
          navigation guard, and row-locking are reused verbatim (nothing extra is wired here). -->
     <ListBox Classes="profilesRail" ItemsSource="{Binding FilteredProfiles}" SelectedItem="{Binding SelectedProfile}">
+        <ListBox.ItemsPanel>
+            <!-- Uniform gap between avatars; the list's top/bottom padding matches it. -->
+            <ItemsPanelTemplate>
+                <StackPanel Spacing="8" />
+            </ItemsPanelTemplate>
+        </ListBox.ItemsPanel>
         <ListBox.Styles>
             <!-- Identical to ProfileListView: while the editor has unsaved edits, lock every row
                  except the one being edited so the user can't appear to navigate away. -->
