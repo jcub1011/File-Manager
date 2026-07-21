@@ -104,7 +104,10 @@ public sealed class IpcServer(
             }
 
             accepted.TryGetValue(out Stream? stream);
-            Task connection = Task.Run(() => ServeConnectionAsync(stream!, ct), ct);
+            // No scheduling token: with one, a cancellation racing the accept could skip
+            // ServeConnectionAsync entirely and leak the accepted pipe handle (its `await using`
+            // is what disposes the stream). The connection observes ct itself and ends promptly.
+            Task connection = Task.Run(() => ServeConnectionAsync(stream!, ct));
             _connections.TryAdd(connection, 0);
             _ = connection.ContinueWith(
                 t => _connections.TryRemove(t, out _),
@@ -127,7 +130,13 @@ public sealed class IpcServer(
                         return;                     // shutdown
                     if (frame.TryGetError(out string? readError))
                     {
-                        logger.LogDebug("IPC connection ended: {Reason}", readError);
+                        // A clean close at a frame boundary is routine (client disconnected);
+                        // anything else — torn frame, bad length, I/O error — is the abnormal
+                        // connection death that must be visible at production log levels.
+                        if (readError == IpcFrameCodec.ConnectionClosedMessage)
+                            logger.LogDebug("IPC connection closed");
+                        else
+                            logger.LogWarning("IPC connection ended abnormally: {Reason}", readError);
                         return;
                     }
                     frame.TryGetValue(out byte[]? payload);
@@ -161,7 +170,10 @@ public sealed class IpcServer(
             }
             catch (Exception ex) when (ex is IOException or ObjectDisposedException)
             {
-                logger.LogDebug(ex, "IPC connection dropped");
+                // Warning, not Debug: the service logs at Information in production, and a dropped
+                // connection that only shows at Debug is exactly the silent-death failure mode the
+                // catch-and-log directive exists to prevent.
+                logger.LogWarning(ex, "IPC connection dropped");
             }
             catch (Exception ex)
             {
@@ -293,7 +305,9 @@ public sealed class IpcServer(
             return false;                           // shutdown
         if (writeResult.TryGetError(out string? writeError))
         {
-            logger.LogDebug("IPC connection ended: {Reason}", writeError);
+            // A failed mid-response write means the client sees a torn reply — abnormal, so it
+            // must be visible at production log levels (Warning, not Debug).
+            logger.LogWarning("IPC connection ended writing a {RequestType} response: {Reason}", requestType, writeError);
             return false;
         }
         return true;

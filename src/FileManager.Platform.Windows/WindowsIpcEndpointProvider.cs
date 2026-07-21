@@ -25,35 +25,43 @@ public sealed class WindowsIpcEndpointProvider(ILogger<WindowsIpcEndpointProvide
 
     public async Task<Result<Stream, string>> AcceptAsync(CancellationToken ct = default)
     {
-        NamedPipeServerStream pipe = new(
-            ResolvePipeName(),
-            PipeDirection.InOut,
-            NamedPipeServerStream.MaxAllowedServerInstances,
-            PipeTransmissionMode.Byte,
-            PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly,
-            inBufferSize: PipeBufferBytes,
-            outBufferSize: PipeBufferBytes);
+        // The constructor sits INSIDE the try: it can itself throw (e.g. UnauthorizedAccessException
+        // when another local user has squatted the predictable pipe name, denying
+        // FILE_CREATE_PIPE_INSTANCE). As a thrown exception that would escape AcceptAsync and kill
+        // the server's accept loop permanently; as a failure value it is retried with backoff.
+        NamedPipeServerStream? pipe = null;
         try
         {
+            pipe = new NamedPipeServerStream(
+                ResolvePipeName(),
+                PipeDirection.InOut,
+                NamedPipeServerStream.MaxAllowedServerInstances,
+                PipeTransmissionMode.Byte,
+                PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly,
+                inBufferSize: PipeBufferBytes,
+                outBufferSize: PipeBufferBytes);
             await pipe.WaitForConnectionAsync(ct).ConfigureAwait(false);
             return pipe;
         }
         catch (OperationCanceledException)
         {
-            await pipe.DisposeAsync().ConfigureAwait(false);
+            if (pipe is not null)
+                await pipe.DisposeAsync().ConfigureAwait(false);
             return Result<Stream, string>.Canceled();
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
             logger.LogError(ex, "Could not listen on the service pipe {PipeName}", ResolvePipeName());
-            await pipe.DisposeAsync().ConfigureAwait(false);
+            if (pipe is not null)
+                await pipe.DisposeAsync().ConfigureAwait(false);
             return $"could not listen on the service pipe: {ex.Message}";
         }
         catch (Exception ex)
         {
             // Last resort: unexpected exceptions become logged failures, not faulted callers.
             logger.LogError(ex, "Listening on the service pipe {PipeName} failed unexpectedly", ResolvePipeName());
-            await pipe.DisposeAsync().ConfigureAwait(false);
+            if (pipe is not null)
+                await pipe.DisposeAsync().ConfigureAwait(false);
             return $"could not listen on the service pipe: {ex.GetType().Name}: {ex.Message}";
         }
     }

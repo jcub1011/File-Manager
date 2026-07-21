@@ -121,34 +121,52 @@ public sealed class IpcGateway : IIpcGateway, IAsyncDisposable
         IpcRequest request, Func<TResponse, TValue> project, CancellationToken ct)
         where TResponse : IpcResponse
     {
-        var clientResult = await EnsureConnectedAsync(ct).ConfigureAwait(false);
-        if (clientResult.IsCanceled)
-            return Result<TValue, IpcError>.Canceled();
-        if (clientResult.TryGetError(out IpcError? connectError))
+        try
         {
-            if (request is not GetStatusRequest)
-                Log.Warning("IPC request {RequestType} could not connect: {Code} {Message}",
-                    request.GetType().Name, connectError.Code, connectError.Message);
-            return connectError;
-        }
-        clientResult.TryGetValue(out IpcClient? client);
+            var clientResult = await EnsureConnectedAsync(ct).ConfigureAwait(false);
+            if (clientResult.IsCanceled)
+                return Result<TValue, IpcError>.Canceled();
+            if (clientResult.TryGetError(out IpcError? connectError))
+            {
+                if (request is not GetStatusRequest)
+                    Log.Warning("IPC request {RequestType} could not connect: {Code} {Message}",
+                        request.GetType().Name, connectError.Code, connectError.Message);
+                return connectError;
+            }
+            clientResult.TryGetValue(out IpcClient? client);
 
-        var response = await client!.RequestAsync<TResponse>(request, ct).ConfigureAwait(false);
-        if (response.IsCanceled)
-            return Result<TValue, IpcError>.Canceled();
-        if (response.TryGetError(out IpcError? error))
-        {
-            // The status poll fires every couple of seconds; logging each failed poll here would
-            // flood the log during an outage. StatusBarViewModel logs that once, on transition.
-            if (request is not GetStatusRequest)
-                Log.Warning("IPC request {RequestType} failed: {Code} {Message}",
-                    request.GetType().Name, error.Code, error.Message);
-            if (error.Code == "IPC_TRANSPORT")
+            var response = await client!.RequestAsync<TResponse>(request, ct).ConfigureAwait(false);
+
+            // A cancelled request may have desynchronized the connection (the client marks itself
+            // poisoned once its write began) — recycle it so the NEXT request gets a clean one
+            // instead of reading this request's leftover response.
+            if (client.IsPoisoned)
                 await DropClientAsync(client).ConfigureAwait(false);
-            return error;
+
+            if (response.IsCanceled)
+                return Result<TValue, IpcError>.Canceled();
+            if (response.TryGetError(out IpcError? error))
+            {
+                // The status poll fires every couple of seconds; logging each failed poll here would
+                // flood the log during an outage. StatusBarViewModel logs that once, on transition.
+                if (request is not GetStatusRequest)
+                    Log.Warning("IPC request {RequestType} failed: {Code} {Message}",
+                        request.GetType().Name, error.Code, error.Message);
+                if (error.Code is "IPC_TRANSPORT" or "IPC_UNEXPECTED_RESPONSE" or "IPC_MALFORMED"
+                    && !client.IsPoisoned)   // poisoned was already dropped above
+                    await DropClientAsync(client).ConfigureAwait(false);
+                return error;
+            }
+            response.TryGetValue(out TResponse? typed);
+            return project(typed!);
         }
-        response.TryGetValue(out TResponse? typed);
-        return project(typed!);
+        catch (Exception ex)
+        {
+            // Last-resort catch-all (directive): nothing may escape raw into viewmodel code —
+            // several call sites (commands, timers) have no exception boundary of their own.
+            Log.Error(ex, "IPC request {RequestType} failed unexpectedly", request.GetType().Name);
+            return new IpcError("IPC_INTERNAL", $"{ex.GetType().Name}: {ex.Message}");
+        }
     }
 
     private async Task<Result<IpcClient, IpcError>> EnsureConnectedAsync(CancellationToken ct)
@@ -161,6 +179,13 @@ public sealed class IpcGateway : IIpcGateway, IAsyncDisposable
         {
             // Cancelled before the gate was acquired — nothing to release.
             return Result<IpcClient, IpcError>.Canceled();
+        }
+        catch (Exception ex)
+        {
+            // Last-resort catch-all (directive): DisposeAsync disposes _connectGate; a request
+            // racing shutdown must get a failure value, not an unhandled ObjectDisposedException.
+            Log.Warning(ex, "IPC connect gate unavailable (gateway shutting down?)");
+            return new IpcError("IPC_TRANSPORT", $"gateway is shutting down: {ex.GetType().Name}");
         }
         try
         {
@@ -183,16 +208,28 @@ public sealed class IpcGateway : IIpcGateway, IAsyncDisposable
 
     private async Task DropClientAsync(IpcClient client)
     {
-        await _connectGate.WaitAsync().ConfigureAwait(false);
         try
         {
-            if (ReferenceEquals(_client, client))
-                _client = null;
+            await _connectGate.WaitAsync().ConfigureAwait(false);
+            try
+            {
+                if (ReferenceEquals(_client, client))
+                    _client = null;
+            }
+            finally
+            {
+                _connectGate.Release();
+            }
+            // Disposing while another request is mid-flight on this client is a benign race: the
+            // client tolerates it (its request gate survives disposal) and the loser gets a
+            // transport-failure value.
+            await client.DisposeAsync().ConfigureAwait(false);
         }
-        finally
+        catch (Exception ex)
         {
-            _connectGate.Release();
+            // Last-resort catch-all (directive): dropping a dead client is best-effort cleanup and
+            // must never replace the caller's real result with a teardown exception.
+            Log.Warning(ex, "Dropping a dead IPC client failed");
         }
-        await client.DisposeAsync().ConfigureAwait(false);
     }
 }

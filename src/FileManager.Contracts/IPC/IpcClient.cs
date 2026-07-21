@@ -18,8 +18,16 @@ public sealed class IpcClient : IAsyncDisposable
 
     private readonly NamedPipeClientStream _pipe;
     private readonly SemaphoreSlim _requestGate = new(1, 1);
+    private volatile bool _poisoned;
 
     private IpcClient(NamedPipeClientStream pipe) => _pipe = pipe;
+
+    /// <summary>True once request/response framing can no longer be trusted: a request was
+    /// cancelled after its write began (the response is still queued on the pipe — or the frame
+    /// itself is torn), or a response arrived malformed / of an unexpected type. Every further
+    /// request would read the previous request's leftovers, so callers must discard this client
+    /// and connect a fresh one. Checked at the top of <see cref="RequestAsync"/>.</summary>
+    public bool IsPoisoned => _poisoned;
 
     /// <summary>Connects with a short timeout so the §3.3 probe-then-start handshake stays fast.
     /// Failure to connect is an expected state (service not running), not an exception.</summary>
@@ -77,10 +85,28 @@ public sealed class IpcClient : IAsyncDisposable
             // Cancelled before the gate was acquired — nothing to release.
             return Result<TResponse, IpcError>.Canceled();
         }
+        catch (Exception ex)
+        {
+            // Last-resort catch-all (directive): a concurrent DisposeAsync can dispose the pipe
+            // under a parked waiter; that must surface as a failure value, never an unhandled throw.
+            return new IpcError("IPC_TRANSPORT", $"connection is shutting down: {ex.GetType().Name}: {ex.Message}");
+        }
+
+        // Everything from the first write byte onward runs poisoned-by-default: only an outcome
+        // that provably consumed exactly one whole response frame (a typed response or an
+        // ErrorResponse) re-arms the connection for the next request. A cancellation mid-write
+        // tears the frame; one mid-read leaves the response queued — either way the NEXT request
+        // would read this request's leftovers, so the client refuses further use instead.
+        if (_poisoned)
+        {
+            ReleaseGate();
+            return new IpcError("IPC_TRANSPORT", "the connection was desynchronized by an earlier cancellation and must be reopened");
+        }
 
         try
         {
             byte[] payload = IpcSerializer.SerializeRequest(request);
+            _poisoned = true;
             Result writeResult = await IpcFrameCodec.WriteFrameAsync(_pipe, payload, ct).ConfigureAwait(false);
             if (writeResult.IsCanceled)
                 return Result<TResponse, IpcError>.Canceled();
@@ -98,13 +124,20 @@ public sealed class IpcClient : IAsyncDisposable
             if (parsed.TryGetError(out string? parseError))
                 return new IpcError("IPC_MALFORMED", $"the service sent a response that could not be parsed: {parseError}");
             parsed.TryGetValue(out IpcResponse? response);
-            return response! switch
+            switch (response!)
             {
-                ErrorResponse error => new IpcError(error.Code, error.Message),
-                TResponse typed => typed,
-                IpcResponse other => new IpcError("IPC_UNEXPECTED_RESPONSE",
-                    $"expected {typeof(TResponse).Name}, got {other.GetType().Name}"),
-            };
+                case ErrorResponse error:
+                    _poisoned = false;               // a whole frame was consumed — still in sync
+                    return new IpcError(error.Code, error.Message);
+                case TResponse typed:
+                    _poisoned = false;
+                    return typed;
+                default:
+                    // A whole frame was consumed but of the wrong type: request/response
+                    // correlation can no longer be trusted — stay poisoned.
+                    return new IpcError("IPC_UNEXPECTED_RESPONSE",
+                        $"expected {typeof(TResponse).Name}, got {response!.GetType().Name}");
+            }
         }
         catch (OperationCanceledException)
         {
@@ -122,7 +155,21 @@ public sealed class IpcClient : IAsyncDisposable
         }
         finally
         {
+            ReleaseGate();
+        }
+    }
+
+    /// <summary>Releases the request gate, tolerating a concurrent DisposeAsync having disposed
+    /// the semaphore — the request's outcome (already computed) must win over a teardown race.</summary>
+    private void ReleaseGate()
+    {
+        try
+        {
             _requestGate.Release();
+        }
+        catch (ObjectDisposedException)
+        {
+            // A concurrent DisposeAsync tore the client down while this request was in flight.
         }
     }
 
@@ -151,10 +198,23 @@ public sealed class IpcClient : IAsyncDisposable
         {
             return Result<DryRunReport, IpcError>.Canceled();
         }
+        catch (Exception ex)
+        {
+            // Last-resort catch-all (directive): a concurrent DisposeAsync can dispose the pipe
+            // under a parked waiter; that must surface as a failure value, never an unhandled throw.
+            return new IpcError("IPC_TRANSPORT", $"connection is shutting down: {ex.GetType().Name}: {ex.Message}");
+        }
+
+        if (_poisoned)
+        {
+            ReleaseGate();
+            return new IpcError("IPC_TRANSPORT", "the connection was desynchronized by an earlier cancellation and must be reopened");
+        }
 
         try
         {
             byte[] payload = IpcSerializer.SerializeRequest(request);
+            _poisoned = true;   // re-armed only by a complete, in-sync stream outcome (see RequestAsync)
             Result writeResult = await IpcFrameCodec.WriteFrameAsync(_pipe, payload, ct).ConfigureAwait(false);
             if (writeResult.IsCanceled)
                 return Result<DryRunReport, IpcError>.Canceled();
@@ -212,6 +272,7 @@ public sealed class IpcClient : IAsyncDisposable
                         destinationOperations.AddRange(chunk.DestinationOperations);
                         break;
                     case DryRunCompleteResponse complete:
+                        _poisoned = false;           // terminator consumed — connection in sync
                         return new DryRunReport
                         {
                             ProfileId = request.ProfileId,
@@ -230,6 +291,7 @@ public sealed class IpcClient : IAsyncDisposable
                             progressFrame.Phase, progressFrame.SourceFiles, progressFrame.DestinationFiles));
                         break;
                     case ErrorResponse error:
+                        _poisoned = false;           // the server ends the stream after an error frame
                         return new IpcError(error.Code, error.Message);
                     default:
                         return new IpcError("IPC_UNEXPECTED_RESPONSE",
@@ -253,7 +315,7 @@ public sealed class IpcClient : IAsyncDisposable
         }
         finally
         {
-            _requestGate.Release();
+            ReleaseGate();
         }
     }
 
@@ -293,8 +355,13 @@ public sealed class IpcClient : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
+        // The request gate is deliberately NOT disposed: a caller may legitimately dispose the
+        // client while another request is parked in WaitAsync or releasing in its finally (the
+        // gateway drops the shared client on transport death exactly this way). Disposing the
+        // semaphore would turn that benign race into ObjectDisposedException inside the loser;
+        // an undisposed SemaphoreSlim (no AvailableWaitHandle use) holds no unmanaged state.
+        _poisoned = true;
         await _pipe.DisposeAsync().ConfigureAwait(false);
-        _requestGate.Dispose();
     }
 }
 
