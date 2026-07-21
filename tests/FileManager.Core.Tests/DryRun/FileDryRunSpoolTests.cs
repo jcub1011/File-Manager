@@ -38,21 +38,47 @@ public sealed class FileDryRunSpoolTests : IDisposable
         return new FileEvaluation(source, sourceOp, [dest], [destOp]);
     }
 
-    private static void AssertEntryEqual(FileEvaluation expected, FileEvaluation actual)
+    // ReadAllAsync yields IEvaluationView: original records on the in-memory/non-spilled path, pooled
+    // carriers on the spilled path. Comparing field-by-field via the view covers both uniformly.
+    private static void AssertEntryEqual(FileEvaluation expected, IEvaluationView actual)
     {
-        Assert.Equal(expected.SourceFile, actual.SourceFile);       // records: value equality on scalars
-        Assert.Equal(expected.SourceOp, actual.SourceOp);
-        Assert.Equal(expected.DestinationFiles, actual.DestinationFiles);
-        Assert.Equal(expected.DestinationOps, actual.DestinationOps);
+        AssertFileEqual(expected.SourceFile, actual.SourceFile);
+        AssertOpEqual(expected.SourceOp, actual.SourceOp);
+        Assert.Equal(expected.DestinationFiles.Count, actual.DestinationFiles.Count);
+        for (int i = 0; i < expected.DestinationFiles.Count; i++)
+            AssertFileEqual(expected.DestinationFiles[i], actual.DestinationFiles[i]);
+        Assert.Equal(expected.DestinationOps.Count, actual.DestinationOps.Count);
+        for (int i = 0; i < expected.DestinationOps.Count; i++)
+            AssertOpEqual(expected.DestinationOps[i], actual.DestinationOps[i]);
     }
 
-    private async Task<List<FileEvaluation>> WriteReadAsync(IDryRunSpool spool, IReadOnlyList<FileEvaluation> entries)
+    private static void AssertFileEqual(IPhysicalFileView expected, IPhysicalFileView actual)
+    {
+        Assert.Equal(expected.Path, actual.Path);
+        Assert.Equal(expected.Root, actual.Root);
+        Assert.Equal(expected.Length, actual.Length);
+        Assert.Equal(expected.LastWritten, actual.LastWritten);
+        Assert.Equal(expected.IsReparsePoint, actual.IsReparsePoint);
+    }
+
+    private static void AssertOpEqual(IFileOperationView expected, IFileOperationView actual)
+    {
+        Assert.Equal(expected.Path, actual.Path);
+        Assert.Equal(expected.Root, actual.Root);
+        Assert.Equal(expected.Kind, actual.Kind);
+        Assert.Equal(expected.SourceIndex, actual.SourceIndex);
+        Assert.Equal(expected.SubjectIndex, actual.SubjectIndex);
+        Assert.Equal(expected.SourceDisposition, actual.SourceDisposition);
+        Assert.Equal(expected.Detail, actual.Detail);
+    }
+
+    private async Task<List<IEvaluationView>> WriteReadAsync(IDryRunSpool spool, IReadOnlyList<FileEvaluation> entries)
     {
         foreach (FileEvaluation e in entries)
             await spool.WriteAsync(e, default);
         await spool.CompleteWritingAsync();
-        List<FileEvaluation> read = [];
-        await foreach (FileEvaluation e in spool.ReadAllAsync(default))
+        List<IEvaluationView> read = [];
+        await foreach (IEvaluationView e in spool.ReadAllAsync(default))
             read.Add(e);
         return read;
     }
@@ -62,9 +88,9 @@ public sealed class FileDryRunSpoolTests : IDisposable
     {
         List<FileEvaluation> entries = [.. Enumerable.Range(0, 20).Select(Entry)];
         // A generous threshold so this modest set never spills.
-        await using FileDryRunSpool spool = new(_scratch, spillThresholdBytes: 1 << 20, NullLogger.Instance);
+        await using FileDryRunSpool spool = new(_scratch, spillThresholdBytes: 1 << 20, new EvaluationCarrierPool(), NullLogger.Instance);
 
-        List<FileEvaluation> read = await WriteReadAsync(spool, entries);
+        List<IEvaluationView> read = await WriteReadAsync(spool, entries);
 
         Assert.Equal(entries.Count, read.Count);
         for (int i = 0; i < entries.Count; i++)
@@ -78,7 +104,7 @@ public sealed class FileDryRunSpoolTests : IDisposable
     {
         List<FileEvaluation> entries = [.. Enumerable.Range(0, 200).Select(Entry)];
         // A tiny threshold forces a spill almost immediately.
-        FileDryRunSpool spool = new(_scratch, spillThresholdBytes: 8, NullLogger.Instance);
+        FileDryRunSpool spool = new(_scratch, spillThresholdBytes: 8, new EvaluationCarrierPool(), NullLogger.Instance);
 
         foreach (FileEvaluation e in entries)
             await spool.WriteAsync(e, default);
@@ -87,8 +113,10 @@ public sealed class FileDryRunSpoolTests : IDisposable
         Assert.True(Directory.EnumerateFiles(_scratch, "*.snapshot").Any(),
             "an above-threshold run must spill to a snapshot file");
 
-        List<FileEvaluation> read = [];
-        await foreach (FileEvaluation e in spool.ReadAllAsync(default))
+        // Spilled read yields pooled carriers; the test never recycles, so each entry is a distinct
+        // rented instance and collecting them is safe.
+        List<IEvaluationView> read = [];
+        await foreach (IEvaluationView e in spool.ReadAllAsync(default))
             read.Add(e);
 
         Assert.Equal(entries.Count, read.Count);
@@ -102,7 +130,7 @@ public sealed class FileDryRunSpoolTests : IDisposable
     [Fact]
     public async Task Dispose_without_completing_deletes_the_snapshot_file()
     {
-        FileDryRunSpool spool = new(_scratch, spillThresholdBytes: 8, NullLogger.Instance);
+        FileDryRunSpool spool = new(_scratch, spillThresholdBytes: 8, new EvaluationCarrierPool(), NullLogger.Instance);
         foreach (FileEvaluation e in Enumerable.Range(0, 50).Select(Entry))
             await spool.WriteAsync(e, default);
         await spool.CompleteWritingAsync();

@@ -38,11 +38,11 @@ public sealed class DestinationProjector(
     /// to <paramref name="survivors"/> — so the sweep never re-reports a path a source already writes
     /// to (or the pre-existing file a rename was routed around, which the engine emits as an explicit
     /// Untouched op). Safe to call repeatedly across streamed chunks.</summary>
-    public static void AccumulateSurvivors(ISet<NormalizedPath> survivors, IReadOnlyList<VirtualFileOperation> destinationOperations)
+    public static void AccumulateSurvivors(ISet<NormalizedPath> survivors, IReadOnlyList<IFileOperationView> destinationOperations)
     {
         ArgumentNullException.ThrowIfNull(survivors);
         ArgumentNullException.ThrowIfNull(destinationOperations);
-        foreach (VirtualFileOperation op in destinationOperations)
+        foreach (IFileOperationView op in destinationOperations)
             AddNormalized(survivors, op.Path);
     }
 

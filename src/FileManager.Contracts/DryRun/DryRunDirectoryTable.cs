@@ -64,7 +64,7 @@ public sealed class DryRunDirectoryTableBuilder
         return (GetOrAdd(dir), Path.GetFileName(absolutePath), GetOrAdd(root));
     }
 
-    public DryRunFile Convert(PhysicalFile file)
+    public DryRunFile Convert(IPhysicalFileView file)
     {
         (int dirIndex, string fileName, int rootDirIndex) = Convert(file.Path, file.Root);
         return new DryRunFile
@@ -78,7 +78,7 @@ public sealed class DryRunDirectoryTableBuilder
         };
     }
 
-    public DryRunOperation Convert(VirtualFileOperation op)
+    public DryRunOperation Convert(IFileOperationView op)
     {
         (int dirIndex, string fileName, int rootDirIndex) = Convert(op.Path, op.Root);
         return new DryRunOperation

@@ -102,12 +102,19 @@ public sealed class DryRunEngine(
     /// Production uses <see cref="ChunkByteThreshold"/>; tests shrink it to force a spill.</summary>
     internal long SpillThresholdBytes { get; init; } = ChunkByteThreshold;
 
+    /// <summary>Test seam: the carrier pool the streamed read-back rents from. Null (production) builds
+    /// a fresh pool per run; tests inject one so they can assert every rented carrier was recycled
+    /// (borrowed == returned) after a spilled run.</summary>
+    internal EvaluationCarrierPool? StreamCarrierPool { get; init; }
+
     /// <summary>The per-run spool for the streamed path: the injected test factory, else a disk-backed
     /// spool that spills to <see cref="GlobalSettings.ScratchDirectory"/> past
-    /// <see cref="SpillThresholdBytes"/> (small runs stay in memory).</summary>
-    private IDryRunSpool CreateSpool() =>
+    /// <see cref="SpillThresholdBytes"/> (small runs stay in memory). The disk-backed spool shares the
+    /// run's <paramref name="pool"/> so its spilled read-back fills recycled carriers; an injected
+    /// factory (tests use the in-memory spool) ignores the pool and replays original records.</summary>
+    private IDryRunSpool CreateSpool(EvaluationCarrierPool pool) =>
         SpoolFactory?.Create()
-        ?? new FileDryRunSpool(settings.Current.ScratchDirectory, SpillThresholdBytes, logger);
+        ?? new FileDryRunSpool(settings.Current.ScratchDirectory, SpillThresholdBytes, pool, logger);
 
     /// <summary>Previews the given profile object directly (a persisted profile the handler resolved
     /// from the catalog, or an unsaved in-memory draft). All collaborators remain read-only
@@ -273,7 +280,11 @@ public sealed class DryRunEngine(
         // fatal fault ends the stream with a failure; cancellation propagates as an
         // OperationCanceledException from the enumerator, exactly as before.
         RunCounters counters = new();
-        await using IDryRunSpool spool = CreateSpool();
+        // One carrier pool per run, shared with the spool (rents on a spilled read-back) and recycled
+        // here per chunk. Dropped with the run — no cross-run retention. A test may inject one to
+        // assert borrowed == returned.
+        EvaluationCarrierPool pool = StreamCarrierPool ?? new();
+        await using IDryRunSpool spool = CreateSpool(pool);
         PipelineOutcome outcome = await ScanAndEvaluateAsync(
             profile, scopePath, filtersBySourceRoot!, hasTransformers, MaxScannedCandidates, counters,
             progress, (evaluation, token) => spool.WriteAsync(evaluation, token), ct)
@@ -301,18 +312,25 @@ public sealed class DryRunEngine(
         // client concatenates the chunks, then sorts them for display.
         StreamAccumulator accumulator = new();
         bool anyEmitted = false;
-        await foreach (FileEvaluation evaluation in spool.ReadAllAsync(ct).ConfigureAwait(false))
+        await foreach (IEvaluationView evaluation in spool.ReadAllAsync(ct).ConfigureAwait(false))
         {
             accumulator.Add(evaluation);
             if (accumulator.Bytes >= ChunkByteBudget)
             {
-                yield return Result<DryRunChunk, string>.Success(accumulator.Flush() with { ScanTruncated = scanTruncated });
+                (DryRunChunk chunk, List<IEvaluationView> recyclables) = accumulator.Flush();
+                yield return Result<DryRunChunk, string>.Success(chunk with { ScanTruncated = scanTruncated });
+                // I-POOL-RECYCLE: the yield has resumed, so the handler has fully consumed this chunk
+                // (frames serialize synchronously before the next MoveNext) — its carriers are safe to
+                // return. A no-op for original records; recycles carriers for a spilled run.
+                Recycle(recyclables);
                 anyEmitted = true;
             }
         }
         if (accumulator.HasData)
         {
-            yield return Result<DryRunChunk, string>.Success(accumulator.Flush() with { ScanTruncated = scanTruncated });
+            (DryRunChunk chunk, List<IEvaluationView> recyclables) = accumulator.Flush();
+            yield return Result<DryRunChunk, string>.Success(chunk with { ScanTruncated = scanTruncated });
+            Recycle(recyclables);
             anyEmitted = true;
         }
 
@@ -331,6 +349,15 @@ public sealed class DryRunEngine(
                 profile.Id, accumulator.TotalSourceFiles, (completedAt - startedAt).TotalMilliseconds,
                 outcome.ScanMs, outcome.EvalMs,
                 counters.ExistenceProbes, counters.ExistingStats, counters.FilesHashed, counters.BytesHashed);
+    }
+
+    /// <summary>Returns a flushed chunk's entries to the carrier pool. A no-op for original records
+    /// (in-memory / non-spilled replay); recycles the carrier graph for a spilled run. Called only
+    /// after the chunk's <c>yield return</c> has resumed — the consumer is provably done with it.</summary>
+    private static void Recycle(List<IEvaluationView> entries)
+    {
+        foreach (IEvaluationView entry in entries)
+            entry.Recycle();
     }
 
     /// <summary>The fused scan+evaluation pipeline's outcome (metadata only). Each evaluated finding
@@ -531,26 +558,6 @@ public sealed class DryRunEngine(
         }
     }
 
-    /// <summary>Appends a bundle's records into the four report lists, remapping bundle-local indices
-    /// to the global positions given by <paramref name="sourceIndex"/> (this bundle's source-file
-    /// position) and <paramref name="destBase"/> (the count of destination files already present).</summary>
-    private static void AppendGlobalized(
-        FileEvaluation bundle, int sourceIndex, int destBase,
-        List<PhysicalFile> sourceFiles, List<PhysicalFile> destinationFiles,
-        List<VirtualFileOperation> sourceOps, List<VirtualFileOperation> destinationOps)
-    {
-        sourceFiles.Add(bundle.SourceFile);
-        sourceOps.Add(bundle.SourceOp with { SourceIndex = sourceIndex });
-        foreach (PhysicalFile file in bundle.DestinationFiles)
-            destinationFiles.Add(file);
-        foreach (VirtualFileOperation op in bundle.DestinationOps)
-            destinationOps.Add(op with
-            {
-                SourceIndex = op.SourceIndex == 0 ? sourceIndex : -1,
-                SubjectIndex = op.SubjectIndex >= 0 ? destBase + op.SubjectIndex : -1,
-            });
-    }
-
     /// <summary>Batched-report accumulator with truncation to the serialized byte budget, fed bundles
     /// in final (source-path) order. Emits the normalized wire shape: records carry
     /// (DirIndex, FileName) into a shared directory table built as bundles arrive. Sizing uses the
@@ -584,9 +591,9 @@ public sealed class DryRunEngine(
         private long _total;
 
         /// <summary>Adds a whole per-file bundle atomically, remapping bundle-local indices to global
-        /// positions exactly as <see cref="AppendGlobalized"/> does on the streamed path. Returns
-        /// false (and sets <see cref="Truncated"/>) without keeping anything if it would cross the
-        /// budget.</summary>
+        /// positions with the same arithmetic the streamed <see cref="StreamAccumulator"/> applies.
+        /// Returns false (and sets <see cref="Truncated"/>) without keeping anything if it would cross
+        /// the budget.</summary>
         public bool TryAddBundle(FileEvaluation bundle)
         {
             int mark = _dirs.Mark();
@@ -666,16 +673,24 @@ public sealed class DryRunEngine(
         }
     }
 
-    /// <summary>Streaming accumulator: buffers one chunk's records while tracking global source/dest
+    /// <summary>Streaming accumulator: buffers one chunk's entries while tracking global source/dest
     /// counts across all chunks, so operation indices stay valid positions into the fully assembled
     /// report. Sizing uses the cheap upper-bound estimate only (a chunk just needs to sit under the
-    /// frame cap).</summary>
+    /// frame cap).
+    /// <para>The chunk lists hold the read-only view, so an entry's file/op objects — original records
+    /// or pooled carriers — flow through untouched (no copy). The global-index remap is the one place
+    /// the two entry kinds diverge: an original record is immutable, so its ops are copied via
+    /// <c>record with { }</c>; a pooled carrier is mutated in place (that in-place remap is the whole
+    /// reason the spilled read path is backed by carriers). The arithmetic is identical either way.
+    /// <see cref="Flush"/> also returns the chunk's entries so the engine can recycle any pooled
+    /// carriers once the chunk is consumed.</para></summary>
     private sealed class StreamAccumulator
     {
-        private List<PhysicalFile> _sourceFiles = [];
-        private List<PhysicalFile> _destinationFiles = [];
-        private List<VirtualFileOperation> _sourceOps = [];
-        private List<VirtualFileOperation> _destinationOps = [];
+        private List<IPhysicalFileView> _sourceFiles = [];
+        private List<IPhysicalFileView> _destinationFiles = [];
+        private List<IFileOperationView> _sourceOps = [];
+        private List<IFileOperationView> _destinationOps = [];
+        private List<IEvaluationView> _entries = [];
         private int _globalSourceCount;
         private int _globalDestCount;
 
@@ -683,24 +698,63 @@ public sealed class DryRunEngine(
         public int TotalSourceFiles => _globalSourceCount;
         public bool HasData => _sourceFiles.Count > 0 || _destinationFiles.Count > 0;
 
-        public void Add(FileEvaluation bundle)
+        public void Add(IEvaluationView bundle)
         {
-            AppendGlobalized(bundle, _globalSourceCount, _globalDestCount,
-                _sourceFiles, _destinationFiles, _sourceOps, _destinationOps);
+            int sourceIndex = _globalSourceCount;
+            int destBase = _globalDestCount;
+
+            // Files carry no bundle-local index, so the view references append unchanged for either
+            // entry kind.
+            _sourceFiles.Add(bundle.SourceFile);
+            foreach (IPhysicalFileView file in bundle.DestinationFiles)
+                _destinationFiles.Add(file);
+
+            // Ops: remap bundle-local indices to global positions. Same arithmetic the batched
+            // ReportBuilder applies; records copy (immutable), carriers mutate in place.
+            switch (bundle)
+            {
+                case FileEvaluation original:
+                    _sourceOps.Add(original.SourceOp with { SourceIndex = sourceIndex });
+                    foreach (VirtualFileOperation op in original.DestinationOps)
+                        _destinationOps.Add(op with
+                        {
+                            SourceIndex = op.SourceIndex == 0 ? sourceIndex : -1,
+                            SubjectIndex = op.SubjectIndex >= 0 ? destBase + op.SubjectIndex : -1,
+                        });
+                    break;
+                case PooledEvaluation pooled:
+                    pooled.SourceOp.SourceIndex = sourceIndex;
+                    _sourceOps.Add(pooled.SourceOp);
+                    foreach (PooledFileOperation op in pooled.DestinationOps)
+                    {
+                        int subject = op.SubjectIndex;
+                        op.SourceIndex = op.SourceIndex == 0 ? sourceIndex : -1;
+                        op.SubjectIndex = subject >= 0 ? destBase + subject : -1;
+                        _destinationOps.Add(op);
+                    }
+                    break;
+            }
+
             _globalSourceCount += 1;
             _globalDestCount += bundle.DestinationFiles.Count;
             Bytes += BundleUpperBound(bundle);
+            _entries.Add(bundle);
         }
 
-        public DryRunChunk Flush()
+        /// <summary>Seals the current chunk and resets for the next. Returns the chunk plus the entries
+        /// that went into it — the engine recycles those after the chunk's <c>yield</c> resumes so any
+        /// pooled carriers return to the pool (a no-op for original records).</summary>
+        public (DryRunChunk Chunk, List<IEvaluationView> Entries) Flush()
         {
             DryRunChunk chunk = new(_sourceFiles, _destinationFiles, _sourceOps, _destinationOps);
+            List<IEvaluationView> entries = _entries;
             _sourceFiles = [];
             _destinationFiles = [];
             _sourceOps = [];
             _destinationOps = [];
+            _entries = [];
             Bytes = 0;
-            return chunk;
+            return (chunk, entries);
         }
     }
 
@@ -713,18 +767,18 @@ public sealed class DryRunEngine(
     private const int OperationStructuralBytes = 320;
     private const int DirectoryStructuralBytes = 64;
 
-    private static long BundleUpperBound(FileEvaluation bundle)
+    private static long BundleUpperBound(IEvaluationView bundle)
     {
         long bytes = UpperBoundBytes(bundle.SourceFile) + UpperBoundBytes(bundle.SourceOp);
-        foreach (PhysicalFile f in bundle.DestinationFiles) bytes += UpperBoundBytes(f);
-        foreach (VirtualFileOperation o in bundle.DestinationOps) bytes += UpperBoundBytes(o);
+        foreach (IPhysicalFileView f in bundle.DestinationFiles) bytes += UpperBoundBytes(f);
+        foreach (IFileOperationView o in bundle.DestinationOps) bytes += UpperBoundBytes(o);
         return bytes;
     }
 
-    private static long UpperBoundBytes(PhysicalFile file) =>
+    private static long UpperBoundBytes(IPhysicalFileView file) =>
         PhysicalFileStructuralBytes + StringUpperBound(file.Path) + StringUpperBound(file.Root);
 
-    private static long UpperBoundBytes(VirtualFileOperation op) =>
+    private static long UpperBoundBytes(IFileOperationView op) =>
         OperationStructuralBytes + StringUpperBound(op.Path) + StringUpperBound(op.Root) + StringUpperBound(op.Detail);
 
     private static long UpperBoundBytes(DryRunFile file) =>

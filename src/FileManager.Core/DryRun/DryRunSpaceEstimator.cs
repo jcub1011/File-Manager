@@ -41,15 +41,15 @@ public sealed class DryRunSpaceEstimator
     /// (the running counts <em>before</em> this chunk is appended). The destination sweep is fed as a
     /// standalone chunk with both bases 0 (its ops index its own file list directly).</summary>
     public void Accumulate(
-        IReadOnlyList<PhysicalFile> sourceFiles,
-        IReadOnlyList<PhysicalFile> destinationFiles,
-        IReadOnlyList<VirtualFileOperation> sourceOperations,
-        IReadOnlyList<VirtualFileOperation> destinationOperations,
+        IReadOnlyList<IPhysicalFileView> sourceFiles,
+        IReadOnlyList<IPhysicalFileView> destinationFiles,
+        IReadOnlyList<IFileOperationView> sourceOperations,
+        IReadOnlyList<IFileOperationView> destinationOperations,
         int sourceBase,
         int destBase,
         bool stageOverwrites)
     {
-        foreach (VirtualFileOperation op in destinationOperations)
+        foreach (IFileOperationView op in destinationOperations)
         {
             switch (op.Kind)
             {
@@ -99,7 +99,7 @@ public sealed class DryRunSpaceEstimator
             }
         }
 
-        foreach (VirtualFileOperation op in sourceOperations)
+        foreach (IFileOperationView op in sourceOperations)
         {
             // The source original is only genuinely freed by a permanent delete. Move-to-trash keeps
             // it in the recycle bin (same volume) and move-to-archive may land on the same volume, so
@@ -108,7 +108,7 @@ public sealed class DryRunSpaceEstimator
             // only to volumes that also receive writes, so a pure source drive is not reported.
             if (op.SourceDisposition == OnSuccessAction.PermanentDelete && op.SourceIndex >= 0)
             {
-                PhysicalFile sf = sourceFiles[op.SourceIndex - sourceBase];
+                IPhysicalFileView sf = sourceFiles[op.SourceIndex - sourceBase];
                 VolumeTally v = VolumeFor(sf.Root);
                 v.SourceFreed += RoundUp(sf.Length, v.Cluster);
             }
@@ -180,7 +180,7 @@ public sealed class DryRunSpaceEstimator
         };
     }
 
-    private static long Length(IReadOnlyList<PhysicalFile> files, int localIndex) =>
+    private static long Length(IReadOnlyList<IPhysicalFileView> files, int localIndex) =>
         localIndex >= 0 && localIndex < files.Count ? files[localIndex].Length : 0;
 
     private static long RoundUp(long length, long cluster)

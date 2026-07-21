@@ -95,13 +95,13 @@ public sealed class DryRunEngineTests : IDisposable
     private static async Task<List<(string SourcePath, OperationKind Kind)>> CollectStream(
         DryRunEngine engine, Profile profile, string? scope = null, CancellationToken ct = default)
     {
-        List<PhysicalFile> files = [];
-        Dictionary<int, VirtualFileOperation> ops = [];
+        List<IPhysicalFileView> files = [];
+        Dictionary<int, IFileOperationView> ops = [];
         await foreach (Result<DryRunChunk, string> chunk in engine.SimulateStreamAsync(profile, scope, ct: ct))
         {
             Assert.True(chunk.TryGetValue(out DryRunChunk? c), "stream yielded a failure chunk");
             files.AddRange(c!.SourceFiles);
-            foreach (VirtualFileOperation op in c.SourceOperations)
+            foreach (IFileOperationView op in c.SourceOperations)
                 ops[op.SourceIndex] = op;
         }
         return files.Select((f, i) => (f.Path, ops[i].Kind)).ToList();
@@ -700,6 +700,77 @@ public sealed class DryRunEngineTests : IDisposable
         Assert.Equal(30, chunks.Sum(c => c.SourceFiles.Count));
     }
 
+    // ----- streaming: spool spill + carrier pooling -----
+
+    [Fact]
+    public async Task Spilled_stream_report_is_content_identical_to_the_unpooled_in_memory_run()
+    {
+        // A run large enough to spill to disk (SpillThresholdBytes = 1) replays through pooled,
+        // mutated-in-place carriers; the in-memory spool replays the original records via `with { }`.
+        // The two must assemble to the same report content — the guard against a wrong in-place index
+        // remap or cross-carrier aliasing. A mix of New / SkipUnchanged / Overwrite exercises the
+        // destination-file + SubjectIndex remap that source-only runs never touch.
+        for (int i = 0; i < 40; i++)
+        {
+            SourceFile($"{i:D3}.txt", $"content {i}");
+            if (i % 3 == 0) TargetFile($"{i:D3}.txt", $"content {i}");          // identical → SkipUnchanged
+            else if (i % 3 == 1) TargetFile($"{i:D3}.txt", $"different {i}!!"); // → Overwrite
+        }
+        Profile profile = ProfileUnderTest(conflict: ConflictResolution.Overwrite);
+
+        string scratch = Path.Combine(_root, "spill-identical");
+        AssembledStream pooled = await AssembleStream(SpillingEngine(scratch, chunkByteBudget: 4000, pool: null), profile);
+        AssembledStream unpooled = await AssembleStream(InMemoryStreamEngine(chunkByteBudget: 4000), profile);
+
+        AssertSameContent(unpooled, pooled);
+        // Sanity: this really did stream a non-trivial report through the spill path.
+        Assert.Equal(40, pooled.SourceFiles.Count);
+    }
+
+    [Fact]
+    public async Task Spilled_stream_returns_every_rented_carrier_to_the_pool()
+    {
+        for (int i = 0; i < 60; i++)
+            SourceFile($"{i:D3}.txt", $"content {i}");
+        Profile profile = ProfileUnderTest();
+
+        // Tiny chunk budget → one file per chunk → many recycle cycles across the run.
+        EvaluationCarrierPool pool = new();
+        string scratch = Path.Combine(_root, "spill-recycle");
+        AssembledStream assembled = await AssembleStream(SpillingEngine(scratch, chunkByteBudget: 512, pool), profile);
+
+        Assert.Equal(60, assembled.SourceFiles.Count);
+        Assert.Equal(60, pool.RentedEvaluations);                 // the spill path actually ran
+        Assert.Equal(pool.RentedEvaluations, pool.ReturnedEvaluations);   // borrowed == returned
+        // Retained set is bounded by a chunk's carriers (a handful), NOT by the file count — the
+        // memory-flatness property. 60 files, retained must stay tiny because each chunk recycles
+        // before the next is built.
+        Assert.True(pool.RetainedCount < 30,
+            $"pool retained {pool.RetainedCount} carriers — expected a small chunk-bounded set, not file-count-proportional");
+    }
+
+    [Fact]
+    public async Task Spilled_stream_with_many_tiny_chunks_has_no_cross_chunk_aliasing()
+    {
+        // Force spill AND many chunks (one file each). If a later chunk's carrier reuse corrupted an
+        // earlier chunk, the assembled report would diverge from the unpooled baseline. AssembleStream
+        // copies each chunk's data out on arrival (never retaining a view), as a buffering consumer of
+        // pool-owned chunks must.
+        for (int i = 0; i < 25; i++)
+        {
+            SourceFile($"{i:D3}.txt", $"content number {i}");
+            if (i % 2 == 0) TargetFile($"{i:D3}.txt", $"content number {i}");   // SkipUnchanged: dest file + SubjectIndex
+        }
+        Profile profile = ProfileUnderTest();
+
+        string scratch = Path.Combine(_root, "spill-alias");
+        AssembledStream pooled = await AssembleStream(SpillingEngine(scratch, chunkByteBudget: 256, pool: null), profile);
+        AssembledStream unpooled = await AssembleStream(InMemoryStreamEngine(chunkByteBudget: 256), profile);
+
+        AssertSameContent(unpooled, pooled);
+        Assert.Equal(25, pooled.SourceFiles.Count);
+    }
+
     [Fact]
     public async Task Stream_cancellation_throws_from_the_enumerator()
     {
@@ -715,6 +786,100 @@ public sealed class DryRunEngineTests : IDisposable
             {
             }
         });
+    }
+
+    // ----- spill/pooling harness -----
+
+    /// <summary>An engine whose streamed path spills to <paramref name="scratch"/> immediately
+    /// (SpillThresholdBytes = 1), so the read-back exercises the pooled-carrier path. A null
+    /// <paramref name="pool"/> lets the engine build its own; a supplied one is inspectable afterward.</summary>
+    private DryRunEngine SpillingEngine(string scratch, int chunkByteBudget, EvaluationCarrierPool? pool) =>
+        BuildEngine(GlobalSettings.Default with { ScratchDirectory = scratch },
+            chunkByteBudget, spillThresholdBytes: 1, spoolFactory: null, pool);
+
+    /// <summary>An engine whose streamed path uses the in-memory spool (no serialization, no pooling) —
+    /// the unpooled baseline the spilled run must match.</summary>
+    private DryRunEngine InMemoryStreamEngine(int chunkByteBudget) =>
+        BuildEngine(GlobalSettings.Default, chunkByteBudget, spillThresholdBytes: DryRunEngine.ChunkByteThreshold,
+            spoolFactory: new InMemoryDryRunSpoolFactory(), pool: null);
+
+    private static DryRunEngine BuildEngine(
+        GlobalSettings global, int chunkByteBudget, long spillThresholdBytes,
+        IDryRunSpoolFactory? spoolFactory, EvaluationCarrierPool? pool)
+    {
+        FileSystemService fileSystem = new(NullLogger<FileSystemService>.Instance);
+        FakeSettings settings = new(global);
+        ScanScheduler scheduler = new(NullLogger<ScanScheduler>.Instance, fileSystem, settings);
+        return new DryRunEngine(
+            NullLogger<DryRunEngine>.Instance,
+            new SourceScanner(TimeProvider.System, scheduler),
+            new FilterCompiler(NullLogger<FilterCompiler>.Instance, TimeProvider.System),
+            new FileHasher(NullLogger<FileHasher>.Instance),
+            new ConflictResolver(new(), new(), NullLogger<ConflictResolver>.Instance),
+            settings,
+            TimeProvider.System,
+            new DestinationProjector(NullLogger<DestinationProjector>.Instance, new FakeVolumeInfoProvider(), scheduler))
+        {
+            ChunkByteBudget = chunkByteBudget,
+            SpillThresholdBytes = spillThresholdBytes,
+            SpoolFactory = spoolFactory,
+            StreamCarrierPool = pool,
+        };
+    }
+
+    /// <summary>A run's streamed chunks flattened into global lists, copied out of each chunk on arrival
+    /// (never retaining a pool-owned view — the buffering-consumer contract).</summary>
+    private sealed record AssembledStream(
+        List<(string Path, string Root, long Length)> SourceFiles,
+        List<(string Path, string Root, long Length)> DestFiles,
+        Dictionary<int, (string Path, OperationKind Kind, OnSuccessAction? Disp)> SourceOps,
+        List<(int SourceIndex, int SubjectIndex, string Path, OperationKind Kind, string? Detail)> DestOps);
+
+    private static async Task<AssembledStream> AssembleStream(DryRunEngine engine, Profile profile)
+    {
+        List<(string, string, long)> sourceFiles = [];
+        List<(string, string, long)> destFiles = [];
+        Dictionary<int, (string, OperationKind, OnSuccessAction?)> sourceOps = [];
+        List<(int, int, string, OperationKind, string?)> destOps = [];
+        await foreach (Result<DryRunChunk, string> item in engine.SimulateStreamAsync(profile, null))
+        {
+            Assert.True(item.TryGetValue(out DryRunChunk? c), "stream yielded a failure chunk");
+            foreach (IPhysicalFileView f in c!.SourceFiles) sourceFiles.Add((f.Path, f.Root, f.Length));
+            foreach (IPhysicalFileView f in c.DestinationFiles) destFiles.Add((f.Path, f.Root, f.Length));
+            foreach (IFileOperationView o in c.SourceOperations) sourceOps[o.SourceIndex] = (o.Path, o.Kind, o.SourceDisposition);
+            foreach (IFileOperationView o in c.DestinationOperations) destOps.Add((o.SourceIndex, o.SubjectIndex, o.Path, o.Kind, o.Detail));
+        }
+        return new AssembledStream(sourceFiles, destFiles, sourceOps, destOps);
+    }
+
+    /// <summary>Asserts two assembled streams carry the same report content. Compares each projected
+    /// list separately so xUnit does a structural (element-wise) comparison — a tuple-of-lists compares
+    /// by list reference and would spuriously pass/fail.</summary>
+    private static void AssertSameContent(AssembledStream expected, AssembledStream actual)
+    {
+        var e = Normalize(expected);
+        var a = Normalize(actual);
+        Assert.Equal(e.Src, a.Src);
+        Assert.Equal(e.Dst, a.Dst);
+        Assert.Equal(e.SrcOps, a.SrcOps);
+        Assert.Equal(e.DstOps, a.DstOps);
+    }
+
+    /// <summary>Order-independent projection: sorted file lists and ops with their integer indices
+    /// resolved to the referenced file paths, so two runs whose discovery (index) order differs still
+    /// compare equal when — and only when — their report content and the index remap agree.</summary>
+    private static (List<string> Src, List<string> Dst, List<string> SrcOps, List<string> DstOps) Normalize(AssembledStream a)
+    {
+        List<string> src = a.SourceFiles.Select(f => $"{f.Path}|{f.Root}|{f.Length}").OrderBy(x => x, StringComparer.Ordinal).ToList();
+        List<string> dst = a.DestFiles.Select(f => $"{f.Path}|{f.Root}|{f.Length}").OrderBy(x => x, StringComparer.Ordinal).ToList();
+        List<string> srcOps = a.SourceOps.Values.Select(o => $"{o.Path}|{o.Kind}|{o.Disp}").OrderBy(x => x, StringComparer.Ordinal).ToList();
+        List<string> dstOps = a.DestOps.Select(o =>
+        {
+            string sp = o.SourceIndex >= 0 ? a.SourceFiles[o.SourceIndex].Path : "-";
+            string bp = o.SubjectIndex >= 0 ? a.DestFiles[o.SubjectIndex].Path : "-";
+            return $"{o.Path}|{o.Kind}|src:{sp}|subj:{bp}|{o.Detail}";
+        }).OrderBy(x => x, StringComparer.Ordinal).ToList();
+        return (src, dst, srcOps, dstOps);
     }
 
     private Dictionary<string, (long Length, DateTime Mtime)> SnapshotTree() =>

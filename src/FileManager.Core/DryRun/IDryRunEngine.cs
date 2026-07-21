@@ -33,12 +33,21 @@ public interface IDryRunEngine
 /// (positions into the fully assembled report lists), so the client simply concatenates chunks in
 /// receive order. <paramref name="ScanTruncated"/> is set once the source scan hit its candidate
 /// safety bound — the handler must OR it into its own truncation flag before running the destination
-/// sweep, since a truncated (prefix-only) survivor set would make every orphan judgement unsound.</summary>
+/// sweep, since a truncated (prefix-only) survivor set would make every orphan judgement unsound.
+/// <para><b>Pool-ownership invariant (I-POOL-RECYCLE).</b> The element type is the read-only
+/// <see cref="IPhysicalFileView"/>/<see cref="IFileOperationView"/> view, not the concrete record,
+/// because a spilled streamed run backs a chunk with <em>pool-owned mutable carriers</em>
+/// (<c>DryRunEngine</c>'s spool read path). A streamed chunk's entries are valid <b>only until the
+/// consumer requests the next chunk</b>: the engine recycles that chunk's carriers back to its per-run
+/// pool the instant the <c>yield return</c> resumes (safe because the IPC server serializes each frame
+/// synchronously before pulling the next). No consumer may retain a chunk's files/ops — or an object
+/// reachable from them — past its own iteration step. Copy out anything you keep (paths, sizes),
+/// exactly as the existing consumers do.</para></summary>
 public sealed record DryRunChunk(
-    IReadOnlyList<PhysicalFile> SourceFiles,
-    IReadOnlyList<PhysicalFile> DestinationFiles,
-    IReadOnlyList<VirtualFileOperation> SourceOperations,
-    IReadOnlyList<VirtualFileOperation> DestinationOperations,
+    IReadOnlyList<IPhysicalFileView> SourceFiles,
+    IReadOnlyList<IPhysicalFileView> DestinationFiles,
+    IReadOnlyList<IFileOperationView> SourceOperations,
+    IReadOnlyList<IFileOperationView> DestinationOperations,
     bool ScanTruncated = false);
 
 /// <summary>The destination sweep's output: pre-existing files under the target roots that no source

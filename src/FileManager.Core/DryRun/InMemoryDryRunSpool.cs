@@ -21,10 +21,12 @@ internal sealed class InMemoryDryRunSpool : IDryRunSpool
 
     public ValueTask CompleteWritingAsync() => ValueTask.CompletedTask;
 
-    public async IAsyncEnumerable<FileEvaluation> ReadAllAsync(
+    public async IAsyncEnumerable<IEvaluationView> ReadAllAsync(
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct)
     {
         // Snapshot the list length under the lock is unnecessary — writes are complete before reads.
+        // The originals are single-allocation and shared, so they replay as-is (no pooling): their
+        // Recycle is a no-op, so the engine's per-chunk recycle leaves them untouched.
         foreach (FileEvaluation entry in _entries)
         {
             ct.ThrowIfCancellationRequested();

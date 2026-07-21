@@ -29,6 +29,7 @@ internal sealed class FileDryRunSpool : IDryRunSpool
 
     private readonly string _scratchDirectory;
     private readonly long _spillThresholdBytes;
+    private readonly EvaluationCarrierPool _pool;
     private readonly ILogger _logger;
 
     private readonly Channel<FileEvaluation> _channel = Channel.CreateBounded<FileEvaluation>(
@@ -42,10 +43,11 @@ internal sealed class FileDryRunSpool : IDryRunSpool
     private string? _filePath;
     private Exception? _writerError;
 
-    public FileDryRunSpool(string scratchDirectory, long spillThresholdBytes, ILogger logger)
+    public FileDryRunSpool(string scratchDirectory, long spillThresholdBytes, EvaluationCarrierPool pool, ILogger logger)
     {
         _scratchDirectory = scratchDirectory;
         _spillThresholdBytes = spillThresholdBytes;
+        _pool = pool;
         _logger = logger;
         _writerTask = Task.Run(DrainAsync);
     }
@@ -61,10 +63,12 @@ internal sealed class FileDryRunSpool : IDryRunSpool
             throw new IOException($"writing the dry-run snapshot failed: {_writerError.Message}", _writerError);
     }
 
-    public async IAsyncEnumerable<FileEvaluation> ReadAllAsync([EnumeratorCancellation] CancellationToken ct)
+    public async IAsyncEnumerable<IEvaluationView> ReadAllAsync([EnumeratorCancellation] CancellationToken ct)
     {
         if (!_spilled)
         {
+            // Below threshold: the original records were never serialized, so replay them directly —
+            // single-allocation, shared, not pool-owned (their Recycle is a no-op).
             foreach (FileEvaluation entry in _buffered ?? [])
             {
                 ct.ThrowIfCancellationRequested();
@@ -73,6 +77,10 @@ internal sealed class FileDryRunSpool : IDryRunSpool
             yield break;
         }
 
+        // Spilled: every record lives on disk. Read each back into rented carriers (parsed straight
+        // from the framed bytes) instead of a fresh record graph — the allocation the snapshot
+        // round-trip would otherwise reintroduce per file. The engine recycles each chunk's carriers
+        // once the chunk is consumed, so the pool churns a bounded working set across the whole replay.
         await using FileStream file = new(
             _filePath!, FileMode.Open, FileAccess.Read, FileShare.Read, FileBufferSize, useAsync: true);
         byte[] lengthBuffer = new byte[4];
@@ -88,14 +96,12 @@ internal sealed class FileDryRunSpool : IDryRunSpool
             if (length < 0)
                 throw new IOException($"the dry-run snapshot has a negative record length ({length})");
 
-            FileEvaluation entry;
+            PooledEvaluation entry;
             byte[] rented = ArrayPool<byte>.Shared.Rent(length);
             try
             {
                 await file.ReadExactlyAsync(rented.AsMemory(0, length), ct).ConfigureAwait(false);
-                entry = JsonSerializer.Deserialize(
-                    rented.AsSpan(0, length), DryRunSnapshotJsonContext.Default.FileEvaluation)
-                    ?? throw new IOException("a dry-run snapshot record deserialized to null");
+                entry = PooledEvaluation.Parse(rented.AsSpan(0, length), _pool);
             }
             finally
             {
@@ -217,5 +223,5 @@ internal sealed class FileDryRunSpoolFactory(
     Func<string> scratchDirectoryProvider, long spillThresholdBytes, ILogger logger) : IDryRunSpoolFactory
 {
     public IDryRunSpool Create() =>
-        new FileDryRunSpool(scratchDirectoryProvider(), spillThresholdBytes, logger);
+        new FileDryRunSpool(scratchDirectoryProvider(), spillThresholdBytes, new EvaluationCarrierPool(), logger);
 }

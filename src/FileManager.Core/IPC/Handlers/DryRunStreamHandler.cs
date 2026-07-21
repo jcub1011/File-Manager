@@ -267,20 +267,20 @@ public sealed class DryRunStreamHandler(
             Convert(slice.SourceFiles, slice.DestinationFiles, slice.SourceOperations, slice.DestinationOperations);
 
         public DryRunChunkResponse Convert(
-            IReadOnlyList<PhysicalFile> sourceFiles, IReadOnlyList<PhysicalFile> destinationFiles,
-            IReadOnlyList<VirtualFileOperation> sourceOps, IReadOnlyList<VirtualFileOperation> destinationOps)
+            IReadOnlyList<IPhysicalFileView> sourceFiles, IReadOnlyList<IPhysicalFileView> destinationFiles,
+            IReadOnlyList<IFileOperationView> sourceOps, IReadOnlyList<IFileOperationView> destinationOps)
         {
             List<DryRunFile> wireSourceFiles = new(sourceFiles.Count);
-            foreach (PhysicalFile f in sourceFiles)
+            foreach (IPhysicalFileView f in sourceFiles)
                 wireSourceFiles.Add(_dirs.Convert(f));
             List<DryRunFile> wireDestinationFiles = new(destinationFiles.Count);
-            foreach (PhysicalFile f in destinationFiles)
+            foreach (IPhysicalFileView f in destinationFiles)
                 wireDestinationFiles.Add(_dirs.Convert(f));
             List<DryRunOperation> wireSourceOps = new(sourceOps.Count);
-            foreach (VirtualFileOperation o in sourceOps)
+            foreach (IFileOperationView o in sourceOps)
                 wireSourceOps.Add(_dirs.Convert(o));
             List<DryRunOperation> wireDestinationOps = new(destinationOps.Count);
-            foreach (VirtualFileOperation o in destinationOps)
+            foreach (IFileOperationView o in destinationOps)
                 wireDestinationOps.Add(_dirs.Convert(o));
 
             return new DryRunChunkResponse

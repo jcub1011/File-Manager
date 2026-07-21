@@ -104,11 +104,42 @@ public sealed record DryRunOperation
     public string? Detail { get; init; }
 }
 
+/// <summary>Read-only view of a discovered file's fields, implemented by both the immutable
+/// <see cref="PhysicalFile"/> record and the engine's pooled mutable carrier on the dry-run spool
+/// read-back path. Widening the streamed <c>DryRunChunk</c> and the chunk consumers to this view lets
+/// a spilled run replay through recycled carriers instead of a second set of records, without any
+/// consumer knowing which concrete type it holds. <c>IReadOnlyList&lt;PhysicalFile&gt;</c> is
+/// covariantly assignable to <c>IReadOnlyList&lt;IPhysicalFileView&gt;</c>, so existing callers that
+/// pass concrete lists (e.g. the destination sweep) keep compiling unchanged.</summary>
+public interface IPhysicalFileView
+{
+    string Path { get; }
+    string Root { get; }
+    long Length { get; }
+    DateTimeOffset LastWritten { get; }
+    bool IsReparsePoint { get; }
+}
+
+/// <summary>Read-only view of an operation's fields — the <see cref="VirtualFileOperation"/> analogue
+/// of <see cref="IPhysicalFileView"/>. The index fields (<see cref="SourceIndex"/>/
+/// <see cref="SubjectIndex"/>) are read-only here; the engine's pooled carrier mutates them through
+/// its concrete type during the streamed global-index remap, never through this view.</summary>
+public interface IFileOperationView
+{
+    string Path { get; }
+    string Root { get; }
+    OperationKind Kind { get; }
+    int SourceIndex { get; }
+    int SubjectIndex { get; }
+    OnSuccessAction? SourceDisposition { get; }
+    string? Detail { get; }
+}
+
 /// <summary>An actual file discovered on disk — pure ground truth, no verdict. <see cref="Length"/>
 /// and <see cref="LastWritten"/> come free from the enumeration/stat snapshot (no extra I/O).
 /// Engine-internal currency: evaluation, hashing, and the destination sweep work on absolute
 /// paths; the wire carries <see cref="DryRunFile"/> instead.</summary>
-public sealed record PhysicalFile
+public sealed record PhysicalFile : IPhysicalFileView
 {
     public required string Path { get; init; }          // absolute
     /// <summary>The source root or target root this file was discovered under — the group/facet key.</summary>
@@ -122,7 +153,7 @@ public sealed record PhysicalFile
 /// integer index into the report's file lists. List membership (Source vs Destination operations)
 /// determines the "side"; there is no side discriminator. Engine-internal currency: the wire
 /// carries <see cref="DryRunOperation"/> instead.</summary>
-public sealed record VirtualFileOperation
+public sealed record VirtualFileOperation : IFileOperationView
 {
     /// <summary>Source op: the source file's path. Destination op: the resulting path (which may be
     /// a not-yet-existing New/Rename path).</summary>

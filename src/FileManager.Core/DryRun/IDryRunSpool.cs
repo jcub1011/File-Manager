@@ -23,8 +23,13 @@ internal interface IDryRunSpool : System.IAsyncDisposable
     ValueTask CompleteWritingAsync();
 
     /// <summary>Replays every written finding in write (discovery) order. Call once, after
-    /// <see cref="CompleteWritingAsync"/>.</summary>
-    IAsyncEnumerable<FileEvaluation> ReadAllAsync(CancellationToken ct);
+    /// <see cref="CompleteWritingAsync"/>. Yields entries as <see cref="IEvaluationView"/>: the
+    /// in-memory (and non-spilled disk) path replays the original <see cref="FileEvaluation"/> records;
+    /// a spilled disk run reads each record back into <em>pool-owned carriers</em>
+    /// (<see cref="PooledEvaluation"/>) so no second record set is allocated. Carrier-backed entries are
+    /// valid only until the caller advances the enumerator or recycles them (see
+    /// <see cref="DryRunChunk"/>'s I-POOL-RECYCLE invariant).</summary>
+    IAsyncEnumerable<IEvaluationView> ReadAllAsync(CancellationToken ct);
 }
 
 /// <summary>Creates a fresh <see cref="IDryRunSpool"/> per dry-run. Injected into the engine so tests
