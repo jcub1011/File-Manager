@@ -2,28 +2,28 @@ using BenchmarkDotNet.Attributes;
 using FileManager.Contracts.DryRun;
 using FileManager.Contracts.Profiles;
 using FileManager.Core.DryRun;
+using System.Buffers;
 using System.Text.Json;
 
 namespace FileManager.Core.Benchmarks.DryRun;
 
-/// <summary>Isolates the dry-run spool <em>read-back</em> — the step entry-object pooling targets. On a
-/// run that spills to disk, the engine reads every finding back from the snapshot and assembles it into
-/// chunks; the naïve path deserializes a fresh <see cref="FileEvaluation"/> record graph per file
-/// (source file + source op + dest files/ops + two lists + the record), a second full allocation set on
-/// top of the one evaluation produced. Pooling replaces it with rented mutable carriers, recycled once
-/// each chunk is consumed.
-///
-/// <para>This bench sidesteps the scan/hash/write cost (which would drown out the read-back signal) by
-/// pre-framing the snapshot bytes once in setup, then measuring only the read-back loop:
+/// <summary>Isolates the dry-run spool <em>read-back</em> — the step entry-object pooling and the
+/// trimmed snapshot format target. On a run that spills to disk, the engine reads every finding back
+/// from the snapshot and assembles it into chunks. The bench sidesteps the scan/hash/write cost (which
+/// would drown out the read-back signal) by pre-framing the snapshot bytes once in setup, then
+/// measuring only the read-back loop, across three tiers:
 /// <list type="bullet">
-/// <item><see cref="Unpooled"/> — the pre-pooling behavior: <c>JsonSerializer.Deserialize</c> into a
-/// fresh record graph per finding.</item>
-/// <item><see cref="Pooled"/> — the current behavior: <see cref="PooledEvaluation.Parse"/> into rented
-/// carriers, recycled every chunk.</item>
+/// <item><see cref="Unpooled"/> — the original behavior: full-record JSON, <c>JsonSerializer.Deserialize</c>
+/// into a fresh <see cref="FileEvaluation"/> graph per finding.</item>
+/// <item><see cref="PooledV1"/> — pooling only: the same full-record JSON, parsed into recycled
+/// carriers (no format trim, no string dedup).</item>
+/// <item><see cref="PooledV2"/> — pooling + the trimmed format: <see cref="DryRunSnapshotFormat"/>'s
+/// shape (omitted derivable Path/Root, interned roots), parsed into recycled carriers. This is the
+/// current production path.</item>
 /// </list>
-/// Both pay the same unavoidable per-string cost (paths/roots are real data the JSON reader must
-/// materialize either way); the delta is exactly the per-file record/list/carrier churn pooling
-/// removes. <see cref="MemoryDiagnoser"/> reports Allocated and the Gen0/1/2 collections.</para></summary>
+/// The V1→V2 delta is the payoff of optimizations A (root interning), B (dest-op path reuse) and C
+/// (omit the source op's path/root); the Unpooled→V1 delta is the earlier pooling win.
+/// <see cref="MemoryDiagnoser"/> reports Allocated and the GC collections.</summary>
 [MemoryDiagnoser]
 public class DryRunSpoolReadbackBenchmarks
 {
@@ -31,25 +31,40 @@ public class DryRunSpoolReadbackBenchmarks
     /// frame is serialized (I-POOL-RECYCLE), so the pool holds ~one chunk's working set at a time.</summary>
     private const int ChunkEntries = 4096;
 
-    /// <summary>Findings read back. Sized to the regime pooling targets: a large scan that spilled.</summary>
+    /// <summary>Findings read back. Sized to the regime these optimizations target: a large scan that
+    /// spilled.</summary>
     [Params(50_000, 250_000)]
     public int FileCount { get; set; }
 
-    private byte[][] _framed = null!;
+    private byte[][] _fullFramed = null!;      // naïve full-record JSON (Unpooled + PooledV1)
+    private byte[][] _trimmedFramed = null!;   // DryRunSnapshotFormat's trimmed shape (PooledV2)
 
     [GlobalSetup]
     public void Setup()
     {
-        _framed = new byte[FileCount][];
+        _fullFramed = new byte[FileCount][];
+        _trimmedFramed = new byte[FileCount][];
+        ArrayBufferWriter<byte> buffer = new();
+        Utf8JsonWriter writer = new(buffer);
         for (int i = 0; i < FileCount; i++)
-            _framed[i] = JsonSerializer.SerializeToUtf8Bytes(MakeEvaluation(i), DryRunSnapshotJsonContext.Default.FileEvaluation);
+        {
+            FileEvaluation e = MakeEvaluation(i);
+            _fullFramed[i] = JsonSerializer.SerializeToUtf8Bytes(e, DryRunSnapshotJsonContext.Default.FileEvaluation);
+
+            buffer.Clear();
+            writer.Reset(buffer);
+            DryRunSnapshotFormat.Write(writer, e);
+            writer.Flush();
+            _trimmedFramed[i] = buffer.WrittenSpan.ToArray();
+        }
+        writer.Dispose();
     }
 
     [Benchmark(Baseline = true)]
     public long Unpooled()
     {
         long acc = 0;
-        foreach (byte[] bytes in _framed)
+        foreach (byte[] bytes in _fullFramed)
         {
             FileEvaluation e = JsonSerializer.Deserialize(bytes, DryRunSnapshotJsonContext.Default.FileEvaluation)!;
             acc += e.SourceFile.Length + e.DestinationOps.Count;   // consume so nothing is elided
@@ -58,14 +73,19 @@ public class DryRunSpoolReadbackBenchmarks
     }
 
     [Benchmark]
-    public long Pooled()
+    public long PooledV1() => ReadAll(_fullFramed, static (b, p) => ParseFull(b, p));
+
+    [Benchmark]
+    public long PooledV2() => ReadAll(_trimmedFramed, static (b, p) => DryRunSnapshotFormat.Read(b, p));
+
+    private static long ReadAll(byte[][] framed, Func<byte[], EvaluationCarrierPool, PooledEvaluation> parse)
     {
         EvaluationCarrierPool pool = new();
         List<PooledEvaluation> chunk = new(ChunkEntries);
         long acc = 0;
-        foreach (byte[] bytes in _framed)
+        foreach (byte[] bytes in framed)
         {
-            PooledEvaluation e = PooledEvaluation.Parse(bytes, pool);
+            PooledEvaluation e = parse(bytes, pool);
             acc += e.SourceFile.Length + e.DestinationOps.Count;
             chunk.Add(e);
             if (chunk.Count == ChunkEntries)
@@ -78,8 +98,76 @@ public class DryRunSpoolReadbackBenchmarks
         return acc;
     }
 
+    /// <summary>The pre-trim carrier parser: reads the full record shape (every Path/Root present, no
+    /// interning) into rented carriers. Mirrors the read path as it stood after pooling but before the
+    /// trimmed format — the PooledV1 tier.</summary>
+    private static PooledEvaluation ParseFull(byte[] json, EvaluationCarrierPool pool)
+    {
+        PooledEvaluation e = pool.RentEvaluation();
+        Utf8JsonReader reader = new(json);
+        reader.Read();   // StartObject
+        while (reader.Read() && reader.TokenType == JsonTokenType.PropertyName)
+        {
+            if (reader.ValueTextEquals("SourceFile"u8)) { reader.Read(); ReadFileFull(ref reader, e.SourceFile); }
+            else if (reader.ValueTextEquals("SourceOp"u8)) { reader.Read(); ReadOpFull(ref reader, e.SourceOp); }
+            else if (reader.ValueTextEquals("DestinationFiles"u8))
+            {
+                reader.Read();
+                while (reader.Read() && reader.TokenType != JsonTokenType.EndArray)
+                {
+                    PooledPhysicalFile f = pool.RentFile();
+                    ReadFileFull(ref reader, f);
+                    e.DestinationFiles.Add(f);
+                }
+            }
+            else if (reader.ValueTextEquals("DestinationOps"u8))
+            {
+                reader.Read();
+                while (reader.Read() && reader.TokenType != JsonTokenType.EndArray)
+                {
+                    PooledFileOperation o = pool.RentOp();
+                    ReadOpFull(ref reader, o);
+                    e.DestinationOps.Add(o);
+                }
+            }
+            else { reader.Read(); reader.Skip(); }
+        }
+        return e;
+    }
+
+    private static void ReadFileFull(ref Utf8JsonReader reader, PooledPhysicalFile f)
+    {
+        f.Length = 0; f.IsReparsePoint = false; f.LastWritten = default;
+        while (reader.Read() && reader.TokenType == JsonTokenType.PropertyName)
+        {
+            if (reader.ValueTextEquals("Path"u8)) { reader.Read(); f.Path = reader.GetString() ?? ""; }
+            else if (reader.ValueTextEquals("Root"u8)) { reader.Read(); f.Root = reader.GetString() ?? ""; }
+            else if (reader.ValueTextEquals("Length"u8)) { reader.Read(); f.Length = reader.GetInt64(); }
+            else if (reader.ValueTextEquals("LastWritten"u8)) { reader.Read(); f.LastWritten = reader.GetDateTimeOffset(); }
+            else if (reader.ValueTextEquals("IsReparsePoint"u8)) { reader.Read(); f.IsReparsePoint = reader.GetBoolean(); }
+            else { reader.Read(); reader.Skip(); }
+        }
+    }
+
+    private static void ReadOpFull(ref Utf8JsonReader reader, PooledFileOperation o)
+    {
+        o.SourceIndex = -1; o.SubjectIndex = -1; o.SourceDisposition = null; o.Detail = null;
+        while (reader.Read() && reader.TokenType == JsonTokenType.PropertyName)
+        {
+            if (reader.ValueTextEquals("Path"u8)) { reader.Read(); o.Path = reader.GetString() ?? ""; }
+            else if (reader.ValueTextEquals("Root"u8)) { reader.Read(); o.Root = reader.GetString() ?? ""; }
+            else if (reader.ValueTextEquals("Kind"u8)) { reader.Read(); o.Kind = (OperationKind)reader.GetInt32(); }
+            else if (reader.ValueTextEquals("SourceIndex"u8)) { reader.Read(); o.SourceIndex = reader.GetInt32(); }
+            else if (reader.ValueTextEquals("SubjectIndex"u8)) { reader.Read(); o.SubjectIndex = reader.GetInt32(); }
+            else if (reader.ValueTextEquals("SourceDisposition"u8)) { reader.Read(); if (reader.TokenType != JsonTokenType.Null) o.SourceDisposition = (OnSuccessAction)reader.GetInt32(); }
+            else if (reader.ValueTextEquals("Detail"u8)) { reader.Read(); o.Detail = reader.GetString(); }
+            else { reader.Read(); reader.Skip(); }
+        }
+    }
+
     /// <summary>A representative finding: a deep-ish source path, one pre-existing target it would
-    /// overwrite (so there is a destination file + a SubjectIndex to carry), realistic string lengths.</summary>
+    /// overwrite (so there is a destination file, a SubjectIndex, and a derivable op path — exercising
+    /// the trim), realistic string lengths.</summary>
     private static FileEvaluation MakeEvaluation(int i)
     {
         string sourceRoot = @"C:\Users\example\Pictures\import";

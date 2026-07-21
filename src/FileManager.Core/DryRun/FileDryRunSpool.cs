@@ -101,7 +101,7 @@ internal sealed class FileDryRunSpool : IDryRunSpool
             try
             {
                 await file.ReadExactlyAsync(rented.AsMemory(0, length), ct).ConfigureAwait(false);
-                entry = PooledEvaluation.Parse(rented.AsSpan(0, length), _pool);
+                entry = DryRunSnapshotFormat.Read(rented.AsSpan(0, length), _pool);
             }
             finally
             {
@@ -173,7 +173,7 @@ internal sealed class FileDryRunSpool : IDryRunSpool
     {
         jsonBuffer.Clear();
         jsonWriter.Reset(jsonBuffer);
-        JsonSerializer.Serialize(jsonWriter, entry, DryRunSnapshotJsonContext.Default.FileEvaluation);
+        DryRunSnapshotFormat.Write(jsonWriter, entry);
         jsonWriter.Flush();
         BinaryPrimitives.WriteInt32LittleEndian(lengthBuffer, jsonBuffer.WrittenCount);
         await file.WriteAsync(lengthBuffer).ConfigureAwait(false);

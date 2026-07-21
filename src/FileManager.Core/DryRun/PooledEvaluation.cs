@@ -2,7 +2,6 @@ using FileManager.Contracts.DryRun;
 using FileManager.Contracts.Profiles;
 using System;
 using System.Collections.Generic;
-using System.Text.Json;
 
 namespace FileManager.Core.DryRun;
 
@@ -82,107 +81,6 @@ internal sealed class PooledEvaluation : IEvaluationView
     IReadOnlyList<IFileOperationView> IEvaluationView.DestinationOps => DestinationOps;
 
     public void Recycle() => _pool.Return(this);
-
-    /// <summary>Parses one snapshot record — the exact JSON <see cref="DryRunSnapshotJsonContext"/>
-    /// writes for a <see cref="FileEvaluation"/> — into a rented carrier graph, reading straight from
-    /// the framed bytes with a <see cref="Utf8JsonReader"/> so nothing intermediate is allocated. Enum
-    /// members are numbers (the source generator's default) and properties may arrive in any order;
-    /// unknown properties are skipped, so an additive change to the record shape does not break the
-    /// read even before the writer is regenerated. If the on-disk record shape changes materially,
-    /// update both this parser and the write path.</summary>
-    public static PooledEvaluation Parse(ReadOnlySpan<byte> json, EvaluationCarrierPool pool)
-    {
-        PooledEvaluation e = pool.RentEvaluation();
-        Utf8JsonReader reader = new(json);
-
-        if (!reader.Read() || reader.TokenType != JsonTokenType.StartObject)
-            throw new JsonException("dry-run snapshot record is not a JSON object");
-
-        while (reader.Read() && reader.TokenType == JsonTokenType.PropertyName)
-        {
-            if (reader.ValueTextEquals("SourceFile"u8))
-            {
-                reader.Read();
-                ReadFile(ref reader, e.SourceFile);
-            }
-            else if (reader.ValueTextEquals("SourceOp"u8))
-            {
-                reader.Read();
-                ReadOp(ref reader, e.SourceOp);
-            }
-            else if (reader.ValueTextEquals("DestinationFiles"u8))
-            {
-                reader.Read();   // StartArray
-                while (reader.Read() && reader.TokenType != JsonTokenType.EndArray)
-                {
-                    PooledPhysicalFile f = pool.RentFile();
-                    ReadFile(ref reader, f);
-                    e.DestinationFiles.Add(f);
-                }
-            }
-            else if (reader.ValueTextEquals("DestinationOps"u8))
-            {
-                reader.Read();   // StartArray
-                while (reader.Read() && reader.TokenType != JsonTokenType.EndArray)
-                {
-                    PooledFileOperation o = pool.RentOp();
-                    ReadOp(ref reader, o);
-                    e.DestinationOps.Add(o);
-                }
-            }
-            else
-            {
-                reader.Read();
-                reader.Skip();
-            }
-        }
-        return e;
-    }
-
-    // Each reader is positioned on the value's StartObject on entry and left on the matching EndObject,
-    // so the caller's next Read() advances to the following property / array element.
-    private static void ReadFile(ref Utf8JsonReader reader, PooledPhysicalFile f)
-    {
-        f.Length = 0;
-        f.IsReparsePoint = false;
-        f.LastWritten = default;
-        while (reader.Read() && reader.TokenType == JsonTokenType.PropertyName)
-        {
-            if (reader.ValueTextEquals("Path"u8)) { reader.Read(); f.Path = reader.GetString() ?? ""; }
-            else if (reader.ValueTextEquals("Root"u8)) { reader.Read(); f.Root = reader.GetString() ?? ""; }
-            else if (reader.ValueTextEquals("Length"u8)) { reader.Read(); f.Length = reader.GetInt64(); }
-            else if (reader.ValueTextEquals("LastWritten"u8)) { reader.Read(); f.LastWritten = reader.GetDateTimeOffset(); }
-            else if (reader.ValueTextEquals("IsReparsePoint"u8)) { reader.Read(); f.IsReparsePoint = reader.GetBoolean(); }
-            else { reader.Read(); reader.Skip(); }
-        }
-    }
-
-    private static void ReadOp(ref Utf8JsonReader reader, PooledFileOperation o)
-    {
-        o.SourceIndex = -1;
-        o.SubjectIndex = -1;
-        o.SourceDisposition = null;
-        o.Detail = null;
-        while (reader.Read() && reader.TokenType == JsonTokenType.PropertyName)
-        {
-            if (reader.ValueTextEquals("Path"u8)) { reader.Read(); o.Path = reader.GetString() ?? ""; }
-            else if (reader.ValueTextEquals("Root"u8)) { reader.Read(); o.Root = reader.GetString() ?? ""; }
-            else if (reader.ValueTextEquals("Kind"u8)) { reader.Read(); o.Kind = (OperationKind)reader.GetInt32(); }
-            else if (reader.ValueTextEquals("SourceIndex"u8)) { reader.Read(); o.SourceIndex = reader.GetInt32(); }
-            else if (reader.ValueTextEquals("SubjectIndex"u8)) { reader.Read(); o.SubjectIndex = reader.GetInt32(); }
-            else if (reader.ValueTextEquals("SourceDisposition"u8))
-            {
-                reader.Read();
-                o.SourceDisposition = reader.TokenType == JsonTokenType.Null ? null : (OnSuccessAction)reader.GetInt32();
-            }
-            else if (reader.ValueTextEquals("Detail"u8))
-            {
-                reader.Read();
-                o.Detail = reader.TokenType == JsonTokenType.Null ? null : reader.GetString();
-            }
-            else { reader.Read(); reader.Skip(); }
-        }
-    }
 }
 
 /// <summary>A bounded, per-run pool of the carriers a spilled dry-run spool reads back into. Created
@@ -205,6 +103,10 @@ internal sealed class EvaluationCarrierPool
     private readonly Stack<PooledEvaluation> _evaluations = new();
     private readonly Stack<List<PooledPhysicalFile>> _fileLists = new();
     private readonly Stack<List<PooledFileOperation>> _opLists = new();
+
+    /// <summary>Per-run dedup of the handful of distinct root strings (see <see cref="RootInterner"/>).
+    /// Shared with the snapshot reader so a spilled replay allocates each root once, not once per file.</summary>
+    public RootInterner Roots { get; } = new();
 
     /// <summary>Evaluations handed out over the pool's life. Paired with <see cref="ReturnedEvaluations"/>
     /// it proves every rented entry was recycled (tests assert equality after a spilled run).</summary>
