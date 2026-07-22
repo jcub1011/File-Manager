@@ -15,9 +15,13 @@ namespace FileManager.Core.Profiles;
 /// code below: transformer checks are structural only (argument/token/allowlist validation
 /// lands with the transformers subsystem), and cron validation is syntax-only via
 /// <see cref="CronExpression"/>.</summary>
-public sealed class ProfileValidator(ILogger<ProfileValidator> logger, IFilterCompiler filterCompiler) : IProfileValidator
+public sealed class ProfileValidator(
+    ILogger<ProfileValidator> logger,
+    IFilterCompiler filterCompiler,
+    Core.Platform.IPathCanonicalizer? pathCanonicalizer = null) : IProfileValidator
 {
-    private const int SupportedSchemaVersion = 2;
+    /// <summary>Public so tests and tooling build profiles at the version this build accepts.</summary>
+    public const int SupportedSchemaVersion = 2;
 
     private static readonly string[] InfrastructureSegments = [".pipeline_tmp", ".fm_staging"];
 
@@ -67,6 +71,7 @@ public sealed class ProfileValidator(ILogger<ProfileValidator> logger, IFilterCo
                 "OnSuccess is MoveToArchive but no ArchiveFolder is configured."));
 
         CheckVerificationPolicy(candidate, issues);
+        CheckHighRiskSources(candidate, sources, issues);
         CheckCrossProfile(candidate, sources, targets, otherActiveProfiles, issues);
 
         logger.LogDebug("Validated profile {ProfileId} ({Name}): {IssueCount} issues",
@@ -103,7 +108,7 @@ public sealed class ProfileValidator(ILogger<ProfileValidator> logger, IFilterCo
         }
     }
 
-    private static List<NormalizedPath> NormalizePaths(
+    private List<NormalizedPath> NormalizePaths(
         IEnumerable<string> paths, string role, List<ValidationIssue> issues)
     {
         List<NormalizedPath> normalized = [];
@@ -116,6 +121,17 @@ public sealed class ProfileValidator(ILogger<ProfileValidator> logger, IFilterCo
                 continue;
             }
             result.TryGetValue(out NormalizedPath value);
+
+            // Expand OS aliases (8.3 short names) so identity checks — target==source, overlap,
+            // cycle, high-risk root — see one spelling per physical location. Best-effort: a
+            // nonexistent path stays as written.
+            if (pathCanonicalizer is not null)
+            {
+                string canonical = pathCanonicalizer.Canonicalize(value.Value);
+                if (!string.Equals(canonical, value.Value, StringComparison.Ordinal)
+                    && NormalizedPath.Create(canonical).TryGetValue(out NormalizedPath expanded))
+                    value = expanded;
+            }
 
             foreach (string segment in value.Value.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar))
             {
@@ -161,6 +177,12 @@ public sealed class ProfileValidator(ILogger<ProfileValidator> logger, IFilterCo
             if (step.TimeoutSeconds <= 0)
                 issues.Add(Error("PROFILE_TRANSFORMER_INVALID",
                     $"Transformer step {step.Step} (\"{step.Name}\"): TimeoutSeconds must be positive."));
+            // Until the executor's allowlist lands, the executable is named loudly on every save so
+            // a transformer smuggled in via IMPORT (the GUI never authors one) cannot ride along
+            // silently. Warning, not blocking: the step does not run in this build.
+            issues.Add(Warning("PROFILE_TRANSFORMER_EXECUTABLE_WARN",
+                $"Transformer step {step.Step} (\"{step.Name}\") will run the external executable " +
+                $"\"{step.ExecutablePath}\" on your files. Review it before activating this profile."));
         }
     }
 
@@ -213,6 +235,66 @@ public sealed class ProfileValidator(ILogger<ProfileValidator> logger, IFilterCo
                     "VerificationMethod None combined with MoveToTrash relies on the Recycle Bin as the only safety net (§6.1)."));
                 break;
         }
+    }
+
+    /// <summary>Guards the blast radius of a destructive disposition: a profile whose Source is a
+    /// drive root, the user-profile root, or a system directory would dispose files across that
+    /// entire tree on its first run. BlockingWarning, not Error — acknowledgeable, so a power user
+    /// who genuinely means it is not blocked. Especially load-bearing on IMPORT, where the paths
+    /// were authored by someone else.</summary>
+    private static void CheckHighRiskSources(Profile candidate, List<NormalizedPath> sources, List<ValidationIssue> issues)
+    {
+        if (candidate.Policies.OnSuccess is not (OnSuccessAction.PermanentDelete or OnSuccessAction.MoveToTrash))
+            return;
+
+        foreach (NormalizedPath source in sources)
+        {
+            if (DescribeHighRiskRoot(source.Value) is string why)
+                issues.Add(new ValidationIssue(ValidationSeverity.BlockingWarning, "PROFILE_HIGH_RISK_SOURCE",
+                    $"Source \"{source.Value}\" is {why}, and OnSuccess is {candidate.Policies.OnSuccess} — " +
+                    "a run would dispose files across that entire tree. Save requires explicit acknowledgment."));
+        }
+    }
+
+    /// <summary>Why the path is a high-risk disposition root, or null when it is not. NormalizedPath
+    /// values are absolute and trailing-separator-trimmed, so comparisons trim both sides.</summary>
+    private static string? DescribeHighRiskRoot(string path)
+    {
+        string trimmed = Path.TrimEndingDirectorySeparator(path);
+        string? root = Path.GetPathRoot(path);
+        if (!string.IsNullOrEmpty(root)
+            && string.Equals(Path.TrimEndingDirectorySeparator(root), trimmed, StringComparison.OrdinalIgnoreCase))
+            return "a drive root";
+
+        // The user-profile ROOT only: its subfolders (Downloads, Desktop, …) are exactly what this
+        // tool is for; the whole profile tree at once is the mistake worth interrupting.
+        if (IsOrEquals(trimmed, Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), out bool underProfile) && !underProfile)
+            return "the user-profile root";
+        if (IsOrEquals(trimmed, Environment.GetFolderPath(Environment.SpecialFolder.Windows), out bool underWindows))
+            return underWindows ? "inside the Windows directory" : "the Windows directory";
+        if (IsOrEquals(trimmed, Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), out bool underPf)
+            || IsOrEquals(trimmed, Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), out underPf))
+            return underPf ? "inside a Program Files directory" : "a Program Files directory";
+
+        return null;
+    }
+
+    /// <summary>True when <paramref name="path"/> equals <paramref name="specialRoot"/> or —
+    /// except for the user-profile root, where only equality is high-risk (subfolders like
+    /// Downloads are the tool's bread and butter) — sits under it. <paramref name="isUnder"/>
+    /// distinguishes the two for the message. Both inputs must be trailing-separator-trimmed.</summary>
+    private static bool IsOrEquals(string path, string specialRoot, out bool isUnder)
+    {
+        isUnder = false;
+        if (string.IsNullOrEmpty(specialRoot))
+            return false;
+        string root = Path.TrimEndingDirectorySeparator(specialRoot);
+        if (string.Equals(path, root, StringComparison.OrdinalIgnoreCase))
+            return true;
+        isUnder = path.Length > root.Length
+            && path.StartsWith(root, StringComparison.OrdinalIgnoreCase)
+            && (path[root.Length] == Path.DirectorySeparatorChar || path[root.Length] == Path.AltDirectorySeparatorChar);
+        return isUnder;
     }
 
     private static void CheckCrossProfile(

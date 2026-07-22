@@ -13,12 +13,16 @@ public sealed class ProfileCatalog(ILogger<ProfileCatalog> logger, IProfileStore
 {
     private readonly object _gate = new();
     private readonly List<Subscription> _subscriptions = [];
-    private volatile IReadOnlyList<Profile> _all = [];
-    private volatile IReadOnlyList<Profile> _active = [];
+    // One volatile snapshot holding BOTH lists: publishing them as two independent fields lets a
+    // reader between the writes observe a mismatched pair (e.g. a just-deleted profile absent from
+    // All but still in Active), which a future watcher/scheduler re-arm would act on.
+    private volatile Snapshot _snapshot = new([], []);
 
-    public IReadOnlyList<Profile> All => _all;
+    public IReadOnlyList<Profile> All => _snapshot.All;
 
-    public IReadOnlyList<Profile> Active => _active;
+    public IReadOnlyList<Profile> Active => _snapshot.Active;
+
+    private sealed record Snapshot(IReadOnlyList<Profile> All, IReadOnlyList<Profile> Active);
 
     public IDisposable Subscribe(Action changeHandler)
     {
@@ -36,10 +40,10 @@ public sealed class ProfileCatalog(ILogger<ProfileCatalog> logger, IProfileStore
             return error;
         loaded.TryGetValue(out IReadOnlyList<Profile>? profiles);
 
-        _all = profiles!;
-        _active = profiles!.Where(p => p.Active).ToList();
+        Snapshot next = new(profiles!, profiles!.Where(p => p.Active).ToList());
+        _snapshot = next;
         logger.LogInformation("Profile catalog reloaded: {Total} profiles, {Active} active",
-            _all.Count, _active.Count);
+            next.All.Count, next.Active.Count);
 
         Subscription[] snapshot;
         lock (_gate)

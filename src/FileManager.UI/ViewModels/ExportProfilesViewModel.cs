@@ -127,6 +127,14 @@ public sealed partial class ExportProfilesViewModel : ViewModelBase
                 {
                     failures.Add($"{row.Name}: {ex.Message}");
                 }
+                catch (Exception ex)
+                {
+                    // Last-resort catch-all (directive): an unexpected per-profile failure (e.g. a
+                    // reserved device name) records THIS profile as failed and the batch continues,
+                    // instead of aborting every remaining selection via the outer catch.
+                    Serilog.Log.Error(ex, "Exporting profile {ProfileId} failed unexpectedly", row.ProfileId);
+                    failures.Add($"{row.Name}: {ex.GetType().Name}: {ex.Message}");
+                }
             }
 
             if (failures.Count == 0)

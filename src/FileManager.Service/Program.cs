@@ -95,6 +95,7 @@ internal static class Program
         services.AddSingleton<IVolumeInfoProvider, WindowsVolumeInfoProvider>();
         services.AddSingleton<IMetadataPreserver, WindowsMetadataPreserver>();
         services.AddSingleton<ITrashService, WindowsTrashService>();
+        services.AddSingleton<IPathCanonicalizer, WindowsPathCanonicalizer>();
         services.AddSingleton<IDiskPreflight, DiskPreflight>();
         services.AddSingleton<IAtomicPlacer, AtomicPlacer>();
         services.AddSingleton<IRollbackExecutor, RollbackExecutor>();

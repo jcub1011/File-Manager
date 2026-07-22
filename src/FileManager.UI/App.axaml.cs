@@ -54,6 +54,8 @@ namespace FileManager.UI
                     export.RequestClose = dialog.Close;
                     await dialog.ShowDialog(window);
                 };
+                viewModel.ConfirmImport = async preview =>
+                    await new ImportPreviewWindow { DataContext = preview }.ShowDialog<bool>(window);
                 viewModel.ConfirmClose = async message =>
                     await new ConfirmWindow(message).ShowDialog<bool>(window);
                 window.DataContext = viewModel;

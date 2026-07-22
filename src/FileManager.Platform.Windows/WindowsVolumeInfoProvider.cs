@@ -128,9 +128,21 @@ public sealed partial class WindowsVolumeInfoProvider(ILogger<WindowsVolumeInfoP
     {
         string full = Path.GetFullPath(path);
         // GetDiskFreeSpaceEx wants a directory; if the path is (or looks like) a file, use its parent.
-        if (Directory.Exists(full))
-            return full;
-        return Path.GetDirectoryName(full) ?? full;
+        string dir = Directory.Exists(full) ? full : Path.GetDirectoryName(full) ?? full;
+        return ExtendIfLong(dir);
+    }
+
+    /// <summary>Prefixes an extended-length marker for paths near MAX_PATH: without it, deep trees
+    /// fail the free-space preflight on default Windows (LongPathsEnabled off) even though the
+    /// volume would answer. Kept per-directory (not hoisted to the root) because free space is a
+    /// per-directory answer under quotas and mount points.</summary>
+    private static string ExtendIfLong(string dir)
+    {
+        if (dir.Length < 248 || dir.StartsWith(@"\\?\", StringComparison.Ordinal))
+            return dir;
+        return dir.StartsWith(@"\\", StringComparison.Ordinal)
+            ? string.Concat(@"\\?\UNC\", dir.AsSpan(2))
+            : @"\\?\" + dir;
     }
 
     /// <summary>The volume root GetDiskFreeSpaceW wants (drive root "C:\" or UNC share root with a

@@ -22,7 +22,10 @@ public sealed class ProfileImportExportTests : IDisposable
 
     private static Profile Sample(string name, Guid? id = null, bool active = true) => new()
     {
-        SchemaVersion = 1,
+        // Must match ProfileValidator.SupportedSchemaVersion (Core is not referenceable from the UI
+        // test project): the fake gateway here never validates, so a stale version would green-light
+        // an import the real service rejects. ProfileValidatorTests pins the round-trip.
+        SchemaVersion = 2,
         Id = id ?? Guid.NewGuid(),
         Name = name,
         Active = active,
@@ -203,6 +206,60 @@ public sealed class ProfileImportExportTests : IDisposable
         Assert.NotEqual(originalId, saved.Id);   // a fresh id — never overwrites
         Assert.False(saved.Active);              // imported inactive
         Assert.False(ack);
+    }
+
+    [Fact]
+    public async Task Import_preview_shows_the_profiles_contents_and_skip_saves_nothing()
+    {
+        Profile original = Sample("Alpha") with
+        {
+            Policies = Sample("Alpha").Policies with { OnSuccess = OnSuccessAction.PermanentDelete },
+        };
+        string file = Path.Combine(_dir, "alpha.json");
+        await using (FileStream stream = File.Create(file))
+            JsonSerializer.Serialize(stream, original, FileManagerJsonContext.Default.Profile);
+
+        FakeIpcGateway gateway = new();
+        FakeFolderPicker picker = new() { FilesResult = [file] };
+        MainWindowViewModel vm = new(gateway, picker, new FakeLogFolder(), new FakeDryRunItemActions(), uiStatePath: Path.Combine(_dir, "ui-state.json"));
+
+        ImportPreviewViewModel? shown = null;
+        vm.ConfirmImport = preview =>
+        {
+            shown = preview;
+            return Task.FromResult(false);   // the user clicks Skip
+        };
+
+        await vm.ImportProfilesCommand.ExecuteAsync(null);
+
+        Assert.NotNull(shown);
+        Assert.Equal("Alpha", shown!.ProfileName);
+        Assert.Contains(@"C:\src", shown.Sources);
+        Assert.Contains(@"C:\dst", shown.Targets);
+        Assert.True(shown.IsDestructive);                          // PermanentDelete highlighted
+        Assert.Contains("PERMANENTLY DELETED", shown.DispositionText);
+        Assert.Empty(gateway.SaveCalls);                           // Skip leaves nothing saved
+        Assert.Null(vm.List.ErrorMessage);                         // a deliberate skip is not an error
+    }
+
+    [Fact]
+    public async Task Import_preview_accept_saves_the_copy()
+    {
+        string file = Path.Combine(_dir, "alpha.json");
+        await using (FileStream stream = File.Create(file))
+            JsonSerializer.Serialize(stream, Sample("Alpha"), FileManagerJsonContext.Default.Profile);
+
+        FakeIpcGateway gateway = new();
+        FakeFolderPicker picker = new() { FilesResult = [file] };
+        MainWindowViewModel vm = new(gateway, picker, new FakeLogFolder(), new FakeDryRunItemActions(), uiStatePath: Path.Combine(_dir, "ui-state.json"))
+        {
+            ConfirmImport = _ => Task.FromResult(true),
+        };
+
+        await vm.ImportProfilesCommand.ExecuteAsync(null);
+
+        (Profile saved, _) = Assert.Single(gateway.SaveCalls);
+        Assert.Equal("Alpha (imported)", saved.Name);
     }
 
     [Fact]

@@ -267,9 +267,16 @@ public sealed partial class MainWindowViewModel : ViewModelBase
         }
     }
 
+    /// <summary>Set by the composition root to show the modal per-profile import preview and return
+    /// the user's Import/Skip choice. Null (headless/tests) imports without a preview — the
+    /// validator's blocking warnings remain the safety net there.</summary>
+    public Func<ImportPreviewViewModel, Task<bool>>? ConfirmImport { get; set; }
+
     /// <summary>Imports profile files as new copies: each keeps its settings but gets a fresh id and a
     /// "(imported)" name, and comes in inactive so it never silently starts syncing or collides with an
-    /// active profile on import. Collisions with existing ids are therefore impossible.</summary>
+    /// active profile on import. Collisions with existing ids are therefore impossible. Before saving,
+    /// each profile's sources/targets/disposition/transformers are shown for confirmation — the file
+    /// was authored outside this app, so the user must see what it would touch.</summary>
     [RelayCommand]
     public async Task ImportProfiles()
     {
@@ -306,6 +313,10 @@ public sealed partial class MainWindowViewModel : ViewModelBase
                     problems.Add($"{Path.GetFileName(file)}: not a valid profile file");
                     continue;
                 }
+
+                if (ConfirmImport is not null
+                    && !await ConfirmImport(ImportPreviewViewModel.From(Path.GetFileName(file), profile)))
+                    continue;   // skipped by the user — deliberate, so not a "problem"
 
                 Profile copy = profile with
                 {

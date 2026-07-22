@@ -117,6 +117,10 @@ public sealed class ProfileStore(ILogger<ProfileStore> logger, ISettingsProvider
             return Result<IReadOnlyList<ValidationIssue>, string>.Success(issues);
         }
 
+        // Randomized temp name (matching ProfileExport.WriteAtomic): a fixed "<id>.json.tmp" makes
+        // two concurrent saves of the same profile collide on a sharing violation, and a crash
+        // leaves a name the next save would trip over.
+        string? tempPath = null;
         try
         {
             // Resolve the live directory ONCE for the whole write: a concurrent relocation must not
@@ -124,7 +128,7 @@ public sealed class ProfileStore(ILogger<ProfileStore> logger, ISettingsProvider
             string directory = ProfilesDirectory;
             Directory.CreateDirectory(directory);
             string finalPath = Path.Combine(directory, profile.Id.ToString("D") + ".json");
-            string tempPath = finalPath + ".tmp";
+            tempPath = $"{finalPath}.{Guid.NewGuid():N}.tmp";
 
             using (FileStream stream = new(tempPath, FileMode.Create, FileAccess.Write, FileShare.None))
             {
@@ -139,13 +143,31 @@ public sealed class ProfileStore(ILogger<ProfileStore> logger, ISettingsProvider
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
             logger.LogError(ex, "Could not save profile {ProfileId} ({Name})", profile.Id, profile.Name);
+            TryDeleteTemp(tempPath);
             return $"could not save profile {profile.Id}: {ex.Message}";
         }
         catch (Exception ex)
         {
             // Last resort: unexpected exceptions become logged failures, not faulted callers.
             logger.LogError(ex, "Saving profile {ProfileId} ({Name}) failed unexpectedly", profile.Id, profile.Name);
+            TryDeleteTemp(tempPath);
             return $"could not save profile {profile.Id}: {ex.GetType().Name}: {ex.Message}";
+        }
+    }
+
+    private void TryDeleteTemp(string? tempPath)
+    {
+        if (tempPath is null)
+            return;
+        try
+        {
+            if (File.Exists(tempPath))
+                File.Delete(tempPath);
+        }
+        catch (Exception ex)
+        {
+            // Best-effort cleanup of a failed save's leftover — logged (directive), never fatal.
+            logger.LogWarning(ex, "Could not delete leftover profile temp file {Path}", tempPath);
         }
     }
 

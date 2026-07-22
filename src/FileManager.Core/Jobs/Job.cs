@@ -48,6 +48,17 @@ public readonly record struct NormalizedPath : IComparable<NormalizedPath>
         // the message, and the validator re-wraps failures as PROFILE_PATH_INVALID.
         if (string.IsNullOrWhiteSpace(path))
             return new JobError { Code = JobErrorCode.SourceUnreadable, Message = "path is empty", Path = path };
+
+        // Strip extended-length prefixes BEFORE canonicalizing: GetFullPath preserves them, so
+        // "\\?\C:\data" and "C:\data" (one physical location) would otherwise normalize to unequal
+        // keys and defeat every identity built on this type — path locks, session priorities,
+        // self-write suppression. "\\?\" also disables GetFullPath's normalization entirely.
+        if (path.StartsWith(@"\\?\UNC\", StringComparison.OrdinalIgnoreCase)
+            || path.StartsWith(@"\\.\UNC\", StringComparison.OrdinalIgnoreCase))
+            path = string.Concat(@"\\", path.AsSpan(8));
+        else if (path.StartsWith(@"\\?\", StringComparison.Ordinal) || path.StartsWith(@"\\.\", StringComparison.Ordinal))
+            path = path[4..];
+
         if (!System.IO.Path.IsPathFullyQualified(path))
             return new JobError { Code = JobErrorCode.SourceUnreadable, Message = $"path is not absolute: \"{path}\"", Path = path };
         try

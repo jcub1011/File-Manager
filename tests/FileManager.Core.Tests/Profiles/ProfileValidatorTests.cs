@@ -276,4 +276,89 @@ public sealed class ProfileValidatorTests
         };
         AssertHas(Validate(candidate), "PROFILE_UNVERIFIED_TRASH_WARN", ValidationSeverity.Warning);
     }
+
+    private static Profile WithDestructiveSource(string sourcePath, OnSuccessAction onSuccess = OnSuccessAction.PermanentDelete)
+    {
+        Profile candidate = TestProfiles.Valid(sourcePath: sourcePath);
+        return candidate with { Policies = candidate.Policies with { OnSuccess = onSuccess } };
+    }
+
+    [Fact]
+    public void Destructive_disposition_on_the_user_profile_root_is_a_blocking_warning() =>
+        AssertHas(Validate(WithDestructiveSource(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile))),
+            "PROFILE_HIGH_RISK_SOURCE", ValidationSeverity.BlockingWarning);
+
+    [Fact]
+    public void Destructive_disposition_on_a_drive_root_is_a_blocking_warning() =>
+        AssertHas(Validate(WithDestructiveSource(Path.GetPathRoot(Path.GetTempPath())!)),
+            "PROFILE_HIGH_RISK_SOURCE", ValidationSeverity.BlockingWarning);
+
+    [Fact]
+    public void Destructive_disposition_under_the_windows_directory_is_a_blocking_warning() =>
+        AssertHas(Validate(WithDestructiveSource(
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "Temp"),
+                OnSuccessAction.MoveToTrash)),
+            "PROFILE_HIGH_RISK_SOURCE", ValidationSeverity.BlockingWarning);
+
+    [Fact]
+    public void Destructive_disposition_on_a_normal_subfolder_is_not_flagged()
+    {
+        // Downloads-style subfolders of the user profile are the tool's bread and butter.
+        string downloads = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Downloads");
+        Assert.DoesNotContain(Validate(WithDestructiveSource(downloads)),
+            i => i.Code == "PROFILE_HIGH_RISK_SOURCE");
+    }
+
+    [Fact]
+    public void Keeping_sources_on_a_drive_root_is_not_flagged()
+    {
+        Profile candidate = TestProfiles.Valid(sourcePath: Path.GetPathRoot(Path.GetTempPath())!);
+        Assert.DoesNotContain(Validate(candidate), i => i.Code == "PROFILE_HIGH_RISK_SOURCE");
+    }
+
+    [Fact]
+    public void Transformer_steps_warn_with_the_executable_named()
+    {
+        string executable = Path.GetTempFileName();
+        try
+        {
+            Profile candidate = TestProfiles.Valid() with
+            {
+                Transformers =
+                [
+                    new TransformerStep
+                    {
+                        Step = 1, Name = "t", ExecutablePath = executable,
+                        ArgumentMode = ArgumentMode.Literal, Arguments = "$input",
+                        OutputMode = OutputMode.InPlace, TimeoutSeconds = 5,
+                    },
+                ],
+            };
+            IReadOnlyList<ValidationIssue> issues = Validate(candidate);
+            ValidationIssue warn = Assert.Single(issues, i => i.Code == "PROFILE_TRANSFORMER_EXECUTABLE_WARN");
+            Assert.Equal(ValidationSeverity.Warning, warn.Severity);
+            Assert.Contains(executable, warn.Message);
+        }
+        finally
+        {
+            File.Delete(executable);
+        }
+    }
+
+    [Fact]
+    public void An_exported_profile_round_trips_through_json_and_passes_the_real_validator()
+    {
+        // The UI import/export tests run against a fake gateway that never validates; this pins the
+        // wire shape (FileManagerJsonContext, the exporter's serializer) to the real validator so a
+        // schema-version or shape drift fails HERE instead of green-lighting a doomed import.
+        Profile original = TestProfiles.Valid();
+        string json = System.Text.Json.JsonSerializer.Serialize(
+            original, FileManager.Contracts.FileManagerJsonContext.Default.Profile);
+        Profile? imported = System.Text.Json.JsonSerializer.Deserialize(
+            json, FileManager.Contracts.FileManagerJsonContext.Default.Profile);
+
+        Assert.NotNull(imported);
+        Assert.Equal(ProfileValidator.SupportedSchemaVersion, imported!.SchemaVersion);
+        Assert.DoesNotContain(Validate(imported), i => i.Severity == ValidationSeverity.Error);
+    }
 }
