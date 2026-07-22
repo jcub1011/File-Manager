@@ -1,0 +1,661 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:vm="using:FileManager.UI.ViewModels"
+             xmlns:ctrl="using:FileManager.UI.Controls"
+             xmlns:conv="using:FileManager.UI.Converters"
+             x:Class="FileManager.UI.Views.DryRunView"
+             x:DataType="vm:DryRunViewModel">
+
+    <UserControl.Resources>
+        <!-- Shared cell templates for both the Sources and Destinations trees (rendered by
+             TreeDataGrid, which flattens the hierarchy into a single virtualized row list). The
+             expander column draws the chevron + indentation; these templates supply the node name and
+             a strip of rolled-up, colour-coded summary pills. The pills are data-driven (each carries
+             its own brushes) so one template serves both tabs. -->
+        <DataTemplate x:Key="DryRunNameCell" x:DataType="vm:DryRunTreeNode">
+            <TextBlock Text="{Binding Name}" FontFamily="{StaticResource MonoFontFamily}"
+                       VerticalAlignment="Center" Classes.dir="{Binding IsDirectory}"
+                       TextTrimming="CharacterEllipsis" ToolTip.Tip="{Binding FullPath}" />
+        </DataTemplate>
+        <!-- Rendered through the same (centred) template-cell path as the name, in the same monospace
+             font, so the size and name share identical vertical metrics and line up on one centreline
+             — a plain TextColumn cell uses the default proportional font and drifts off-centre. -->
+        <DataTemplate x:Key="DryRunSizeCell" x:DataType="vm:DryRunTreeNode">
+            <!-- Horizontal margin restores the gap the old TextColumn's cell padding gave: space from
+                 the name on the left and from the status pills on the right. -->
+            <TextBlock Text="{Binding SizeText}" FontFamily="{StaticResource MonoFontFamily}"
+                       VerticalAlignment="Center" TextAlignment="Right" Opacity="0.7"
+                       Margin="8,0,8,0" />
+        </DataTemplate>
+        <DataTemplate x:Key="DryRunPillsCell" x:DataType="vm:DryRunTreeNode">
+            <!-- WrapPanel (not a horizontal StackPanel) so a high-count node's rolled-up counts wrap
+                 to a second line rather than clipping or starving the Name column. Each pill is a
+                 colour-tinted glyph + count; the glyph/colour are resolved from the pill's resource
+                 keys (IconConverters) and the kind word is the tooltip. -->
+            <!-- Right margin reserves a gutter for the overlay vertical scrollbar (Avalonia's
+                 Fluent bar floats over content and reserves no width), so the pills — the
+                 rightmost column — aren't hidden behind it when the tree scrolls. -->
+            <ItemsControl ItemsSource="{Binding Pills}" Margin="0,0,16,0">
+                <ItemsControl.ItemsPanel>
+                    <ItemsPanelTemplate>
+                        <WrapPanel />
+                    </ItemsPanelTemplate>
+                </ItemsControl.ItemsPanel>
+                <ItemsControl.ItemTemplate>
+                    <DataTemplate x:DataType="vm:TreePill">
+                        <ctrl:StatusCount Margin="0,0,10,2" ToolTip.Tip="{Binding Tip}"
+                                          Text="{Binding CountText}"
+                                          Icon="{Binding IconKey, Converter={x:Static conv:IconConverters.Geometry}}"
+                                          Glyph="{Binding ColorKey, Converter={x:Static conv:IconConverters.Brush}}" />
+                    </DataTemplate>
+                </ItemsControl.ItemTemplate>
+            </ItemsControl>
+        </DataTemplate>
+
+        <!-- Right-click menu for the tree rows, attached to every row via the TreeDataGridRow style
+             below. One shared flyout serves both folders and files: the folder-navigation items and
+             the file-only items toggle on IsDirectory, so a folder shows the nav + folder actions and
+             a file shows only the file actions. On open its DataContext is the right-clicked node, so
+             every item binds to that node's commands. CompileBindings off because the row style sits
+             at UserControl (view-model) scope, not the node's; every item carries a leading icon so
+             the right option is quick to spot. -->
+        <MenuFlyout x:Key="NodeContextMenu" x:CompileBindings="False">
+            <!-- Folder navigation (folders only) -->
+            <MenuItem Header="Open Folder" Command="{Binding OpenFolderCommand}" IsVisible="{Binding IsDirectory}" InputGesture="Enter">
+                <MenuItem.Icon><PathIcon Data="{StaticResource IconAdd}" Width="16" Height="16" /></MenuItem.Icon>
+            </MenuItem>
+            <MenuItem Header="Open Folder and All Nested Folders" Command="{Binding OpenFolderRecursiveCommand}" IsVisible="{Binding IsDirectory}" InputGesture="Ctrl+Enter">
+                <MenuItem.Icon><PathIcon Data="{StaticResource IconAdd}" Width="16" Height="16" /></MenuItem.Icon>
+            </MenuItem>
+            <MenuItem Header="Close Folder" Command="{Binding CloseFolderCommand}" IsVisible="{Binding IsDirectory}" InputGesture="Enter">
+                <MenuItem.Icon><PathIcon Data="{StaticResource IconMinimize}" Width="16" Height="16" /></MenuItem.Icon>
+            </MenuItem>
+            <Separator IsVisible="{Binding IsDirectory}" />
+            <MenuItem Header="Expand All Folders" Command="{Binding ExpandAllCommand}" IsVisible="{Binding IsDirectory}">
+                <MenuItem.Icon><PathIcon Data="{StaticResource IconAdd}" Width="16" Height="16" /></MenuItem.Icon>
+            </MenuItem>
+            <MenuItem Header="Close All Folders" Command="{Binding CloseAllCommand}" IsVisible="{Binding IsDirectory}">
+                <MenuItem.Icon><PathIcon Data="{StaticResource IconMinimize}" Width="16" Height="16" /></MenuItem.Icon>
+            </MenuItem>
+            <Separator IsVisible="{Binding IsDirectory}" />
+            <!-- Copy (both kinds; the name item's label differs by kind) -->
+            <MenuItem Header="Copy Path" Command="{Binding CopyPathCommand}" InputGesture="Ctrl+C">
+                <MenuItem.Icon><PathIcon Data="{StaticResource IconRestore}" Width="16" Height="16" /></MenuItem.Icon>
+            </MenuItem>
+            <MenuItem Header="Copy File Name" Command="{Binding CopyNameCommand}" IsVisible="{Binding !IsDirectory}" InputGesture="Alt+C">
+                <MenuItem.Icon><PathIcon Data="{StaticResource IconRestore}" Width="16" Height="16" /></MenuItem.Icon>
+            </MenuItem>
+            <MenuItem Header="Copy File Name Without Extension" Command="{Binding CopyNameWithoutExtensionCommand}" IsVisible="{Binding !IsDirectory}">
+                <MenuItem.Icon><PathIcon Data="{StaticResource IconRestore}" Width="16" Height="16" /></MenuItem.Icon>
+            </MenuItem>
+            <MenuItem Header="Copy Folder Name" Command="{Binding CopyNameCommand}" IsVisible="{Binding IsDirectory}" InputGesture="Alt+C">
+                <MenuItem.Icon><PathIcon Data="{StaticResource IconRestore}" Width="16" Height="16" /></MenuItem.Icon>
+            </MenuItem>
+            <Separator />
+            <!-- Open (file → default app / reveal; folder → reveal) -->
+            <MenuItem Header="Open File" Command="{Binding OpenFileCommand}" IsVisible="{Binding !IsDirectory}" InputGesture="Shift+Space">
+                <MenuItem.Icon><PathIcon Data="{StaticResource IconDocument}" Width="16" Height="16" /></MenuItem.Icon>
+            </MenuItem>
+            <MenuItem Header="Open File In Explorer" Command="{Binding RevealInExplorerCommand}" IsVisible="{Binding !IsDirectory}" InputGesture="Ctrl+Space">
+                <MenuItem.Icon><PathIcon Data="{StaticResource IconFolder}" Width="16" Height="16" /></MenuItem.Icon>
+            </MenuItem>
+            <MenuItem Header="Open Folder In Explorer" Command="{Binding OpenFolderInExplorerCommand}" IsVisible="{Binding IsDirectory}" InputGesture="Ctrl+Space">
+                <MenuItem.Icon><PathIcon Data="{StaticResource IconFolder}" Width="16" Height="16" /></MenuItem.Icon>
+            </MenuItem>
+        </MenuFlyout>
+
+        <!-- Right-click menu for the flat Sources/Destinations list rows (always files). Shared by
+             both lists: DryRunFileRow and DryRunDestinationRow expose the same command names, so on
+             open the items bind against whichever row's DataContext they were shown on. Open File /
+             Open File In Explorer grey out (CanExecute disk check) when the file isn't on disk. -->
+        <MenuFlyout x:Key="FileContextMenu" x:CompileBindings="False">
+            <MenuItem Header="Copy Path" Command="{Binding CopyPathCommand}" InputGesture="Ctrl+C">
+                <MenuItem.Icon><PathIcon Data="{StaticResource IconRestore}" Width="16" Height="16" /></MenuItem.Icon>
+            </MenuItem>
+            <MenuItem Header="Copy File Name" Command="{Binding CopyNameCommand}" InputGesture="Alt+C">
+                <MenuItem.Icon><PathIcon Data="{StaticResource IconRestore}" Width="16" Height="16" /></MenuItem.Icon>
+            </MenuItem>
+            <MenuItem Header="Copy File Name Without Extension" Command="{Binding CopyNameWithoutExtensionCommand}">
+                <MenuItem.Icon><PathIcon Data="{StaticResource IconRestore}" Width="16" Height="16" /></MenuItem.Icon>
+            </MenuItem>
+            <Separator />
+            <MenuItem Header="Open File" Command="{Binding OpenFileCommand}" InputGesture="Shift+Space">
+                <MenuItem.Icon><PathIcon Data="{StaticResource IconDocument}" Width="16" Height="16" /></MenuItem.Icon>
+            </MenuItem>
+            <MenuItem Header="Open File In Explorer" Command="{Binding RevealInExplorerCommand}" InputGesture="Ctrl+Space">
+                <MenuItem.Icon><PathIcon Data="{StaticResource IconFolder}" Width="16" Height="16" /></MenuItem.Icon>
+            </MenuItem>
+        </MenuFlyout>
+
+        <!-- A tab's source + destination filter facets: two WrapPanels of checkboxes. -->
+        <DataTemplate x:Key="FacetTemplate" x:DataType="vm:DryRunFacetRow">
+            <CheckBox IsChecked="{Binding IsSelected}" Margin="0,0,12,0"
+                      Content="{Binding Label}" ToolTip.Tip="{Binding Key}" />
+        </DataTemplate>
+
+        <!-- A summary status chip that doubles as a filter: a toggleable StatusCount (icon + count).
+             Selecting one or more narrows the pane's list to rows carrying that status; the chip's
+             checked state is styled in Controls.axaml (ToggleButton.statusFilter). -->
+        <DataTemplate x:Key="StatusFilterTemplate" x:DataType="vm:DryRunStatusFilter">
+            <ToggleButton Classes="statusFilter" IsChecked="{Binding IsSelected}"
+                          ToolTip.Tip="{Binding Label}" Margin="0,0,8,0" Padding="7,3">
+                <ctrl:StatusCount Text="{Binding CountText}"
+                                  Icon="{Binding IconKey, Converter={x:Static conv:IconConverters.Geometry}}"
+                                  Glyph="{Binding ColorKey, Converter={x:Static conv:IconConverters.Brush}}" />
+            </ToggleButton>
+        </DataTemplate>
+
+        <!-- One destination volume: header (root + settled used/free), the nested-increment storage
+             bar, a details line, an optional warning, and an optional per-target-root drill-down. -->
+        <DataTemplate x:Key="VolumeSpaceTemplate" x:DataType="vm:VolumeSpaceRow">
+            <Border BorderThickness="0,0,0,1" BorderBrush="{DynamicResource SystemControlBackgroundListLowBrush}"
+                    Padding="0,6">
+                <StackPanel Spacing="4">
+                    <Grid ColumnDefinitions="Auto,*">
+                        <TextBlock Grid.Column="0" Text="{Binding VolumeRoot}" FontWeight="SemiBold"
+                                   FontFamily="{StaticResource MonoFontFamily}" VerticalAlignment="Center" />
+                        <TextBlock Grid.Column="1" FontSize="11" Opacity="0.7" HorizontalAlignment="Right"
+                                   VerticalAlignment="Center" IsVisible="{Binding CapacityKnown}"
+                                   ToolTip.Tip="The drive's state right now, before this run makes any changes">
+                            <Run Text="(Current Status) " /><Run Text="{Binding UsedNowText}" /><Run Text=" used · " /><Run Text="{Binding CurrentFreeText}" /><Run Text=" free of " /><Run Text="{Binding CapacityText}" />
+                        </TextBlock>
+                    </Grid>
+
+                    <ctrl:StorageBar Height="20" IsVisible="{Binding CapacityKnown}"
+                                     CapacityBytes="{Binding CapacityBytes}" UsedNowBytes="{Binding UsedNowBytes}"
+                                     SettledBytes="{Binding SettledBytes}" RealisticPeakBytes="{Binding RealisticPeakBytes}"
+                                     SafeCeilingBytes="{Binding SafeCeilingBytes}" MarginBytes="{Binding MarginBytes}" />
+
+                    <TextBlock IsVisible="{Binding !CapacityKnown}" FontSize="11" Opacity="0.7"
+                               Text="Free space could not be determined for this volume." />
+
+                    <StackPanel Orientation="Horizontal" Spacing="6">
+                        <TextBlock FontSize="11" Opacity="0.7" ToolTip.Tip="Realistic Peak Storage Usage">
+                            <Run Text="RPSU " /><Run Text="{Binding PeakText}" />
+                        </TextBlock>
+                        <TextBlock FontSize="11" Opacity="0.4" Text="·" />
+                        <TextBlock FontSize="11" Opacity="0.7" ToolTip.Tip="Absolute Peak Storage Usage">
+                            <Run Text="APSU " /><Run Text="{Binding CeilingText}" />
+                        </TextBlock>
+                        <TextBlock FontSize="11" Opacity="0.4" Text="·" />
+                        <TextBlock FontSize="11" Opacity="0.7">
+                            <Run Text="Data Written " /><Run Text="{Binding WrittenText}" />
+                        </TextBlock>
+                        <TextBlock FontSize="11" Opacity="0.4" Text="·" />
+                        <TextBlock FontSize="11" Opacity="0.7" ToolTip.Tip="Storage Used At Rest">
+                            <Run Text="SUAR " /><Run Text="{Binding SettledUsedText}" />
+                        </TextBlock>
+                    </StackPanel>
+
+                    <StackPanel Orientation="Horizontal" HorizontalAlignment="Left" IsVisible="{Binding HasWarning}">
+                        <ctrl:StatusCount IsVisible="{Binding IsDanger}" Text="{Binding WarningText}"
+                                          Icon="{StaticResource IconWarning}" Glyph="{DynamicResource Brush.Danger}" />
+                        <ctrl:StatusCount IsVisible="{Binding IsWarning}" Text="{Binding WarningText}"
+                                          Icon="{StaticResource IconWarning}" Glyph="{DynamicResource Brush.Warning}" />
+                    </StackPanel>
+
+                    <Expander IsVisible="{Binding HasFolders}" Header="By folder" Padding="0" Margin="0,2,0,0">
+                        <ItemsControl ItemsSource="{Binding Folders}">
+                            <ItemsControl.ItemTemplate>
+                                <DataTemplate x:DataType="vm:FolderSpaceRow">
+                                    <Grid ColumnDefinitions="*,Auto,Auto,Auto" Margin="0,2">
+                                        <TextBlock Grid.Column="0" Text="{Binding Root}" FontFamily="{StaticResource MonoFontFamily}"
+                                                   FontSize="11" TextTrimming="CharacterEllipsis" ToolTip.Tip="{Binding Root}" />
+                                        <TextBlock Grid.Column="1" Text="{Binding FileCountText}" FontSize="11" Opacity="0.6" Margin="12,0,0,0" />
+                                        <TextBlock Grid.Column="2" Text="{Binding WrittenText}" FontSize="11" Margin="12,0,0,0" />
+                                        <TextBlock Grid.Column="3" Text="{Binding NetChangeText}" FontSize="11" Opacity="0.8" Margin="12,0,0,0" />
+                                    </Grid>
+                                </DataTemplate>
+                            </ItemsControl.ItemTemplate>
+                        </ItemsControl>
+                    </Expander>
+                </StackPanel>
+            </Border>
+        </DataTemplate>
+    </UserControl.Resources>
+
+    <UserControl.Styles>
+        <!-- Status glyphs use the ctrl:StatusCount control (theme in Themes/Controls.axaml). -->
+
+        <!-- Virtualized row lists: strip default ListBoxItem chrome so rows render like plain rows. -->
+        <Style Selector="ListBox.rows">
+            <Setter Property="Background" Value="Transparent" />
+            <Setter Property="BorderThickness" Value="0" />
+            <Setter Property="Padding" Value="0" />
+        </Style>
+        <Style Selector="ListBox.rows > ListBoxItem">
+            <Setter Property="Padding" Value="0" />
+            <Setter Property="Margin" Value="0" />
+            <Setter Property="MinHeight" Value="0" />
+        </Style>
+        <!-- Light-blue hover highlight on list rows (override Fluent's default grey pointer-over). -->
+        <Style Selector="ListBox.rows > ListBoxItem:pointerover /template/ ContentPresenter#PART_ContentPresenter">
+            <Setter Property="Background" Value="{DynamicResource Brush.Hover.Soft}" />
+        </Style>
+
+        <Style Selector="TextBlock.dir">
+            <Setter Property="FontWeight" Value="SemiBold" />
+        </Style>
+
+        <!-- The tree lists render with TreeDataGrid, which flattens the hierarchy into one virtualized
+             row list (only visible rows are realized, however deep or expanded the forest). Keep the
+             surface clean: transparent, borderless, compact rows to match the rest of the panel. -->
+        <Style Selector="TreeDataGrid.rows">
+            <Setter Property="Background" Value="Transparent" />
+            <Setter Property="ShowColumnHeaders" Value="True" />
+            <Setter Property="CanUserSortColumns" Value="True" />
+        </Style>
+        <Style Selector="TreeDataGrid.rows TreeDataGridRow">
+            <Setter Property="MinHeight" Value="24" />
+            <!-- Directory rows get a slight manila-folder wash so folders stand out from files; the
+                 row's DataContext is the DryRunTreeNode, so IsDirectory drives the tint. DataType pins
+                 the compiled-binding type to the row node (the ambient x:DataType is the view model), so
+                 this stays a compiled, AOT-safe binding rather than a reflection one. -->
+            <Setter Property="Background"
+                    Value="{Binding IsDirectory, DataType=vm:DryRunTreeNode, Converter={x:Static conv:IconConverters.FolderTint}}" />
+            <!-- Whole-row right-click menu on every row; the shared flyout shows the folder actions or
+                 the file actions per the node's IsDirectory. The row's DataContext is the node, so the
+                 menu opens with the right node's commands. -->
+            <Setter Property="ContextFlyout" Value="{StaticResource NodeContextMenu}" />
+        </Style>
+        <!-- Light-blue hover highlight on tree rows; overrides the folder tint / transparent base while
+             the pointer is over the row. -->
+        <Style Selector="TreeDataGrid.rows TreeDataGridRow:pointerover">
+            <Setter Property="Background" Value="{DynamicResource Brush.Hover.Soft}" />
+        </Style>
+    </UserControl.Styles>
+
+    <DockPanel>
+        <!-- ═══════════════ Command bar ═══════════════
+             One slim row: run controls (left), the blast-radius summary as inline chips (centre,
+             the whole point of a dry run per spec §8 — deletions and overwrites), and the run
+             timestamp (right). The dry run always simulates every source; the per-panel Filter
+             flyouts below only narrow the *view*. -->
+        <!-- Run controls (split button + Cancel) now live on the tab-header row (MainWindow.axaml).
+             This bar carries the live status caption, the blast-radius chips, and the timestamp. -->
+        <Grid DockPanel.Dock="Top" ColumnDefinitions="*,Auto" Margin="0,4,0,0">
+            <!-- Live run status: phase + discovery counts while the dry run works. Shares Column 0
+                 with the blast-radius chips — the chips hide during a run (see the MultiBinding
+                 below) so a re-run's stale numbers never sit beside the live caption. -->
+            <TextBlock Grid.Column="0" Margin="0,0,12,0" VerticalAlignment="Center" Classes="caption"
+                       Text="{Binding RunStatusText}" IsVisible="{Binding RunCommand.IsRunning}" />
+
+            <!-- blast-radius: icon + count, in a WrapPanel so they wrap rather than clip when the
+                 window is narrow (the two 360-min list columns already eat the width). The kind is in
+                 each icon's tooltip. -->
+            <WrapPanel Grid.Column="0" Margin="0,0,12,0" VerticalAlignment="Center">
+                <WrapPanel.IsVisible>
+                    <MultiBinding Converter="{x:Static BoolConverters.And}">
+                        <Binding Path="HasReport" />
+                        <Binding Path="!RunCommand.IsRunning" />
+                    </MultiBinding>
+                </WrapPanel.IsVisible>
+                <ctrl:StatusCount Margin="0,2,12,2" ToolTip.Tip="Files scanned"
+                                  Text="{Binding TotalFiles, StringFormat={}{0:N0}}"
+                                  Icon="{StaticResource IconDocument}" Glyph="{DynamicResource Brush.Text.Secondary}" />
+                <ctrl:StatusCount Margin="0,2,12,2" ToolTip.Tip="Overwrites" IsVisible="{Binding !!OverwriteCount}"
+                                  Text="{Binding OverwriteCount, StringFormat={}{0:N0}}"
+                                  Icon="{StaticResource IconOverwrite}" Glyph="{DynamicResource Brush.Danger}" />
+                <ctrl:StatusCount Margin="0,2,12,2" ToolTip.Tip="Renames" IsVisible="{Binding !!RenameCount}"
+                                  Text="{Binding RenameCount, StringFormat={}{0:N0}}"
+                                  Icon="{StaticResource IconRename}" Glyph="{DynamicResource Brush.Warning}" />
+                <ctrl:StatusCount Margin="0,2,12,2" ToolTip.Tip="Source disposals" IsVisible="{Binding !!DisposalCount}"
+                                  Text="{Binding DisposalCount, StringFormat={}{0:N0}}"
+                                  Icon="{StaticResource IconTrash}" Glyph="{DynamicResource Brush.Danger}" />
+                <ctrl:StatusCount Margin="0,2,12,2" ToolTip.Tip="No destructive actions"
+                                  IsVisible="{Binding !HasDestructiveActions}"
+                                  Icon="{StaticResource IconCheckmark}" Glyph="{DynamicResource Brush.Success}" />
+            </WrapPanel>
+
+            <TextBlock Grid.Column="1" Text="{Binding GeneratedAtText}" Classes="caption"
+                       VerticalAlignment="Center" IsVisible="{Binding HasReport}" />
+        </Grid>
+
+        <ProgressBar DockPanel.Dock="Top" IsIndeterminate="True" Margin="0,8,0,0"
+                     IsVisible="{Binding RunCommand.IsRunning}" />
+
+        <Border DockPanel.Dock="Top" Classes="infoBar danger" Margin="0,8,0,0"
+                IsVisible="{Binding ErrorMessage, Converter={x:Static ObjectConverters.IsNotNull}}">
+            <TextBlock Text="{Binding ErrorMessage}" TextWrapping="Wrap" />
+        </Border>
+
+        <Border DockPanel.Dock="Top" Classes="infoBar warning" Margin="0,8,0,0"
+                IsVisible="{Binding WasTruncated}">
+            <TextBlock Text="{Binding TruncationNotice}" FontWeight="SemiBold" TextWrapping="Wrap" />
+        </Border>
+
+        <!-- ═══════════════ Report body ═══════════════
+             A collapsible Storage panel (Auto) above the two file lists (*), so the lists take the
+             vast majority of the height. -->
+        <Grid Margin="0,8,0,0" IsVisible="{Binding HasReport}" RowDefinitions="Auto,*">
+
+            <!-- Storage: per-volume used·free·bounded-maximum with a per-folder drill-down. Collapsed
+                 by default to reclaim vertical space; the header carries a one-line summary and a
+                 badge, and the panel auto-opens (OneWay bind — never fights a manual collapse) only
+                 when a destination volume is at capacity risk. Hidden entirely when no projection was
+                 computed (truncated report, or volumes that could not be resolved). -->
+            <Border Grid.Row="0" Classes="card" Padding="0" Margin="0,0,0,8" ClipToBounds="True"
+                    IsVisible="{Binding Space, Converter={x:Static ObjectConverters.IsNotNull}}">
+                <Expander Classes="card" HorizontalAlignment="Stretch"
+                          IsExpanded="{Binding Space.HasWarning, Mode=OneWay}">
+                    <!-- Neutralise Fluent's stock header/content chrome so the wrapping Border.card
+                         surface shows through and the panel reads like the app's other cards. -->
+                    <Expander.Resources>
+                        <SolidColorBrush x:Key="ExpanderHeaderBackground" Color="Transparent" />
+                        <SolidColorBrush x:Key="ExpanderHeaderBackgroundPointerOver" Color="#19808080" />
+                        <SolidColorBrush x:Key="ExpanderHeaderBackgroundPressed" Color="#0F808080" />
+                        <SolidColorBrush x:Key="ExpanderHeaderBackgroundDisabled" Color="Transparent" />
+                        <SolidColorBrush x:Key="ExpanderContentBackground" Color="Transparent" />
+                        <Thickness x:Key="ExpanderHeaderBorderThickness">0</Thickness>
+                        <Thickness x:Key="ExpanderContentDownBorderThickness">0</Thickness>
+                        <Thickness x:Key="ExpanderContentUpBorderThickness">0</Thickness>
+                        <Thickness x:Key="ExpanderHeaderPadding">12,8</Thickness>
+                        <Thickness x:Key="ExpanderContentPadding">12,0,12,12</Thickness>
+                        <x:Double x:Key="ExpanderMinHeight">0</x:Double>
+                    </Expander.Resources>
+                    <Expander.Header>
+                        <StackPanel Orientation="Horizontal" Spacing="8" VerticalAlignment="Center">
+                            <TextBlock Text="Storage" FontWeight="Bold" VerticalAlignment="Center" />
+                            <TextBlock Text="{Binding Space.SummaryText}" Classes="secondary"
+                                       FontSize="11" VerticalAlignment="Center" />
+                            <ctrl:StatusCount VerticalAlignment="Center" IsVisible="{Binding Space.HasWarning}"
+                                              Text="capacity risk" ToolTip.Tip="A destination drive may not have room"
+                                              Icon="{StaticResource IconWarning}" Glyph="{DynamicResource Brush.Warning}" />
+                        </StackPanel>
+                    </Expander.Header>
+
+                    <ItemsControl ItemsSource="{Binding Space.Volumes}" ItemTemplate="{StaticResource VolumeSpaceTemplate}" />
+                </Expander>
+            </Border>
+
+            <!-- Sources and Destinations side by side (draggable split) so the whole picture is
+                 visible at once. Paths are shown relative to each panel's common root to reclaim the
+                 horizontal space that repeated drive prefixes used to waste. -->
+            <Grid Grid.Row="1">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*" MinWidth="360" />
+                    <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="*" MinWidth="360" />
+                </Grid.ColumnDefinitions>
+
+                <!-- ============================= SOURCES ============================= -->
+                <Grid Grid.Column="0" RowDefinitions="Auto,Auto,Auto,*" RowSpacing="6" Margin="0,4,8,0">
+
+                    <!-- header: title + visible-row count | status filters (right). None selected → the
+                         list shows everything; selecting one or more narrows it. The ✕ clears them, and
+                         only appears while a status filter is active. -->
+                    <Grid Grid.Row="0" ColumnDefinitions="Auto,*" ColumnSpacing="8">
+                        <StackPanel Grid.Column="0" Orientation="Horizontal" Spacing="6" VerticalAlignment="Center">
+                            <TextBlock Text="Sources" FontWeight="Bold" FontSize="14" />
+                            <TextBlock Classes="secondary" VerticalAlignment="Center">
+                                <Run Text="(" /><Run Text="{Binding Sources.VisibleRows.Count}" /><Run Text=")" />
+                            </TextBlock>
+                        </StackPanel>
+                        <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="6"
+                                    HorizontalAlignment="Right" VerticalAlignment="Center">
+                            <Button Classes="iconButton" Content="✕" FontSize="12" Padding="6,2"
+                                    VerticalAlignment="Center"
+                                    IsVisible="{Binding Sources.AnyStatusSelected}"
+                                    Command="{Binding Sources.ClearStatusFiltersCommand}"
+                                    ToolTip.Tip="Clear status filters" />
+                            <ItemsControl ItemsSource="{Binding Sources.StatusFilters}"
+                                          ItemTemplate="{StaticResource StatusFilterTemplate}">
+                                <ItemsControl.ItemsPanel>
+                                    <ItemsPanelTemplate><WrapPanel /></ItemsPanelTemplate>
+                                </ItemsControl.ItemsPanel>
+                            </ItemsControl>
+                        </StackPanel>
+                    </Grid>
+
+                    <!-- toolbar: search (stretches) | Filter flyout | list/tree toggle -->
+                    <Grid Grid.Row="1" ColumnDefinitions="*,Auto,Auto">
+                        <TextBox Grid.Column="0" Text="{Binding Sources.SearchText}"
+                                 PlaceholderText="Filter by source or target path…" />
+                        <Button Grid.Column="1" Content="{Binding Sources.FilterLabel}" FontSize="12"
+                                Margin="8,0,0,0" VerticalAlignment="Stretch"
+                                IsVisible="{Binding Sources.ShowAnyFacet}"
+                                ToolTip.Tip="Narrow the view by source and destination root">
+                            <Button.Flyout>
+                                <Flyout Placement="BottomEdgeAlignedRight">
+                                    <StackPanel Spacing="10" MinWidth="200">
+                                        <StackPanel Spacing="6" IsVisible="{Binding Sources.ShowSourceFacet}">
+                                            <TextBlock Classes="panelHeader" Text="SOURCES" />
+                                            <ItemsControl ItemsSource="{Binding Sources.SourceFacets}" ItemTemplate="{StaticResource FacetTemplate}">
+                                                <ItemsControl.ItemsPanel>
+                                                    <ItemsPanelTemplate><WrapPanel MaxWidth="380" /></ItemsPanelTemplate>
+                                                </ItemsControl.ItemsPanel>
+                                            </ItemsControl>
+                                        </StackPanel>
+                                        <StackPanel Spacing="6" IsVisible="{Binding Sources.ShowDestinationFacet}">
+                                            <TextBlock Classes="panelHeader" Text="DESTINATIONS" />
+                                            <ItemsControl ItemsSource="{Binding Sources.DestinationFacets}" ItemTemplate="{StaticResource FacetTemplate}">
+                                                <ItemsControl.ItemsPanel>
+                                                    <ItemsPanelTemplate><WrapPanel MaxWidth="380" /></ItemsPanelTemplate>
+                                                </ItemsControl.ItemsPanel>
+                                            </ItemsControl>
+                                        </StackPanel>
+                                    </StackPanel>
+                                </Flyout>
+                            </Button.Flyout>
+                        </Button>
+                        <ToggleButton Grid.Column="2" Content="Tree view" IsChecked="{Binding Sources.ShowTree}"
+                                      FontSize="12" Margin="8,0,0,0" VerticalAlignment="Stretch"
+                                      ToolTip.Tip="Group the files into a navigable directory tree" />
+                    </Grid>
+
+                    <!-- common root the listed paths are shown relative to (trimmed, full path in tooltip) -->
+                    <TextBlock Grid.Row="2" Text="{Binding Sources.CommonRootDisplay}"
+                               FontFamily="{StaticResource MonoFontFamily}" FontSize="11" Opacity="0.6"
+                               TextTrimming="CharacterEllipsis" VerticalAlignment="Center"
+                               ToolTip.Tip="{Binding Sources.CommonRoot}" />
+
+                    <ListBox Grid.Row="3" Classes="rows" ItemsSource="{Binding Sources.VisibleRows}"
+                             IsVisible="{Binding !Sources.ShowTree}"
+                             SelectionMode="Single" ScrollViewer.HorizontalScrollBarVisibility="Disabled">
+                        <ListBox.ItemTemplate>
+                            <DataTemplate x:DataType="vm:DryRunFileRow">
+                                <Border Background="Transparent" BorderThickness="0,0,0,1" BorderBrush="{DynamicResource SystemControlBackgroundListLowBrush}"
+                                        Padding="4,6,16,6" ToolTip.Tip="{Binding SourcePath}"
+                                        ContextFlyout="{StaticResource FileContextMenu}"><!-- Transparent (not null) background so the whole row hit-tests for the right-click menu, not just the painted text; right inset reserves a gutter for the overlay scrollbar so the status glyphs aren't covered -->
+                                    <Grid RowDefinitions="Auto,Auto" ColumnDefinitions="*,Auto">
+                                        <!-- line 1: file name (extension preserved on truncation) -->
+                                        <ctrl:PathText Grid.Row="0" Grid.Column="0" Text="{Binding FileName}"
+                                                       Mode="EndPreservingExtension" FontFamily="{StaticResource MonoFontFamily}"
+                                                       FontSize="13" VerticalAlignment="Center" Opacity="{Binding ContentOpacity}" />
+
+                                        <!-- line 1: status glyphs — the single target-op kind, then the
+                                             source-side status (Processed and Deleted can both show). -->
+                                        <StackPanel Grid.Row="0" Grid.Column="1" Orientation="Horizontal" Spacing="8"
+                                                    Margin="8,0,0,0" VerticalAlignment="Center">
+                                            <ctrl:StatusCount IsVisible="{Binding HasTargetKind}" ToolTip.Tip="{Binding PrimaryKindText}"
+                                                              Icon="{Binding PrimaryKindIconKey, Converter={x:Static conv:IconConverters.Geometry}}"
+                                                              Glyph="{Binding PrimaryKindColorKey, Converter={x:Static conv:IconConverters.Brush}}" />
+                                            <ctrl:StatusCount IsVisible="{Binding IsUntouched}" ToolTip.Tip="Untouched"
+                                                              Icon="{StaticResource IconUntouched}" Glyph="{DynamicResource Brush.Info}" />
+                                            <ctrl:StatusCount IsVisible="{Binding IsProcessed}" ToolTip.Tip="Processed"
+                                                              Icon="{StaticResource IconCheckmark}" Glyph="{DynamicResource Brush.Success}" />
+                                            <ctrl:StatusCount IsVisible="{Binding IsDeleted}" ToolTip.Tip="Deleted"
+                                                              Icon="{StaticResource IconTrash}" Glyph="{DynamicResource Brush.Danger}" />
+                                        </StackPanel>
+
+                                        <!-- line 2: parent directory (relative, folder-truncated) + right-aligned size -->
+                                        <ctrl:PathText Grid.Row="1" Grid.Column="0" Text="{Binding ParentDisplay}"
+                                                       Mode="FolderMiddleEllipsis" FontFamily="{StaticResource MonoFontFamily}"
+                                                       FontSize="11" Margin="0,2,0,0" Opacity="0.6" VerticalAlignment="Center" />
+                                        <TextBlock Grid.Row="1" Grid.Column="1" Text="{Binding SizeText}"
+                                                   FontSize="11" Opacity="0.6" VerticalAlignment="Center"
+                                                   HorizontalAlignment="Right" Margin="8,2,0,0" />
+                                    </Grid>
+                                </Border>
+                            </DataTemplate>
+                        </ListBox.ItemTemplate>
+                    </ListBox>
+
+                    <!-- The tree grid is hosted in a ContentControl (not a plain IsVisible toggle) so it
+                         is created only while a forest is present and destroyed the moment the tree is
+                         toggled off: TreeSource goes null, the ContentPresenter drops the TreeDataGrid,
+                         and the control's realized rows / element-recycle pool — which root the whole
+                         forest of nodes and would otherwise stack across toggles — go with it. A fresh
+                         grid is built when the tree is turned back on. -->
+                    <ContentControl Grid.Row="3" IsVisible="{Binding Sources.ShowTree}"
+                                    Content="{Binding Sources.TreeSource}">
+                        <ContentControl.ContentTemplate>
+                            <DataTemplate x:CompileBindings="False">
+                                <TreeDataGrid Classes="rows" Source="{Binding}" />
+                            </DataTemplate>
+                        </ContentControl.ContentTemplate>
+                    </ContentControl>
+
+                    <!-- Loading overlay: shown while a large rebuild (tree build / filter pass) runs
+                         on the thread pool — the view beneath is empty or stale until it publishes. -->
+                    <Panel Grid.Row="3" IsVisible="{Binding Sources.IsRebuilding}">
+                        <Border Background="{DynamicResource Brush.Window.Background}" Opacity="0.6" />
+                        <StackPanel Spacing="10" MinWidth="220" VerticalAlignment="Center" HorizontalAlignment="Center">
+                            <ProgressBar IsIndeterminate="True" />
+                            <TextBlock Classes="caption" Text="Building view…" HorizontalAlignment="Center" />
+                        </StackPanel>
+                    </Panel>
+                </Grid>
+
+                <GridSplitter Grid.Column="1" Width="6" ResizeDirection="Columns"
+                              Background="{DynamicResource SystemControlBackgroundListLowBrush}" />
+
+                <!-- ============================ DESTINATIONS ============================ -->
+                <Grid Grid.Column="2" RowDefinitions="Auto,Auto,Auto,*" RowSpacing="6" Margin="8,4,0,0">
+
+                    <!-- header: title + visible-row count | status filters (right, see Sources). -->
+                    <Grid Grid.Row="0" ColumnDefinitions="Auto,*" ColumnSpacing="8">
+                        <StackPanel Grid.Column="0" Orientation="Horizontal" Spacing="6" VerticalAlignment="Center">
+                            <TextBlock Text="Destinations" FontWeight="Bold" FontSize="14" />
+                            <TextBlock Classes="secondary" VerticalAlignment="Center">
+                                <Run Text="(" /><Run Text="{Binding Destinations.VisibleRows.Count}" /><Run Text=")" />
+                            </TextBlock>
+                        </StackPanel>
+                        <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="6"
+                                    HorizontalAlignment="Right" VerticalAlignment="Center">
+                            <Button Classes="iconButton" Content="✕" FontSize="12" Padding="6,2"
+                                    VerticalAlignment="Center"
+                                    IsVisible="{Binding Destinations.AnyStatusSelected}"
+                                    Command="{Binding Destinations.ClearStatusFiltersCommand}"
+                                    ToolTip.Tip="Clear status filters" />
+                            <ItemsControl ItemsSource="{Binding Destinations.StatusFilters}"
+                                          ItemTemplate="{StaticResource StatusFilterTemplate}">
+                                <ItemsControl.ItemsPanel>
+                                    <ItemsPanelTemplate><WrapPanel /></ItemsPanelTemplate>
+                                </ItemsControl.ItemsPanel>
+                            </ItemsControl>
+                        </StackPanel>
+                    </Grid>
+
+                    <Grid Grid.Row="1" ColumnDefinitions="*,Auto,Auto">
+                        <TextBox Grid.Column="0" Text="{Binding Destinations.SearchText}"
+                                 PlaceholderText="Filter by destination or source path…" />
+                        <Button Grid.Column="1" Content="{Binding Destinations.FilterLabel}" FontSize="12"
+                                Margin="8,0,0,0" VerticalAlignment="Stretch"
+                                IsVisible="{Binding Destinations.ShowAnyFacet}"
+                                ToolTip.Tip="Narrow the view by source and destination root">
+                            <Button.Flyout>
+                                <Flyout Placement="BottomEdgeAlignedRight">
+                                    <StackPanel Spacing="10" MinWidth="200">
+                                        <StackPanel Spacing="6" IsVisible="{Binding Destinations.ShowSourceFacet}">
+                                            <TextBlock Classes="panelHeader" Text="SOURCES" />
+                                            <ItemsControl ItemsSource="{Binding Destinations.SourceFacets}" ItemTemplate="{StaticResource FacetTemplate}">
+                                                <ItemsControl.ItemsPanel>
+                                                    <ItemsPanelTemplate><WrapPanel MaxWidth="380" /></ItemsPanelTemplate>
+                                                </ItemsControl.ItemsPanel>
+                                            </ItemsControl>
+                                        </StackPanel>
+                                        <StackPanel Spacing="6" IsVisible="{Binding Destinations.ShowDestinationFacet}">
+                                            <TextBlock Classes="panelHeader" Text="DESTINATIONS" />
+                                            <ItemsControl ItemsSource="{Binding Destinations.DestinationFacets}" ItemTemplate="{StaticResource FacetTemplate}">
+                                                <ItemsControl.ItemsPanel>
+                                                    <ItemsPanelTemplate><WrapPanel MaxWidth="380" /></ItemsPanelTemplate>
+                                                </ItemsControl.ItemsPanel>
+                                            </ItemsControl>
+                                        </StackPanel>
+                                    </StackPanel>
+                                </Flyout>
+                            </Button.Flyout>
+                        </Button>
+                        <ToggleButton Grid.Column="2" Content="Tree view" IsChecked="{Binding Destinations.ShowTree}"
+                                      FontSize="12" Margin="8,0,0,0" VerticalAlignment="Stretch"
+                                      ToolTip.Tip="Group the resulting files into a navigable directory tree" />
+                    </Grid>
+
+                    <!-- common root the listed paths are shown relative to (trimmed, full path in tooltip) -->
+                    <TextBlock Grid.Row="2" Text="{Binding Destinations.CommonRootDisplay}"
+                               FontFamily="{StaticResource MonoFontFamily}" FontSize="11" Opacity="0.6"
+                               TextTrimming="CharacterEllipsis" VerticalAlignment="Center"
+                               ToolTip.Tip="{Binding Destinations.CommonRoot}" />
+
+                    <ListBox Grid.Row="3" Classes="rows" ItemsSource="{Binding Destinations.VisibleRows}"
+                             IsVisible="{Binding !Destinations.ShowTree}"
+                             SelectionMode="Single" ScrollViewer.HorizontalScrollBarVisibility="Disabled">
+                        <ListBox.ItemTemplate>
+                            <DataTemplate x:DataType="vm:DryRunDestinationRow">
+                                <Border Background="Transparent" BorderThickness="0,0,0,1" BorderBrush="{DynamicResource SystemControlBackgroundListLowBrush}"
+                                        Padding="4,6,16,6" ContextFlyout="{StaticResource FileContextMenu}"><!-- Transparent (not null) background so the whole row hit-tests for the right-click menu, not just the painted text; right inset reserves a gutter for the overlay scrollbar so the status glyphs aren't covered -->
+                                    <!-- Compact 2-row layout mirroring the source row: destination name + status
+                                         glyphs (one per distinct kind) on line 1, the first destination's relative
+                                         folder + size on line 2. Fan-out targets share the same relative path, so
+                                         only the first is shown (filter by destination to split them); the tooltip
+                                         carries the originating source path. -->
+                                    <Grid RowDefinitions="Auto,Auto" ColumnDefinitions="*,Auto"
+                                          ToolTip.Tip="{Binding HoverPath}">
+                                        <ctrl:PathText Grid.Row="0" Grid.Column="0" Text="{Binding Primary.FileName}"
+                                                       Mode="EndPreservingExtension" FontFamily="{StaticResource MonoFontFamily}"
+                                                       FontSize="13" VerticalAlignment="Center" />
+
+                                        <ItemsControl Grid.Row="0" Grid.Column="1" ItemsSource="{Binding DistinctStatusEntries}"
+                                                      Margin="8,0,0,0" VerticalAlignment="Center" HorizontalAlignment="Right">
+                                            <ItemsControl.ItemsPanel>
+                                                <ItemsPanelTemplate><StackPanel Orientation="Horizontal" Spacing="8" /></ItemsPanelTemplate>
+                                            </ItemsControl.ItemsPanel>
+                                            <ItemsControl.ItemTemplate>
+                                                <DataTemplate x:DataType="vm:DryRunDestinationEntry">
+                                                    <ctrl:StatusCount VerticalAlignment="Center" ToolTip.Tip="{Binding StatusText}"
+                                                                      Icon="{Binding StatusIconKey, Converter={x:Static conv:IconConverters.Geometry}}"
+                                                                      Glyph="{Binding StatusColorKey, Converter={x:Static conv:IconConverters.Brush}}" />
+                                                </DataTemplate>
+                                            </ItemsControl.ItemTemplate>
+                                        </ItemsControl>
+
+                                        <ctrl:PathText Grid.Row="1" Grid.Column="0" Text="{Binding Primary.ParentDisplay}"
+                                                       Mode="FolderMiddleEllipsis" FontFamily="{StaticResource MonoFontFamily}"
+                                                       FontSize="11" Margin="0,2,0,0" Opacity="0.6" VerticalAlignment="Center" />
+                                        <TextBlock Grid.Row="1" Grid.Column="1" Text="{Binding Primary.SizeText}"
+                                                   FontSize="11" Opacity="0.6" VerticalAlignment="Center"
+                                                   HorizontalAlignment="Right" Margin="8,2,0,0" />
+                                    </Grid>
+                                </Border>
+                            </DataTemplate>
+                        </ListBox.ItemTemplate>
+                    </ListBox>
+
+                    <!-- Hosted in a ContentControl so the grid is created/destroyed with the forest —
+                         see the Sources tab above for why (releasing the TreeDataGrid's realized rows
+                         on toggle-off instead of stranding them). -->
+                    <ContentControl Grid.Row="3" IsVisible="{Binding Destinations.ShowTree}"
+                                    Content="{Binding Destinations.TreeSource}">
+                        <ContentControl.ContentTemplate>
+                            <DataTemplate x:CompileBindings="False">
+                                <TreeDataGrid Classes="rows" Source="{Binding}" />
+                            </DataTemplate>
+                        </ContentControl.ContentTemplate>
+                    </ContentControl>
+
+                    <!-- Loading overlay: shown while a large rebuild (tree build / filter pass) runs
+                         on the thread pool — the view beneath is empty or stale until it publishes. -->
+                    <Panel Grid.Row="3" IsVisible="{Binding Destinations.IsRebuilding}">
+                        <Border Background="{DynamicResource Brush.Window.Background}" Opacity="0.6" />
+                        <StackPanel Spacing="10" MinWidth="220" VerticalAlignment="Center" HorizontalAlignment="Center">
+                            <ProgressBar IsIndeterminate="True" />
+                            <TextBlock Classes="caption" Text="Building view…" HorizontalAlignment="Center" />
+                        </StackPanel>
+                    </Panel>
+                </Grid>
+            </Grid>
+        </Grid>
+    </DockPanel>
+
+</UserControl>

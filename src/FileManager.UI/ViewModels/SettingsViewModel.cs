@@ -1,0 +1,303 @@
+using CommunityToolkit.Mvvm.ComponentModel;
+using CommunityToolkit.Mvvm.Input;
+using FileManager.Contracts.IPC;
+using FileManager.Contracts.Settings;
+using FileManager.UI.Services;
+using System;
+using System.Collections.Generic;
+using System.Collections.ObjectModel;
+using System.IO;
+using System.Threading.Tasks;
+
+namespace FileManager.UI.ViewModels;
+
+/// <summary>Edits the machine-level <see cref="GlobalSettings"/> — theme, service startup, and the
+/// scan/hash thread budgets (<see cref="ScanThreadingSettings"/>). Loads from and saves to the service
+/// over IPC. Scan concurrency is global-only now: profiles no longer override it.</summary>
+public sealed partial class SettingsViewModel : ViewModelBase
+{
+    private readonly IIpcGateway _gateway;
+    private readonly IFolderPicker _folderPicker;
+
+    public SettingsViewModel(IIpcGateway gateway, IFolderPicker folderPicker)
+    {
+        _gateway = gateway;
+        _folderPicker = folderPicker;
+    }
+
+    public IReadOnlyList<ServiceStartupMode> ServiceStartupModeOptions { get; } =
+        [ServiceStartupMode.RunOnStartup, ServiceStartupMode.StartOnProgramOpen, ServiceStartupMode.StartAndStopWithProgram];
+
+    public IReadOnlyList<ThemeMode> ThemeModeOptions { get; } =
+        [ThemeMode.System, ThemeMode.Light, ThemeMode.Dark];
+
+    // Shadow "explicit" defaults shown when a budget's Auto is unchecked, matching the engine's auto
+    // formulas so the starting number is the value auto would have chosen.
+    private static int ScanAutoDefault => Environment.ProcessorCount * 8;
+    private static int HashAutoDefault => Math.Max(1, Environment.ProcessorCount - 1);
+    private static int PerDriveAutoDefault => Environment.ProcessorCount * 4;
+
+    [ObservableProperty] public partial ThemeMode ThemeMode { get; set; } = ThemeMode.System;
+    [ObservableProperty] public partial ServiceStartupMode StartupMode { get; set; } = ServiceStartupMode.StartAndStopWithProgram;
+
+    [ObservableProperty] public partial bool MaxScanThreadsAuto { get; set; } = true;
+    [ObservableProperty] public partial int MaxScanThreadsValue { get; set; } = ScanAutoDefault;
+    [ObservableProperty] public partial bool MaxHashThreadsAuto { get; set; } = true;
+    [ObservableProperty] public partial int MaxHashThreadsValue { get; set; } = HashAutoDefault;
+    [ObservableProperty] public partial bool PerDriveDefaultAuto { get; set; } = true;
+    [ObservableProperty] public partial int PerDriveDefaultValue { get; set; } = PerDriveAutoDefault;
+
+    [ObservableProperty] public partial string ScratchDirectory { get; set; } = GlobalSettings.DefaultScratchDirectory;
+
+    [ObservableProperty] public partial string ProfilesDirectory { get; set; } = GlobalSettings.DefaultProfilesDirectory;
+
+    [ObservableProperty] public partial string? StatusMessage { get; set; }
+    [ObservableProperty] public partial string? ErrorMessage { get; set; }
+    [ObservableProperty] public partial bool IsBusy { get; set; }
+
+    public bool ShowMaxScanThreadsValue => !MaxScanThreadsAuto;
+    public bool ShowMaxHashThreadsValue => !MaxHashThreadsAuto;
+    public bool ShowPerDriveDefaultValue => !PerDriveDefaultAuto;
+
+    partial void OnMaxScanThreadsAutoChanged(bool value) => OnPropertyChanged(nameof(ShowMaxScanThreadsValue));
+    partial void OnMaxHashThreadsAutoChanged(bool value) => OnPropertyChanged(nameof(ShowMaxHashThreadsValue));
+    partial void OnPerDriveDefaultAutoChanged(bool value) => OnPropertyChanged(nameof(ShowPerDriveDefaultValue));
+
+    public ObservableCollection<DriveTypeOverrideRowViewModel> DriveTypeOverrides { get; } = [];
+    public ObservableCollection<SpecificDriveOverrideRowViewModel> SpecificDriveOverrides { get; } = [];
+
+    [RelayCommand]
+    private async Task BrowseScratchDirectory()
+    {
+        string? picked = await _folderPicker.PickFolderAsync("Choose the dry-run scratch directory");
+        if (picked is not null)
+            ScratchDirectory = picked;
+    }
+
+    /// <summary>Set by the host to ask (modal Yes/No, defaulting to No) whether the existing profiles
+    /// should be moved into the newly chosen folder. Kept as a callback so the VM stays
+    /// window-agnostic (mirrors <see cref="RequestClose"/>).</summary>
+    public Func<string, Task<bool>>? ConfirmMoveProfiles { get; set; }
+
+    /// <summary>Set by the host to refresh the profile list after a successful relocation (the service
+    /// now serves a different directory). Kept as a callback so the VM stays shell-agnostic.</summary>
+    public Func<Task>? ProfilesRelocated { get; set; }
+
+    /// <summary>Changes the profiles storage folder. Applied immediately (and transactionally) on the
+    /// service via a dedicated IPC call — independent of the Save button — because it moves files and
+    /// reloads the catalog. The generic Save just re-persists the resulting path.</summary>
+    [RelayCommand]
+    private async Task ChangeProfilesDirectory()
+    {
+        ErrorMessage = null;
+        StatusMessage = null;
+
+        // The whole body is guarded: even Path.GetFullPath can throw (corrupt settings can hand us
+        // an empty ProfilesDirectory), and an escape from the command boundary would take down the
+        // UI thread unlogged.
+        try
+        {
+            string? picked = await _folderPicker.PickFolderAsync("Choose the profiles storage folder");
+            if (picked is null)
+                return;
+            if (IsSameFolder(picked, ProfilesDirectory))
+                return;   // same folder — nothing to do
+
+            bool move = ConfirmMoveProfiles is not null
+                && await ConfirmMoveProfiles(
+                    $"Move the existing profiles into \"{picked}\"? Choose No to start fresh there and leave the current profiles where they are.");
+
+            IsBusy = true;
+            var result = await _gateway.RelocateProfilesAsync(picked, move);
+            if (result.TryGetError(out IpcError? error))
+            {
+                ErrorMessage = $"Could not change the profiles folder: {error.Message}";
+                return;
+            }
+            result.TryGetValue(out RelocateProfilesResponse? outcome);
+            ProfilesDirectory = outcome!.Settings.ProfilesDirectory;
+            if (outcome.SkippedFiles.Count > 0)
+                // Never report a clean success over a collision: the new folder's pre-existing
+                // (possibly stale) copies are the ones in use now.
+                ErrorMessage =
+                    $"Profiles folder changed, but {outcome.SkippedFiles.Count} profile file(s) stayed in the old folder " +
+                    "because the new folder already had files with the same names — those pre-existing copies are the ones in use.";
+            else
+                StatusMessage = move
+                    ? $"Profiles folder changed; {outcome.MovedCount} profile file(s) moved."
+                    : "Profiles folder changed.";
+            if (ProfilesRelocated is not null)
+                await ProfilesRelocated();
+        }
+        catch (Exception ex)
+        {
+            Serilog.Log.Error(ex, "Changing the profiles folder failed unexpectedly");
+            ErrorMessage = $"Could not change the profiles folder: {ex.Message}";
+        }
+        finally
+        {
+            IsBusy = false;
+        }
+    }
+
+    /// <summary>Same-location check tolerant of bad current state: an empty/invalid current
+    /// directory never matches (the relocation proceeds and the service validates).</summary>
+    private static bool IsSameFolder(string picked, string current)
+    {
+        if (string.IsNullOrWhiteSpace(current))
+            return false;
+        return string.Equals(
+            Path.TrimEndingDirectorySeparator(Path.GetFullPath(picked)),
+            Path.TrimEndingDirectorySeparator(Path.GetFullPath(current)),
+            StringComparison.OrdinalIgnoreCase);
+    }
+
+    [RelayCommand] private void AddDriveTypeOverride() => DriveTypeOverrides.Add(new DriveTypeOverrideRowViewModel { Value = PerDriveAutoDefault });
+    [RelayCommand] private void RemoveDriveTypeOverride(DriveTypeOverrideRowViewModel row) => DriveTypeOverrides.Remove(row);
+    [RelayCommand] private void AddSpecificDriveOverride() => SpecificDriveOverrides.Add(new SpecificDriveOverrideRowViewModel { Value = PerDriveAutoDefault });
+    [RelayCommand] private void RemoveSpecificDriveOverride(SpecificDriveOverrideRowViewModel row) => SpecificDriveOverrides.Remove(row);
+
+    /// <summary>Set by the host so a successful save can close the dialog. Kept as a callback so the
+    /// VM stays window-agnostic (mirrors the folder-picker seam).</summary>
+    public Action? RequestClose { get; set; }
+
+    public async Task LoadAsync()
+    {
+        IsBusy = true;
+        ErrorMessage = null;
+        StatusMessage = null;
+        try
+        {
+            var result = await _gateway.GetSettingsAsync();
+            if (result.TryGetError(out IpcError? error))
+            {
+                ErrorMessage = $"Could not load settings: {error.Message}";
+                return;
+            }
+            result.TryGetValue(out GlobalSettings? settings);
+            ThemeMode = settings!.ThemeMode;
+            StartupMode = settings.ServiceStartupMode;
+            ScratchDirectory = settings.ScratchDirectory;
+            ProfilesDirectory = settings.ProfilesDirectory;
+
+            ScanThreadingSettings st = settings.ScanThreading;
+            (MaxScanThreadsAuto, MaxScanThreadsValue) = FromBudget(st.MaxScanThreads, ScanAutoDefault);
+            (MaxHashThreadsAuto, MaxHashThreadsValue) = FromBudget(st.MaxHashThreads, HashAutoDefault);
+            (PerDriveDefaultAuto, PerDriveDefaultValue) = FromBudget(st.PerDriveDefault, PerDriveAutoDefault);
+
+            DriveTypeOverrides.Clear();
+            foreach (KeyValuePair<DriveClass, ThreadBudget> e in st.DriveTypeOverrides)
+            {
+                (bool auto, int value) = FromBudget(e.Value, PerDriveAutoDefault);
+                DriveTypeOverrides.Add(new DriveTypeOverrideRowViewModel { Class = e.Key, Auto = auto, Value = value });
+            }
+
+            SpecificDriveOverrides.Clear();
+            foreach (KeyValuePair<string, ThreadBudget> e in st.SpecificDriveOverrides)
+            {
+                (bool auto, int value) = FromBudget(e.Value, PerDriveAutoDefault);
+                SpecificDriveOverrides.Add(new SpecificDriveOverrideRowViewModel { VolumeKey = e.Key, Auto = auto, Value = value });
+            }
+        }
+        catch (Exception ex)
+        {
+            // Last resort: an unexpected exception becomes an error banner, not an unobserved fault.
+            Serilog.Log.Error(ex, "Loading global settings failed unexpectedly");
+            ErrorMessage = $"Could not load settings: {ex.Message}";
+        }
+        finally
+        {
+            IsBusy = false;
+        }
+    }
+
+    [RelayCommand]
+    private async Task SaveAsync()
+    {
+        IsBusy = true;
+        ErrorMessage = null;
+        StatusMessage = null;
+        try
+        {
+            // Reject duplicate keys rather than silently collapsing them (last-wins), which would drop a
+            // row the user thinks they saved. TryAdd fails on a repeat, so the first conflict aborts.
+            Dictionary<DriveClass, ThreadBudget> byType = [];
+            foreach (DriveTypeOverrideRowViewModel row in DriveTypeOverrides)
+            {
+                if (!byType.TryAdd(row.Class, ToBudget(row.Auto, row.Value)))
+                {
+                    ErrorMessage = $"Duplicate drive-type override for {row.Class}.";
+                    return;
+                }
+            }
+
+            Dictionary<string, ThreadBudget> specific = [];
+            foreach (SpecificDriveOverrideRowViewModel row in SpecificDriveOverrides)
+            {
+                if (string.IsNullOrWhiteSpace(row.VolumeKey))
+                    continue;
+                string key = row.VolumeKey.Trim().ToLowerInvariant();
+                if (!specific.TryAdd(key, ToBudget(row.Auto, row.Value)))
+                {
+                    ErrorMessage = $"Duplicate volume key \"{key}\".";
+                    return;
+                }
+            }
+
+            string scratch = ScratchDirectory?.Trim() ?? "";
+            if (scratch.Length == 0)
+            {
+                ErrorMessage = "The scratch directory cannot be empty.";
+                return;
+            }
+            if (!Path.IsPathFullyQualified(scratch))
+            {
+                ErrorMessage = "The scratch directory must be an absolute path.";
+                return;
+            }
+
+            GlobalSettings settings = new()
+            {
+                ThemeMode = ThemeMode,
+                ServiceStartupMode = StartupMode,
+                ScratchDirectory = scratch,
+                // The profiles directory is changed transactionally via ChangeProfilesDirectory; carry
+                // the current value through so a generic Save never resets it to the default.
+                ProfilesDirectory = ProfilesDirectory,
+                ScanThreading = new ScanThreadingSettings
+                {
+                    MaxScanThreads = ToBudget(MaxScanThreadsAuto, MaxScanThreadsValue),
+                    MaxHashThreads = ToBudget(MaxHashThreadsAuto, MaxHashThreadsValue),
+                    PerDriveDefault = ToBudget(PerDriveDefaultAuto, PerDriveDefaultValue),
+                    DriveTypeOverrides = byType,
+                    SpecificDriveOverrides = specific,
+                },
+            };
+            var result = await _gateway.SaveSettingsAsync(settings);
+            if (result.TryGetError(out IpcError? error))
+            {
+                ErrorMessage = $"Save failed: {error.Message}";
+                return;
+            }
+            StatusMessage = "Saved.";
+            ThemeApplier.Apply(ThemeMode);      // apply the selected theme app-wide on save
+            RequestClose?.Invoke();
+        }
+        catch (Exception ex)
+        {
+            // Last resort: an unexpected exception becomes an error banner, not an unobserved fault.
+            Serilog.Log.Error(ex, "Saving global settings failed unexpectedly");
+            ErrorMessage = $"Save failed unexpectedly: {ex.Message}";
+        }
+        finally
+        {
+            IsBusy = false;
+        }
+    }
+
+    private static (bool Auto, int Value) FromBudget(ThreadBudget budget, int autoDefault) =>
+        budget.Value is int v ? (false, v) : (true, autoDefault);
+
+    private static ThreadBudget ToBudget(bool auto, int value) =>
+        auto ? ThreadBudget.Auto : ThreadBudget.Explicit(Math.Max(1, value));
+}

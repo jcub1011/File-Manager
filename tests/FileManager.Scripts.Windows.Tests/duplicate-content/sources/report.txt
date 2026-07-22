@@ -1,0 +1,1 @@
+Quarterly report body. Every byte here is identical across copies.

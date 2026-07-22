@@ -1,0 +1,29 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:vm="using:FileManager.UI.ViewModels"
+             x:Class="FileManager.UI.Views.StatusBarView"
+             x:DataType="vm:StatusBarViewModel">
+
+    <UserControl.Styles>
+        <!-- VS-signature solid accent status strip; turns to a danger tint while disconnected. -->
+        <Style Selector="Border.statusBar">
+            <Setter Property="Background" Value="{DynamicResource Brush.StatusBar.Background}" />
+        </Style>
+        <Style Selector="Border.statusBar.disconnected">
+            <Setter Property="Background" Value="{DynamicResource Brush.StatusBar.Disconnected}" />
+        </Style>
+    </UserControl.Styles>
+
+    <Border Classes="statusBar" Classes.disconnected="{Binding !IsConnected}" Padding="12,5">
+        <StackPanel Orientation="Horizontal" Spacing="8">
+            <Ellipse Width="9" Height="9" Fill="#7FFFFFFF" VerticalAlignment="Center"
+                     IsVisible="{Binding IsConnected}" />
+            <Ellipse Width="9" Height="9" Fill="White" VerticalAlignment="Center"
+                     IsVisible="{Binding !IsConnected}" />
+            <TextBlock Text="{Binding StatusText}" VerticalAlignment="Center"
+                       FontSize="{StaticResource Font.Small}"
+                       Foreground="{DynamicResource Brush.StatusBar.Foreground}" />
+        </StackPanel>
+    </Border>
+
+</UserControl>

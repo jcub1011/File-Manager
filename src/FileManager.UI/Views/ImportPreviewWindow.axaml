@@ -1,0 +1,76 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="using:FileManager.UI.ViewModels"
+        x:Class="FileManager.UI.Views.ImportPreviewWindow"
+        x:DataType="vm:ImportPreviewViewModel"
+        Width="520" Height="560"
+        WindowStartupLocation="CenterOwner"
+        FontFamily="{StaticResource AppFontFamily}"
+        FontSize="{StaticResource Font.Body}"
+        Background="{DynamicResource Brush.Window.Background}"
+        Title="Import profile?">
+
+    <DockPanel Margin="16">
+        <Border DockPanel.Dock="Top" Classes="sectionHeader" Margin="0,0,0,8">
+            <TextBlock Text="{Binding ProfileName, StringFormat='Import &quot;{0}&quot;?'}" />
+        </Border>
+        <TextBlock DockPanel.Dock="Top" TextWrapping="Wrap" Classes="secondary" Margin="0,0,0,8"
+                   Text="{Binding FileName, StringFormat='This profile file ({0}) was authored outside this app. Review what it reads, writes, and deletes before importing. It is imported inactive either way.'}" />
+
+        <StackPanel DockPanel.Dock="Bottom" Orientation="Horizontal" Spacing="8"
+                    HorizontalAlignment="Right" Margin="0,12,0,0">
+            <Button Content="Import" Classes="accent" Click="OnImportClick" />
+            <Button Content="Skip" IsDefault="True" Click="OnSkipClick" />
+        </StackPanel>
+
+        <ScrollViewer>
+            <StackPanel Spacing="10">
+                <Border Classes="infoBar danger" IsVisible="{Binding IsDestructive}">
+                    <TextBlock Text="{Binding DispositionText}" TextWrapping="Wrap" />
+                </Border>
+                <TextBlock Text="{Binding DispositionText}" TextWrapping="Wrap"
+                           IsVisible="{Binding !IsDestructive}" />
+
+                <StackPanel Spacing="2">
+                    <TextBlock Text="Reads from (sources):" FontWeight="SemiBold" />
+                    <ItemsControl ItemsSource="{Binding Sources}">
+                        <ItemsControl.ItemTemplate>
+                            <DataTemplate x:DataType="x:String">
+                                <TextBlock Text="{Binding}" TextWrapping="Wrap" Classes="secondary" Margin="8,0,0,0" />
+                            </DataTemplate>
+                        </ItemsControl.ItemTemplate>
+                    </ItemsControl>
+                </StackPanel>
+
+                <StackPanel Spacing="2">
+                    <TextBlock Text="Writes to (targets):" FontWeight="SemiBold" />
+                    <ItemsControl ItemsSource="{Binding Targets}">
+                        <ItemsControl.ItemTemplate>
+                            <DataTemplate x:DataType="x:String">
+                                <TextBlock Text="{Binding}" TextWrapping="Wrap" Classes="secondary" Margin="8,0,0,0" />
+                            </DataTemplate>
+                        </ItemsControl.ItemTemplate>
+                    </ItemsControl>
+                </StackPanel>
+
+                <TextBlock Text="{Binding VerificationText}" Classes="secondary" />
+                <TextBlock Text="{Binding SyncModeText}" Classes="secondary" />
+
+                <StackPanel Spacing="2" IsVisible="{Binding HasTransformers}">
+                    <Border Classes="infoBar danger">
+                        <TextBlock Text="This profile contains transformer steps that run external programs on your files:"
+                                   TextWrapping="Wrap" />
+                    </Border>
+                    <ItemsControl ItemsSource="{Binding TransformerLines}">
+                        <ItemsControl.ItemTemplate>
+                            <DataTemplate x:DataType="x:String">
+                                <TextBlock Text="{Binding}" TextWrapping="Wrap" Classes="secondary" Margin="8,0,0,0" />
+                            </DataTemplate>
+                        </ItemsControl.ItemTemplate>
+                    </ItemsControl>
+                </StackPanel>
+            </StackPanel>
+        </ScrollViewer>
+    </DockPanel>
+
+</Window>

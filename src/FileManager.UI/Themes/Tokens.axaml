@@ -1,0 +1,142 @@
+<ResourceDictionary xmlns="https://github.com/avaloniaui"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+    <!--
+      Central design tokens for the whole app (VS-inspired). Theme-dependent colours live in
+      ThemeDictionaries so they follow the system light/dark variant; reference them with
+      {DynamicResource ...} so a variant switch re-resolves them live. Variant-independent scalars
+      (spacing, radii, font sizes, font family) are plain resources below and can be {StaticResource}.
+    -->
+    <ResourceDictionary.ThemeDictionaries>
+
+        <!-- ============================ DARK (signature) ============================ -->
+        <ResourceDictionary x:Key="Dark">
+            <!-- surfaces -->
+            <SolidColorBrush x:Key="Brush.Window.Background" Color="#1E1E1E" />
+            <SolidColorBrush x:Key="Brush.Panel.Background" Color="#252526" />
+            <SolidColorBrush x:Key="Brush.Chrome.Background" Color="#2D2D30" />
+            <SolidColorBrush x:Key="Brush.Panel.Border" Color="#3F3F46" />
+
+            <!-- controls -->
+            <SolidColorBrush x:Key="Brush.Control.Background" Color="#333337" />
+            <SolidColorBrush x:Key="Brush.Control.Border" Color="#3F3F46" />
+            <SolidColorBrush x:Key="Brush.Control.BorderHover" Color="#5A5A5E" />
+
+            <!-- list rows -->
+            <SolidColorBrush x:Key="Brush.Item.Hover" Color="#2A2D2E" />
+            <SolidColorBrush x:Key="Brush.Item.Selected" Color="#37373D" />
+
+            <!-- accent -->
+            <SolidColorBrush x:Key="Brush.Accent" Color="#007ACC" />
+            <SolidColorBrush x:Key="Brush.Accent.Hover" Color="#1C8AD6" />
+            <SolidColorBrush x:Key="Brush.Accent.Pressed" Color="#0E639C" />
+            <SolidColorBrush x:Key="Brush.Accent.Foreground" Color="#FFFFFF" />
+
+            <!-- text -->
+            <SolidColorBrush x:Key="Brush.Text.Primary" Color="#F1F1F1" />
+            <SolidColorBrush x:Key="Brush.Text.Secondary" Color="#9DA3AB" />
+            <SolidColorBrush x:Key="Brush.Text.Disabled" Color="#6D6D70" />
+
+            <!-- status bar -->
+            <SolidColorBrush x:Key="Brush.StatusBar.Background" Color="#007ACC" />
+            <SolidColorBrush x:Key="Brush.StatusBar.Disconnected" Color="#A1260D" />
+            <SolidColorBrush x:Key="Brush.StatusBar.Foreground" Color="#FFFFFF" />
+
+            <!-- neutral chip -->
+            <SolidColorBrush x:Key="Brush.Chip.Background" Color="#3A3A3D" />
+
+            <!-- Re-point Fluent's accent so every stock control (accent button, checkbox check,
+                 combobox selection, focus adorner) adopts VS blue without per-control templating. -->
+            <Color x:Key="SystemAccentColor">#007ACC</Color>
+            <Color x:Key="SystemAccentColorDark1">#0E639C</Color>
+            <Color x:Key="SystemAccentColorDark2">#0A557F</Color>
+            <Color x:Key="SystemAccentColorDark3">#083F5E</Color>
+            <Color x:Key="SystemAccentColorLight1">#1C8AD6</Color>
+            <Color x:Key="SystemAccentColorLight2">#3D9BDC</Color>
+            <Color x:Key="SystemAccentColorLight3">#5EACE2</Color>
+        </ResourceDictionary>
+
+        <!-- ================================ LIGHT ================================ -->
+        <ResourceDictionary x:Key="Light">
+            <!-- surfaces -->
+            <SolidColorBrush x:Key="Brush.Window.Background" Color="#FFFFFF" />
+            <SolidColorBrush x:Key="Brush.Panel.Background" Color="#F3F3F3" />
+            <SolidColorBrush x:Key="Brush.Chrome.Background" Color="#EEEEF2" />
+            <SolidColorBrush x:Key="Brush.Panel.Border" Color="#DCDCE0" />
+
+            <!-- controls -->
+            <SolidColorBrush x:Key="Brush.Control.Background" Color="#FFFFFF" />
+            <SolidColorBrush x:Key="Brush.Control.Border" Color="#C8C8CC" />
+            <SolidColorBrush x:Key="Brush.Control.BorderHover" Color="#8A8A90" />
+
+            <!-- list rows -->
+            <SolidColorBrush x:Key="Brush.Item.Hover" Color="#E8E8EC" />
+            <SolidColorBrush x:Key="Brush.Item.Selected" Color="#E5EFFA" />
+
+            <!-- accent -->
+            <SolidColorBrush x:Key="Brush.Accent" Color="#0067B8" />
+            <SolidColorBrush x:Key="Brush.Accent.Hover" Color="#1275C7" />
+            <SolidColorBrush x:Key="Brush.Accent.Pressed" Color="#005494" />
+            <SolidColorBrush x:Key="Brush.Accent.Foreground" Color="#FFFFFF" />
+
+            <!-- text -->
+            <SolidColorBrush x:Key="Brush.Text.Primary" Color="#1E1E1E" />
+            <SolidColorBrush x:Key="Brush.Text.Secondary" Color="#5A5F66" />
+            <SolidColorBrush x:Key="Brush.Text.Disabled" Color="#A0A0A6" />
+
+            <!-- status bar -->
+            <SolidColorBrush x:Key="Brush.StatusBar.Background" Color="#0067B8" />
+            <SolidColorBrush x:Key="Brush.StatusBar.Disconnected" Color="#C4271C" />
+            <SolidColorBrush x:Key="Brush.StatusBar.Foreground" Color="#FFFFFF" />
+
+            <!-- neutral chip -->
+            <SolidColorBrush x:Key="Brush.Chip.Background" Color="#E4E4E8" />
+
+            <!-- Re-point Fluent's accent so every stock control (accent button, checkbox check,
+                 combobox selection, focus adorner) adopts VS blue without per-control templating. -->
+            <Color x:Key="SystemAccentColor">#0067B8</Color>
+            <Color x:Key="SystemAccentColorLight1">#1275C7</Color>
+            <Color x:Key="SystemAccentColorLight2">#3D8FD4</Color>
+            <Color x:Key="SystemAccentColorLight3">#5EA6DE</Color>
+            <Color x:Key="SystemAccentColorDark1">#005494</Color>
+            <Color x:Key="SystemAccentColorDark2">#004374</Color>
+            <Color x:Key="SystemAccentColorDark3">#003257</Color>
+        </ResourceDictionary>
+    </ResourceDictionary.ThemeDictionaries>
+
+    <!-- ===================== Semantic colours (variant-independent) =====================
+         Kept identical across variants so the meaning of a colour never shifts; the soft
+         variants are low-alpha tints that read correctly over both dark and light surfaces. -->
+    <SolidColorBrush x:Key="Brush.Danger" Color="#C05A54" />
+    <SolidColorBrush x:Key="Brush.Warning" Color="#C39A3C" />
+    <SolidColorBrush x:Key="Brush.Success" Color="#56986E" />
+    <SolidColorBrush x:Key="Brush.Info" Color="#4E86B6" />
+    <SolidColorBrush x:Key="Brush.Danger.Soft" Color="#26C05A54" />
+    <SolidColorBrush x:Key="Brush.Warning.Soft" Color="#26C39A3C" />
+    <!-- Manila-folder tint for directory rows in the dry-run trees; low alpha so it reads as a slight
+         wash over both the dark and light row surfaces. -->
+    <SolidColorBrush x:Key="Brush.Folder.Soft" Color="#33D9B48A" />
+    <!-- Light-blue row hover highlight for the dry-run list and tree rows; low alpha so it reads over
+         both the dark and light row surfaces (and over the folder tint). -->
+    <SolidColorBrush x:Key="Brush.Hover.Soft" Color="#334E9BE6" />
+    <SolidColorBrush x:Key="Brush.Success.Soft" Color="#2656986E" />
+    <SolidColorBrush x:Key="Brush.Info.Soft" Color="#264E86B6" />
+    <SolidColorBrush x:Key="Brush.Muted" Color="#717780" />
+    <SolidColorBrush x:Key="Brush.OnColor.Light" Color="#FFFFFF" />
+    <SolidColorBrush x:Key="Brush.OnColor.Dark" Color="#1E1E1E" />
+
+    <!-- ============================ Scalars ============================ -->
+    <FontFamily x:Key="AppFontFamily">Segoe UI Variable Text, Segoe UI</FontFamily>
+
+    <x:Double x:Key="Font.Caption">11</x:Double>
+    <x:Double x:Key="Font.Small">12</x:Double>
+    <x:Double x:Key="Font.Body">13</x:Double>
+    <x:Double x:Key="Font.Section">14</x:Double>
+    <x:Double x:Key="Font.Title">13</x:Double>
+
+    <CornerRadius x:Key="Radius.Control">4</CornerRadius>
+    <CornerRadius x:Key="Radius.Card">6</CornerRadius>
+
+    <!-- Common paddings, expressed as Thickness so views can reference them directly. -->
+    <Thickness x:Key="Pad.Card">12</Thickness>
+    <Thickness x:Key="Pad.Field">10,6</Thickness>
+</ResourceDictionary>

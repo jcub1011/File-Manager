@@ -1,0 +1,86 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:vm="using:FileManager.UI.ViewModels"
+             xmlns:conv="using:FileManager.UI.Converters"
+             x:Class="FileManager.UI.Views.ProfileRailView"
+             x:DataType="vm:ProfileListViewModel">
+
+    <UserControl.Styles>
+        <!-- The dashed "add profile" tile at the foot of the rail. Mirrors the avatar footprint
+             (40x40, Radius.Control corner) but with a dashed outline + "+" so it reads as an
+             affordance rather than a profile. Hover brightens the stroke and glyph to match the
+             avatars' pointer-over cue. -->
+        <Style Selector="Button.railAddTile Rectangle">
+            <Setter Property="Stroke" Value="{DynamicResource Brush.Control.Border}" />
+        </Style>
+        <Style Selector="Button.railAddTile PathIcon">
+            <Setter Property="Foreground" Value="{DynamicResource Brush.Text.Secondary}" />
+        </Style>
+        <Style Selector="Button.railAddTile:pointerover Rectangle">
+            <Setter Property="Stroke" Value="{DynamicResource Brush.Control.BorderHover}" />
+        </Style>
+        <Style Selector="Button.railAddTile:pointerover PathIcon">
+            <Setter Property="Foreground" Value="{DynamicResource Brush.Text.Primary}" />
+        </Style>
+    </UserControl.Styles>
+
+    <!-- Collapsed sidebar: profiles as two-letter acronym avatars, with a trailing dashed "+" tile.
+         The ListBox is bound to the SAME ProfileListViewModel as the expanded ProfileListView, so
+         switching, the unsaved-changes navigation guard, and row-locking are reused verbatim. The
+         ListBox + add tile live in one scrolling StackPanel: inside a vertical stack the ListBox
+         measures to content (no inner scroll), so the tile always renders directly after the last
+         avatar and the outer ScrollViewer scrolls the whole set. -->
+    <ScrollViewer HorizontalScrollBarVisibility="Disabled">
+    <StackPanel Spacing="8">
+    <ListBox Classes="profilesRail" ItemsSource="{Binding FilteredProfiles}" SelectedItem="{Binding SelectedProfile}">
+        <ListBox.ItemsPanel>
+            <!-- Uniform gap between avatars; the list's top/bottom padding matches it. -->
+            <ItemsPanelTemplate>
+                <StackPanel Spacing="8" />
+            </ItemsPanelTemplate>
+        </ListBox.ItemsPanel>
+        <ListBox.Styles>
+            <!-- Identical to ProfileListView: while the editor has unsaved edits, lock every row
+                 except the one being edited so the user can't appear to navigate away. -->
+            <Style Selector="ListBoxItem">
+                <Setter Property="IsEnabled">
+                    <MultiBinding Converter="{x:Static conv:MultiValueConverters.RowSelectable}">
+                        <Binding Path="((vm:ProfileListViewModel)DataContext).HasUnsavedChanges"
+                                 RelativeSource="{RelativeSource AncestorType=ListBox}" />
+                        <Binding Path="((vm:ProfileListItem)DataContext).ProfileId"
+                                 RelativeSource="{RelativeSource Self}" />
+                        <Binding Path="((vm:ProfileListViewModel)DataContext).UnsavedProfileId"
+                                 RelativeSource="{RelativeSource AncestorType=ListBox}" />
+                    </MultiBinding>
+                </Setter>
+            </Style>
+        </ListBox.Styles>
+        <ListBox.ItemTemplate>
+            <DataTemplate x:DataType="vm:ProfileListItem">
+                <Border Classes="avatar" ToolTip.Tip="{Binding Name}">
+                    <Border.ContextMenu>
+                        <ContextMenu x:DataType="vm:ProfileListItem">
+                            <MenuItem Header="Export…" Command="{Binding ExportCommand}" CommandParameter="{Binding}" />
+                        </ContextMenu>
+                    </Border.ContextMenu>
+                    <TextBlock Text="{Binding Acronym}" />
+                </Border>
+            </DataTemplate>
+        </ListBox.ItemTemplate>
+    </ListBox>
+
+    <!-- Add-profile tile: last entry in the rail. Chrome-less button (iconButton) so only the dashed
+         Rectangle + "+" show. Runs the shell's NewProfileCommand via the CreateProfileCommand
+         passthrough on the list VM, inheriting its unsaved-changes guard. -->
+    <Button Classes="iconButton railAddTile" Command="{Binding CreateProfileCommand}"
+            HorizontalAlignment="Center" Padding="0" ToolTip.Tip="New profile">
+        <Panel Width="40" Height="40">
+            <Rectangle RadiusX="4" RadiusY="4" StrokeThickness="1.5" StrokeDashArray="3,3" />
+            <PathIcon Data="{StaticResource IconAdd}" Width="16" Height="16" />
+        </Panel>
+    </Button>
+
+    </StackPanel>
+    </ScrollViewer>
+
+</UserControl>

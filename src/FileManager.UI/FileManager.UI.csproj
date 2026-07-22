@@ -10,9 +10,44 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <Folder Include="Models\" />
     <AvaloniaResource Include="Assets\**" />
   </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="FileManager.UI.Benchmarks" />
+    <InternalsVisibleTo Include="FileManager.UI.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\FileManager.Contracts\FileManager.Contracts.csproj" />
+    <!-- TreeDataGrid is built from its MIT source (vendored as a git submodule under third_party/)
+         rather than the official NuGet: the published package (11.2.0+) injects an Avalonia Pro
+         license-key gate, but the source itself is MIT with no such check. Assembly name stays
+         "Avalonia.Controls.TreeDataGrid", so the App.axaml theme include and control namespaces
+         match the NuGet exactly. -->
+    <ProjectReference Include="..\..\third_party\TreeDataGrid\src\Avalonia.Controls.TreeDataGrid\Avalonia.Controls.TreeDataGrid.csproj" />
+    <!-- Build-order + copy-output only, NOT an assembly reference (§1 rule 3: the UI references
+         Contracts only). ServiceLauncher resolves FileManager.Service.exe beside the UI exe —
+         the publish layout — so the dev build must lay the files out the same way. -->
+    <ProjectReference Include="..\FileManager.Service\FileManager.Service.csproj" ReferenceOutputAssembly="false" OutputItemType="ServiceHostAssembly" Private="false" />
+  </ItemGroup>
+
+  <!-- Fail fast with an actionable message when the TreeDataGrid submodule wasn't checked out
+       (a plain `git clone` that omits the recurse-submodules flag leaves third_party/TreeDataGrid
+       empty, so the ProjectReference above would otherwise fail with an opaque "project not found"). -->
+  <Target Name="EnsureTreeDataGridSubmodule" BeforeTargets="PrepareForBuild">
+    <Error Condition="!Exists('$(MSBuildThisFileDirectory)..\..\third_party\TreeDataGrid\src\Avalonia.Controls.TreeDataGrid\Avalonia.Controls.TreeDataGrid.csproj')"
+           Text="The TreeDataGrid submodule is missing. Run: git submodule update --init --recursive" />
+  </Target>
+
+  <!-- Copies the Service host's entire output (exe, dlls, runtimeconfig) into the UI's output
+       directory so ServiceLauncher's side-by-side probe works under F5 without env overrides. -->
+  <Target Name="CopyServiceHostOutput" AfterTargets="Build" Condition="'@(ServiceHostAssembly)' != ''">
+    <ItemGroup>
+      <ServiceHostFiles Include="%(ServiceHostAssembly.RootDir)%(ServiceHostAssembly.Directory)**\*" />
+    </ItemGroup>
+    <Copy SourceFiles="@(ServiceHostFiles)" DestinationFiles="@(ServiceHostFiles->'$(OutDir)%(RecursiveDir)%(Filename)%(Extension)')" SkipUnchangedFiles="true" />
+  </Target>
 
   <ItemGroup>
     <PackageReference Include="Avalonia" Version="12.0.5" />
@@ -24,5 +59,7 @@
       <PrivateAssets Condition="'$(Configuration)' != 'Debug'">All</PrivateAssets>
     </PackageReference>
     <PackageReference Include="CommunityToolkit.Mvvm" Version="8.4.2" />
+    <PackageReference Include="Serilog" Version="4.3.1" />
+    <PackageReference Include="Serilog.Sinks.File" Version="7.0.0" />
   </ItemGroup>
 </Project>

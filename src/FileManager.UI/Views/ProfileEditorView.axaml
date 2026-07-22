@@ -1,0 +1,223 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:vm="using:FileManager.UI.ViewModels"
+             xmlns:ed="using:FileManager.UI.ViewModels.Editor"
+             xmlns:conv="using:FileManager.UI.Converters"
+             xmlns:prof="using:FileManager.Contracts.Profiles"
+             x:Class="FileManager.UI.Views.ProfileEditorView"
+             x:DataType="vm:ProfileEditorViewModel">
+
+    <DockPanel>
+        <!-- action bar (top): Save/Discard, then the switch-blocked unsaved-changes warning -->
+        <Border DockPanel.Dock="Top" Padding="0,0,0,10" Margin="0,0,0,8">
+            <StackPanel Spacing="8">
+                <Border Classes="infoBar danger"
+                        IsVisible="{Binding LocalError, Converter={x:Static ObjectConverters.IsNotNull}}">
+                    <TextBlock Text="{Binding LocalError}" TextWrapping="Wrap" />
+                </Border>
+                <Border Classes="infoBar success"
+                        IsVisible="{Binding StatusMessage, Converter={x:Static ObjectConverters.IsNotNull}}">
+                    <TextBlock Text="{Binding StatusMessage}" TextWrapping="Wrap" />
+                </Border>
+                <!-- Save / Discard now live on the tab-header row (MainWindow.axaml). This bar keeps
+                     the blocking-validation "save anyway" acknowledgement beside its warning. -->
+                <StackPanel Orientation="Horizontal" Spacing="8"
+                            IsVisible="{Binding CanAcknowledgeAndSave}">
+                    <Button Content="I understand the risk — save anyway"
+                            Command="{Binding AcknowledgeAndSaveCommand}"
+                            Classes="danger" />
+                </StackPanel>
+                <Border Classes="infoBar warning" IsVisible="{Binding ShowUnsavedWarning}">
+                    <TextBlock Text="You have unsaved changes — save or discard them before switching profiles."
+                               TextWrapping="Wrap" />
+                </Border>
+            </StackPanel>
+        </Border>
+
+        <ScrollViewer>
+            <StackPanel Margin="4,0,16,0" Spacing="2">
+
+                <!-- validation issues -->
+                <Border Classes="card" Margin="0,4,0,4"
+                        IsVisible="{Binding !!Issues.Count}">
+                    <StackPanel Spacing="4">
+                        <TextBlock Text="Validation results" FontWeight="SemiBold" />
+                        <ItemsControl ItemsSource="{Binding Issues}">
+                            <ItemsControl.ItemTemplate>
+                                <DataTemplate x:DataType="ed:ValidationIssueItem">
+                                    <StackPanel Orientation="Horizontal" Spacing="6" Margin="0,2">
+                                        <TextBlock Text="{Binding Glyph}" />
+                                        <TextBlock Text="{Binding Code}" FontFamily="Consolas,monospace" FontSize="12"
+                                                   VerticalAlignment="Center" Opacity="0.8" />
+                                        <TextBlock Text="{Binding Message}" TextWrapping="Wrap" MaxWidth="640" />
+                                    </StackPanel>
+                                </DataTemplate>
+                            </ItemsControl.ItemTemplate>
+                        </ItemsControl>
+                    </StackPanel>
+                </Border>
+
+                <!-- general -->
+                <Border Classes="sectionHeader"><TextBlock Text="General" /></Border>
+                <Grid ColumnDefinitions="140,*" RowDefinitions="Auto,Auto,Auto,Auto,Auto" Margin="0,0,0,4">
+                    <TextBlock Grid.Row="0" Grid.Column="0" Classes="fieldLabel" Text="Name" />
+                    <TextBox Grid.Row="0" Grid.Column="1" Text="{Binding ProfileName}" Margin="0,2" />
+                    <TextBlock Grid.Row="1" Grid.Column="0" Classes="fieldLabel" Text="Active" />
+                    <CheckBox Grid.Row="1" Grid.Column="1" IsChecked="{Binding Active}" Margin="0,2" />
+                    <TextBlock Grid.Row="2" Grid.Column="0" Classes="fieldLabel" Text="Sync mode" />
+                    <ComboBox Grid.Row="2" Grid.Column="1" ItemsSource="{Binding SyncModeOptions}"
+                              SelectedItem="{Binding SyncMode}" Margin="0,2" MinWidth="220">
+                        <ComboBox.ItemTemplate>
+                            <DataTemplate x:DataType="prof:SyncMode">
+                                <TextBlock Text="{Binding Converter={x:Static conv:EnumTitleConverters.SyncMode}}" />
+                            </DataTemplate>
+                        </ComboBox.ItemTemplate>
+                    </ComboBox>
+                    <TextBlock Grid.Row="3" Grid.Column="0" Classes="fieldLabel" Text="Scan destinations" />
+                    <CheckBox Grid.Row="3" Grid.Column="1" IsChecked="{Binding ScanDestination}"
+                              IsEnabled="{Binding CanEditScanDestination}" Margin="0,2"
+                              ToolTip.Tip="Lists pre-existing destination files in the dry-run preview. Mirror mode always scans (it needs the scan to detect files to delete)." />
+                    <TextBlock Grid.Row="4" Grid.Column="0" Classes="fieldLabel" Text="Target layout" />
+                    <ComboBox Grid.Row="4" Grid.Column="1" ItemsSource="{Binding TargetLayoutOptions}"
+                              SelectedItem="{Binding TargetLayout}" Margin="0,2" MinWidth="220">
+                        <ComboBox.ItemTemplate>
+                            <DataTemplate x:DataType="prof:TargetLayout">
+                                <TextBlock Text="{Binding Converter={x:Static conv:EnumTitleConverters.TargetLayout}}" />
+                            </DataTemplate>
+                        </ComboBox.ItemTemplate>
+                    </ComboBox>
+                </Grid>
+
+                <!-- sources -->
+                <Border Classes="sectionHeader"><TextBlock Text="Sources" /></Border>
+                <ItemsControl ItemsSource="{Binding Sources}">
+                    <ItemsControl.ItemTemplate>
+                        <DataTemplate x:DataType="ed:SourceRowViewModel">
+                            <Grid ColumnDefinitions="*,Auto,Auto,Auto,Auto" Margin="0,2">
+                                <TextBox Grid.Column="0" Text="{Binding Path}" PlaceholderText="Absolute source folder path" />
+                                <Button Grid.Column="1" Content="Browse…" Margin="6,0,0,0" Command="{Binding BrowseCommand}" />
+                                <NumericUpDown Grid.Column="2" Value="{Binding SettleDelaySeconds}" Minimum="0" Maximum="3600"
+                                               Width="120" Margin="6,0,0,0" FormatString="0"
+                                               ToolTip.Tip="Settle delay (seconds)" />
+                                <NumericUpDown Grid.Column="3" Value="{Binding StabilityIntervalMs}" Minimum="0" Maximum="60000"
+                                               Width="130" Margin="6,0,0,0" FormatString="0"
+                                               ToolTip.Tip="Stability interval (ms, network paths)" />
+                                <Button Grid.Column="4" Content="✕" Margin="6,0,0,0"
+                                        Command="{Binding $parent[ItemsControl].((vm:ProfileEditorViewModel)DataContext).RemoveSourceCommand}"
+                                        CommandParameter="{Binding}" />
+                            </Grid>
+                        </DataTemplate>
+                    </ItemsControl.ItemTemplate>
+                </ItemsControl>
+                <Button Content="Add source" Command="{Binding AddSourceCommand}" Margin="0,4,0,0" HorizontalAlignment="Left" />
+
+                <!-- targets -->
+                <Border Classes="sectionHeader"><TextBlock Text="Targets" /></Border>
+                <ItemsControl ItemsSource="{Binding Targets}">
+                    <ItemsControl.ItemTemplate>
+                        <DataTemplate x:DataType="ed:TargetRowViewModel">
+                            <Grid ColumnDefinitions="*,Auto,Auto" Margin="0,2">
+                                <TextBox Grid.Column="0" Text="{Binding Path}" PlaceholderText="Absolute target folder path" />
+                                <Button Grid.Column="1" Content="Browse…" Margin="6,0,0,0" Command="{Binding BrowseCommand}" />
+                                <Button Grid.Column="2" Content="✕" Margin="6,0,0,0"
+                                        Command="{Binding $parent[ItemsControl].((vm:ProfileEditorViewModel)DataContext).RemoveTargetCommand}"
+                                        CommandParameter="{Binding}" />
+                            </Grid>
+                        </DataTemplate>
+                    </ItemsControl.ItemTemplate>
+                </ItemsControl>
+                <Button Content="Add target" Command="{Binding AddTargetCommand}" Margin="0,4,0,0" HorizontalAlignment="Left" />
+
+                <!-- policies -->
+                <Border Classes="sectionHeader"><TextBlock Text="Policies" /></Border>
+                <Grid ColumnDefinitions="140,*" RowDefinitions="Auto,Auto,Auto,Auto,Auto,Auto" Margin="0,0,0,4">
+                    <TextBlock Grid.Row="0" Grid.Column="0" Classes="fieldLabel" Text="On conflict" />
+                    <ComboBox Grid.Row="0" Grid.Column="1" ItemsSource="{Binding ConflictResolutionOptions}"
+                              SelectedItem="{Binding ConflictResolution}" Margin="0,2" MinWidth="220">
+                        <ComboBox.ItemTemplate>
+                            <DataTemplate x:DataType="prof:ConflictResolution">
+                                <TextBlock Text="{Binding Converter={x:Static conv:EnumTitleConverters.ConflictResolution}}" />
+                            </DataTemplate>
+                        </ComboBox.ItemTemplate>
+                    </ComboBox>
+                    <TextBlock Grid.Row="1" Grid.Column="0" Classes="fieldLabel" Text="Overwrite handling" />
+                    <ComboBox Grid.Row="1" Grid.Column="1" ItemsSource="{Binding OverwriteHandlingOptions}"
+                              SelectedItem="{Binding OverwriteHandling}" Margin="0,2" MinWidth="220">
+                        <ComboBox.ItemTemplate>
+                            <DataTemplate x:DataType="prof:OverwriteHandling">
+                                <TextBlock Text="{Binding Converter={x:Static conv:EnumTitleConverters.OverwriteHandling}}" />
+                            </DataTemplate>
+                        </ComboBox.ItemTemplate>
+                    </ComboBox>
+                    <TextBlock Grid.Row="2" Grid.Column="0" Classes="fieldLabel" Text="Verification" />
+                    <ComboBox Grid.Row="2" Grid.Column="1" ItemsSource="{Binding VerificationOptions}"
+                              SelectedItem="{Binding VerificationMethod}" Margin="0,2" MinWidth="220">
+                        <ComboBox.ItemTemplate>
+                            <DataTemplate x:DataType="prof:VerificationMethod">
+                                <TextBlock Text="{Binding Converter={x:Static conv:EnumTitleConverters.VerificationMethod}}" />
+                            </DataTemplate>
+                        </ComboBox.ItemTemplate>
+                    </ComboBox>
+                    <TextBlock Grid.Row="3" Grid.Column="0" Classes="fieldLabel" Text="On success" />
+                    <ComboBox Grid.Row="3" Grid.Column="1" ItemsSource="{Binding OnSuccessOptions}"
+                              SelectedItem="{Binding OnSuccess}" Margin="0,2" MinWidth="220">
+                        <ComboBox.ItemTemplate>
+                            <DataTemplate x:DataType="prof:OnSuccessAction">
+                                <TextBlock Text="{Binding Converter={x:Static conv:EnumTitleConverters.OnSuccessAction}}" />
+                            </DataTemplate>
+                        </ComboBox.ItemTemplate>
+                    </ComboBox>
+                    <TextBlock Grid.Row="4" Grid.Column="0" Classes="fieldLabel" Text="Archive folder"
+                               IsVisible="{Binding ShowArchiveFolder}" />
+                    <TextBox Grid.Row="4" Grid.Column="1" Text="{Binding ArchiveFolder}" Margin="0,2"
+                             PlaceholderText="Absolute archive folder path"
+                             IsVisible="{Binding ShowArchiveFolder}" />
+                    <TextBlock Grid.Row="5" Grid.Column="0" Classes="fieldLabel" Text="Metadata loss" />
+                    <ComboBox Grid.Row="5" Grid.Column="1" ItemsSource="{Binding MetadataOptions}"
+                              SelectedItem="{Binding MetadataOnConflict}" Margin="0,2" MinWidth="220">
+                        <ComboBox.ItemTemplate>
+                            <DataTemplate x:DataType="prof:MetadataOnConflict">
+                                <TextBlock Text="{Binding Converter={x:Static conv:EnumTitleConverters.MetadataOnConflict}}" />
+                            </DataTemplate>
+                        </ComboBox.ItemTemplate>
+                    </ComboBox>
+                </Grid>
+
+                <!-- filters -->
+                <Border Classes="sectionHeader"><TextBlock Text="Filters" /></Border>
+                <Grid ColumnDefinitions="140,*" RowDefinitions="Auto,Auto,Auto,Auto,Auto" Margin="0,0,0,4">
+                    <TextBlock Grid.Row="0" Grid.Column="0" Classes="fieldLabel" Text="Include globs" VerticalAlignment="Top" Margin="0,6,8,0" />
+                    <TextBox Grid.Row="0" Grid.Column="1" Text="{Binding IncludeGlobsText}" AcceptsReturn="True"
+                             MinHeight="52" Margin="0,2" PlaceholderText="One glob per line, e.g. *.wav — empty = include everything" />
+                    <TextBlock Grid.Row="1" Grid.Column="0" Classes="fieldLabel" Text="Exclude globs" VerticalAlignment="Top" Margin="0,6,8,0" />
+                    <TextBox Grid.Row="1" Grid.Column="1" Text="{Binding ExcludeGlobsText}" AcceptsReturn="True"
+                             MinHeight="52" Margin="0,2" PlaceholderText="One glob per line, e.g. *.tmp" />
+                    <TextBlock Grid.Row="2" Grid.Column="0" Classes="fieldLabel" Text="Min size (bytes)" />
+                    <TextBox Grid.Row="2" Grid.Column="1" Text="{Binding MinSizeText}" Margin="0,2" Width="220" HorizontalAlignment="Left" />
+                    <TextBlock Grid.Row="3" Grid.Column="0" Classes="fieldLabel" Text="Max size (bytes)" />
+                    <TextBox Grid.Row="3" Grid.Column="1" Text="{Binding MaxSizeText}" Margin="0,2" Width="220" HorizontalAlignment="Left" />
+                    <TextBlock Grid.Row="4" Grid.Column="0" Classes="fieldLabel" Text="Max depth" />
+                    <TextBox Grid.Row="4" Grid.Column="1" Text="{Binding MaxDepthText}" Margin="0,2" Width="220" HorizontalAlignment="Left" />
+                </Grid>
+
+                <!-- logging -->
+                <Border Classes="sectionHeader"><TextBlock Text="Logging" /></Border>
+                <Grid ColumnDefinitions="140,*" RowDefinitions="Auto,Auto" Margin="0,0,0,8">
+                    <TextBlock Grid.Row="0" Grid.Column="0" Classes="fieldLabel" Text="Verbosity" />
+                    <ComboBox Grid.Row="0" Grid.Column="1" ItemsSource="{Binding VerbosityOptions}"
+                              SelectedItem="{Binding Verbosity}" Margin="0,2" MinWidth="220">
+                        <ComboBox.ItemTemplate>
+                            <DataTemplate x:DataType="prof:LogVerbosity">
+                                <TextBlock Text="{Binding Converter={x:Static conv:EnumTitleConverters.LogVerbosity}}" />
+                            </DataTemplate>
+                        </ComboBox.ItemTemplate>
+                    </ComboBox>
+                    <TextBlock Grid.Row="1" Grid.Column="0" Classes="fieldLabel" Text="Notify on failure" />
+                    <CheckBox Grid.Row="1" Grid.Column="1" IsChecked="{Binding NotifyOnFailure}" Margin="0,2" />
+                </Grid>
+
+            </StackPanel>
+        </ScrollViewer>
+    </DockPanel>
+
+</UserControl>

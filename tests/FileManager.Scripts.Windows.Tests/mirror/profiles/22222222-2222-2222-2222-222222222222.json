@@ -1,0 +1,35 @@
+{
+  "SchemaVersion": 2,
+  "ProfileId": "22222222-2222-2222-2222-222222222222",
+  "Name": "Mirror - Orphan Preview",
+  "Active": true,
+  "SyncMode": "Mirror",
+  "ScanDestination": false,
+  "TargetLayout": "PreserveStructure",
+  "Triggers": {
+    "ManualShell": true,
+    "Watcher": false
+  },
+  "Sources": [
+    {
+      "Path": "C:\\Users\\Jacob McCormack\\source\\repos\\File-Manager\\tests\\FileManager.Scripts.Windows.Tests\\mirror\\sources"
+    }
+  ],
+  "Targets": [
+    {
+      "Path": "C:\\Users\\Jacob McCormack\\source\\repos\\File-Manager\\tests\\FileManager.Scripts.Windows.Tests\\mirror\\targets"
+    }
+  ],
+  "Policies": {
+    "ConflictResolution": "Skip",
+    "OverwriteHandling": "StageOverwrites",
+    "VerificationMethod": "XXH3-128",
+    "OnSuccess": "KeepSource",
+    "OnFailure": "AbortRestoreAndClean",
+    "MetadataOnConflict": "WarnAndContinue"
+  },
+  "Logging": {
+    "Verbosity": "FailuresAndSkips",
+    "NotifyOnFailure": true
+  }
+}

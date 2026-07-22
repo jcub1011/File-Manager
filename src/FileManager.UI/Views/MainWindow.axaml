@@ -1,20 +1,198 @@
 <Window xmlns="https://github.com/avaloniaui"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:vm="using:FileManager.UI.ViewModels"
-        xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
-        xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
-        mc:Ignorable="d" d:DesignWidth="800" d:DesignHeight="450"
+        xmlns:v="using:FileManager.UI.Views"
+        xmlns:chrome="using:Avalonia.Controls.Chrome"
         x:Class="FileManager.UI.Views.MainWindow"
         x:DataType="vm:MainWindowViewModel"
         Icon="/Assets/avalonia-logo.ico"
-        Title="FileManager.UI">
+        Width="1200" Height="760"
+        Title="File Manager"
+        FontFamily="{StaticResource AppFontFamily}"
+        FontSize="{StaticResource Font.Body}"
+        Background="{DynamicResource Brush.Window.Background}"
+        ExtendClientAreaToDecorationsHint="True"
+        WindowDecorations="BorderOnly">
 
-    <Design.DataContext>
-        <!-- This only sets the DataContext for the previewer in an IDE,
-             to set the actual DataContext for runtime, set the DataContext property in code (look at App.axaml.cs) -->
-        <vm:MainWindowViewModel/>
-    </Design.DataContext>
+    <!-- Caption- and icon-button styles now live in Themes/Controls.axaml (app-wide). -->
 
-    <TextBlock Text="{Binding Greeting}" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+    <DockPanel>
+        <!-- Custom title bar (Avalonia 12 WindowDecorations="BorderOnly" + ElementRole markers). The
+             OS keeps the resizable window frame but draws no system title bar, so there is nothing to
+             reserve space for — no hardcoded margins, DPI- and platform-independent. ElementRole="TitleBar" makes the grid the drag +
+             double-click-maximize region. CRITICAL: every interactive child must carry its own role
+             (User for app buttons, {Min,Max,Close}Button for the caption buttons) or the drag region
+             swallows its clicks. The role only routes input — the Click handlers still do the work. -->
+        <Grid DockPanel.Dock="Top" Height="32" Background="{DynamicResource Brush.Chrome.Background}"
+              ColumnDefinitions="Auto,*,Auto"
+              chrome:WindowDecorationProperties.ElementRole="TitleBar">
+            <StackPanel Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Center" Margin="10,0,0,0">
+                <Border Width="18" Height="18" CornerRadius="4" Background="{DynamicResource Brush.Accent}">
+                    <PathIcon Data="{StaticResource IconFolder}" Width="11" Height="11" Foreground="White" />
+                </Border>
+                <TextBlock Text="File Manager" VerticalAlignment="Center"
+                           Margin="8,0,0,0" FontSize="{StaticResource Font.Title}"
+                           Foreground="{DynamicResource Brush.Text.Primary}" />
+            </StackPanel>
+
+            <StackPanel Grid.Column="2" Orientation="Horizontal">
+                <Button Classes="iconButton" chrome:WindowDecorationProperties.ElementRole="User"
+                        Command="{Binding ImportProfilesCommand}" ToolTip.Tip="Import profiles">
+                    <PathIcon Data="{StaticResource IconImport}" Width="16" Height="16" />
+                </Button>
+                <Button Classes="iconButton" chrome:WindowDecorationProperties.ElementRole="User"
+                        Command="{Binding ExportProfilesCommand}" ToolTip.Tip="Export profiles">
+                    <PathIcon Data="{StaticResource IconExport}" Width="16" Height="16" />
+                </Button>
+                <Button Classes="iconButton" chrome:WindowDecorationProperties.ElementRole="User"
+                        Command="{Binding OpenLogFolderCommand}" ToolTip.Tip="Open log folder">
+                    <PathIcon Data="{StaticResource IconFolder}" Width="16" Height="16" />
+                </Button>
+                <Button Classes="iconButton" chrome:WindowDecorationProperties.ElementRole="User"
+                        Command="{Binding OpenSettingsCommand}" ToolTip.Tip="Settings" Margin="0,0,8,0">
+                    <PathIcon Data="{StaticResource IconGear}" Width="16" Height="16" />
+                </Button>
+
+                <Button Classes="caption" chrome:WindowDecorationProperties.ElementRole="MinimizeButton"
+                        Click="OnMinimize" ToolTip.Tip="Minimize">
+                    <PathIcon Data="{StaticResource IconMinimize}" Width="10" Height="10" />
+                </Button>
+                <Button x:Name="MaximizeButton" Classes="caption"
+                        chrome:WindowDecorationProperties.ElementRole="MaximizeButton"
+                        Click="OnMaximizeRestore" ToolTip.Tip="Maximize">
+                    <PathIcon x:Name="MaximizeIcon" Data="{StaticResource IconMaximize}" Width="10" Height="10" />
+                </Button>
+                <Button Classes="caption close" chrome:WindowDecorationProperties.ElementRole="CloseButton"
+                        Click="OnClose" ToolTip.Tip="Close">
+                    <PathIcon Data="{StaticResource IconClose}" Width="10" Height="10" />
+                </Button>
+            </StackPanel>
+        </Grid>
+
+        <v:StatusBarView DockPanel.Dock="Bottom" DataContext="{Binding StatusBar}" />
+
+        <Grid x:Name="ContentGrid">
+            <Grid.ColumnDefinitions>
+                <!-- Width is driven from code-behind (MainWindow.axaml.cs); the column stays freely
+                     draggable down to the rail width, and the current width decides collapsed vs
+                     expanded (dragging across the 180px threshold switches modes). -->
+                <ColumnDefinition Width="280" MinWidth="58" />
+                <ColumnDefinition Width="4" />
+                <ColumnDefinition Width="*" />
+            </Grid.ColumnDefinitions>
+            <!-- Left tool-window: PROFILES. Its own panel surface + a divider border against the
+                 document area on the right. Two content modes coexist and toggle on SidebarCollapsed:
+                 the full list, or the collapsed acronym rail. The mode toggle lives on this Border
+                 (MainWindow DataContext), while the rail's own DataContext is reassigned to List. -->
+            <Border Grid.Column="0" Background="{DynamicResource Brush.Panel.Background}"
+                    BorderBrush="{DynamicResource Brush.Panel.Border}" BorderThickness="0,0,1,0">
+                <Panel>
+                    <DockPanel Margin="8,10,8,8" IsVisible="{Binding !SidebarCollapsed}">
+                        <Grid DockPanel.Dock="Top" ColumnDefinitions="*,Auto,Auto" Margin="4,0,0,8">
+                            <TextBlock Grid.Column="0" Classes="panelHeader" Text="PROFILES" />
+                            <Button Grid.Column="1" Classes="iconButton" Command="{Binding List.RefreshCommand}" ToolTip.Tip="Refresh">
+                                <PathIcon Data="{StaticResource IconRefresh}" Width="16" Height="16" />
+                            </Button>
+                            <Button Grid.Column="2" Classes="iconButton" Command="{Binding NewProfileCommand}" ToolTip.Tip="New profile">
+                                <PathIcon Data="{StaticResource IconAdd}" Width="16" Height="16" />
+                            </Button>
+                        </Grid>
+                        <TextBox DockPanel.Dock="Top" Text="{Binding List.SearchText}"
+                                 PlaceholderText="Search profiles…" Margin="0,0,0,8">
+                            <TextBox.InnerLeftContent>
+                                <PathIcon Data="{StaticResource IconSearch}" Width="14" Height="14"
+                                          Margin="8,0,0,0" Foreground="{DynamicResource Brush.Text.Secondary}" />
+                            </TextBox.InnerLeftContent>
+                        </TextBox>
+                        <v:ProfileListView DataContext="{Binding List}" />
+                    </DockPanel>
+
+                    <ContentControl IsVisible="{Binding SidebarCollapsed}">
+                        <v:ProfileRailView DataContext="{Binding List}" />
+                    </ContentControl>
+                </Panel>
+            </Border>
+
+            <GridSplitter x:Name="SidebarSplitter" Grid.Column="1" Background="Transparent"
+                          ResizeDirection="Columns" ToolTip.Tip="Double-click to collapse or expand" />
+
+            <!-- Document area: tabs, with each tab's primary action buttons overlaid at the
+                 right of the header strip (context-switched by the active tab's IsSelected). -->
+            <Grid Grid.Column="2" Margin="8,6,10,8" IsVisible="{Binding Editor.HasProfile}">
+                <TabControl Classes="documents">
+                    <TabItem x:Name="ProfileTab" Header="Profile">
+                        <v:ProfileEditorView DataContext="{Binding Editor}" />
+                    </TabItem>
+                    <TabItem x:Name="DryRunTab" Header="Dry Run" IsEnabled="{Binding DryRun.CanRun}">
+                        <v:DryRunView DataContext="{Binding DryRun}" />
+                    </TabItem>
+                </TabControl>
+
+                <!-- Action buttons on the tab-header row (right side). Each sub-group re-typed for
+                     compiled bindings and shown only while its tab is active. -->
+                <StackPanel HorizontalAlignment="Right" VerticalAlignment="Top"
+                            Orientation="Horizontal" Spacing="8" Margin="0,6,0,0">
+                    <StackPanel Orientation="Horizontal" Spacing="8"
+                                DataContext="{Binding Editor}" x:DataType="vm:ProfileEditorViewModel"
+                                IsVisible="{Binding #ProfileTab.IsSelected}">
+                        <Button Content="Save" Command="{Binding SaveCommand}" Classes="accent" />
+                        <Button Content="Discard changes" Command="{Binding DiscardCommand}"
+                                IsVisible="{Binding IsDirty}" />
+                    </StackPanel>
+
+                    <StackPanel Orientation="Horizontal" Spacing="6"
+                                DataContext="{Binding DryRun}" x:DataType="vm:DryRunViewModel"
+                                IsVisible="{Binding #DryRunTab.IsSelected}">
+                        <!-- Split button: the primary press runs the dry run with the currently selected scan
+                             choice; the dropdown changes that choice (checkmark = active). "No Destination
+                             Scan" is disabled in Mirror mode, where the destination sweep is mandatory. -->
+                        <SplitButton Classes="accent" Command="{Binding RunCommand}" Content="{Binding RunButtonLabel}">
+                            <SplitButton.Flyout>
+                                <MenuFlyout>
+                                    <MenuItem Header="{Binding WithScanLabel}"
+                                              Command="{Binding SelectWithScanCommand}">
+                                        <MenuItem.Icon>
+                                            <TextBlock Text="✓" IsVisible="{Binding RunWithDestinationScan}" />
+                                        </MenuItem.Icon>
+                                    </MenuItem>
+                                    <MenuItem Header="{Binding NoScanLabel}"
+                                              Command="{Binding SelectNoScanCommand}"
+                                              IsEnabled="{Binding CanChooseNoScan}"
+                                              ToolTip.Tip="Mirror mode always scans the destinations to detect files to delete.">
+                                        <MenuItem.Icon>
+                                            <TextBlock Text="✓" IsVisible="{Binding !RunWithDestinationScan}" />
+                                        </MenuItem.Icon>
+                                    </MenuItem>
+                                </MenuFlyout>
+                            </SplitButton.Flyout>
+                        </SplitButton>
+                        <Button Content="Cancel" Command="{Binding RunCancelCommand}"
+                                IsVisible="{Binding RunCommand.IsRunning}" />
+                    </StackPanel>
+                </StackPanel>
+            </Grid>
+
+            <!-- Empty state: shown whenever no profile is loaded in the editor. The message switches
+                 on whether any profiles exist at all (List.HasProfiles): none → create one; some →
+                 pick one. Text-only; the actionable "+" lives in the sidebar. -->
+            <StackPanel Grid.Column="2" VerticalAlignment="Center" HorizontalAlignment="Center"
+                        Spacing="8" MaxWidth="360" IsVisible="{Binding !Editor.HasProfile}">
+                <PathIcon Data="{StaticResource IconFolder}" Width="40" Height="40"
+                          HorizontalAlignment="Center" Foreground="{DynamicResource Brush.Text.Secondary}" />
+                <StackPanel Spacing="4" IsVisible="{Binding List.HasProfiles}">
+                    <TextBlock Text="No profile selected" Classes="panelHeader" HorizontalAlignment="Center" />
+                    <TextBlock Text="Select a profile in the sidebar to get started."
+                               Foreground="{DynamicResource Brush.Text.Secondary}"
+                               TextWrapping="Wrap" TextAlignment="Center" />
+                </StackPanel>
+                <StackPanel Spacing="4" IsVisible="{Binding !List.HasProfiles}">
+                    <TextBlock Text="No profiles yet" Classes="panelHeader" HorizontalAlignment="Center" />
+                    <TextBlock Text="Create a profile using the + in the sidebar to get started."
+                               Foreground="{DynamicResource Brush.Text.Secondary}"
+                               TextWrapping="Wrap" TextAlignment="Center" />
+                </StackPanel>
+            </StackPanel>
+        </Grid>
+    </DockPanel>
 
 </Window>

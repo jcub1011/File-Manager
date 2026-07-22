@@ -1,0 +1,341 @@
+<Styles xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:ctrl="using:FileManager.UI.Controls">
+
+    <!-- Status indicator (dry-run): a colour-tinted glyph + optional count. Replaces the old filled
+         status pills; the icon carries the meaning (pair with ToolTip.Tip), the text an optional
+         count (hidden when empty → icon-only). -->
+    <Styles.Resources>
+        <ControlTheme x:Key="{x:Type ctrl:StatusCount}" TargetType="ctrl:StatusCount">
+            <Setter Property="VerticalAlignment" Value="Center" />
+            <Setter Property="Template">
+                <ControlTemplate>
+                    <StackPanel Orientation="Horizontal" Spacing="4" VerticalAlignment="Center">
+                        <PathIcon Width="14" Height="14" VerticalAlignment="Center"
+                                  Data="{TemplateBinding Icon}" Foreground="{TemplateBinding Glyph}" />
+                        <TextBlock VerticalAlignment="Center" FontSize="{StaticResource Font.Small}"
+                                   Foreground="{DynamicResource Brush.Text.Primary}"
+                                   Text="{TemplateBinding Text}"
+                                   IsVisible="{Binding Text, RelativeSource={RelativeSource TemplatedParent}, Converter={x:Static StringConverters.IsNotNullOrEmpty}}" />
+                    </StackPanel>
+                </ControlTemplate>
+            </Setter>
+        </ControlTheme>
+    </Styles.Resources>
+
+    <!--
+      Shared, class-based styles layered on top of FluentTheme. Included after <FluentTheme/> in
+      App.axaml so these win. Colours come from Tokens.axaml (DynamicResource so they track the
+      light/dark variant). Hover/pressed states on Fluent-templated controls must target
+      "/template/ ContentPresenter" because Fluent paints those states inside the template rather
+      than through the control's own Background property.
+    -->
+
+    <!-- ============================ Title-bar chrome ============================
+         Flat, transparent icon buttons (title bar + tool-window toolbars). Also used for the
+         list's row delete button. -->
+    <Style Selector="Button.iconButton">
+        <Setter Property="Background" Value="Transparent" />
+        <Setter Property="BorderThickness" Value="0" />
+        <Setter Property="Padding" Value="8,4" />
+        <Setter Property="CornerRadius" Value="{StaticResource Radius.Control}" />
+        <Setter Property="VerticalAlignment" Value="Center" />
+    </Style>
+    <Style Selector="Button.iconButton:pointerover /template/ ContentPresenter">
+        <Setter Property="Background" Value="{DynamicResource Brush.Item.Hover}" />
+    </Style>
+    <Style Selector="Button.iconButton:pressed /template/ ContentPresenter">
+        <Setter Property="Background" Value="{DynamicResource Brush.Item.Selected}" />
+    </Style>
+    <!-- Idle glyphs sit at the secondary weight and brighten on hover — softer and more
+         cohesive than stark full-contrast icons. -->
+    <Style Selector="Button.iconButton PathIcon">
+        <Setter Property="Foreground" Value="{DynamicResource Brush.Text.Secondary}" />
+    </Style>
+    <Style Selector="Button.iconButton:pointerover PathIcon">
+        <Setter Property="Foreground" Value="{DynamicResource Brush.Text.Primary}" />
+    </Style>
+
+    <!-- Caption buttons (minimize/maximize/close). WindowDecorations="BorderOnly" keeps the OS
+         resize border but draws no system caption, so we size our own to the standard 46x32. -->
+    <Style Selector="Button.caption">
+        <Setter Property="Background" Value="Transparent" />
+        <Setter Property="BorderThickness" Value="0" />
+        <Setter Property="CornerRadius" Value="0" />
+        <Setter Property="Width" Value="46" />
+        <Setter Property="Height" Value="32" />
+        <Setter Property="Padding" Value="0" />
+        <Setter Property="VerticalAlignment" Value="Stretch" />
+    </Style>
+    <Style Selector="Button.caption:pointerover /template/ ContentPresenter">
+        <Setter Property="Background" Value="#19808080" />
+    </Style>
+    <Style Selector="Button.caption:pressed /template/ ContentPresenter">
+        <Setter Property="Background" Value="#0F808080" />
+    </Style>
+    <!-- Close gets the conventional Windows 11 red hover with a light glyph. -->
+    <Style Selector="Button.caption.close:pointerover /template/ ContentPresenter">
+        <Setter Property="Background" Value="#C42B1C" />
+    </Style>
+    <Style Selector="Button.caption.close:pressed /template/ ContentPresenter">
+        <Setter Property="Background" Value="#B4271C" />
+    </Style>
+    <Style Selector="Button.caption.close:pointerover PathIcon">
+        <Setter Property="Foreground" Value="White" />
+    </Style>
+
+    <!-- ============================ Buttons ============================
+         A compact, slightly-tighter default that reads more like a desktop tool button. -->
+    <Style Selector="Button">
+        <Setter Property="Padding" Value="12,5" />
+        <Setter Property="CornerRadius" Value="{StaticResource Radius.Control}" />
+        <Setter Property="FontSize" Value="{StaticResource Font.Body}" />
+    </Style>
+
+    <!-- Destructive action button (red). -->
+    <Style Selector="Button.danger">
+        <Setter Property="Background" Value="{DynamicResource Brush.Danger}" />
+        <Setter Property="Foreground" Value="White" />
+        <Setter Property="BorderThickness" Value="0" />
+    </Style>
+    <Style Selector="Button.danger:pointerover /template/ ContentPresenter">
+        <Setter Property="Background" Value="#C62828" />
+        <Setter Property="Foreground" Value="White" />
+    </Style>
+    <Style Selector="Button.danger:pressed /template/ ContentPresenter">
+        <Setter Property="Background" Value="#B71C1C" />
+        <Setter Property="Foreground" Value="White" />
+    </Style>
+
+    <!-- ============================ Inputs ============================ -->
+    <Style Selector="TextBox">
+        <Setter Property="CornerRadius" Value="{StaticResource Radius.Control}" />
+        <Setter Property="FontSize" Value="{StaticResource Font.Body}" />
+    </Style>
+    <Style Selector="ComboBox">
+        <Setter Property="CornerRadius" Value="{StaticResource Radius.Control}" />
+        <Setter Property="FontSize" Value="{StaticResource Font.Body}" />
+    </Style>
+    <Style Selector="NumericUpDown">
+        <Setter Property="CornerRadius" Value="{StaticResource Radius.Control}" />
+        <Setter Property="FontSize" Value="{StaticResource Font.Body}" />
+    </Style>
+
+    <!-- ============================ Text roles ============================ -->
+    <Style Selector="TextBlock.secondary">
+        <Setter Property="Foreground" Value="{DynamicResource Brush.Text.Secondary}" />
+    </Style>
+    <Style Selector="TextBlock.caption">
+        <Setter Property="FontSize" Value="{StaticResource Font.Caption}" />
+        <Setter Property="Foreground" Value="{DynamicResource Brush.Text.Secondary}" />
+    </Style>
+
+    <!-- Tool-window header, e.g. "PROFILES" (write the text upper-cased in the view). -->
+    <Style Selector="TextBlock.panelHeader">
+        <Setter Property="FontSize" Value="{StaticResource Font.Small}" />
+        <Setter Property="FontWeight" Value="SemiBold" />
+        <Setter Property="Foreground" Value="{DynamicResource Brush.Text.Secondary}" />
+        <Setter Property="VerticalAlignment" Value="Center" />
+    </Style>
+
+    <!-- Field label in the two-column editor/settings grids. -->
+    <Style Selector="TextBlock.fieldLabel">
+        <Setter Property="VerticalAlignment" Value="Center" />
+        <Setter Property="Margin" Value="0,0,10,0" />
+        <Setter Property="Foreground" Value="{DynamicResource Brush.Text.Secondary}" />
+    </Style>
+
+    <!-- Section header with a hairline rule beneath (wrap the header text in this Border). -->
+    <Style Selector="Border.sectionHeader">
+        <Setter Property="BorderBrush" Value="{DynamicResource Brush.Panel.Border}" />
+        <Setter Property="BorderThickness" Value="0,0,0,1" />
+        <Setter Property="Padding" Value="0,0,0,4" />
+        <Setter Property="Margin" Value="0,18,0,10" />
+    </Style>
+    <Style Selector="Border.sectionHeader > TextBlock">
+        <Setter Property="FontSize" Value="{StaticResource Font.Section}" />
+        <Setter Property="FontWeight" Value="SemiBold" />
+        <Setter Property="Foreground" Value="{DynamicResource Brush.Text.Primary}" />
+    </Style>
+
+    <!-- ============================ Surfaces ============================ -->
+    <!-- Subtle grouped container. -->
+    <Style Selector="Border.card">
+        <Setter Property="Background" Value="{DynamicResource Brush.Panel.Background}" />
+        <Setter Property="BorderBrush" Value="{DynamicResource Brush.Panel.Border}" />
+        <Setter Property="BorderThickness" Value="1" />
+        <Setter Property="CornerRadius" Value="{StaticResource Radius.Card}" />
+        <Setter Property="Padding" Value="{StaticResource Pad.Card}" />
+    </Style>
+
+    <!-- Info bar (VS-style inline message): 1px semantic border over a soft tint. Base is neutral;
+         add .danger/.warning/.success/.info to colour it. -->
+    <Style Selector="Border.infoBar">
+        <Setter Property="BorderThickness" Value="1" />
+        <Setter Property="BorderBrush" Value="{DynamicResource Brush.Panel.Border}" />
+        <Setter Property="Background" Value="{DynamicResource Brush.Panel.Background}" />
+        <Setter Property="CornerRadius" Value="{StaticResource Radius.Control}" />
+        <Setter Property="Padding" Value="10,8" />
+    </Style>
+    <Style Selector="Border.infoBar.danger">
+        <Setter Property="BorderBrush" Value="{DynamicResource Brush.Danger}" />
+        <Setter Property="Background" Value="{DynamicResource Brush.Danger.Soft}" />
+    </Style>
+    <Style Selector="Border.infoBar.warning">
+        <Setter Property="BorderBrush" Value="{DynamicResource Brush.Warning}" />
+        <Setter Property="Background" Value="{DynamicResource Brush.Warning.Soft}" />
+    </Style>
+    <Style Selector="Border.infoBar.success">
+        <Setter Property="BorderBrush" Value="{DynamicResource Brush.Success}" />
+        <Setter Property="Background" Value="{DynamicResource Brush.Success.Soft}" />
+    </Style>
+    <Style Selector="Border.infoBar.info">
+        <Setter Property="BorderBrush" Value="{DynamicResource Brush.Info}" />
+        <Setter Property="Background" Value="{DynamicResource Brush.Info.Soft}" />
+    </Style>
+
+    <!-- Flyout popup surface (the only flyout in the app is the dry-run facet filter). Match the
+         token-driven card look instead of Fluent's stock presenter chrome, and cap the width so a
+         long list of facet keys wraps rather than sprawling across the screen. -->
+    <Style Selector="FlyoutPresenter">
+        <Setter Property="Background" Value="{DynamicResource Brush.Panel.Background}" />
+        <Setter Property="BorderBrush" Value="{DynamicResource Brush.Panel.Border}" />
+        <Setter Property="BorderThickness" Value="1" />
+        <Setter Property="CornerRadius" Value="{StaticResource Radius.Card}" />
+        <Setter Property="Padding" Value="12" />
+        <Setter Property="MaxWidth" Value="440" />
+    </Style>
+
+    <!-- Card-like Expander (the dry-run Storage panel). The header/content backgrounds and borders
+         are neutralised inline on the instance (Expander.Resources) so the wrapping Border.card
+         surface shows through; here we only tune the styled properties. -->
+    <Style Selector="Expander.card">
+        <Setter Property="MinHeight" Value="0" />
+        <Setter Property="Background" Value="Transparent" />
+        <Setter Property="BorderThickness" Value="0" />
+    </Style>
+
+    <!-- (Status pills/chips and the dead per-target "kind" text tags were replaced by the
+         ctrl:StatusCount control above — the dry-run view was their only consumer.) -->
+
+    <!-- ============================ Profile list ============================
+         VS Solution-Explorer feel: transparent rows, subtle hover, an accent left-bar on the
+         selected row. Fluent already draws an accent bar on selected ListBoxItems; we tune the
+         fill/spacing and let the accent override (Tokens.axaml) colour it VS blue. -->
+    <Style Selector="ListBox.profiles">
+        <Setter Property="Background" Value="Transparent" />
+        <Setter Property="BorderThickness" Value="0" />
+        <Setter Property="Padding" Value="0" />
+    </Style>
+    <Style Selector="ListBox.profiles ListBoxItem">
+        <Setter Property="Padding" Value="8,6" />
+        <Setter Property="Margin" Value="0,1" />
+        <Setter Property="CornerRadius" Value="{StaticResource Radius.Control}" />
+    </Style>
+
+    <!-- ====================== Collapsed profile rail ======================
+         The collapsed sidebar: one acronym avatar per profile, centred. Selection and hover are
+         drawn on the avatar Border itself (not the default ListBoxItem chrome), so we blank the
+         Fluent selection background/pipe and let the avatar carry the accent. Disabled (locked)
+         rows keep Fluent's reduced opacity as the "switch blocked" cue. -->
+    <Style Selector="ListBox.profilesRail">
+        <Setter Property="Background" Value="Transparent" />
+        <Setter Property="BorderThickness" Value="0" />
+        <!-- Vertical spacing comes from the list: top/bottom padding + inter-item gap (ItemsPanel
+             Spacing in ProfileRailView). Horizontal spacing comes from the collapsed column width
+             centring the avatar. -->
+        <Setter Property="Padding" Value="0,8" />
+    </Style>
+    <Style Selector="ListBox.profilesRail ListBoxItem">
+        <Setter Property="Padding" Value="0" />
+        <Setter Property="Margin" Value="0" />
+        <Setter Property="HorizontalContentAlignment" Value="Center" />
+    </Style>
+    <!-- Suppress the default row selection chrome; the avatar handles all visuals. -->
+    <Style Selector="ListBox.profilesRail ListBoxItem:pointerover /template/ Border#PART_LayoutRoot">
+        <Setter Property="Background" Value="Transparent" />
+    </Style>
+    <Style Selector="ListBox.profilesRail ListBoxItem:selected /template/ Border#PART_LayoutRoot">
+        <Setter Property="Background" Value="Transparent" />
+    </Style>
+    <Style Selector="ListBox.profilesRail ListBoxItem:selected /template/ Border#PART_SelectedPipe">
+        <Setter Property="IsVisible" Value="False" />
+    </Style>
+
+    <Style Selector="ListBox.profilesRail Border.avatar">
+        <Setter Property="Width" Value="40" />
+        <Setter Property="Height" Value="40" />
+        <Setter Property="HorizontalAlignment" Value="Center" />
+        <Setter Property="CornerRadius" Value="{StaticResource Radius.Control}" />
+        <Setter Property="Background" Value="{DynamicResource Brush.Control.Background}" />
+        <Setter Property="BorderBrush" Value="{DynamicResource Brush.Control.Border}" />
+        <Setter Property="BorderThickness" Value="1" />
+    </Style>
+    <Style Selector="ListBox.profilesRail Border.avatar > TextBlock">
+        <Setter Property="HorizontalAlignment" Value="Center" />
+        <Setter Property="VerticalAlignment" Value="Center" />
+        <Setter Property="FontWeight" Value="SemiBold" />
+        <Setter Property="Foreground" Value="{DynamicResource Brush.Text.Primary}" />
+    </Style>
+    <Style Selector="ListBox.profilesRail ListBoxItem:pointerover Border.avatar">
+        <Setter Property="Background" Value="{DynamicResource Brush.Item.Hover}" />
+        <Setter Property="BorderBrush" Value="{DynamicResource Brush.Control.BorderHover}" />
+    </Style>
+    <Style Selector="ListBox.profilesRail ListBoxItem:selected Border.avatar">
+        <Setter Property="Background" Value="{DynamicResource Brush.Accent}" />
+        <Setter Property="BorderBrush" Value="{DynamicResource Brush.Accent}" />
+    </Style>
+    <Style Selector="ListBox.profilesRail ListBoxItem:selected Border.avatar > TextBlock">
+        <Setter Property="Foreground" Value="{DynamicResource Brush.Accent.Foreground}" />
+    </Style>
+
+    <!-- ============================ Document tabs ============================
+         The Profile / Dry Run switch is a primary navigation control, so give it real presence:
+         larger type, generous hit target, a divider rule beneath the strip, and a bold accent
+         underline on the selected tab. -->
+    <Style Selector="TabControl.documents > TabItem">
+        <Setter Property="FontSize" Value="16" />
+        <Setter Property="Padding" Value="16,10" />
+        <Setter Property="Margin" Value="0,0,4,0" />
+        <Setter Property="Foreground" Value="{DynamicResource Brush.Text.Secondary}" />
+    </Style>
+    <Style Selector="TabControl.documents > TabItem:selected">
+        <Setter Property="FontWeight" Value="SemiBold" />
+        <Setter Property="Foreground" Value="{DynamicResource Brush.Text.Primary}" />
+    </Style>
+    <Style Selector="TabControl.documents > TabItem:pointerover /template/ Border#PART_LayoutRoot">
+        <Setter Property="Background" Value="{DynamicResource Brush.Item.Hover}" />
+    </Style>
+    <!-- Thicken the selected-tab accent underline so the switch reads as a real tab bar. -->
+    <Style Selector="TabControl.documents > TabItem:selected /template/ Border#PART_SelectedPipe">
+        <Setter Property="Height" Value="3" />
+        <Setter Property="Background" Value="{DynamicResource Brush.Accent}" />
+    </Style>
+
+    <!-- ============================ Dry-run status chips ============================
+         The dry-run summary counts double as filters: each is a toggleable StatusCount. Idle it
+         reads like the old read-only summary (flat, no chrome); checked it gains a soft tinted fill
+         and an accent border so an active filter is obvious. The border stays 1px in every state so
+         toggling never shifts the row's layout. Fluent paints the checked/hover fill inside the
+         template, so the state selectors target /template/ ContentPresenter. -->
+    <Style Selector="ToggleButton.statusFilter">
+        <Setter Property="Background" Value="Transparent" />
+        <Setter Property="BorderThickness" Value="1" />
+        <Setter Property="BorderBrush" Value="Transparent" />
+        <Setter Property="CornerRadius" Value="{StaticResource Radius.Control}" />
+        <Setter Property="VerticalAlignment" Value="Center" />
+        <Setter Property="MinHeight" Value="0" />
+    </Style>
+    <Style Selector="ToggleButton.statusFilter:pointerover /template/ ContentPresenter">
+        <Setter Property="Background" Value="{DynamicResource Brush.Item.Hover}" />
+        <Setter Property="BorderBrush" Value="Transparent" />
+    </Style>
+    <Style Selector="ToggleButton.statusFilter:checked /template/ ContentPresenter">
+        <Setter Property="Background" Value="{DynamicResource Brush.Item.Selected}" />
+        <Setter Property="BorderBrush" Value="{DynamicResource Brush.Accent}" />
+    </Style>
+    <Style Selector="ToggleButton.statusFilter:checked:pointerover /template/ ContentPresenter">
+        <Setter Property="Background" Value="{DynamicResource Brush.Item.Selected}" />
+        <Setter Property="BorderBrush" Value="{DynamicResource Brush.Accent}" />
+    </Style>
+</Styles>

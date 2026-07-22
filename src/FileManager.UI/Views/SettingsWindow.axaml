@@ -1,0 +1,160 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="using:FileManager.UI.ViewModels"
+        xmlns:conv="using:FileManager.UI.Converters"
+        xmlns:settings="using:FileManager.Contracts.Settings"
+        x:Class="FileManager.UI.Views.SettingsWindow"
+        x:DataType="vm:SettingsViewModel"
+        Width="560" SizeToContent="Height"
+        WindowStartupLocation="CenterOwner"
+        FontFamily="{StaticResource AppFontFamily}"
+        FontSize="{StaticResource Font.Body}"
+        Background="{DynamicResource Brush.Window.Background}"
+        Title="Settings">
+
+    <StackPanel Margin="16" Spacing="4">
+        <Border Classes="sectionHeader" Margin="0,0,0,8"><TextBlock Text="Appearance" /></Border>
+        <TextBlock TextWrapping="Wrap" Classes="secondary" Margin="0,0,0,8"
+                   Text="The application theme. System follows the Windows light/dark preference; Light and Dark force a fixed theme." />
+
+        <Grid ColumnDefinitions="140,*" RowDefinitions="Auto" Margin="0,0,0,4">
+            <TextBlock Grid.Row="0" Grid.Column="0" Classes="fieldLabel" Text="Theme" />
+            <ComboBox Grid.Row="0" Grid.Column="1" ItemsSource="{Binding ThemeModeOptions}"
+                      SelectedItem="{Binding ThemeMode}" Margin="0,2" MinWidth="220">
+                <ComboBox.ItemTemplate>
+                    <DataTemplate x:DataType="settings:ThemeMode">
+                        <TextBlock Text="{Binding Converter={x:Static conv:EnumTitleConverters.ThemeMode}}" />
+                    </DataTemplate>
+                </ComboBox.ItemTemplate>
+            </ComboBox>
+        </Grid>
+
+        <Border Classes="sectionHeader" Margin="0,0,0,8"><TextBlock Text="Service startup" /></Border>
+        <TextBlock TextWrapping="Wrap" Classes="secondary" Margin="0,0,0,8"
+                   Text="When the background service runs. RunOnStartup launches it at Windows login. StartOnProgramOpen starts it when this app opens and leaves it running. StartAndStopWithProgram starts it on open and stops it when the app closes (warning first if jobs are running)." />
+
+        <Grid ColumnDefinitions="140,*" RowDefinitions="Auto" Margin="0,0,0,4">
+            <TextBlock Grid.Row="0" Grid.Column="0" Classes="fieldLabel" Text="Startup mode" />
+            <ComboBox Grid.Row="0" Grid.Column="1" ItemsSource="{Binding ServiceStartupModeOptions}"
+                      SelectedItem="{Binding StartupMode}" Margin="0,2" MinWidth="220">
+                <ComboBox.ItemTemplate>
+                    <DataTemplate x:DataType="settings:ServiceStartupMode">
+                        <TextBlock Text="{Binding Converter={x:Static conv:EnumTitleConverters.ServiceStartupMode}}" />
+                    </DataTemplate>
+                </ComboBox.ItemTemplate>
+            </ComboBox>
+        </Grid>
+
+        <Border Classes="sectionHeader"><TextBlock Text="Scan performance" /></Border>
+        <TextBlock TextWrapping="Wrap" Classes="secondary" Margin="0,0,0,8"
+                   Text="Thread budgets shared across all profiles. Max scan threads caps total directory-enumeration threads (auto = cores × 8). Per-drive default caps threads on any one drive (auto = cores × 4). Max hash threads caps parallel file hashing in a dry run (auto = cores − 1)." />
+
+        <Grid ColumnDefinitions="160,Auto,*" RowDefinitions="Auto" Margin="0,0,0,4">
+            <TextBlock Grid.Column="0" Classes="fieldLabel" Text="Max scan threads" />
+            <CheckBox Grid.Column="1" Content="Auto" IsChecked="{Binding MaxScanThreadsAuto}" Margin="0,2,8,2" />
+            <NumericUpDown Grid.Column="2" Value="{Binding MaxScanThreadsValue}" Minimum="1" Width="160"
+                           HorizontalAlignment="Left" Margin="0,2" FormatString="0"
+                           IsVisible="{Binding ShowMaxScanThreadsValue}" />
+        </Grid>
+        <Grid ColumnDefinitions="160,Auto,*" RowDefinitions="Auto" Margin="0,0,0,4">
+            <TextBlock Grid.Column="0" Classes="fieldLabel" Text="Per-drive default" />
+            <CheckBox Grid.Column="1" Content="Auto" IsChecked="{Binding PerDriveDefaultAuto}" Margin="0,2,8,2" />
+            <NumericUpDown Grid.Column="2" Value="{Binding PerDriveDefaultValue}" Minimum="1" Width="160"
+                           HorizontalAlignment="Left" Margin="0,2" FormatString="0"
+                           IsVisible="{Binding ShowPerDriveDefaultValue}" />
+        </Grid>
+        <Grid ColumnDefinitions="160,Auto,*" RowDefinitions="Auto" Margin="0,0,0,4">
+            <TextBlock Grid.Column="0" Classes="fieldLabel" Text="Max hash threads" />
+            <CheckBox Grid.Column="1" Content="Auto" IsChecked="{Binding MaxHashThreadsAuto}" Margin="0,2,8,2" />
+            <NumericUpDown Grid.Column="2" Value="{Binding MaxHashThreadsValue}" Minimum="1" Width="160"
+                           HorizontalAlignment="Left" Margin="0,2" FormatString="0"
+                           IsVisible="{Binding ShowMaxHashThreadsValue}" />
+        </Grid>
+
+        <Border Classes="sectionHeader" Margin="0,8,0,0"><TextBlock Text="Dry-run scratch directory" /></Border>
+        <TextBlock TextWrapping="Wrap" Classes="secondary" Margin="0,0,0,8"
+                   Text="Where the service spills a large dry run's findings to disk before streaming them to this window. Small runs stay in memory and never touch it. Defaults to a 'scratch' folder in the service's working directory. Leftover snapshots are purged on service startup." />
+
+        <Grid ColumnDefinitions="140,*,Auto" RowDefinitions="Auto" Margin="0,0,0,4">
+            <TextBlock Grid.Column="0" Classes="fieldLabel" Text="Location" />
+            <TextBox Grid.Column="1" Text="{Binding ScratchDirectory}" Margin="0,2" />
+            <Button Grid.Column="2" Content="Browse…" Margin="8,2,0,2"
+                    Command="{Binding BrowseScratchDirectoryCommand}" />
+        </Grid>
+
+        <Border Classes="sectionHeader" Margin="0,8,0,0"><TextBlock Text="Profiles storage" /></Border>
+        <TextBlock TextWrapping="Wrap" Classes="secondary" Margin="0,0,0,8"
+                   Text="Where profile files are stored. Change… applies immediately: it asks whether to move the existing profiles into the new folder (defaulting to no), then switches the service to it." />
+
+        <Grid ColumnDefinitions="140,*,Auto" RowDefinitions="Auto" Margin="0,0,0,4">
+            <TextBlock Grid.Column="0" Classes="fieldLabel" Text="Location" />
+            <TextBox Grid.Column="1" Text="{Binding ProfilesDirectory}" Margin="0,2" IsReadOnly="True" />
+            <Button Grid.Column="2" Content="Change…" Margin="8,2,0,2"
+                    Command="{Binding ChangeProfilesDirectoryCommand}" IsEnabled="{Binding !IsBusy}" />
+        </Grid>
+
+        <Expander Header="Advanced: per-drive overrides" Margin="0,8,0,0">
+            <StackPanel Spacing="8" Margin="0,8,0,0">
+                <TextBlock Classes="secondary" TextWrapping="Wrap"
+                           Text="Override the per-drive budget for a whole drive type, or for a specific volume key (highest precedence). Precedence: specific drive → drive type → per-drive default." />
+
+                <Border Classes="sectionHeader"><TextBlock Text="Drive-type overrides" /></Border>
+                <ItemsControl ItemsSource="{Binding DriveTypeOverrides}">
+                    <ItemsControl.ItemTemplate>
+                        <DataTemplate x:DataType="vm:DriveTypeOverrideRowViewModel">
+                            <Grid ColumnDefinitions="*,Auto,Auto,Auto" Margin="0,2">
+                                <ComboBox Grid.Column="0" ItemsSource="{Binding Options}" SelectedItem="{Binding Class}" MinWidth="150">
+                                    <ComboBox.ItemTemplate>
+                                        <DataTemplate x:DataType="settings:DriveClass">
+                                            <TextBlock Text="{Binding Converter={x:Static conv:EnumTitleConverters.DriveClass}}" />
+                                        </DataTemplate>
+                                    </ComboBox.ItemTemplate>
+                                </ComboBox>
+                                <CheckBox Grid.Column="1" Content="Auto" IsChecked="{Binding Auto}" Margin="8,0" VerticalAlignment="Center" />
+                                <NumericUpDown Grid.Column="2" Value="{Binding Value}" Minimum="1" Width="120" FormatString="0"
+                                               VerticalAlignment="Center" IsVisible="{Binding ShowValue}" />
+                                <Button Grid.Column="3" Content="Remove" Margin="8,0,0,0" VerticalAlignment="Center"
+                                        Command="{Binding $parent[ItemsControl].((vm:SettingsViewModel)DataContext).RemoveDriveTypeOverrideCommand}"
+                                        CommandParameter="{Binding}" />
+                            </Grid>
+                        </DataTemplate>
+                    </ItemsControl.ItemTemplate>
+                </ItemsControl>
+                <Button Content="Add drive-type override" Command="{Binding AddDriveTypeOverrideCommand}" HorizontalAlignment="Left" />
+
+                <Border Classes="sectionHeader"><TextBlock Text="Specific-drive overrides" /></Border>
+                <ItemsControl ItemsSource="{Binding SpecificDriveOverrides}">
+                    <ItemsControl.ItemTemplate>
+                        <DataTemplate x:DataType="vm:SpecificDriveOverrideRowViewModel">
+                            <Grid ColumnDefinitions="*,Auto,Auto,Auto" Margin="0,2">
+                                <TextBox Grid.Column="0" Text="{Binding VolumeKey}" PlaceholderText="c: or \\server\share" MinWidth="150" />
+                                <CheckBox Grid.Column="1" Content="Auto" IsChecked="{Binding Auto}" Margin="8,0" VerticalAlignment="Center" />
+                                <NumericUpDown Grid.Column="2" Value="{Binding Value}" Minimum="1" Width="120" FormatString="0"
+                                               VerticalAlignment="Center" IsVisible="{Binding ShowValue}" />
+                                <Button Grid.Column="3" Content="Remove" Margin="8,0,0,0" VerticalAlignment="Center"
+                                        Command="{Binding $parent[ItemsControl].((vm:SettingsViewModel)DataContext).RemoveSpecificDriveOverrideCommand}"
+                                        CommandParameter="{Binding}" />
+                            </Grid>
+                        </DataTemplate>
+                    </ItemsControl.ItemTemplate>
+                </ItemsControl>
+                <Button Content="Add drive override" Command="{Binding AddSpecificDriveOverrideCommand}" HorizontalAlignment="Left" />
+            </StackPanel>
+        </Expander>
+
+        <Border Classes="infoBar danger" Margin="0,8,0,0"
+                IsVisible="{Binding ErrorMessage, Converter={x:Static ObjectConverters.IsNotNull}}">
+            <TextBlock Text="{Binding ErrorMessage}" TextWrapping="Wrap" />
+        </Border>
+        <Border Classes="infoBar success" Margin="0,8,0,0"
+                IsVisible="{Binding StatusMessage, Converter={x:Static ObjectConverters.IsNotNull}}">
+            <TextBlock Text="{Binding StatusMessage}" TextWrapping="Wrap" />
+        </Border>
+
+        <StackPanel Orientation="Horizontal" Spacing="8" HorizontalAlignment="Right" Margin="0,12,0,0">
+            <Button Content="Save" Command="{Binding SaveCommand}" Classes="accent" IsEnabled="{Binding !IsBusy}" />
+            <Button Content="Close" Click="OnCloseClick" />
+        </StackPanel>
+    </StackPanel>
+
+</Window>

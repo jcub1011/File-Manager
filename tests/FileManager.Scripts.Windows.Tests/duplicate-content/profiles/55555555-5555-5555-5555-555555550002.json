@@ -1,0 +1,35 @@
+{
+  "SchemaVersion": 2,
+  "ProfileId": "55555555-5555-5555-5555-555555550002",
+  "Name": "Duplicate Content - SHA256",
+  "Active": true,
+  "SyncMode": "AdditiveArchive",
+  "ScanDestination": true,
+  "TargetLayout": "PreserveStructure",
+  "Triggers": {
+    "ManualShell": true,
+    "Watcher": false
+  },
+  "Sources": [
+    {
+      "Path": "C:\\Users\\Jacob McCormack\\source\\repos\\File-Manager\\tests\\FileManager.Scripts.Windows.Tests\\duplicate-content\\sources"
+    }
+  ],
+  "Targets": [
+    {
+      "Path": "C:\\Users\\Jacob McCormack\\source\\repos\\File-Manager\\tests\\FileManager.Scripts.Windows.Tests\\duplicate-content\\targets"
+    }
+  ],
+  "Policies": {
+    "ConflictResolution": "Skip",
+    "OverwriteHandling": "StageOverwrites",
+    "VerificationMethod": "SHA256",
+    "OnSuccess": "KeepSource",
+    "OnFailure": "AbortRestoreAndClean",
+    "MetadataOnConflict": "WarnAndContinue"
+  },
+  "Logging": {
+    "Verbosity": "FailuresAndSkips",
+    "NotifyOnFailure": true
+  }
+}
