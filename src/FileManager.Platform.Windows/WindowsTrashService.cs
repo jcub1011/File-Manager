@@ -28,13 +28,22 @@ public sealed partial class WindowsTrashService(ILogger<WindowsTrashService> log
 
     private static readonly StrategyBasedComWrappers ComWrappers = new();
 
+    /// <summary>Bound on the STA join: a hung shell operation (COM deadlock on the fully-suppressed
+    /// UI apartment) must fail the disposition, not block the pipeline forever. The abandoned
+    /// background thread dies with the process.</summary>
+    private static readonly TimeSpan StaTimeout = TimeSpan.FromSeconds(60);
+
     public Result MoveToTrash(string absolutePath)
     {
         Result result = Result.Failure("trash operation did not run");
         var thread = new Thread(() => result = RunSta(absolutePath)) { IsBackground = true };
         thread.SetApartmentState(ApartmentState.STA);
         thread.Start();
-        thread.Join();
+        if (!thread.Join(StaTimeout))
+        {
+            logger.LogError("Recycling \"{Path}\" timed out after {Timeout}; abandoning the shell operation", absolutePath, StaTimeout);
+            return $"recycling \"{absolutePath}\" timed out after {StaTimeout.TotalSeconds:N0}s";
+        }
         return result;
     }
 
@@ -65,6 +74,13 @@ public sealed partial class WindowsTrashService(ILogger<WindowsTrashService> log
                 operation.SetOperationFlags(OperationFlags);
                 operation.DeleteItem(shellItem, IntPtr.Zero);
                 operation.PerformOperations();
+                // PerformOperations can return S_OK with the item silently skipped (FOF_NOERRORUI
+                // suppresses any dialog): with FOFX_RECYCLEONDELETE the shell refuses to permanently
+                // delete on a volume with no Recycle Bin (UNC shares, some removable media) and
+                // ABORTS instead. Reporting Success then would corrupt disposition accounting —
+                // the caller believes the source is gone while it still exists.
+                if (operation.GetAnyOperationsAborted())
+                    return $"the shell aborted recycling \"{absolutePath}\" (the volume may have no Recycle Bin); the file was not moved";
                 return Result.Success();
             }
             finally
@@ -137,4 +153,6 @@ internal partial interface IFileOperation
     void DeleteItems(nint punkItems);                      // 17
     void NewItem(nint psiDestinationFolder, uint dwFileAttributes, nint pszName, nint pszTemplateName, nint pfopsProgressSink);  // 18
     void PerformOperations();                              // 19
+    [return: MarshalAs(UnmanagedType.Bool)]
+    bool GetAnyOperationsAborted();                        // 20 — TRUE when any item was skipped/aborted
 }

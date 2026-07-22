@@ -88,7 +88,7 @@ public sealed class WindowsMetadataPreserver(ILogger<WindowsMetadataPreserver> l
         }
     }
 
-    private static string? TryDriveFormat(string path)
+    private string? TryDriveFormat(string path)
     {
         try
         {
@@ -101,6 +101,13 @@ public sealed class WindowsMetadataPreserver(ILogger<WindowsMetadataPreserver> l
         }
         catch (Exception ex) when (ex is IOException or ArgumentException or UnauthorizedAccessException)
         {
+            return null;
+        }
+        catch (Exception ex)
+        {
+            // Last-resort catch-all (directive): the format probe is a best-effort refinement and
+            // must degrade to "cannot determine", logged, never a throw out of metadata handling.
+            logger.LogWarning(ex, "Drive-format probe failed unexpectedly for {Path}", path);
             return null;
         }
     }
