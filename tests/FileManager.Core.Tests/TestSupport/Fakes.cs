@@ -1,11 +1,71 @@
+using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
 using FileManager.Contracts.Primitives;
 using FileManager.Contracts.Profiles;
 using FileManager.Contracts.Settings;
+using FileManager.Core.Jobs;
 using FileManager.Core.Platform;
+using FileManager.Core.Profiles;
 using FileManager.Core.Settings;
+using FileManager.Core.Watching;
 
 namespace FileManager.Core.Tests.TestSupport;
+
+/// <summary>In-memory pause flag that notifies subscribers synchronously; lets a test toggle the
+/// trigger-queue gate without touching disk.</summary>
+internal sealed class FakePauseState : IPauseStateService
+{
+    private readonly List<Action<bool>> _handlers = [];
+    public bool IsPaused { get; private set; }
+
+    public Result SetPaused(bool paused)
+    {
+        IsPaused = paused;
+        foreach (Action<bool> handler in _handlers.ToArray())
+            handler(paused);
+        return Result.Success();
+    }
+
+    public IDisposable Subscribe(Action<bool> pauseHandler)
+    {
+        _handlers.Add(pauseHandler);
+        return new Subscription(_handlers, pauseHandler);
+    }
+
+    private sealed class Subscription(List<Action<bool>> handlers, Action<bool> handler) : IDisposable
+    {
+        public void Dispose() => handlers.Remove(handler);
+    }
+}
+
+/// <summary>A catalog over a fixed profile set.</summary>
+internal sealed class FakeProfileCatalog(params Profile[] profiles) : IProfileCatalog
+{
+    public IReadOnlyList<Profile> All { get; } = profiles;
+    public IReadOnlyList<Profile> Active { get; } = profiles.Where(p => p.Active).ToList();
+    public IDisposable Subscribe(Action changeHandler) => new Noop();
+    public Result Reload() => Result.Success();
+    private sealed class Noop : IDisposable { public void Dispose() { } }
+}
+
+/// <summary>Records executed plans and returns a canned completion (Succeeded unless overridden).</summary>
+internal sealed class FakeJobExecutor : IJobExecutor
+{
+    public Func<JobPlan, JobCompletion>? OnExecute { get; set; }
+    public ConcurrentBag<JobPlan> Executed { get; } = [];
+
+    public Task<JobCompletion> ExecuteAsync(JobPlan plan, CancellationToken ct = default)
+    {
+        Executed.Add(plan);
+        JobCompletion completion = OnExecute?.Invoke(plan)
+            ?? new JobCompletion(plan.JobId, JobOutcome.Succeeded, null, null, TimeSpan.Zero);
+        return Task.FromResult(completion);
+    }
+}
 
 /// <summary>Serves a fixed <see cref="GlobalSettings"/> snapshot (default unless one is supplied);
 /// <see cref="Update"/> echoes the input.</summary>

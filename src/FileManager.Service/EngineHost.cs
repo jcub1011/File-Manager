@@ -1,10 +1,13 @@
 using FileManager.Contracts.IPC;
 using FileManager.Contracts.Primitives;
 using FileManager.Core.IPC;
+using FileManager.Core.Jobs;
 using FileManager.Core.Journal;
+using FileManager.Core.Observability;
 using FileManager.Core.Platform;
 using FileManager.Core.Profiles;
 using FileManager.Core.Settings;
+using FileManager.Core.Watching;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using System;
@@ -24,9 +27,15 @@ internal sealed class EngineHost(
     IIpcServer ipcServer,
     ISettingsProvider settings,
     IAutostartRegistrar autostart,
-    ICrashRecovery crashRecovery) : BackgroundService
+    ICrashRecovery crashRecovery,
+    IJobOrchestrator orchestrator,
+    IEngineEventBus eventBus,
+    IPauseStateService pauseState,
+    TimeProvider time) : BackgroundService
 {
     private Mutex? _singleInstanceMutex;
+    private IDisposable? _eventBridge;
+    private IDisposable? _pauseBridge;
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -114,7 +123,21 @@ internal sealed class EngineHost(
         // 6. Reconcile OS autostart with the configured startup mode (idempotent).
         AutostartApplier.Apply(settings.Current.ServiceStartupMode, autostart, logger);
         //    [slot] IShellIntegration.RegisterContextMenu().
-        //    [slot] Start triggers: watcher, scheduler missed-run evaluation, trigger-queue consumer.
+
+        // 7. Start the live job pipeline (§2.4 step 6): bridge engine events to IPC subscribers,
+        //    mirror pause changes as events, then start the orchestrator's trigger-queue consumer.
+        //    Order: bridges first so the consumer's very first job's events are already observed.
+        _eventBridge = eventBus.Subscribe(ipcServer.Broadcast);
+        _pauseBridge = pauseState.Subscribe(paused =>
+            eventBus.Publish(new PauseChangedEvent { AtUtc = time.GetUtcNow(), Paused = paused }));
+        Result orchestratorStarted = orchestrator.Start();
+        if (orchestratorStarted.TryGetError(out string? orchestratorError))
+        {
+            logger.LogCritical("Job orchestrator failed to start: {Error}", orchestratorError);
+            lifetime.StopApplication();
+            return;
+        }
+        //    [slot] Start triggers: watcher, scheduler missed-run evaluation.
         //    [slot] Spawn the tray client when a desktop session exists.
 
         try
@@ -126,6 +149,11 @@ internal sealed class EngineHost(
             // normal shutdown
         }
 
+        // Drain the live pipeline before stopping IPC: stop dequeuing and await in-flight jobs
+        // (I-ATOMIC-JOB — a started job is never suspended), then tear down the event bridges.
+        await orchestrator.StopAsync();
+        _pauseBridge?.Dispose();
+        _eventBridge?.Dispose();
         await ipcServer.StopAsync(CancellationToken.None);
     }
 
@@ -152,6 +180,8 @@ internal sealed class EngineHost(
 
     public override void Dispose()
     {
+        _pauseBridge?.Dispose();
+        _eventBridge?.Dispose();
         _singleInstanceMutex?.Dispose();
         base.Dispose();
     }

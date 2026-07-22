@@ -127,8 +127,15 @@ public sealed partial class WindowsVolumeInfoProvider(ILogger<WindowsVolumeInfoP
     private static string DirectoryOf(string path)
     {
         string full = Path.GetFullPath(path);
-        // GetDiskFreeSpaceEx wants a directory; if the path is (or looks like) a file, use its parent.
-        string dir = Directory.Exists(full) ? full : Path.GetDirectoryName(full) ?? full;
+        // GetDiskFreeSpaceEx wants an EXISTING directory. A job's workspace/target directory may not
+        // exist yet — disk preflight (§4.3) runs before the workspace is created — so walk up to the
+        // nearest existing ancestor. Free space is a per-volume answer, so any existing ancestor on
+        // the same volume gives the right number; bottom out at the volume root.
+        string? dir = Directory.Exists(full) ? full : Path.GetDirectoryName(full);
+        while (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
+            dir = Path.GetDirectoryName(dir);
+        if (string.IsNullOrEmpty(dir))
+            dir = Path.GetPathRoot(full) ?? full;
         return ExtendIfLong(dir);
     }
 

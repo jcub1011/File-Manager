@@ -6,8 +6,10 @@ using FileManager.Core.Files;
 using FileManager.Core.Filtering;
 using FileManager.Core.IPC;
 using FileManager.Core.IPC.Handlers;
+using FileManager.Core.Jobs;
 using FileManager.Core.Journal;
 using FileManager.Core.Locking;
+using FileManager.Core.Observability;
 using FileManager.Core.Placement;
 using FileManager.Core.Platform;
 using FileManager.Core.Preflight;
@@ -102,8 +104,24 @@ internal static class Program
         services.AddSingleton<ISourceDispositionService, SourceDispositionService>();
         services.AddSingleton<ICrashRecovery, CrashRecovery>();
 
+        // Live single-job vertical (Set 3): the trigger queue, pause state, event bus, per-job log
+        // store, profile matcher, plan factory, executor, and orchestrator that drive the substrate.
+        services.AddSingleton<IPauseStateService, PauseStateService>();
+        services.AddSingleton<IEngineEventBus, EngineEventBus>();
+        services.AddSingleton<IJobLogStore, JobLogStore>();
+        services.AddSingleton<ITriggerQueue, TriggerQueue>();
+        services.AddSingleton<IProfileMatcher, ProfileMatcher>();
+        services.AddSingleton<JobPlanFactory>();
+        services.AddSingleton<IJobExecutor, JobExecutor>();
+        services.AddSingleton<IJobOrchestrator, JobOrchestrator>();
+
         // Explicit dispatch table — no reflection-based handler discovery (§1 AOT constraints).
         services.AddSingleton<GetStatusHandler>();
+        services.AddSingleton<GetMatchingProfilesHandler>();
+        services.AddSingleton<RunProfileHandler>();
+        services.AddSingleton<SetPausedHandler>();
+        services.AddSingleton<GetRecentJobsHandler>();
+        services.AddSingleton<GetJobLogHandler>();
         services.AddSingleton<ListProfilesHandler>();
         services.AddSingleton<GetProfileHandler>();
         services.AddSingleton<SaveProfileHandler>();
@@ -120,6 +138,11 @@ internal static class Program
             IIpcRequestHandler[] handlers =
             [
                 provider.GetRequiredService<GetStatusHandler>(),
+                provider.GetRequiredService<GetMatchingProfilesHandler>(),
+                provider.GetRequiredService<RunProfileHandler>(),
+                provider.GetRequiredService<SetPausedHandler>(),
+                provider.GetRequiredService<GetRecentJobsHandler>(),
+                provider.GetRequiredService<GetJobLogHandler>(),
                 provider.GetRequiredService<ListProfilesHandler>(),
                 provider.GetRequiredService<GetProfileHandler>(),
                 provider.GetRequiredService<SaveProfileHandler>(),

@@ -7,6 +7,7 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Threading;
+using System.Threading.Channels;
 using System.Threading.Tasks;
 
 namespace FileManager.Core.IPC;
@@ -20,7 +21,13 @@ public sealed class IpcServer(
     IIpcEndpointProvider endpoint,
     IReadOnlyDictionary<string, IIpcRequestHandler> handlers) : IIpcServer
 {
+    // A slow/dead event subscriber must never block the publisher (§8): each holds a bounded channel
+    // of pre-serialized frames, dropping the oldest under back-pressure (event delivery is
+    // best-effort — the activity view/tray tolerate a gap).
+    private const int SubscriberQueueCapacity = 1024;
+
     private readonly ConcurrentDictionary<Task, byte> _connections = new();
+    private readonly ConcurrentDictionary<Subscriber, byte> _subscribers = new();
     private CancellationTokenSource? _cts;
     private Task? _acceptLoop;
 
@@ -54,11 +61,28 @@ public sealed class IpcServer(
         logger.LogInformation("IPC server stopped");
     }
 
-    /// <summary>Structural no-op in this slice: the subscriber registry exists so event
-    /// subscription (SubscribeEventsRequest) slots in without reshaping the class, but nothing
-    /// registers yet — the dispatch table answers "subscribe" with NOT_IMPLEMENTED.</summary>
+    /// <summary>Fans an engine event out to every subscribed connection (§4.9, §4.10). Serializes
+    /// once, then non-blocking-writes the frame to each subscriber's bounded channel — a per-connection
+    /// writer task drains it. Never blocks on a slow/dead subscriber (§8).</summary>
     public void Broadcast(EngineEvent evt)
     {
+        if (_subscribers.IsEmpty)
+            return;
+
+        byte[] frame;
+        try
+        {
+            frame = IpcSerializer.SerializeEvent(evt);
+        }
+        catch (Exception ex)
+        {
+            // Last-resort catch-and-log: a serialization fault must not take down the publisher.
+            logger.LogError(ex, "Failed to serialize engine event {Type}; dropping it", evt.GetType().Name);
+            return;
+        }
+
+        foreach (Subscriber subscriber in _subscribers.Keys)
+            subscriber.Channel.Writer.TryWrite(frame);   // DropOldest — always accepts, never blocks
     }
 
     private async Task AcceptLoopAsync(CancellationToken ct)
@@ -150,6 +174,14 @@ public sealed class IpcServer(
                         continue;
                     }
 
+                    if (resolution.IsSubscribe)
+                    {
+                        // Event subscription (§3.2): ack once, then this connection becomes a one-way
+                        // event stream until the client disconnects or the server stops.
+                        await ServeEventSubscriptionAsync(stream, ct).ConfigureAwait(false);
+                        return;
+                    }
+
                     if (resolution.Handler is IIpcStreamingRequestHandler streaming)
                     {
                         // One request, many response frames (§ streamed dry-run). The connection
@@ -186,7 +218,8 @@ public sealed class IpcServer(
 
     /// <summary>The outcome of parsing + routing one request frame: either an <see cref="Error"/>
     /// response to send once, or a resolved <see cref="Handler"/> and <see cref="Request"/> to serve.</summary>
-    private readonly record struct Resolution(string RequestType, IpcRequest? Request, IIpcRequestHandler? Handler, IpcResponse? Error);
+    private readonly record struct Resolution(
+        string RequestType, IpcRequest? Request, IIpcRequestHandler? Handler, IpcResponse? Error, bool IsSubscribe = false);
 
     /// <summary>Parses the frame, checks the protocol version, and looks up the handler — the shared
     /// front half of both the single-response and streaming paths.</summary>
@@ -208,6 +241,11 @@ public sealed class IpcServer(
                 Code = "IPC_VERSION_MISMATCH",
                 Message = $"this service speaks protocol version {IpcRequest.CurrentProtocolVersion}, the client sent {request.ProtocolVersion}",
             });
+
+        // Event subscription is served by the connection loop directly (open-ended, Broadcast-driven),
+        // not through the request/response dispatch table.
+        if (discriminator == IpcRequestTypes.Subscribe)
+            return new Resolution(discriminator, request, null, null, IsSubscribe: true);
 
         if (!handlers.TryGetValue(discriminator, out IIpcRequestHandler? handler))
             return new Resolution(discriminator, null, null, new ErrorResponse
@@ -278,6 +316,50 @@ public sealed class IpcServer(
         {
             await enumerator.DisposeAsync().ConfigureAwait(false);
         }
+    }
+
+    /// <summary>Serves an event subscription: acknowledges with an <see cref="OkResponse"/> (the
+    /// client contract), then drains this subscriber's bounded channel to the wire as one event frame
+    /// each until the client disconnects (a write fails) or the server stops. A subscriber left idle
+    /// after a client vanishes is reaped on the next event's failed write, or at shutdown.</summary>
+    private async Task ServeEventSubscriptionAsync(Stream stream, CancellationToken ct)
+    {
+        if (!await TryWriteResponseFrameAsync(stream, IpcRequestTypes.Subscribe, new OkResponse(), ct).ConfigureAwait(false))
+            return;
+
+        Subscriber subscriber = new();
+        _subscribers.TryAdd(subscriber, 0);
+        try
+        {
+            await foreach (byte[] frame in subscriber.Channel.Reader.ReadAllAsync(ct).ConfigureAwait(false))
+            {
+                Result write = await IpcFrameCodec.WriteFrameAsync(stream, frame, ct).ConfigureAwait(false);
+                if (write.IsCanceled)
+                    return;
+                if (write.TryGetError(out string? writeError))
+                {
+                    logger.LogDebug("Event subscription ended: {Reason}", writeError);
+                    return;
+                }
+            }
+        }
+        finally
+        {
+            _subscribers.TryRemove(subscriber, out _);
+        }
+    }
+
+    /// <summary>One event-subscription connection: a bounded, drop-oldest channel of pre-serialized
+    /// event frames the connection's writer task drains.</summary>
+    private sealed class Subscriber
+    {
+        public Channel<byte[]> Channel { get; } = System.Threading.Channels.Channel.CreateBounded<byte[]>(
+            new BoundedChannelOptions(SubscriberQueueCapacity)
+            {
+                FullMode = BoundedChannelFullMode.DropOldest,
+                SingleReader = true,
+                SingleWriter = false,
+            });
     }
 
     /// <summary>Serializes and writes one response frame, swapping an oversized payload for a
