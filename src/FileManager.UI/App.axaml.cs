@@ -63,6 +63,11 @@ namespace FileManager.UI
                 viewModel.ConfirmRunProfile = async message =>
                     await new ConfirmWindow(message, "Run now", "Cancel", confirmIsDanger: true)
                         .ShowDialog<bool>(window);
+                // Modal rather than an inline bar so the same confirmation appears whichever entry
+                // point asked (Profile tab button, list row menu, collapsed rail menu).
+                viewModel.ConfirmDeleteProfile = async message =>
+                    await new ConfirmWindow(message, "Delete", "Cancel", confirmIsDanger: true)
+                        .ShowDialog<bool>(window);
                 window.DataContext = viewModel;
                 desktop.MainWindow = window;
 

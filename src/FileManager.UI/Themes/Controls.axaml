@@ -128,6 +128,27 @@
         <Setter Property="Foreground" Value="White" />
     </Style>
 
+    <!-- "Go" action button (green): the manual Run. Same shape as Button.danger, and like it the
+         hover/press shades are literal darker steps of Brush.Success rather than tokens of their
+         own — nothing else needs them. -->
+    <Style Selector="Button.success">
+        <Setter Property="Background" Value="{DynamicResource Brush.Success}" />
+        <Setter Property="Foreground" Value="White" />
+        <Setter Property="BorderThickness" Value="0" />
+    </Style>
+    <Style Selector="Button.success:pointerover /template/ ContentPresenter">
+        <Setter Property="Background" Value="#47825D" />
+        <Setter Property="Foreground" Value="White" />
+    </Style>
+    <Style Selector="Button.success:pressed /template/ ContentPresenter">
+        <Setter Property="Background" Value="#3B6E4E" />
+        <Setter Property="Foreground" Value="White" />
+    </Style>
+    <!-- The Run glyph must follow the button's white foreground, not the theme's icon brush. -->
+    <Style Selector="Button.success PathIcon">
+        <Setter Property="Foreground" Value="White" />
+    </Style>
+
     <!-- ============================ Inputs ============================ -->
     <Style Selector="TextBox">
         <Setter Property="CornerRadius" Value="{StaticResource Radius.Control}" />
@@ -249,7 +270,9 @@
         <Setter Property="Padding" Value="0" />
     </Style>
     <Style Selector="ListBox.profiles ListBoxItem">
-        <Setter Property="Padding" Value="8,6" />
+        <!-- Inert: ProfileListView overrides this to 0 and carries the inset on the template's Border
+             instead, so the whole row is right-clickable. Kept in step with that value. -->
+        <Setter Property="Padding" Value="8,3" />
         <Setter Property="Margin" Value="0,1" />
         <Setter Property="CornerRadius" Value="{StaticResource Radius.Control}" />
     </Style>

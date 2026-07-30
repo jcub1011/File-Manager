@@ -84,31 +84,31 @@ public sealed class ProfileListViewModelTests
     }
 
     [Fact]
-    public async Task Confirmed_delete_calls_the_gateway_and_refreshes()
+    public async Task Delete_calls_the_gateway_and_refreshes()
     {
+        // The confirmation is the shell's (a modal); by the time DeleteAsync runs the user said yes.
         var (list, gateway) = NewList();
         await list.RefreshAsync();
         list.CanNavigate = () => true;
 
-        list.RequestDelete(list.Profiles[1]);
-        Assert.NotNull(list.PendingDelete);
-        await list.ConfirmDeleteAsync();
+        await list.DeleteAsync(list.Profiles[1]);
 
         Assert.Equal([IdB], gateway.DeleteCalls);
-        Assert.Null(list.PendingDelete);
+        Assert.Null(list.ErrorMessage);
     }
 
     [Fact]
-    public async Task Cancelled_delete_touches_nothing()
+    public async Task Deleting_the_open_profile_clears_the_selection()
     {
         var (list, gateway) = NewList();
         await list.RefreshAsync();
+        list.CanNavigate = () => true;
+        list.SelectedProfile = list.Profiles[0];
 
-        list.RequestDelete(list.Profiles[0]);
-        list.CancelDelete();
-        await list.ConfirmDeleteAsync();       // nothing pending → no-op
+        await list.DeleteAsync(list.Profiles[0]);
 
-        Assert.Empty(gateway.DeleteCalls);
+        Assert.Equal([IdA], gateway.DeleteCalls);
+        Assert.Null(list.SelectedProfile);
     }
 
     [Fact]

@@ -69,7 +69,8 @@ public sealed partial class SettingsViewModel : ViewModelBase
     [RelayCommand]
     private async Task BrowseScratchDirectory()
     {
-        string? picked = await _folderPicker.PickFolderAsync("Choose the dry-run scratch directory");
+        string? picked = await _folderPicker.PickFolderAsync(
+            "Choose the dry-run scratch directory", ScratchDirectory);
         if (picked is not null)
             ScratchDirectory = picked;
     }
@@ -97,7 +98,8 @@ public sealed partial class SettingsViewModel : ViewModelBase
         // UI thread unlogged.
         try
         {
-            string? picked = await _folderPicker.PickFolderAsync("Choose the profiles storage folder");
+            string? picked = await _folderPicker.PickFolderAsync(
+                "Choose the profiles storage folder", ProfilesDirectory);
             if (picked is null)
                 return;
             if (IsSameFolder(picked, ProfilesDirectory))

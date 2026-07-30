@@ -250,6 +250,24 @@ public sealed class SettingsViewModelTests
     }
 
     [Fact]
+    public async Task Both_folder_pickers_open_at_the_currently_configured_folder()
+    {
+        // Re-choosing a folder should start where the setting already points, not at the OS default.
+        FakeFolderPicker picker = new(result: null);
+        SettingsViewModel vm = new(new FakeIpcGateway(), picker)
+        {
+            ScratchDirectory = @"D:\scratch",
+            ProfilesDirectory = @"E:\profiles",
+        };
+
+        await vm.BrowseScratchDirectoryCommand.ExecuteAsync(null);
+        Assert.Equal(@"D:\scratch", picker.LastStartNear);
+
+        await vm.ChangeProfilesDirectoryCommand.ExecuteAsync(null);
+        Assert.Equal(@"E:\profiles", picker.LastStartNear);
+    }
+
+    [Fact]
     public async Task Change_profiles_directory_does_nothing_when_the_picker_is_cancelled()
     {
         FakeIpcGateway gateway = new();

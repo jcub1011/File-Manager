@@ -152,6 +152,29 @@
                                 IsVisible="{Binding IsDirty}" />
                     </StackPanel>
 
+                    <!-- Delete + Run act on the PERSISTED profile, not the draft, so this group stays
+                         at shell scope (no DataContext override) and takes the selected list row as its
+                         parameter. Both disable when there is no saved row (a brand-new draft). -->
+                    <StackPanel Orientation="Horizontal" Spacing="8"
+                                IsVisible="{Binding #ProfileTab.IsSelected}">
+                        <Button Content="Delete" Classes="danger"
+                                Command="{Binding DeleteProfileCommand}"
+                                CommandParameter="{Binding List.SelectedProfile}"
+                                IsEnabled="{Binding List.CanDeleteSelected}"
+                                ToolTip.Tip="Delete this profile" />
+                        <Button Classes="success"
+                                Command="{Binding RunProfileNowCommand}"
+                                CommandParameter="{Binding List.SelectedProfile}"
+                                IsEnabled="{Binding List.CanRunSelected}"
+                                ToolTip.Tip="Performs a real run: moves files and applies the source disposition.">
+                            <StackPanel Orientation="Horizontal" Spacing="6">
+                                <PathIcon Data="{StaticResource IconPlay}" Width="11" Height="11"
+                                          VerticalAlignment="Center" />
+                                <TextBlock Text="Run" />
+                            </StackPanel>
+                        </Button>
+                    </StackPanel>
+
                     <StackPanel Orientation="Horizontal" Spacing="6"
                                 DataContext="{Binding DryRun}" x:DataType="vm:DryRunViewModel"
                                 IsVisible="{Binding #DryRunTab.IsSelected}">

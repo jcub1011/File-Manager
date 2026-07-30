@@ -327,7 +327,10 @@
         <!-- ═══════════════ Report body ═══════════════
              A collapsible Storage panel (Auto) above the two file lists (*), so the lists take the
              vast majority of the height. -->
-        <Grid Margin="0,8,0,0" IsVisible="{Binding HasReport}" RowDefinitions="Auto,*">
+        <!-- The HasReport gate sits on the two children rather than here, so the "run one first"
+             placeholder below can share row 1 with the lists it replaces. The Storage card's own
+             Space-is-not-null gate already implies HasReport (ClearReport nulls Space). -->
+        <Grid Margin="0,8,0,0" RowDefinitions="Auto,*">
 
             <!-- Storage: per-volume used·free·bounded-maximum with a per-folder drill-down. Collapsed
                  by default to reclaim vertical space; the header carries a one-line summary and a
@@ -371,7 +374,7 @@
             <!-- Sources and Destinations side by side (draggable split) so the whole picture is
                  visible at once. Paths are shown relative to each panel's common root to reclaim the
                  horizontal space that repeated drive prefixes used to waste. -->
-            <Grid Grid.Row="1">
+            <Grid Grid.Row="1" IsVisible="{Binding HasReport}">
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="*" MinWidth="360" />
                     <ColumnDefinition Width="Auto" />
@@ -655,6 +658,23 @@
                     </Panel>
                 </Grid>
             </Grid>
+
+            <!-- Empty state: the tab is otherwise a blank slab before the first run. Hidden while a
+                 run is in flight, where the progress bar above is the right thing to look at. -->
+            <StackPanel Grid.Row="1" VerticalAlignment="Center" HorizontalAlignment="Center"
+                        Spacing="8" MaxWidth="360">
+                <StackPanel.IsVisible>
+                    <MultiBinding Converter="{x:Static BoolConverters.And}">
+                        <Binding Path="!HasReport" />
+                        <Binding Path="!RunCommand.IsRunning" />
+                    </MultiBinding>
+                </StackPanel.IsVisible>
+                <PathIcon Data="{StaticResource IconPlay}" Width="32" Height="32"
+                          HorizontalAlignment="Center" Foreground="{DynamicResource Brush.Text.Secondary}" />
+                <TextBlock Text="Perform a dry run to preview file operations."
+                           Foreground="{DynamicResource Brush.Text.Secondary}"
+                           TextWrapping="Wrap" TextAlignment="Center" />
+            </StackPanel>
         </Grid>
     </DockPanel>
 

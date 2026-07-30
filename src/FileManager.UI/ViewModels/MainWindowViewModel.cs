@@ -53,6 +53,7 @@ public sealed partial class MainWindowViewModel : ViewModelBase
         List.CreateProfileCommand = NewProfileCommand;
         List.ExportProfileCommand = ExportProfileCommand;
         List.RunProfileCommand = RunProfileNowCommand;
+        List.DeleteProfileCommand = DeleteProfileCommand;
         List.CanNavigate = () => !Editor.IsDirty;
         List.NavigationBlocked = () => Editor.ShowUnsavedWarning = true;
         List.SelectionCommitted = item => _ = LoadSelectionSafeAsync(item);
@@ -242,6 +243,31 @@ public sealed partial class MainWindowViewModel : ViewModelBase
             Log.Error(ex, "Running profile {ProfileId} failed", item.ProfileId);
             List.ErrorMessage = $"Could not run \"{item.Name}\": {ex.Message}";
         }
+    }
+
+    /// <summary>Set by the composition root to confirm a delete before it is submitted. Mirrors
+    /// <see cref="ConfirmRunProfile"/>: a modal, so the same confirmation appears whether the delete
+    /// came from the Profile tab, a list row, or the collapsed rail. A null callback proceeds, so
+    /// headless tests are not blocked.</summary>
+    public Func<string, Task<bool>>? ConfirmDeleteProfile { get; set; }
+
+    /// <summary>Deletes a profile after confirming. Falls back to the selected profile so the Profile
+    /// tab's button and the rows' right-click menu can share one command.</summary>
+    [RelayCommand]
+    public async Task DeleteProfileAsync(ProfileListItem? item)
+    {
+        item ??= List.SelectedProfile;
+        if (item is null)
+            return;
+        if (ConfirmDeleteProfile is not null
+            && !await ConfirmDeleteProfile($"Delete profile \"{item.Name}\"? This cannot be undone."))
+            return;
+        // Deleting a profile implies discarding an unsaved draft of it — the user just confirmed the
+        // profile itself is going. Without this the list's dirty-editor navigation guard would revert
+        // the post-delete deselection and leave the editor open on a profile that no longer exists.
+        if (Editor.IsDirty && List.UnsavedProfileId == item.ProfileId)
+            Editor.Discard();
+        await List.DeleteAsync(item);
     }
 
     /// <summary>The confirmation text. This is the ONLY place the user learns which roots will be

@@ -67,7 +67,17 @@
                                     <PathIcon Data="{StaticResource IconPlay}" Width="12" Height="12" />
                                 </MenuItem.Icon>
                             </MenuItem>
-                            <MenuItem Header="Export…" Command="{Binding ExportCommand}" CommandParameter="{Binding}" />
+                            <MenuItem Header="Export…" Command="{Binding ExportCommand}" CommandParameter="{Binding}">
+                                <MenuItem.Icon>
+                                    <PathIcon Data="{StaticResource IconExport}" Width="12" Height="12" />
+                                </MenuItem.Icon>
+                            </MenuItem>
+                            <Separator />
+                            <MenuItem Header="Delete…" Command="{Binding DeleteCommand}" CommandParameter="{Binding}">
+                                <MenuItem.Icon>
+                                    <PathIcon Data="{StaticResource IconTrash}" Width="12" Height="12" />
+                                </MenuItem.Icon>
+                            </MenuItem>
                         </ContextMenu>
                     </Border.ContextMenu>
                     <TextBlock Text="{Binding Acronym}" />

@@ -254,7 +254,15 @@ internal sealed class FakeFolderPicker(string? result = null) : IFolderPicker
     /// <summary>Files returned by <see cref="PickFilesAsync"/> (empty = user cancelled).</summary>
     public IReadOnlyList<string> FilesResult { get; set; } = [];
 
-    public Task<string?> PickFolderAsync(string title) => Task.FromResult(result);
+    /// <summary>The start folder the caller asked for on the last <see cref="PickFolderAsync"/> call —
+    /// the assertion seam for the "open where the user already is" behaviour.</summary>
+    public string? LastStartNear { get; private set; }
+
+    public Task<string?> PickFolderAsync(string title, string? startNear = null)
+    {
+        LastStartNear = startNear;
+        return Task.FromResult(result);
+    }
 
     public Task<IReadOnlyList<string>> PickFilesAsync(string title) => Task.FromResult(FilesResult);
 }
