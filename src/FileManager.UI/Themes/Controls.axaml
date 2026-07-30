@@ -67,6 +67,27 @@
         <Setter Property="Padding" Value="0" />
         <Setter Property="VerticalAlignment" Value="Stretch" />
     </Style>
+
+    <!-- Icon button sitting ON the solid accent status strip. Button.iconButton can't be reused:
+         it takes the theme foreground, which renders near-invisible against the accent fill. -->
+    <Style Selector="Button.statusBar">
+        <Setter Property="Background" Value="Transparent" />
+        <Setter Property="BorderThickness" Value="0" />
+        <Setter Property="CornerRadius" Value="3" />
+        <Setter Property="Padding" Value="6,1" />
+        <Setter Property="MinWidth" Value="0" />
+        <Setter Property="Foreground" Value="{DynamicResource Brush.StatusBar.Foreground}" />
+    </Style>
+    <Style Selector="Button.statusBar:pointerover /template/ ContentPresenter">
+        <Setter Property="Background" Value="#26FFFFFF" />
+    </Style>
+    <Style Selector="Button.statusBar:pressed /template/ ContentPresenter">
+        <Setter Property="Background" Value="#40FFFFFF" />
+    </Style>
+    <Style Selector="Button.statusBar:disabled /template/ ContentPresenter">
+        <Setter Property="Background" Value="Transparent" />
+        <Setter Property="Opacity" Value="0.5" />
+    </Style>
     <Style Selector="Button.caption:pointerover /template/ ContentPresenter">
         <Setter Property="Background" Value="#19808080" />
     </Style>

@@ -1,4 +1,4 @@
-# Architecture & Type Reference: File Manager v1
+﻿# Architecture & Type Reference: File Manager v1
 
 **Version:** 1
 **Status:** Draft for review
@@ -235,8 +235,11 @@ frame = one serialized `IpcRequest`, `IpcResponse`, or `EngineEvent` (§5.2), se
   the connection becomes a one-way event stream of `EngineEvent` frames until the client
   disconnects. The tray and the GUI activity view each hold one subscription connection.
 - **Versioning:** every request carries `ProtocolVersion` (`IpcRequest.CurrentProtocolVersion`,
-  currently `2` — v2 normalized the dry-run wire against a shared directory table). The server
-  rejects mismatches with `ErrorResponse("IPC_VERSION_MISMATCH", …)`.
+  currently `6`). History: 2 normalized the dry-run wire against a shared directory table; 3 added
+  interleaved dry-run progress frames; 4 added inline profile drafts; 5 added `relocate-profiles`;
+  6 added the `job-progress` and `run-queued` events and gave `run-profile` a `run-profile-result`
+  reply. The authoritative value is the constant in `IpcRequest.cs` — see its history comment. The
+  server rejects mismatches with `ErrorResponse("IPC_VERSION_MISMATCH", …)`.
 
 ### 3.3 Start-if-not-running handshake
 
@@ -1190,7 +1193,11 @@ public interface IIpcRequestHandler
 
 Handlers (one class each, thin delegation to §4 services): `GetStatus`, `ListProfiles`,
 `GetProfile`, `SaveProfile`, `DeleteProfile`, `ValidateProfile`, `GetMatchingProfiles`,
-`RunProfile`, `SetPaused`, `DryRun`, `GetRecentJobs`, `GetJobLog`, `SubscribeEvents`.
+`RunProfile`, `SetPaused`, `DryRun`, `DryRunStream`, `GetRecentJobs`, `GetJobLog`,
+`GetSettings`, `UpdateSettings`, `RelocateProfiles`, `Shutdown`.
+`SubscribeEvents` is **not** a dispatch-table handler: an event subscription is open-ended and
+`Broadcast`-driven, unlike the terminating request/response and streaming handlers, so the connection
+loop serves it directly (ack, then a one-way frame stream).
 
 ```csharp
 // Contracts (client side)
@@ -1536,7 +1543,7 @@ Polymorphic envelopes, source-gen compatible:
 [JsonDerivedType(typeof(SubscribeEventsRequest), "subscribe")]
 public abstract record IpcRequest
 {
-    public const int CurrentProtocolVersion = 2;
+    public const int CurrentProtocolVersion = 6;
 
     public int ProtocolVersion { get; init; } = CurrentProtocolVersion;
 }
@@ -1581,6 +1588,7 @@ public sealed record SubscribeEventsRequest : IpcRequest;
 [JsonDerivedType(typeof(DryRunResponse), "dry-run-report")]
 [JsonDerivedType(typeof(RecentJobsResponse), "recent-jobs")]
 [JsonDerivedType(typeof(JobLogResponse), "job-log")]
+[JsonDerivedType(typeof(RunProfileResponse), "run-profile-result")]
 public abstract record IpcResponse;
 
 public sealed record OkResponse : IpcResponse;
@@ -1597,6 +1605,15 @@ public sealed record MatchingProfilesResponse : IpcResponse { public required IR
 public sealed record DryRunResponse : IpcResponse { public required DryRunReport Report { get; init; } }
 public sealed record RecentJobsResponse : IpcResponse { public required IReadOnlyList<JobSummaryDto> Jobs { get; init; } }
 public sealed record JobLogResponse : IpcResponse { public required IReadOnlyList<string> Lines { get; init; } }
+/// <summary>Answer to run-profile. A single file is enqueued synchronously, so QueuedCount is exact
+/// and Scanning is false. A folder starts a background enumeration so the reply stays prompt
+/// (§8 rule 5): Scanning is true, QueuedCount is 0, and the final count — including 0 for "nothing
+/// matched" — arrives as a RunQueuedEvent. Queued means accepted, not copied.</summary>
+public sealed record RunProfileResponse : IpcResponse
+{
+    public required int QueuedCount { get; init; }
+    public required bool Scanning { get; init; }
+}
 ```
 
 Engine events (one-way stream after `SubscribeEventsRequest`):
@@ -1604,10 +1621,12 @@ Engine events (one-way stream after `SubscribeEventsRequest`):
 ```csharp
 [JsonPolymorphic(TypeDiscriminatorPropertyName = "type")]
 [JsonDerivedType(typeof(JobStartedEvent), "job-started")]
+[JsonDerivedType(typeof(JobProgressEvent), "job-progress")]
 [JsonDerivedType(typeof(JobCompletedEvent), "job-completed")]
 [JsonDerivedType(typeof(JobFailedEvent), "job-failed")]
 [JsonDerivedType(typeof(PauseChangedEvent), "pause-changed")]
 [JsonDerivedType(typeof(ProfilesChangedEvent), "profiles-changed")]
+[JsonDerivedType(typeof(RunQueuedEvent), "run-queued")]
 [JsonDerivedType(typeof(EngineWarningEvent), "engine-warning")]
 public abstract record EngineEvent
 {
@@ -1620,6 +1639,22 @@ public sealed record JobStartedEvent : EngineEvent
     public required Guid ProfileId { get; init; }
     public required string SourcePath { get; init; }
 }
+/// <summary>§4.3 phases, for progress reporting. Deliberately not Core's JobState (guard-only states
+/// the UI has no use for). Declaration order is the phase order and is load-bearing.</summary>
+public enum JobPhase
+{
+    Locking, Opening, Preflighting, Screening, Sealing, Distributing, Committing, Disposing, RollingBack
+}
+
+/// <summary>Best-effort intra-job progress. Throttled (~10/s) and LOSSY by design; the terminal
+/// job-completed / job-failed event is authoritative. A frame for an unknown JobId is ignored.</summary>
+public sealed record JobProgressEvent : EngineEvent
+{
+    public required Guid JobId { get; init; }
+    public required JobPhase Phase { get; init; }
+    public required int TargetsCompleted { get; init; }   // never decreases
+    public required int TargetCount { get; init; }
+}
 public sealed record JobCompletedEvent : EngineEvent { public required JobSummaryDto Job { get; init; } }
 public sealed record JobFailedEvent : EngineEvent
 {
@@ -1628,11 +1663,23 @@ public sealed record JobFailedEvent : EngineEvent
     /// <summary>The profile's Logging.NotifyOnFailure, stamped by the service at publish time so
     /// the Contracts-only tray can decide whether to raise a native notification (spec §7).</summary>
     public required bool NotifyOnFailure { get; init; }
-    /// <summary>Non-empty when rollback itself failed — paths needing manual remediation.</summary>
+    /// <summary>Paths the rollback sweep could not revert — these need manual remediation. Populated
+    /// only for a RollbackFailed outcome, and empty even then when rollback failed before it could
+    /// enumerate residuals, so empty + RollbackFailed is a legitimate state.</summary>
     public IReadOnlyList<string> ResidualPaths { get; init; } = [];
 }
 public sealed record PauseChangedEvent : EngineEvent { public required bool Paused { get; init; } }
 public sealed record ProfilesChangedEvent : EngineEvent;
+/// <summary>Terminates a folder run's background enumeration: the count actually queued, or 0 for
+/// "nothing matched". Correlates with the RunProfileResponse that reported Scanning=true by
+/// (ProfileId, ScopePath). Never emitted for a single-file run.</summary>
+public sealed record RunQueuedEvent : EngineEvent
+{
+    public required Guid ProfileId { get; init; }
+    public required string ScopePath { get; init; }
+    public required int QueuedCount { get; init; }
+    public string? Error { get; init; }        // set when enumeration aborted; count is then partial
+}
 public sealed record EngineWarningEvent : EngineEvent { public required string Message { get; init; } }
 ```
 

@@ -14,8 +14,8 @@ namespace FileManager.Core.IPC;
 
 /// <summary>The IPC server (§4.9): one accept loop, one task per connection, requests on a
 /// connection handled strictly sequentially (§3.2). Dispatch is a table keyed by the wire
-/// discriminator — an unregistered request type answers NOT_IMPLEMENTED, which is how every
-/// out-of-scope request (run-profile, subscribe, …) responds in this slice.</summary>
+/// discriminator — an unregistered request type answers NOT_IMPLEMENTED, so a request this build does
+/// not serve gets a per-request answer rather than a dropped connection.</summary>
 public sealed class IpcServer(
     ILogger<IpcServer> logger,
     IIpcEndpointProvider endpoint,

@@ -4,6 +4,7 @@ using FileManager.Contracts.Primitives;
 using FileManager.Contracts.Profiles;
 using FileManager.Contracts.Settings;
 using FileManager.UI.Services;
+using System.Runtime.CompilerServices;
 
 namespace FileManager.UI.Tests.Fakes;
 
@@ -130,6 +131,121 @@ internal sealed class FakeIpcGateway : IIpcGateway
     {
         ShutdownCalls++;
         return Task.FromResult(ShutdownResult);
+    }
+
+    // ---- live single-job surface ------------------------------------------------------------------
+
+    public List<(Guid ProfileId, string Path)> RunProfileCalls { get; } = [];
+
+    public Result<RunProfileResponse, IpcError> RunProfileResult { get; set; } =
+        new RunProfileResponse { QueuedCount = 1, Scanning = false, RunId = Guid.NewGuid() };
+
+    /// <summary>Per-path override, so one test can script an accepted root and a failing one.</summary>
+    public Dictionary<string, Result<RunProfileResponse, IpcError>> RunProfileResults { get; } =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    public List<bool> SetPausedCalls { get; } = [];
+    public Result<bool, IpcError> SetPausedResult { get; set; } = true;
+
+    /// <summary>When set, SetPausedAsync awaits this before returning (poll-race tests). Mirrors
+    /// <see cref="DryRunGate"/>.</summary>
+    public TaskCompletionSource? SetPausedGate { get; set; }
+
+    public List<int> RecentJobsCalls { get; } = [];
+    public Result<IReadOnlyList<JobSummaryDto>, IpcError> RecentJobsResult { get; set; } =
+        Result<IReadOnlyList<JobSummaryDto>, IpcError>.Success([]);
+
+    public List<Guid> JobLogCalls { get; } = [];
+    public Result<IReadOnlyList<string>, IpcError> JobLogResult { get; set; } =
+        new IpcError("JOB_LOG_NOT_FOUND", "not scripted");
+    public Dictionary<Guid, Result<IReadOnlyList<string>, IpcError>> JobLogResults { get; } = [];
+
+    /// <summary>Per-job gate, so a stale-response test can resolve selections out of order.</summary>
+    public Dictionary<Guid, TaskCompletionSource> JobLogGates { get; } = [];
+
+    /// <summary>One entry per SubscribeEventsAsync attempt: each is yielded in order and then the
+    /// stream ends, so a pump under test sees N connect/disconnect cycles.</summary>
+    public Queue<IReadOnlyList<Result<EngineEvent, IpcError>>> SubscribeSegments { get; } = new();
+    public int SubscribeCalls { get; private set; }
+
+    /// <summary>Awaited once <see cref="SubscribeSegments"/> is exhausted so the pump PARKS rather
+    /// than hot-looping reconnects for the rest of the test. Null parks until cancellation.</summary>
+    public TaskCompletionSource? SubscribeIdleGate { get; set; }
+
+    public Task<Result<RunProfileResponse, IpcError>> RunProfileAsync(
+        Guid profileId, string path, CancellationToken ct = default)
+    {
+        RunProfileCalls.Add((profileId, path));
+        return Task.FromResult(
+            RunProfileResults.TryGetValue(path, out var scripted) ? scripted : RunProfileResult);
+    }
+
+    public async Task<Result<bool, IpcError>> SetPausedAsync(bool paused, CancellationToken ct = default)
+    {
+        SetPausedCalls.Add(paused);
+        if (SetPausedGate is not null)
+        {
+            try
+            {
+                await SetPausedGate.Task.WaitAsync(ct);
+            }
+            catch (OperationCanceledException)
+            {
+                return Result<bool, IpcError>.Canceled();   // mirror the real gateway
+            }
+        }
+        return SetPausedResult;
+    }
+
+    public Task<Result<IReadOnlyList<JobSummaryDto>, IpcError>> GetRecentJobsAsync(
+        int count = 50, CancellationToken ct = default)
+    {
+        RecentJobsCalls.Add(count);
+        return Task.FromResult(RecentJobsResult);
+    }
+
+    public async Task<Result<IReadOnlyList<string>, IpcError>> GetJobLogAsync(
+        Guid jobId, CancellationToken ct = default)
+    {
+        JobLogCalls.Add(jobId);
+        if (JobLogGates.TryGetValue(jobId, out TaskCompletionSource? gate))
+        {
+            try
+            {
+                await gate.Task.WaitAsync(ct);
+            }
+            catch (OperationCanceledException)
+            {
+                return Result<IReadOnlyList<string>, IpcError>.Canceled();
+            }
+        }
+        return JobLogResults.TryGetValue(jobId, out var scripted) ? scripted : JobLogResult;
+    }
+
+    public async IAsyncEnumerable<Result<EngineEvent, IpcError>> SubscribeEventsAsync(
+        [EnumeratorCancellation] CancellationToken ct = default)
+    {
+        SubscribeCalls++;
+        if (SubscribeSegments.Count > 0)
+        {
+            foreach (Result<EngineEvent, IpcError> item in SubscribeSegments.Dequeue())
+            {
+                ct.ThrowIfCancellationRequested();
+                yield return item;
+            }
+            yield break;
+        }
+
+        // Exhausted: park so the pump under test doesn't spin reconnecting.
+        Task park = SubscribeIdleGate?.Task ?? Task.Delay(Timeout.Infinite, ct);
+        try
+        {
+            await park.WaitAsync(ct);
+        }
+        catch (OperationCanceledException)
+        {
+            yield break;
+        }
     }
 }
 

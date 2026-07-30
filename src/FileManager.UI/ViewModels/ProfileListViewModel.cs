@@ -25,6 +25,11 @@ public sealed record ProfileListItem(Guid ProfileId, string Name, bool Active, s
     /// the list is built, so the popup binds directly to its own DataContext (no cross-namescope
     /// ancestor lookup). Takes this row as its parameter.</summary>
     public ICommand? ExportCommand { get; init; }
+
+    /// <summary>Bound by the row's right-click "Run now…" menu item, stamped the same way as
+    /// <see cref="ExportCommand"/>. Takes this row as its parameter. This starts a REAL run that moves
+    /// files, so the shell confirms before submitting.</summary>
+    public ICommand? RunCommand { get; init; }
 }
 
 public sealed partial class ProfileListViewModel(IIpcGateway gateway) : ViewModelBase
@@ -57,6 +62,10 @@ public sealed partial class ProfileListViewModel(IIpcGateway gateway) : ViewMode
     /// Stamped onto every row's <see cref="ProfileListItem.ExportCommand"/> in <see cref="RefreshAsync"/>
     /// so the right-click "Export" menu works in both the list and the collapsed rail.</summary>
     public ICommand? ExportProfileCommand { get; set; }
+
+    /// <summary>Set by the shell to its manual-run command (takes a <see cref="ProfileListItem"/>),
+    /// stamped onto every row's <see cref="ProfileListItem.RunCommand"/> the same way.</summary>
+    public ICommand? RunProfileCommand { get; set; }
 
     /// <summary>Whether any profiles exist at all (independent of the search filter). Drives the
     /// content-area empty state: false → "no profiles yet, create one"; true → "select a profile".
@@ -205,6 +214,7 @@ public sealed partial class ProfileListViewModel(IIpcGateway gateway) : ViewMode
                 Profiles.Add(new ProfileListItem(summary.ProfileId, summary.Name, summary.Active, summary.TriggerSummary)
                 {
                     ExportCommand = ExportProfileCommand,
+                    RunCommand = RunProfileCommand,
                 });
             HasProfiles = Profiles.Count > 0;
             RebuildFiltered(selectedId);   // build the filtered view before re-selecting into it

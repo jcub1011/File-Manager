@@ -11,50 +11,13 @@ namespace FileManager.Core.Observability;
 /// IPC broadcast bridge hands each event to a bounded per-connection channel and returns.</summary>
 public sealed class EngineEventBus(ILogger<EngineEventBus> logger) : IEngineEventBus
 {
-    private readonly object _gate = new();
-    private readonly List<Subscription> _subscriptions = [];
+    private readonly SubscriberList<EngineEvent> _subscribers = new(logger, "engine-event subscriber");
 
     public void Publish(EngineEvent evt)
     {
         ArgumentNullException.ThrowIfNull(evt);
-
-        Subscription[] snapshot;
-        lock (_gate)
-            snapshot = [.. _subscriptions];
-
-        foreach (Subscription subscription in snapshot)
-        {
-            try
-            {
-                subscription.Handler(evt);
-            }
-            catch (Exception ex)
-            {
-                // Last-resort catch-and-log: a bad subscriber must not abort the fan-out to the rest.
-                logger.LogError(ex, "An engine-event subscriber threw; continuing with the remaining subscribers");
-            }
-        }
+        _subscribers.Notify(evt);
     }
 
-    public IDisposable Subscribe(Action<EngineEvent> handler)
-    {
-        ArgumentNullException.ThrowIfNull(handler);
-        Subscription subscription = new(this, handler);
-        lock (_gate)
-            _subscriptions.Add(subscription);
-        return subscription;
-    }
-
-    private void Unsubscribe(Subscription subscription)
-    {
-        lock (_gate)
-            _subscriptions.Remove(subscription);
-    }
-
-    private sealed class Subscription(EngineEventBus owner, Action<EngineEvent> handler) : IDisposable
-    {
-        public Action<EngineEvent> Handler { get; } = handler;
-
-        public void Dispose() => owner.Unsubscribe(this);
-    }
+    public IDisposable Subscribe(Action<EngineEvent> handler) => _subscribers.Subscribe(handler);
 }

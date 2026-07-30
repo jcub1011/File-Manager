@@ -65,21 +65,7 @@ public sealed class ProfileMatcher(
             return true;   // cannot stat — do not hide it
 
         string relativePath = Path.GetRelativePath(root.Value, filePath);
-        int depth = SeparatorCount(relativePath);
-        string? normalized = set.HasPatternRules ? NormalizeSeparators(relativePath) : null;
-        FilterInput input = new(filePath, relativePath, depth, metadata, normalized);
+        FilterInput input = FilterInput.For(filePath, relativePath, metadata, set.HasPatternRules);
         return set.Evaluate(in input).Matched;
     }
-
-    private static int SeparatorCount(string value)
-    {
-        int count = 0;
-        foreach (char c in value)
-            if (c == Path.DirectorySeparatorChar || c == Path.AltDirectorySeparatorChar)
-                count++;
-        return count;
-    }
-
-    private static string NormalizeSeparators(string relativePath) =>
-        Path.DirectorySeparatorChar == '/' ? relativePath : relativePath.Replace('\\', '/');
 }

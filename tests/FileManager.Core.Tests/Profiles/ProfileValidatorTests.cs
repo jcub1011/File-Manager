@@ -105,6 +105,39 @@ public sealed class ProfileValidatorTests
         AssertHas(Validate(candidate), "PROFILE_TARGET_EQUALS_SOURCE", ValidationSeverity.Error);
     }
 
+    /// <summary>Two Targets naming one root give every job two TargetPlans with an identical final path.
+    /// Nothing separates them at placement time — the path locks are per-job — so the two parallel
+    /// placements race the same temp→final move and the job rolls back on every attempt, meaning the file
+    /// is never delivered. Refused at save time, with the same OrdinalIgnoreCase identity as
+    /// target-equals-source.</summary>
+    [Fact]
+    public void Duplicate_targets_are_an_error()
+    {
+        Profile candidate = TestProfiles.Valid() with
+        {
+            Targets =
+            [
+                new TargetConfig { Path = @"C:\fm-test\out" },
+                new TargetConfig { Path = @"C:\FM-TEST\OUT" },
+            ],
+        };
+        AssertHas(Validate(candidate), "PROFILE_TARGET_DUPLICATE", ValidationSeverity.Error);
+    }
+
+    [Fact]
+    public void Two_distinct_targets_are_fine()
+    {
+        Profile candidate = TestProfiles.Valid() with
+        {
+            Targets =
+            [
+                new TargetConfig { Path = @"C:\fm-test\out-a" },
+                new TargetConfig { Path = @"C:\fm-test\out-b" },
+            ],
+        };
+        Assert.DoesNotContain(Validate(candidate), i => i.Code == "PROFILE_TARGET_DUPLICATE");
+    }
+
     [Fact]
     public void Empty_sources_and_targets_are_errors()
     {

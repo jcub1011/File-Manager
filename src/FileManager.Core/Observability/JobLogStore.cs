@@ -21,6 +21,11 @@ public sealed class JobLogStore(EnginePaths paths, TimeProvider time, ILogger<Jo
     private readonly object _ringGate = new();
     private readonly LinkedList<JobSummary> _recent = new();
 
+    // The log directory is created once, not once per line. Guarded by _fileGate along with the write,
+    // so no extra synchronization is needed. Reset on a write failure so a directory deleted underneath
+    // us (or an unwritable one that later becomes writable) is re-created on the next attempt.
+    private bool _directoryEnsured;
+
     public Result Append(Guid jobId, string line)
     {
         string path = LogPathFor(jobId);
@@ -29,43 +34,57 @@ public sealed class JobLogStore(EnginePaths paths, TimeProvider time, ILogger<Jo
         {
             lock (_fileGate)
             {
-                Directory.CreateDirectory(paths.JobLogsDirectory);
+                if (!_directoryEnsured)
+                {
+                    Directory.CreateDirectory(paths.JobLogsDirectory);
+                    _directoryEnsured = true;
+                }
                 File.AppendAllText(path, stamped);
             }
             return Result.Success();
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
+            lock (_fileGate)
+                _directoryEnsured = false;
             logger.LogWarning(ex, "Could not append to the job log for {JobId}", jobId);
             return $"could not append to the job log: {ex.Message}";
         }
         catch (Exception ex)
         {
             // Last-resort catch-and-log: job logging is best-effort and must never surface as a job failure.
+            lock (_fileGate)
+                _directoryEnsured = false;
             logger.LogError(ex, "Unexpected error appending to the job log for {JobId}", jobId);
             return $"could not append to the job log: {ex.Message}";
         }
     }
 
-    public Result<IReadOnlyList<string>, string> Read(Guid jobId)
+    public Result<IReadOnlyList<string>, JobLogReadError> Read(Guid jobId)
     {
         string path = LogPathFor(jobId);
         try
         {
-            if (!File.Exists(path))
-                return $"no log for job {jobId}";
-            string[] lines = File.ReadAllLines(path);
-            return Result<IReadOnlyList<string>, string>.Success(lines);
+            // Under _fileGate, like Append: the job's parallel target tasks append while the GUI reads,
+            // and File.AppendAllText opens the file per call — reading outside the gate raced the
+            // engine's own writes and manufactured the sharing violation this method reports.
+            lock (_fileGate)
+            {
+                if (!File.Exists(path))
+                    return new JobLogReadError(JobLogReadFailure.NotFound, $"no log for job {jobId}");
+                string[] lines = File.ReadAllLines(path);
+                return Result<IReadOnlyList<string>, JobLogReadError>.Success(lines);
+            }
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
-            return $"could not read the job log: {ex.Message}";
+            return new JobLogReadError(JobLogReadFailure.Unreadable, $"could not read the job log: {ex.Message}");
         }
         catch (Exception ex)
         {
             // Last-resort catch-and-log.
             logger.LogError(ex, "Unexpected error reading the job log for {JobId}", jobId);
-            return $"could not read the job log: {ex.Message}";
+            return new JobLogReadError(JobLogReadFailure.Unreadable, $"could not read the job log: {ex.Message}");
         }
     }
 

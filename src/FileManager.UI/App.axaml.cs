@@ -58,8 +58,23 @@ namespace FileManager.UI
                     await new ImportPreviewWindow { DataContext = preview }.ShowDialog<bool>(window);
                 viewModel.ConfirmClose = async message =>
                     await new ConfirmWindow(message).ShowDialog<bool>(window);
+                // A manual run moves real files and applies the profile's source disposition, so it
+                // always confirms, danger-styled — the same friction the close-time warning uses.
+                viewModel.ConfirmRunProfile = async message =>
+                    await new ConfirmWindow(message, "Run now", "Cancel", confirmIsDanger: true)
+                        .ShowDialog<bool>(window);
                 window.DataContext = viewModel;
                 desktop.MainWindow = window;
+
+                // Started from the UI thread, and the pump uses no ConfigureAwait(false) — so every
+                // event handler (and therefore every view-model mutation) resumes on the UI thread
+                // (§8), with no Dispatcher marshalling. Connected re-seeds on each attempt because the
+                // service's event delivery is bounded and drop-oldest.
+                EngineEventPump pump = new(_gateway)
+                {
+                    Event = viewModel.HandleEngineEvent,
+                    Connected = viewModel.ReconcileEngineStateAsync,
+                };
 
                 window.Opened += async (_, _) =>
                 {
@@ -77,6 +92,14 @@ namespace FileManager.UI
                     {
                         Serilog.Log.Error(ex, "Startup failed");
                         viewModel.List.ErrorMessage = $"Startup failed: {ex.Message}";
+                    }
+                    finally
+                    {
+                        // AFTER InitializeAsync, and in a finally so a failed profile load still gets
+                        // live events. The pump's first act is a reconcile, and each activity row
+                        // resolves its profile name through the shell's loaded profile list — starting
+                        // the pump before that list existed left every row of the first seed nameless.
+                        _ = pump.RunAsync(_shutdown.Token);
                     }
                 };
                 _ = viewModel.StatusBar.RunPollLoopAsync(_shutdown.Token);

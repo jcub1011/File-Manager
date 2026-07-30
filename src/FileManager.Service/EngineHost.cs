@@ -1,4 +1,4 @@
-using FileManager.Contracts.IPC;
+﻿using FileManager.Contracts.IPC;
 using FileManager.Contracts.Primitives;
 using FileManager.Core.IPC;
 using FileManager.Core.Jobs;
@@ -36,6 +36,7 @@ internal sealed class EngineHost(
     private Mutex? _singleInstanceMutex;
     private IDisposable? _eventBridge;
     private IDisposable? _pauseBridge;
+    private IDisposable? _profilesBridge;
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -125,11 +126,20 @@ internal sealed class EngineHost(
         //    [slot] IShellIntegration.RegisterContextMenu().
 
         // 7. Start the live job pipeline (§2.4 step 6): bridge engine events to IPC subscribers,
-        //    mirror pause changes as events, then start the orchestrator's trigger-queue consumer.
+        //    mirror pause changes and catalog reloads as events, then start the orchestrator's
+        //    trigger-queue consumer.
         //    Order: bridges first so the consumer's very first job's events are already observed.
+        //    These MUST stay below step 3's catalog.Reload() — creating the catalog bridge earlier
+        //    would publish a spurious profiles-changed at startup. That ordering is load-bearing.
         _eventBridge = eventBus.Subscribe(ipcServer.Broadcast);
         _pauseBridge = pauseState.Subscribe(paused =>
             eventBus.Publish(new PauseChangedEvent { AtUtc = time.GetUtcNow(), Paused = paused }));
+        // Fan-out runs synchronously on the thread that reloaded the catalog (an IPC handler), but
+        // every hop from here to the wire is non-blocking (bus → Broadcast → drop-oldest channel),
+        // so this is safe there. Note a subscriber can therefore observe profiles-changed BEFORE the
+        // requesting client's own success response; clients must tolerate that.
+        _profilesBridge = catalog.Subscribe(() =>
+            eventBus.Publish(new ProfilesChangedEvent { AtUtc = time.GetUtcNow() }));
         Result orchestratorStarted = orchestrator.Start();
         if (orchestratorStarted.TryGetError(out string? orchestratorError))
         {
@@ -152,6 +162,7 @@ internal sealed class EngineHost(
         // Drain the live pipeline before stopping IPC: stop dequeuing and await in-flight jobs
         // (I-ATOMIC-JOB — a started job is never suspended), then tear down the event bridges.
         await orchestrator.StopAsync();
+        _profilesBridge?.Dispose();
         _pauseBridge?.Dispose();
         _eventBridge?.Dispose();
         await ipcServer.StopAsync(CancellationToken.None);
@@ -180,6 +191,7 @@ internal sealed class EngineHost(
 
     public override void Dispose()
     {
+        _profilesBridge?.Dispose();
         _pauseBridge?.Dispose();
         _eventBridge?.Dispose();
         _singleInstanceMutex?.Dispose();

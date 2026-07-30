@@ -5,6 +5,7 @@ using FileManager.Core.Files;
 using FileManager.Core.Filtering;
 using FileManager.Core.Jobs;
 using FileManager.Core.Placement;
+using FileManager.Core.Profiles;
 using FileManager.Core.Scanning;
 using FileManager.Core.Settings;
 using FileManager.Core.Watching;
@@ -922,15 +923,10 @@ public sealed class DryRunEngine(
         };
 
         string relativePath = Path.GetRelativePath(payload.SourceRoot, payload.SourcePath);
-        int depth = SeparatorCount(relativePath);
 
         if (filtersBySourceRoot.TryGetValue(payload.SourceRoot, out CompiledFilterSet? filters))
         {
-            // Normalize once here rather than per pattern rule inside the filter set — but only when
-            // a pattern rule would actually consult it (the attribute filter, always present, does
-            // not), so the common no-glob profile allocates no normalized string.
-            string? normalized = filters.HasPatternRules ? NormalizeSeparators(relativePath) : null;
-            FilterInput input = new(payload.SourcePath, relativePath, depth, metadata, normalized);
+            FilterInput input = FilterInput.For(payload.SourcePath, relativePath, metadata, filters.HasPatternRules);
             FilterDecision decision = filters.Evaluate(in input);
             if (!decision.Matched)
             {
@@ -948,10 +944,9 @@ public sealed class DryRunEngine(
             }
         }
 
-        // M:1 topologies force Flatten (spec §3.1.2); otherwise the profile's TargetLayout rules.
-        bool flatten = profile.TargetLayout == TargetLayout.Flatten || profile.Sources.Count > 1;
-        // Only the flatten branch uses the bare file name; PreserveStructure never allocates it.
-        string? fileName = flatten ? Path.GetFileName(payload.SourcePath) : null;
+        // Same resolution the live plan builder uses — shared so a dry run cannot drift from the run
+        // it is predicting.
+        TargetPathLayout layout = TargetPathLayout.For(profile, payload.SourcePath, relativePath);
 
         List<PhysicalFile> destinationFiles = [];
         List<VirtualFileOperation> destinationOps = [];
@@ -961,9 +956,7 @@ public sealed class DryRunEngine(
         {
             if (ct.IsCancellationRequested)
                 break;      // SimulateAsync's cancellation catch turns this into Canceled
-            string prospective = flatten
-                ? Path.Combine(target.Path, fileName!)
-                : Path.Combine(target.Path, relativePath);
+            string prospective = layout.Resolve(target.Path);
 
             if (hasTransformers)
             {
@@ -1016,20 +1009,6 @@ public sealed class DryRunEngine(
 
         return new FileEvaluation(sourceFile, sourceOp, destinationFiles, destinationOps);
     }
-
-    private static int SeparatorCount(string value)
-    {
-        int count = 0;
-        foreach (char c in value)
-        {
-            if (c == Path.DirectorySeparatorChar || c == Path.AltDirectorySeparatorChar)
-                count++;
-        }
-        return count;
-    }
-
-    private static string NormalizeSeparators(string relativePath) =>
-        Path.DirectorySeparatorChar == '/' ? relativePath : relativePath.Replace('\\', '/');
 
     /// <summary>One target's evaluation: the operation(s) it produces, the pre-existing destination
     /// file it touches (if any), and the (possibly newly computed) cached source hash. Within

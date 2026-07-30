@@ -1,4 +1,4 @@
-using FileManager.Contracts.DryRun;
+﻿using FileManager.Contracts.DryRun;
 using FileManager.Contracts.IPC;
 using FileManager.Contracts.Profiles;
 using FileManager.Contracts.Settings;
@@ -44,6 +44,7 @@ public sealed class EndToEndSmokeTests : IAsyncLifetime
     private JobOrchestrator? _orchestrator;
     private JobJournal? _journal;
     private IDisposable? _eventBridge;
+    private IDisposable? _profilesBridge;
 
     private string SourceDir => Path.Combine(_root, "source");
     private string TargetDir => Path.Combine(_root, "target");
@@ -106,7 +107,7 @@ public sealed class EndToEndSmokeTests : IAsyncLifetime
         [
             new GetStatusHandler(_orchestrator),
             new GetMatchingProfilesHandler(matcher),
-            new RunProfileHandler(catalog, triggerQueue, scanner, TimeProvider.System, NullLogger<RunProfileHandler>.Instance),
+            new RunProfileHandler(catalog, triggerQueue, scanner, eventBus, TimeProvider.System, NullLogger<RunProfileHandler>.Instance),
             new SetPausedHandler(pauseState, NullLogger<SetPausedHandler>.Instance),
             new GetRecentJobsHandler(jobLog),
             new GetJobLogHandler(jobLog),
@@ -125,6 +126,9 @@ public sealed class EndToEndSmokeTests : IAsyncLifetime
             handlers.ToDictionary(h => h.RequestType));
 
         _eventBridge = eventBus.Subscribe(_server.Broadcast);
+        // Same bridge Program.cs/EngineHost installs, so profiles-changed round-trips here too.
+        _profilesBridge = catalog.Subscribe(() =>
+            eventBus.Publish(new ProfilesChangedEvent { AtUtc = TimeProvider.System.GetUtcNow() }));
         Assert.True(_server.Start().IsSuccess);
         Assert.True(_orchestrator.Start().IsSuccess);
         return Task.CompletedTask;
@@ -134,6 +138,7 @@ public sealed class EndToEndSmokeTests : IAsyncLifetime
     {
         if (_orchestrator is not null)
             await _orchestrator.StopAsync();
+        _profilesBridge?.Dispose();
         _eventBridge?.Dispose();
         if (_server is not null)
             await _server.StopAsync(new CancellationTokenSource(TimeSpan.FromSeconds(5)).Token);
@@ -246,9 +251,11 @@ public sealed class EndToEndSmokeTests : IAsyncLifetime
             await Task.Delay(300);   // let the subscription's ack land before the run
 
             // Run.
-            var run = await client.RequestAsync<OkResponse>(
+            var run = await client.RequestAsync<RunProfileResponse>(
                 new RunProfileRequest { ProfileId = profile.Id, Path = sourceFile });
-            Assert.True(run.IsSuccess);
+            Assert.True(run.TryGetValue(out RunProfileResponse? runResponse));
+            Assert.Equal(1, runResponse!.QueuedCount);      // single file — the count is exact
+            Assert.False(runResponse.Scanning);
 
             // The file appears at the target with identical content.
             string targetFile = Path.Combine(TargetDir, "report.txt");
@@ -268,7 +275,20 @@ public sealed class EndToEndSmokeTests : IAsyncLifetime
             Assert.Equal("Succeeded", completedEvent.Job.Outcome);
             Assert.EndsWith("report.txt", completedEvent.Job.SourcePath);
             lock (events)
+            {
                 Assert.Contains(events, e => e is JobStartedEvent);
+
+                // Progress frames reach the wire for this job, ordered after its job-started. NOT
+                // asserting a frame count or a specific phase: the publisher throttles, so a fast job
+                // legitimately emits only one frame and pinning either would be a flaky test.
+                int startedAt = events.FindIndex(e => e is JobStartedEvent);
+                int progressAt = events.FindIndex(e => e is JobProgressEvent);
+                Assert.True(progressAt > startedAt,
+                    $"expected a job-progress after job-started; events=[{string.Join(", ", events.Select(e => e.GetType().Name))}]");
+                JobProgressEvent progress = events.OfType<JobProgressEvent>().First();
+                Assert.Equal(completedEvent.Job.JobId, progress.JobId);
+                Assert.Equal(1, progress.TargetCount);
+            }
 
             // Recent jobs + the per-job log are queryable.
             var recent = await client.RequestAsync<RecentJobsResponse>(new GetRecentJobsRequest { Count = 10 });
@@ -282,6 +302,162 @@ public sealed class EndToEndSmokeTests : IAsyncLifetime
             subCts.Cancel();
             await pump;
             await subClient!.DisposeAsync();
+        }
+    }
+
+    [Fact]
+    public async Task Run_profile_archiving_the_source_moves_the_original_over_the_real_pipe()
+    {
+        // The whole wired stack, end to end, for the disposition that MOVES the user's original file:
+        // copy verified at the target, then the source relocated into the archive — not deleted, not
+        // left behind, and reflected in the streamed completion event.
+        string archiveDir = Path.Combine(_root, "archive");
+        string sourceFile = Path.Combine(SourceDir, "invoice.pdf");
+        File.WriteAllText(sourceFile, "the only copy");
+
+        var connected = await IpcClient.ConnectAsync();
+        Assert.True(connected.TryGetValue(out IpcClient? client));
+        await using (client)
+        {
+            Profile profile = NewProfile();
+            profile = profile with
+            {
+                TargetLayout = TargetLayout.Flatten,
+                Policies = profile.Policies with
+                {
+                    ConflictResolution = ConflictResolution.Overwrite,
+                    OnSuccess = OnSuccessAction.MoveToArchive,
+                    ArchiveFolder = archiveDir,
+                },
+            };
+            var saved = await client!.RequestAsync<ValidationResponse>(
+                new SaveProfileRequest { Profile = profile, AcknowledgeWarnings = true });
+            Assert.True(saved.TryGetValue(out ValidationResponse? validation));
+            Assert.DoesNotContain(validation!.Issues, i => i.Severity == ValidationSeverity.Error);
+
+            await using SubscriptionPump pump = await SubscriptionPump.StartAsync();
+
+            var run = await client.RequestAsync<RunProfileResponse>(
+                new RunProfileRequest { ProfileId = profile.Id, Path = sourceFile });
+            Assert.True(run.IsSuccess);
+
+            JobCompletedEvent completed = await pump.WaitForAsync<JobCompletedEvent>(TimeSpan.FromSeconds(15));
+            Assert.Equal("Succeeded", completed.Job.Outcome);
+
+            // The copy is at the target...
+            string targetFile = Path.Combine(TargetDir, "invoice.pdf");
+            Assert.True(await WaitForAsync(() => File.Exists(targetFile), TimeSpan.FromSeconds(10)),
+                "the target copy was never placed");
+            Assert.Equal("the only copy", File.ReadAllText(targetFile));
+
+            // ...and the ORIGINAL is in the archive, not destroyed and not still in the source tree.
+            string archived = Path.Combine(archiveDir, "invoice.pdf");
+            Assert.True(await WaitForAsync(() => File.Exists(archived), TimeSpan.FromSeconds(10)),
+                "the original was not archived");
+            Assert.Equal("the only copy", File.ReadAllText(archived));
+            Assert.False(File.Exists(sourceFile), "the original should have moved out of the source tree");
+        }
+    }
+
+    [Fact]
+    public async Task Run_profile_on_a_folder_streams_a_run_queued_event()
+    {
+        File.WriteAllText(Path.Combine(SourceDir, "one.txt"), "1");
+        File.WriteAllText(Path.Combine(SourceDir, "two.txt"), "22");
+
+        var connected = await IpcClient.ConnectAsync();
+        Assert.True(connected.TryGetValue(out IpcClient? client));
+        await using (client)
+        {
+            Profile profile = NewProfile();
+            await client!.RequestAsync<ValidationResponse>(
+                new SaveProfileRequest { Profile = profile, AcknowledgeWarnings = false });
+
+            await using SubscriptionPump pump = await SubscriptionPump.StartAsync();
+
+            // A folder run cannot report its count in the reply — enumeration is off the IPC thread.
+            var run = await client.RequestAsync<RunProfileResponse>(
+                new RunProfileRequest { ProfileId = profile.Id, Path = SourceDir });
+            Assert.True(run.TryGetValue(out RunProfileResponse? runResponse));
+            Assert.True(runResponse!.Scanning);
+            Assert.Equal(0, runResponse.QueuedCount);
+
+            RunQueuedEvent queued = await pump.WaitForAsync<RunQueuedEvent>(TimeSpan.FromSeconds(10));
+            Assert.Equal(profile.Id, queued.ProfileId);
+            Assert.Equal(2, queued.QueuedCount);
+            Assert.Null(queued.Error);
+        }
+    }
+
+    [Fact]
+    public async Task Saving_a_profile_streams_a_profiles_changed_event()
+    {
+        var connected = await IpcClient.ConnectAsync();
+        Assert.True(connected.TryGetValue(out IpcClient? client));
+        await using (client)
+        {
+            await using SubscriptionPump pump = await SubscriptionPump.StartAsync();
+
+            await client!.RequestAsync<ValidationResponse>(
+                new SaveProfileRequest { Profile = NewProfile(), AcknowledgeWarnings = false });
+
+            await pump.WaitForAsync<ProfilesChangedEvent>(TimeSpan.FromSeconds(10));
+        }
+    }
+
+    /// <summary>A dedicated subscription connection plus the collected event stream — subscribe makes
+    /// the connection one-way, so it can never be the one carrying requests.</summary>
+    private sealed class SubscriptionPump : IAsyncDisposable
+    {
+        private readonly IpcClient _client;
+        private readonly CancellationTokenSource _cts = new();
+        private readonly List<EngineEvent> _events = [];
+        private readonly Task _pump;
+
+        private SubscriptionPump(IpcClient client)
+        {
+            _client = client;
+            _pump = Task.Run(async () =>
+            {
+                try
+                {
+                    await foreach (EngineEvent evt in client.SubscribeAsync(_cts.Token))
+                        lock (_events) _events.Add(evt);
+                }
+                catch (OperationCanceledException) { }
+            });
+        }
+
+        public static async Task<SubscriptionPump> StartAsync()
+        {
+            var connected = await IpcClient.ConnectAsync();
+            Assert.True(connected.TryGetValue(out IpcClient? client));
+            SubscriptionPump pump = new(client!);
+            await Task.Delay(300);   // let the subscription ack land before the caller acts
+            return pump;
+        }
+
+        public async Task<T> WaitForAsync<T>(TimeSpan timeout) where T : EngineEvent
+        {
+            Stopwatch sw = Stopwatch.StartNew();
+            while (sw.Elapsed < timeout)
+            {
+                lock (_events)
+                    if (_events.OfType<T>().FirstOrDefault() is { } found)
+                        return found;
+                await Task.Delay(25);
+            }
+            lock (_events)
+                Assert.Fail($"no {typeof(T).Name} arrived; events=[{string.Join(", ", _events.Select(e => e.GetType().Name))}]");
+            throw new InvalidOperationException("unreachable");
+        }
+
+        public async ValueTask DisposeAsync()
+        {
+            await _cts.CancelAsync();
+            await _pump;
+            await _client.DisposeAsync();
+            _cts.Dispose();
         }
     }
 
@@ -302,7 +478,7 @@ public sealed class EndToEndSmokeTests : IAsyncLifetime
             var paused = await client.RequestAsync<OkResponse>(new SetPausedRequest { Paused = true });
             Assert.True(paused.IsSuccess);
 
-            var run = await client.RequestAsync<OkResponse>(new RunProfileRequest { ProfileId = profile.Id, Path = sourceFile });
+            var run = await client.RequestAsync<RunProfileResponse>(new RunProfileRequest { ProfileId = profile.Id, Path = sourceFile });
             Assert.True(run.IsSuccess);
 
             string targetFile = Path.Combine(TargetDir, "held.txt");

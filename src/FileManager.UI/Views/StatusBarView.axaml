@@ -1,5 +1,6 @@
 <UserControl xmlns="https://github.com/avaloniaui"
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:conv="using:FileManager.UI.Converters"
              xmlns:vm="using:FileManager.UI.ViewModels"
              x:Class="FileManager.UI.Views.StatusBarView"
              x:DataType="vm:StatusBarViewModel">
@@ -14,16 +15,48 @@
         </Style>
     </UserControl.Styles>
 
-    <Border Classes="statusBar" Classes.disconnected="{Binding !IsConnected}" Padding="12,5">
-        <StackPanel Orientation="Horizontal" Spacing="8">
-            <Ellipse Width="9" Height="9" Fill="#7FFFFFFF" VerticalAlignment="Center"
-                     IsVisible="{Binding IsConnected}" />
-            <Ellipse Width="9" Height="9" Fill="White" VerticalAlignment="Center"
-                     IsVisible="{Binding !IsConnected}" />
-            <TextBlock Text="{Binding StatusText}" VerticalAlignment="Center"
-                       FontSize="{StaticResource Font.Small}"
-                       Foreground="{DynamicResource Brush.StatusBar.Foreground}" />
-        </StackPanel>
+    <Border Classes="statusBar" Classes.disconnected="{Binding !IsConnected}" Padding="12,3">
+        <Grid ColumnDefinitions="*,Auto,Auto,Auto">
+            <StackPanel Grid.Column="0" Orientation="Horizontal" Spacing="8" VerticalAlignment="Center">
+                <Ellipse Width="9" Height="9" Fill="#7FFFFFFF" VerticalAlignment="Center"
+                         IsVisible="{Binding IsConnected}" />
+                <Ellipse Width="9" Height="9" Fill="White" VerticalAlignment="Center"
+                         IsVisible="{Binding !IsConnected}" />
+                <TextBlock Text="{Binding StatusText}" VerticalAlignment="Center"
+                           FontSize="{StaticResource Font.Small}"
+                           Foreground="{DynamicResource Brush.StatusBar.Foreground}" />
+            </StackPanel>
+
+            <!-- The engine's last job failure. The activity panel starts collapsed, so without this the
+                 only at-a-glance signal that a delivery failed was no signal at all. Truncated with the
+                 full text in the tooltip — the strip is one line and the message can be a long path. -->
+            <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="5" Margin="0,0,10,0"
+                        VerticalAlignment="Center" MaxWidth="340"
+                        ToolTip.Tip="{Binding LastError}"
+                        IsVisible="{Binding LastError, Converter={x:Static ObjectConverters.IsNotNull}}">
+                <PathIcon Data="{StaticResource IconWarning}" Width="11" Height="11"
+                          VerticalAlignment="Center"
+                          Foreground="{DynamicResource Brush.StatusBar.Foreground}" />
+                <TextBlock Text="{Binding LastError}" VerticalAlignment="Center"
+                           FontSize="{StaticResource Font.Small}" TextTrimming="CharacterEllipsis"
+                           Foreground="{DynamicResource Brush.StatusBar.Foreground}" />
+            </StackPanel>
+
+            <TextBlock Grid.Column="2" Text="{Binding PauseError}" VerticalAlignment="Center"
+                       Margin="0,0,8,0" FontSize="{StaticResource Font.Small}"
+                       Foreground="{DynamicResource Brush.StatusBar.Foreground}"
+                       IsVisible="{Binding PauseError, Converter={x:Static ObjectConverters.IsNotNull}}" />
+
+            <!-- Global pause (spec §3.2.4): holds new work; in-flight jobs always run to completion.
+                 Disabled while disconnected, since there is nothing to toggle. -->
+            <Button Grid.Column="3" Classes="statusBar" Command="{Binding TogglePauseCommand}"
+                    IsEnabled="{Binding IsConnected}"
+                    ToolTip.Tip="{Binding PauseButtonLabel}" VerticalAlignment="Center">
+                <PathIcon Width="11" Height="11"
+                          Data="{Binding PauseIconKey, Converter={x:Static conv:IconConverters.Geometry}}"
+                          Foreground="{DynamicResource Brush.StatusBar.Foreground}" />
+            </Button>
+        </Grid>
     </Border>
 
 </UserControl>

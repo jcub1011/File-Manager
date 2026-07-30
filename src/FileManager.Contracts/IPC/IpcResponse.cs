@@ -1,6 +1,7 @@
 ﻿using FileManager.Contracts.DryRun;
 using FileManager.Contracts.Profiles;
 using FileManager.Contracts.Settings;
+using System;
 using System.Collections.Generic;
 using System.Text.Json.Serialization;
 
@@ -14,6 +15,7 @@ namespace FileManager.Contracts.IPC;
 [JsonDerivedType(typeof(ProfileResponse), "profile")]
 [JsonDerivedType(typeof(ValidationResponse), "validation")]
 [JsonDerivedType(typeof(MatchingProfilesResponse), "matching")]
+[JsonDerivedType(typeof(RunProfileResponse), "run-profile-result")]
 [JsonDerivedType(typeof(DryRunResponse), "dry-run-report")]
 [JsonDerivedType(typeof(DryRunChunkResponse), "dry-run-chunk")]
 [JsonDerivedType(typeof(DryRunProgressResponse), "dry-run-progress")]
@@ -35,6 +37,23 @@ public sealed record ProfileListResponse : IpcResponse { public required IReadOn
 public sealed record ProfileResponse : IpcResponse { public required Profile Profile { get; init; } }
 public sealed record ValidationResponse : IpcResponse { public required IReadOnlyList<ValidationIssue> Issues { get; init; } }
 public sealed record MatchingProfilesResponse : IpcResponse { public required IReadOnlyList<ProfileMatchDto> Matches { get; init; } }
+/// <summary>Answer to a RunProfileRequest (§4.9). A single-file run is enqueued synchronously, so
+/// <see cref="QueuedCount"/> is exact (1) and <see cref="Scanning"/> is false. A folder run starts a
+/// background recursive enumeration so the reply stays prompt (§8 rule 5): Scanning is true,
+/// QueuedCount is 0, and the final count — including 0 for "nothing matched" — arrives later as a
+/// <see cref="RunQueuedEvent"/> for the same (ProfileId, ScopePath).
+/// <para>Queued means <em>accepted</em>, not copied: the job's own filter gate (§4.3 step 4) may
+/// still skip the file, and an identical run already pending is coalesced by the trigger queue.</para></summary>
+public sealed record RunProfileResponse : IpcResponse
+{
+    public required int QueuedCount { get; init; }
+    public required bool Scanning { get; init; }
+
+    /// <summary>Correlates this reply with the <see cref="RunQueuedEvent"/> that later reports the
+    /// enumeration's outcome. The event bus is a broadcast, so without a correlation id every connected
+    /// client announced "Queued N file(s) from …" for runs it never requested.</summary>
+    public required Guid RunId { get; init; }
+}
 public sealed record DryRunResponse : IpcResponse { public required DryRunReport Report { get; init; } }
 /// <summary>One batch of a streamed dry-run report (see DryRunStreamRequest). The service sends
 /// zero or more of these, each well under the frame cap, then a single

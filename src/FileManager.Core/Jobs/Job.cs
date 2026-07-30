@@ -1,4 +1,5 @@
-﻿using FileManager.Contracts.Profiles;
+﻿using FileManager.Contracts.IPC;
+using FileManager.Contracts.Profiles;
 using FileManager.Core.Files;
 using FileManager.Contracts.Primitives;
 using System;
@@ -164,6 +165,18 @@ public sealed record JobPlan
     public required IReadOnlyList<TargetPlan> Targets { get; init; }
     public required PolicySnapshot Policies { get; init; }
     public required string WorkspaceDir { get; init; }             // <tempRoot>/.pipeline_tmp/<JobId>/
+
+    /// <summary>Index of the payload's originating Source within <see cref="Profile"/>, or -1 when the
+    /// payload's root matches none of them. Resolved ONCE, by the factory that already has both the
+    /// profile and the payload: the M:1 priority rank (spec §3.4) has to be the same value where it is
+    /// written to <see cref="Placement.SourcePriorityRegistry"/> and where it is read back by
+    /// <see cref="Placement.IConflictResolver.Resolve"/>, and deriving it independently on each side is
+    /// how those two silently disagreed.</summary>
+    public required int SourceIndex { get; init; }
+
+    /// <summary>The priority rank to compare against the registry: an unmatched source ranks highest,
+    /// which is the conservative choice — it never lets an unrecognized root evict a known one.</summary>
+    public int PriorityIndex => SourceIndex < 0 ? 0 : SourceIndex;
 }
 
 /// <summary>Sealed transform output — the reference every verification compares against (§7.1 state OutputSealed).</summary>
@@ -230,4 +243,16 @@ public enum JobOutcome { Succeeded, Skipped, Failed, RollbackFailed }
 public enum SkipReason { Filtered, SourceDisposed, UnchangedAtAllTargets }
 
 public sealed record JobCompletion(
-    JobId JobId, JobOutcome Outcome, SkipReason? SkipReason, JobError? Error, TimeSpan Duration);
+    JobId JobId, JobOutcome Outcome, SkipReason? SkipReason, JobError? Error, TimeSpan Duration)
+{
+    /// <summary>Paths the rollback sweep could not revert (§4.7, §7.3) — they need manual
+    /// remediation, so the orchestrator forwards them onto <c>JobFailedEvent.ResidualPaths</c>.
+    /// Non-empty only for <see cref="JobOutcome.RollbackFailed"/>, and empty even then when rollback
+    /// failed before it could enumerate residuals (e.g. its own journal append failed).</summary>
+    public IReadOnlyList<string> ResidualPaths { get; init; } = [];
+}
+
+/// <summary>One intra-job progress sample, pushed by the executor at each §4.3 phase boundary and
+/// after each target settles. Wire-agnostic on purpose: <see cref="JobProgressPublisher"/> turns it
+/// into a <c>JobProgressEvent</c>, so the phase algorithm never touches the IPC contract.</summary>
+public readonly record struct JobProgress(JobPhase Phase, int TargetsCompleted, int TargetCount);

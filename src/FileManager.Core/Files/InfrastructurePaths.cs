@@ -22,6 +22,50 @@ public static class InfrastructurePaths
     public static string StagedPathFor(string targetRoot, Guid jobId, int targetIndex, string finalFileName)
         => Path.Combine(targetRoot, StagingDirectoryName, jobId.ToString("N"), $"{targetIndex}-{finalFileName}");
 
+    /// <summary>Deletes a directory recursively, best-effort, returning the exception instead of
+    /// throwing so the caller can log in its own voice. Both artifact-cleanup paths — the executor's
+    /// post-commit sweep and rollback's teardown — had their own copy of this try/catch, and each
+    /// decided independently what to do about the shared staging parent (see
+    /// <see cref="TryDropSharedStagingParent"/>), which is how the two drifted apart.</summary>
+    public static Exception? TryDeleteDirectory(string? directory)
+    {
+        if (string.IsNullOrEmpty(directory))
+            return null;
+        try
+        {
+            if (Directory.Exists(directory))
+                Directory.Delete(directory, recursive: true);
+            return null;
+        }
+        catch (Exception ex)
+        {
+            return ex;
+        }
+    }
+
+    /// <summary>Drops the shared <c>.fm_staging</c> parent of <paramref name="stagingDir"/> once this
+    /// job's directory is gone. The delete is deliberately NON-recursive: it throws while a concurrent
+    /// job (or a staging dir rollback kept for recovery) still has something in there, which is exactly
+    /// the guard wanted. A no-op when the given path's parent is not a staging root.</summary>
+    public static void TryDropSharedStagingParent(string? stagingDir)
+    {
+        if (string.IsNullOrEmpty(stagingDir))
+            return;
+        string? parent = Path.GetDirectoryName(stagingDir);
+        if (string.IsNullOrEmpty(parent)
+            || !Path.GetFileName(parent).Equals(StagingDirectoryName, StringComparison.OrdinalIgnoreCase))
+            return;
+        try
+        {
+            if (Directory.Exists(parent))
+                Directory.Delete(parent);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // Still occupied, or a sibling job raced us into it. An empty dir left behind is harmless.
+        }
+    }
+
     /// <summary>True when a directory name is one of the tool's own infrastructure directories,
     /// which a walk must never descend into or report.</summary>
     public static bool IsInfrastructureDirectoryName(string name)

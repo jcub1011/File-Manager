@@ -31,9 +31,12 @@ public abstract record IpcRequest
     /// DryRunOperation replace flat path strings); 3 — dry-run streams may interleave
     /// dry-run-progress frames before the terminator; 4 — dry-run requests may carry an inline
     /// Profile draft (InlineProfile) so unsaved edits can be previewed without a catalog lookup;
-    /// 5 — relocate-profiles request added, answered with a relocate-profiles-result frame.
+    /// 5 — relocate-profiles request added, answered with a relocate-profiles-result frame;
+    /// 6 — job-progress engine events may interleave the job lifecycle stream, run-profile answers
+    /// with a run-profile-result frame instead of a bare ok, and a folder run's final queued count
+    /// (including zero for "nothing matched") arrives as a run-queued event.
     /// A mismatched service/UI pair must fail loud (IPC_VERSION_MISMATCH), never half-parse.</summary>
-    public const int CurrentProtocolVersion = 5;
+    public const int CurrentProtocolVersion = 6;
 
     public int ProtocolVersion { get; init; } = CurrentProtocolVersion;
 }

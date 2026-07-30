@@ -1,3 +1,4 @@
+using FileManager.Contracts.IPC;
 using FileManager.Contracts.Profiles;
 using FileManager.Core.Audit;
 using FileManager.Core.Disposition;
@@ -75,6 +76,101 @@ public sealed class JobExecutorTests : IDisposable
         string path = Path.Combine(_sourceDir, name);
         File.WriteAllText(path, content);
         return path;
+    }
+
+    /// <summary>Collects the raw samples the executor pushes — no throttling, no clamping (that is
+    /// <see cref="JobProgressPublisher"/>'s job), so these assert what the phase algorithm reports.</summary>
+    private sealed class RecordingProgress : IProgress<JobProgress>
+    {
+        private readonly List<JobProgress> _samples = [];
+        public IReadOnlyList<JobProgress> Samples
+        {
+            get { lock (_samples) return _samples.ToList(); }
+        }
+        public void Report(JobProgress value)
+        {
+            lock (_samples) _samples.Add(value);
+        }
+    }
+
+    [Fact]
+    public async Task Reports_progress_through_the_phases_of_a_successful_job()
+    {
+        string source = WriteSource("progress.txt", "payload");
+        RecordingProgress progress = new();
+
+        JobCompletion completion = await _executor.ExecuteAsync(
+            Plan(source, Path.Combine(_targetDir, "progress.txt"), _targetDir, Policy()), progress);
+
+        Assert.Equal(JobOutcome.Succeeded, completion.Outcome);
+        IReadOnlyList<JobPhase> phases = progress.Samples.Select(s => s.Phase).ToList();
+        Assert.Equal(
+            [JobPhase.Locking, JobPhase.Opening, JobPhase.Preflighting, JobPhase.Screening,
+             JobPhase.Sealing, JobPhase.Distributing],
+            phases.Take(6));
+        Assert.Equal(JobPhase.Disposing, phases[^1]);
+        Assert.Contains(JobPhase.Committing, phases);
+        // The last distribute sample accounts for every target.
+        JobProgress lastDistribute = progress.Samples.Last(s => s.Phase == JobPhase.Distributing);
+        Assert.Equal(lastDistribute.TargetCount, lastDistribute.TargetsCompleted);
+    }
+
+    [Fact]
+    public async Task Reports_targets_completed_for_a_multi_target_job()
+    {
+        string source = WriteSource("fanout.txt", "payload");
+        string targetB = Path.Combine(_root, "target-b");
+        Directory.CreateDirectory(targetB);
+        JobPlan plan = JobFixtures.Execution(
+            source, _sourceDir,
+            [Path.Combine(_targetDir, "fanout.txt"), Path.Combine(targetB, "fanout.txt")],
+            [_targetDir, targetB], Policy()).Plan;
+        RecordingProgress progress = new();
+
+        JobCompletion completion = await _executor.ExecuteAsync(plan, progress);
+
+        Assert.Equal(JobOutcome.Succeeded, completion.Outcome);
+        IReadOnlyList<int> distributeCounts = progress.Samples
+            .Where(s => s.Phase == JobPhase.Distributing)
+            .Select(s => s.TargetsCompleted).ToList();
+        Assert.All(progress.Samples.Where(s => s.Phase == JobPhase.Distributing),
+            s => Assert.Equal(2, s.TargetCount));
+        // Targets settle in parallel, so ordering is unspecified — but every target must be counted.
+        Assert.Equal(2, distributeCounts.Max());
+        Assert.Contains(0, distributeCounts);   // the phase-entry sample
+    }
+
+    [Fact]
+    public async Task Reports_rolling_back_when_a_placement_fails()
+    {
+        string source = WriteSource("rollback-progress.txt", "payload");
+        _metadata.FailApply = true;
+        RecordingProgress progress = new();
+
+        JobCompletion completion = await _executor.ExecuteAsync(
+            Plan(source, Path.Combine(_targetDir, "rollback-progress.txt"), _targetDir,
+                Policy(metadataOnConflict: MetadataOnConflict.FailJob)), progress);
+
+        Assert.True(completion.Outcome is JobOutcome.Failed or JobOutcome.RollbackFailed);
+        Assert.Contains(JobPhase.RollingBack, progress.Samples.Select(s => s.Phase));
+    }
+
+    [Fact]
+    public async Task A_throwing_progress_sink_does_not_change_the_outcome()
+    {
+        string source = WriteSource("hostile-sink.txt", "payload");
+        string final = Path.Combine(_targetDir, "hostile-sink.txt");
+
+        JobCompletion completion = await _executor.ExecuteAsync(
+            Plan(source, final, _targetDir, Policy()), new ThrowingProgress());
+
+        Assert.Equal(JobOutcome.Succeeded, completion.Outcome);
+        Assert.True(File.Exists(final));
+    }
+
+    private sealed class ThrowingProgress : IProgress<JobProgress>
+    {
+        public void Report(JobProgress value) => throw new InvalidOperationException("hostile sink");
     }
 
     [Fact]

@@ -6,7 +6,9 @@ using FileManager.Contracts.Settings;
 using Serilog;
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
+using System.Runtime.CompilerServices;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -16,7 +18,10 @@ namespace FileManager.UI.Services;
 /// via ServiceLauncher (§3.3). A transport fault disposes the client so the next call
 /// reconnects — no background retry loop. Dry-run deliberately uses its OWN short-lived
 /// connection: requests on a connection are strictly sequential (§3.2), so a cancelled or
-/// minutes-long dry-run must not desynchronize or stall the main channel's status polls.</summary>
+/// minutes-long dry-run must not desynchronize or stall the main channel's status polls.
+/// <para>The event subscription likewise takes its own connection — mandatory, since subscribing
+/// makes a connection one-way — and is likewise single-attempt: <see cref="EngineEventPump"/> owns
+/// the reconnect loop, keeping this class free of background retry.</para></summary>
 public sealed class IpcGateway : IIpcGateway, IAsyncDisposable
 {
     private readonly SemaphoreSlim _connectGate = new(1, 1);
@@ -71,6 +76,94 @@ public sealed class IpcGateway : IIpcGateway, IAsyncDisposable
     public Task<Result<bool, IpcError>> ShutdownServiceAsync(CancellationToken ct = default) =>
         RequestAsync<OkResponse, bool>(
             new ShutdownRequest(), static _ => true, ct);
+
+    public Task<Result<RunProfileResponse, IpcError>> RunProfileAsync(
+        Guid profileId, string path, CancellationToken ct = default) =>
+        RequestAsync<RunProfileResponse, RunProfileResponse>(
+            new RunProfileRequest { ProfileId = profileId, Path = path }, static r => r, ct);
+
+    public Task<Result<bool, IpcError>> SetPausedAsync(bool paused, CancellationToken ct = default) =>
+        RequestAsync<OkResponse, bool>(
+            new SetPausedRequest { Paused = paused }, static _ => true, ct);
+
+    public Task<Result<IReadOnlyList<JobSummaryDto>, IpcError>> GetRecentJobsAsync(
+        int count = 50, CancellationToken ct = default) =>
+        RequestAsync<RecentJobsResponse, IReadOnlyList<JobSummaryDto>>(
+            new GetRecentJobsRequest { Count = count }, static r => r.Jobs, ct);
+
+    public Task<Result<IReadOnlyList<string>, IpcError>> GetJobLogAsync(
+        Guid jobId, CancellationToken ct = default) =>
+        RequestAsync<JobLogResponse, IReadOnlyList<string>>(
+            new GetJobLogRequest { JobId = jobId }, static r => r.Lines, ct);
+
+    public async IAsyncEnumerable<Result<EngineEvent, IpcError>> SubscribeEventsAsync(
+        [EnumeratorCancellation] CancellationToken ct = default)
+    {
+        // Own connection: after SubscribeAsync the connection is a one-way event stream and must never
+        // carry a request (§3.2), so it can never be the shared _client.
+        //
+        // ConnectAsync, deliberately NOT ServiceLauncher.ConnectOrStartAsync: the pump retries this on
+        // a backoff, and ConnectOrStartAsync would spawn a FileManager.Service process (and burn a ~5s
+        // retry budget) on every attempt during a real outage. The 2s status poll already owns
+        // service-start duty through the shared client.
+        var connected = await IpcClient.ConnectAsync(ct).ConfigureAwait(false);
+        if (connected.IsCanceled)
+            yield break;
+        if (connected.TryGetError(out string? connectError))
+        {
+            yield return new IpcError("SERVICE_UNAVAILABLE", connectError);
+            yield break;
+        }
+        connected.TryGetValue(out IpcClient? client);
+
+        await using (client)   // `using` lowers to try/finally, which permits `yield return`
+        {
+            // Manual enumeration: `yield return` is illegal inside a try that has a catch, so the
+            // try/catch wraps ONLY MoveNextAsync — which is where SubscribeAsync's throws originate.
+            await using IAsyncEnumerator<EngineEvent> events =
+                client!.SubscribeAsync(ct).GetAsyncEnumerator(ct);
+            while (true)
+            {
+                EngineEvent? next;
+                IpcError? failure = null;
+                try
+                {
+                    if (!await events.MoveNextAsync().ConfigureAwait(false))
+                        break;                      // clean close at a frame boundary
+                    next = events.Current;
+                }
+                catch (OperationCanceledException)
+                {
+                    break;                          // shutting down — not a failure
+                }
+                catch (InvalidOperationException ex)
+                {
+                    failure = new IpcError("EVENTS_REFUSED", ex.Message);
+                    next = null;
+                }
+                catch (IOException ex)
+                {
+                    failure = new IpcError("IPC_TRANSPORT", ex.Message);
+                    next = null;
+                }
+                catch (Exception ex)
+                {
+                    // Last-resort catch-all (directive): the stream must surface a value, never throw
+                    // into the consumer's `await foreach`.
+                    Log.Error(ex, "Engine event subscription failed unexpectedly");
+                    failure = new IpcError("IPC_INTERNAL", $"{ex.GetType().Name}: {ex.Message}");
+                    next = null;
+                }
+
+                if (failure is not null)
+                {
+                    yield return failure;
+                    yield break;                    // one Failure item, then the sequence ends
+                }
+                yield return next!;
+            }
+        }
+    }
 
     public async Task<Result<DryRunReport, IpcError>> DryRunAsync(
         Guid profileId, IProgress<DryRunProgress>? progress = null, Profile? draft = null,

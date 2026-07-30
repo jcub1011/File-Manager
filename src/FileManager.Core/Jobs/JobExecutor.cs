@@ -1,7 +1,9 @@
+﻿using FileManager.Contracts.IPC;
 using FileManager.Contracts.Primitives;
 using FileManager.Contracts.Profiles;
 using FileManager.Core.Audit;
 using FileManager.Core.Disposition;
+using FileManager.Core.Files;
 using FileManager.Core.Filtering;
 using FileManager.Core.Journal;
 using FileManager.Core.Locking;
@@ -40,7 +42,8 @@ public sealed class JobExecutor(
     TimeProvider time,
     ILogger<JobExecutor> logger) : IJobExecutor
 {
-    public async Task<JobCompletion> ExecuteAsync(JobPlan plan, CancellationToken ct = default)
+    public async Task<JobCompletion> ExecuteAsync(
+        JobPlan plan, IProgress<JobProgress>? progress = null, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(plan);
         long start = time.GetTimestamp();
@@ -57,7 +60,7 @@ public sealed class JobExecutor(
         JobExecution execution = new() { Plan = plan };
         try
         {
-            return await RunAsync(execution, start, ct).ConfigureAwait(false);
+            return await RunAsync(execution, progress, start, ct).ConfigureAwait(false);
         }
         catch (OperationCanceledException)
         {
@@ -75,13 +78,15 @@ public sealed class JobExecutor(
         }
     }
 
-    private async Task<JobCompletion> RunAsync(JobExecution execution, long start, CancellationToken ct)
+    private async Task<JobCompletion> RunAsync(
+        JobExecution execution, IProgress<JobProgress>? progress, long start, CancellationToken ct)
     {
         JobPlan plan = execution.Plan;
         JobStateMachine states = execution.States;
 
         // 1. LOCK — source + every prospective final path (§4.3 step 1). Archive-destination locking
         //    is a documented Set-3 simplification (disposition is post-commit, never rolled back).
+        Report(progress, plan, JobPhase.Locking);
         IReadOnlyList<NormalizedPath> lockPaths = BuildLockSet(plan, out JobError? lockError);
         if (lockError is not null)
             return Completed(plan, JobOutcome.Failed, null, lockError, start);
@@ -97,6 +102,7 @@ public sealed class JobExecutor(
         }
 
         // 2. OPEN — the job now exists durably; from here a failure routes through rollback.
+        Report(progress, plan, JobPhase.Opening);
         JobError? open = TryAppend(new JobOpenedRecord
         {
             JobId = plan.JobId.Value,
@@ -114,7 +120,10 @@ public sealed class JobExecutor(
         Log(plan, "opened");
 
         // 3. PREFLIGHT — self-path check + free-space. I-WAL: nothing written, so close directly.
-        JobError? preflightError = Preflight(plan);
+        Report(progress, plan, JobPhase.Preflighting);
+        // lockPaths is reused, not re-derived: it already holds the source and every prospective final
+        // path in normalized form, in target order (source first).
+        JobError? preflightError = Preflight(plan, lockPaths);
         if (preflightError is not null)
         {
             states.Transition(JobState.Closed);
@@ -125,6 +134,7 @@ public sealed class JobExecutor(
         states.Transition(JobState.Preflighted);
 
         // 4. SCREEN — the authoritative filter gate (a manual single-file run is not pre-filtered).
+        Report(progress, plan, JobPhase.Screening);
         Result<bool, JobError> screen = Screen(plan, out string? decidingRule);
         if (screen.TryGetError(out JobError? screenError))
         {
@@ -145,12 +155,13 @@ public sealed class JobExecutor(
 
         // 5. SEAL SOURCE AS OUTPUT — no transform: the source itself is the sealed artifact. The
         //    guard-only Transforming transition keeps the §7.1 sequence; no workspace is created.
+        Report(progress, plan, JobPhase.Sealing);
         states.Transition(JobState.Transforming);
         Result<SealedOutput, JobError> sealResult = await SealSourceAsync(plan, ct).ConfigureAwait(false);
         if (sealResult.IsCanceled)
-            return await RollBackAsync(execution, CanceledSeal(), start, ct).ConfigureAwait(false);
+            return await RollBackAsync(execution, CanceledSeal(), progress, start, ct).ConfigureAwait(false);
         if (sealResult.TryGetError(out JobError? sealError))
-            return await RollBackAsync(execution, sealError, start, ct).ConfigureAwait(false);
+            return await RollBackAsync(execution, sealError, progress, start, ct).ConfigureAwait(false);
         sealResult.TryGetValue(out SealedOutput? output);
         execution.Output = output;
 
@@ -164,14 +175,15 @@ public sealed class JobExecutor(
             ContentHash = output.ContentHash,
         });
         if (sealedError is not null)
-            return await RollBackAsync(execution, sealedError, start, ct).ConfigureAwait(false);
+            return await RollBackAsync(execution, sealedError, progress, start, ct).ConfigureAwait(false);
         states.Transition(JobState.OutputSealed);
 
         // 6. DISTRIBUTE + VERIFY + PLACE — bounded-parallel per target; cancel siblings on first fail.
+        Report(progress, plan, JobPhase.Distributing);
         states.Transition(JobState.Distributing);
-        JobError? distributeError = await DistributeAsync(execution, locks, ct).ConfigureAwait(false);
+        JobError? distributeError = await DistributeAsync(execution, locks, progress, ct).ConfigureAwait(false);
         if (distributeError is not null)
-            return await RollBackAsync(execution, distributeError, start, ct).ConfigureAwait(false);
+            return await RollBackAsync(execution, distributeError, progress, start, ct).ConfigureAwait(false);
 
         // 7. COMMIT / SKIP decision.
         bool anyPlaced = false, anySkippedConflict = false, allUnchanged = true;
@@ -200,18 +212,28 @@ public sealed class JobExecutor(
 
         // Commit point (I-DISPOSE): source disposition is authorized by this record and nothing else.
         // A failed commit append is fatal → rollback.
+        Report(progress, plan, JobPhase.Committing, TerminalTargetCount(execution));
         JobError? commit = TryAppend(new JobCommittedRecord { JobId = plan.JobId.Value, Seq = 0, AtUtc = time.GetUtcNow() });
         if (commit is not null)
-            return await RollBackAsync(execution, commit, start, ct).ConfigureAwait(false);
+            return await RollBackAsync(execution, commit, progress, start, ct).ConfigureAwait(false);
         states.Transition(JobState.Committed);
         Log(plan, "committed");
 
         // 8. DISPOSE — apply OnSuccess; a disposition failure is logged in job-closed, never rolled back.
+        Report(progress, plan, JobPhase.Disposing, TerminalTargetCount(execution));
         states.Transition(JobState.Disposing);
         string? dispositionError = ApplyDisposition(execution);
         states.Transition(JobState.Closed);
         TryAppend(Close(plan, JobOutcome.Succeeded, skipReason: null, dispositionError));
         Log(plan, dispositionError is null ? "succeeded" : $"succeeded (disposition error: {dispositionError})");
+
+        // 9. RELEASE — staging holds the versions this job replaced. I-STAGING-KEEP authorizes deleting
+        //    a staging dir once the job closed Succeeded, and this must happen AFTER that close is
+        //    journaled: until then a crash still needs the staged originals to roll back. Recovery
+        //    cannot sweep .fm_staging (it sits under arbitrary target roots it cannot enumerate), so
+        //    if the success path does not clean up, every overwrite leaves a full copy of the replaced
+        //    file in the user's target root forever.
+        CleanUpPlacementArtifacts(execution);
         return Completed(plan, JobOutcome.Succeeded, null, null, start);
     }
 
@@ -236,23 +258,42 @@ public sealed class JobExecutor(
         return paths;
     }
 
-    private JobError? Preflight(JobPlan plan)
+    /// <param name="lockPaths">The set built by <see cref="BuildLockSet"/>: the normalized source at
+    /// index 0, then one normalized prospective final path per target in target order. Reused here so
+    /// the source and every target path are normalized ONCE per job rather than twice.</param>
+    private JobError? Preflight(JobPlan plan, IReadOnlyList<NormalizedPath> lockPaths)
     {
-        // Resolved-target self-path check (hard error, spec §3.2.3) — distinct from the profile-level
-        // validator check, which cannot see the per-job resolved final paths.
-        if (NormalizedPath.Create(plan.Source.Path).TryGetValue(out NormalizedPath source))
+        // Resolved-target checks (hard errors, spec §3.2.3) — distinct from the profile-level validator
+        // checks, which cannot see the per-job resolved final paths.
+        NormalizedPath source = lockPaths[0];
+        Dictionary<NormalizedPath, int> seenFinalPaths = new(plan.Targets.Count);
+        for (int i = 0; i < plan.Targets.Count; i++)
         {
-            foreach (TargetPlan target in plan.Targets)
-            {
-                if (NormalizedPath.Create(target.ProspectiveFinalPath).TryGetValue(out NormalizedPath fp) && fp == source)
-                    return new JobError
-                    {
-                        Code = JobErrorCode.SelfPathTarget,
-                        Message = $"target resolves to the source path: {source.Value}",
-                        Path = source.Value,
-                        TargetIndex = target.TargetIndex,
-                    };
-            }
+            TargetPlan target = plan.Targets[i];
+            NormalizedPath fp = lockPaths[i + 1];
+
+            if (fp == source)
+                return new JobError
+                {
+                    Code = JobErrorCode.SelfPathTarget,
+                    Message = $"target resolves to the source path: {source.Value}",
+                    Path = source.Value,
+                    TargetIndex = target.TargetIndex,
+                };
+
+            // Two targets landing on one final path cannot both be placed — the path locks are
+            // per-job, so they would race the same temp→final move and roll the job back. Refuse up
+            // front instead. ProfileValidator rejects duplicate Targets at save time; this covers a
+            // hand-edited profiles.json (and any layout that collapses two roots onto one path).
+            if (seenFinalPaths.TryGetValue(fp, out int firstIndex))
+                return new JobError
+                {
+                    Code = JobErrorCode.ConflictUnresolvable,
+                    Message = $"targets {firstIndex} and {target.TargetIndex} both resolve to \"{fp.Value}\"",
+                    Path = fp.Value,
+                    TargetIndex = target.TargetIndex,
+                };
+            seenFinalPaths[fp] = target.TargetIndex;
         }
 
         Result<DiskPreflightReport, JobError> report = preflight.Evaluate(plan);
@@ -284,9 +325,7 @@ public sealed class JobExecutor(
         compiled.TryGetValue(out CompiledFilterSet? set);
 
         string relativePath = Path.GetRelativePath(plan.Payload.SourceRoot, plan.Source.Path);
-        int depth = SeparatorCount(relativePath);
-        string? normalized = set!.HasPatternRules ? NormalizeSeparators(relativePath) : null;
-        FilterInput input = new(plan.Source.Path, relativePath, depth, plan.SourceMetadata, normalized);
+        FilterInput input = FilterInput.For(plan.Source.Path, relativePath, plan.SourceMetadata, set!.HasPatternRules);
         FilterDecision decision = set.Evaluate(in input);
         decidingRule = decision.DecidingRule;
         return decision.Matched;
@@ -313,12 +352,16 @@ public sealed class JobExecutor(
         };
     }
 
-    private async Task<JobError?> DistributeAsync(JobExecution execution, PathLockSet locks, CancellationToken ct)
+    private async Task<JobError?> DistributeAsync(
+        JobExecution execution, PathLockSet locks, IProgress<JobProgress>? progress, CancellationToken ct)
     {
         JobPlan plan = execution.Plan;
         using CancellationTokenSource linked = CancellationTokenSource.CreateLinkedTokenSource(ct);
         JobError?[] errors = new JobError?[plan.Targets.Count];
         Task[] tasks = new Task[plan.Targets.Count];
+        // Incremented as each target settles. Interlocked because the target tasks run concurrently;
+        // the publisher clamps monotonically, so an out-of-order sample can never count backwards.
+        int completed = 0;
 
         for (int i = 0; i < plan.Targets.Count; i++)
         {
@@ -330,7 +373,9 @@ public sealed class JobExecutor(
                 {
                     errors[index] = error;
                     linked.Cancel();   // cancel sibling target tasks (§4.3 step 6)
+                    return;
                 }
+                Report(progress, plan, JobPhase.Distributing, Interlocked.Increment(ref completed));
             }, CancellationToken.None);
         }
         await Task.WhenAll(tasks).ConfigureAwait(false);
@@ -363,9 +408,11 @@ public sealed class JobExecutor(
                 return null;
             }
 
-            // Conflict resolution (single source → priority index 0).
+            // Conflict resolution. The rank MUST be the plan's resolved source index, not a literal:
+            // the placer records placements under that same index, and a hard-coded 0 made the M:1
+            // "higher-priority source keeps the file" rule (spec §3.4) unreachable.
             Result<ConflictOutcome, JobError> resolve = conflictResolver.Resolve(
-                target.ProspectiveFinalPath, plan.Policies.ConflictResolution, output, sourceIndex: 0, plan.ProfileId, locks);
+                target.ProspectiveFinalPath, plan.Policies.ConflictResolution, output, plan.PriorityIndex, plan.ProfileId, locks);
             if (resolve.TryGetError(out JobError? resolveError))
                 return resolveError;
             resolve.TryGetValue(out ConflictOutcome? outcome);
@@ -436,9 +483,11 @@ public sealed class JobExecutor(
         }
     }
 
-    private async Task<JobCompletion> RollBackAsync(JobExecution execution, JobError cause, long start, CancellationToken ct)
+    private async Task<JobCompletion> RollBackAsync(
+        JobExecution execution, JobError cause, IProgress<JobProgress>? progress, long start, CancellationToken ct)
     {
         JobPlan plan = execution.Plan;
+        Report(progress, plan, JobPhase.RollingBack, TerminalTargetCount(execution));
         execution.States.Transition(JobState.RollingBack);
         Log(plan, $"rolling back: {cause.Message}");
 
@@ -477,9 +526,11 @@ public sealed class JobExecutor(
             return Completed(plan, JobOutcome.Failed, null, cause, start);
         }
 
+        // Residuals are empty when rollback failed before it could enumerate them (its own journal
+        // append failed, so `result` carries a JobError rather than a RollbackResult).
         IReadOnlyList<string> residuals = outcome?.ResidualPaths ?? [];
         Log(plan, $"rollback incomplete; residual paths: {string.Join(", ", residuals)}");
-        return Completed(plan, JobOutcome.RollbackFailed, null, cause, start);
+        return Completed(plan, JobOutcome.RollbackFailed, null, cause, start) with { ResidualPaths = residuals };
     }
 
     // ---- helpers ---------------------------------------------------------------------------------
@@ -487,15 +538,13 @@ public sealed class JobExecutor(
     private static JobError CanceledSeal() =>
         new() { Code = JobErrorCode.SourceUnreadable, Message = "canceled while sealing the source" };
 
-    private static SourceConfig? FindMatchedSource(JobPlan plan)
-    {
-        if (!NormalizedPath.Create(plan.Payload.SourceRoot).TryGetValue(out NormalizedPath payloadRoot))
-            return null;
-        foreach (SourceConfig source in plan.Profile.Sources)
-            if (NormalizedPath.Create(source.Path).TryGetValue(out NormalizedPath root) && root == payloadRoot)
-                return source;
-        return null;
-    }
+    /// <summary>The Source the payload came from, or null when its root matched none. Bounds-checked
+    /// rather than trusting the index: the plan and the profile are separate fields, so a plan built
+    /// against a different profile revision must degrade to "no per-source overrides", never throw.</summary>
+    private static SourceConfig? FindMatchedSource(JobPlan plan) =>
+        plan.SourceIndex >= 0 && plan.SourceIndex < plan.Profile.Sources.Count
+            ? plan.Profile.Sources[plan.SourceIndex]
+            : null;
 
     private JobError? TryAppend(JournalRecord record)
     {
@@ -524,15 +573,68 @@ public sealed class JobExecutor(
 
     private void Log(JobPlan plan, string line) => jobLog.Append(plan.JobId.Value, line);
 
-    private static int SeparatorCount(string value)
+    /// <summary>Pushes one progress sample. Progress is decoration: a throwing sink must never change
+    /// a job's outcome, so it is caught and logged here rather than propagating into the phase
+    /// algorithm. Throttling and monotonic clamping are the publisher's job, not ours.</summary>
+    private void Report(IProgress<JobProgress>? progress, JobPlan plan, JobPhase phase, int completed = 0)
     {
-        int count = 0;
-        foreach (char c in value)
-            if (c == Path.DirectorySeparatorChar || c == Path.AltDirectorySeparatorChar)
-                count++;
-        return count;
+        if (progress is null)
+            return;
+        try
+        {
+            progress.Report(new JobProgress(phase, completed, plan.Targets.Count));
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "Job {JobId}: progress sink threw while reporting {Phase}", plan.JobId.Short, phase);
+        }
     }
 
-    private static string NormalizeSeparators(string relativePath) =>
-        Path.DirectorySeparatorChar == '/' ? relativePath : relativePath.Replace('\\', '/');
+    /// <summary>Releases this job's transient placement artifacts after a successful, journaled close:
+    /// the staging dirs holding the versions it replaced, and the workspace. Entirely best-effort —
+    /// the job is already committed and its targets verified, so a cleanup failure must never change
+    /// the outcome; it only leaves disk to reclaim, which is logged.</summary>
+    private void CleanUpPlacementArtifacts(JobExecution execution)
+    {
+        HashSet<string> stagingDirs = new(StringComparer.OrdinalIgnoreCase);
+        foreach (TargetProgress tp in execution.Targets)
+        {
+            if (tp.StagedPath is null)
+                continue;
+            string? dir = Path.GetDirectoryName(tp.StagedPath);
+            if (!string.IsNullOrEmpty(dir))
+                stagingDirs.Add(dir);
+        }
+
+        foreach (string dir in stagingDirs)
+        {
+            TryDeleteDirectory(execution.Plan, dir);
+            InfrastructurePaths.TryDropSharedStagingParent(dir);
+        }
+
+        TryDeleteDirectory(execution.Plan, execution.Plan.WorkspaceDir);
+    }
+
+    private void TryDeleteDirectory(JobPlan plan, string directory)
+    {
+        // Last-resort log-and-continue: this runs after the job is committed and closed, so nothing
+        // here may surface as a job failure.
+        if (InfrastructurePaths.TryDeleteDirectory(directory) is Exception ex)
+        {
+            logger.LogWarning(ex, "Job {JobId}: could not clean up \"{Directory}\"", plan.JobId.Short, directory);
+            Log(plan, $"cleanup warning: could not delete {directory}: {ex.Message}");
+        }
+    }
+
+    /// <summary>How many targets have reached a terminal state — used for the progress samples of the
+    /// phases after distribution, where the per-target counter is out of scope.</summary>
+    private static int TerminalTargetCount(JobExecution execution)
+    {
+        int done = 0;
+        foreach (TargetProgress tp in execution.Targets)
+            if (tp.State is TargetState.Placed or TargetState.SatisfiedUnchanged or TargetState.SkippedConflict)
+                done++;
+        return done;
+    }
+
 }

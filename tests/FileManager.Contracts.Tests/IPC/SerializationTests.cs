@@ -1,4 +1,4 @@
-using FileManager.Contracts.DryRun;
+﻿using FileManager.Contracts.DryRun;
 using FileManager.Contracts.IPC;
 using FileManager.Contracts.Profiles;
 using FileManager.Contracts.Settings;
@@ -58,6 +58,7 @@ public sealed class SerializationTests
         { new ProfileResponse { Profile = SampleProfile() }, "profile" },
         { new ValidationResponse { Issues = [new ValidationIssue(ValidationSeverity.BlockingWarning, "C", "m")] }, "validation" },
         { new MatchingProfilesResponse { Matches = [] }, "matching" },
+        { new RunProfileResponse { QueuedCount = 1, Scanning = false, RunId = SomeId }, "run-profile-result" },
         { new DryRunResponse { Report = SampleReport() }, "dry-run-report" },
         { new DryRunChunkResponse { Directories = SampleDirectories(), SourceFiles = [SampleWireFile()], SourceOperations = [SampleWireSourceOp()] }, "dry-run-chunk" },
         { new DryRunProgressResponse { Phase = DryRunProgressPhase.ScanningSources, SourceFiles = 1, DestinationFiles = 2 }, "dry-run-progress" },
@@ -83,6 +84,8 @@ public sealed class SerializationTests
     public static TheoryData<EngineEvent, string> Events() => new()
     {
         { new JobStartedEvent { AtUtc = DateTimeOffset.UnixEpoch, JobId = SomeId, ProfileId = SomeId, SourcePath = @"C:\x" }, "job-started" },
+        { new JobProgressEvent { AtUtc = DateTimeOffset.UnixEpoch, JobId = SomeId, Phase = JobPhase.Distributing, TargetsCompleted = 1, TargetCount = 2 }, "job-progress" },
+        { new RunQueuedEvent { AtUtc = DateTimeOffset.UnixEpoch, ProfileId = SomeId, ScopePath = "C:/in", QueuedCount = 3, RunId = SomeId }, "run-queued" },
         { new PauseChangedEvent { AtUtc = DateTimeOffset.UnixEpoch, Paused = true }, "pause-changed" },
         { new ProfilesChangedEvent { AtUtc = DateTimeOffset.UnixEpoch }, "profiles-changed" },
         { new EngineWarningEvent { AtUtc = DateTimeOffset.UnixEpoch, Message = "w" }, "engine-warning" },
@@ -99,6 +102,32 @@ public sealed class SerializationTests
 
         Assert.True(IpcSerializer.DeserializeEvent(wire).TryGetValue(out EngineEvent? roundTripped));
         Assert.Equal(evt.GetType(), roundTripped.GetType());
+    }
+
+    /// <summary>A deliberate tripwire: the protocol version gates UI/service compatibility
+    /// (IPC_VERSION_MISMATCH), so it must never move as an incidental side effect of an edit.</summary>
+    [Fact]
+    public void Current_protocol_version_is_pinned()
+    {
+        Assert.Equal(6, IpcRequest.CurrentProtocolVersion);
+    }
+
+    /// <summary>JobPhase must stay a string on the wire (the context sets UseStringEnumConverter), so
+    /// a consumer reading it never depends on the enum's numeric ordering.</summary>
+    [Fact]
+    public void Job_phase_serializes_as_a_string()
+    {
+        byte[] wire = IpcSerializer.SerializeEvent(new JobProgressEvent
+        {
+            AtUtc = DateTimeOffset.UnixEpoch,
+            JobId = SomeId,
+            Phase = JobPhase.Distributing,
+            TargetsCompleted = 1,
+            TargetCount = 2,
+        });
+
+        using JsonDocument document = JsonDocument.Parse(wire);
+        Assert.Equal("Distributing", document.RootElement.GetProperty("Phase").GetString());
     }
 
     [Fact]

@@ -26,10 +26,15 @@ public sealed class SourceDispositionService(
     {
         JobPlan plan = execution.Plan;
         bool anySkipped = execution.Targets.Any(t => t.State == TargetState.SkippedConflict);
-        string? archiveDest = plan.Policies.OnSuccess == OnSuccessAction.MoveToArchive
+        // The ArchiveFolder null-check belongs HERE, not inside the resolver: a resolver that fell back
+        // to the source path defeated Apply's `archiveDest is null` guard, so a misconfigured profile
+        // did File.Move(source, source) — a silent no-op reported as a SUCCESSFUL archive, which wrote
+        // an audit record claiming the file had been archived to its own location. Validation normally
+        // rejects this combination, but the audit trail is the no-loss safety net and must never lie.
+        string? archiveDest = plan.Policies.OnSuccess == OnSuccessAction.MoveToArchive && plan.Policies.ArchiveFolder is not null
             ? ResolveArchiveDestination(plan.Source.Path, plan.Policies.ArchiveFolder, plan.Profile.TargetLayout, plan.Payload.SourceRoot)
             : null;
-        return Apply(plan.JobId.Value, plan.Source.Path, plan.Policies.OnSuccess, plan.Policies.ArchiveFolder, archiveDest, anySkipped);
+        return Apply(plan.JobId.Value, plan.Source.Path, plan.Policies.OnSuccess, archiveDest, anySkipped);
     }
 
     public Result<DispositionAuditRecord, JobError> Dispose(
@@ -40,11 +45,11 @@ public sealed class SourceDispositionService(
         string? archiveDest = policies.OnSuccess == OnSuccessAction.MoveToArchive && policies.ArchiveFolder is not null
             ? Path.Combine(policies.ArchiveFolder, Path.GetFileName(source.Path))
             : null;
-        return Apply(jobId, source.Path, policies.OnSuccess, policies.ArchiveFolder, archiveDest, anyTargetSkippedConflict);
+        return Apply(jobId, source.Path, policies.OnSuccess, archiveDest, anyTargetSkippedConflict);
     }
 
     private Result<DispositionAuditRecord, JobError> Apply(
-        Guid jobId, string sourcePath, OnSuccessAction action, string? archiveFolder, string? archiveDest, bool anySkipped)
+        Guid jobId, string sourcePath, OnSuccessAction action, string? archiveDest, bool anySkipped)
     {
         DateTimeOffset now = time.GetUtcNow();
 
@@ -56,6 +61,14 @@ public sealed class SourceDispositionService(
 
         if (action == OnSuccessAction.KeepSource)
             return new DispositionAuditRecord(jobId, sourcePath, OnSuccessAction.KeepSource, null, now);
+
+        // The misconfiguration check comes BEFORE the source-gone shortcut, not just before the move:
+        // the shortcut records a success with DestinationFor(action, archiveDest), which for
+        // MoveToArchive with no ArchiveFolder is null — an audit record claiming a completed archive to
+        // nowhere. The audit trail is the no-loss safety net and must never lie, so a destination that
+        // cannot be resolved is a failure whether or not the source is still there.
+        if (action == OnSuccessAction.MoveToArchive && archiveDest is null)
+            return Failure(sourcePath, "MoveToArchive with no ArchiveFolder");
 
         // Idempotent for recovery: a source already gone is treated as disposed.
         if (!File.Exists(sourcePath))
@@ -75,10 +88,8 @@ public sealed class SourceDispositionService(
                     return Record(jobId, sourcePath, action, "RecycleBin", now, append: true);
 
                 case OnSuccessAction.MoveToArchive:
-                    if (archiveDest is null)
-                        return Failure(sourcePath, "MoveToArchive with no ArchiveFolder");
-                    Directory.CreateDirectory(Path.GetDirectoryName(archiveDest)!);
-                    File.Move(sourcePath, archiveDest, overwrite: false);
+                    Directory.CreateDirectory(Path.GetDirectoryName(archiveDest!)!);
+                    File.Move(sourcePath, archiveDest!, overwrite: false);
                     return Record(jobId, sourcePath, action, archiveDest, now, append: true);
 
                 case OnSuccessAction.PermanentDelete:
@@ -126,10 +137,13 @@ public sealed class SourceDispositionService(
     private static JobError Failure(string path, string message) =>
         new() { Code = JobErrorCode.DispositionFailed, Message = message, Path = path };
 
-    private static string ResolveArchiveDestination(string sourcePath, string? archiveFolder, TargetLayout layout, string sourceRoot)
+    /// <summary>Resolves where the original goes. Returning null for a null <paramref name="archiveFolder"/>
+    /// keeps Apply's guard the single place that reports the misconfiguration, rather than silently
+    /// resolving to somewhere harmless-looking.</summary>
+    private static string? ResolveArchiveDestination(string sourcePath, string? archiveFolder, TargetLayout layout, string sourceRoot)
     {
         if (archiveFolder is null)
-            return sourcePath;   // caller validates; Apply fails cleanly on the null-folder path
+            return null;
         if (layout == TargetLayout.Flatten)
             return Path.Combine(archiveFolder, Path.GetFileName(sourcePath));
 

@@ -1,6 +1,7 @@
 using FileManager.Contracts.Primitives;
 using FileManager.Contracts.Profiles;
 using FileManager.Core.Files;
+using FileManager.Core.Profiles;
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -33,17 +34,14 @@ public sealed class JobPlanFactory(EnginePaths paths, EngineConfig config)
 
         JobId jobId = JobId.New();
 
-        // M:1 forces Flatten (spec §3.1.2); otherwise the profile's layout.
-        bool flatten = profile.TargetLayout == TargetLayout.Flatten || profile.Sources.Count > 1;
-        string fileName = Path.GetFileName(payload.SourcePath);
         string relativePath = Path.GetRelativePath(payload.SourceRoot, payload.SourcePath);
+        TargetPathLayout layout = TargetPathLayout.For(profile, payload.SourcePath, relativePath);
 
         List<TargetPlan> targets = new(profile.Targets.Count);
         for (int i = 0; i < profile.Targets.Count; i++)
         {
             string root = profile.Targets[i].Path;
-            string prospective = flatten ? Path.Combine(root, fileName) : Path.Combine(root, relativePath);
-            targets.Add(new TargetPlan { TargetIndex = i, TargetRoot = root, ProspectiveFinalPath = prospective });
+            targets.Add(new TargetPlan { TargetIndex = i, TargetRoot = root, ProspectiveFinalPath = layout.Resolve(root) });
         }
 
         PolicySettings p = profile.Policies;
@@ -71,6 +69,20 @@ public sealed class JobPlanFactory(EnginePaths paths, EngineConfig config)
             Targets = targets,
             Policies = policies,
             WorkspaceDir = workspaceDir,
+            SourceIndex = ResolveSourceIndex(profile, payload.SourceRoot),
         };
+    }
+
+    /// <summary>The payload's originating Source position within the profile, or -1 when its root
+    /// matches none. THE single definition of the M:1 priority rank (spec §3.4) — public so plans built
+    /// outside this factory (test fixtures, recovery) rank identically instead of re-deriving it.</summary>
+    public static int ResolveSourceIndex(Profile profile, string sourceRoot)
+    {
+        if (!NormalizedPath.Create(sourceRoot).TryGetValue(out NormalizedPath root))
+            return -1;
+        for (int i = 0; i < profile.Sources.Count; i++)
+            if (NormalizedPath.Create(profile.Sources[i].Path).TryGetValue(out NormalizedPath candidate) && candidate == root)
+                return i;
+        return -1;
     }
 }

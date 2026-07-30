@@ -82,12 +82,24 @@ public sealed class PathLockRegistry
         ArgumentNullException.ThrowIfNull(held);
         lock (_gate)
         {
+            // Already ours → succeed idempotently, and deliberately do NOT re-add: a duplicate entry
+            // would make DisposeAsync release the same path twice, handing it to a waiter while this
+            // job still believes it holds it.
+            //
+            // This case is normal, not exceptional. A job's lock set already contains every
+            // prospective final path (§4.3 step 1), so a RenameSuffix probe of the desired name
+            // always hits a lock the probing job itself owns. Returning false here made
+            // RenameSuffix skip the free desired name and place at "name (1).ext" on a first,
+            // collision-free run — and, because the desired name then stayed empty, every
+            // re-delivery suffixed again and grew the target set without bound.
+            if (held.HoldsPath(path))
+                return true;
             if (_entries.ContainsKey(path))
                 return false;
             _entries[path] = new LockEntry { Holder = held.Owner };
+            held.AddAcquired(path);
+            return true;
         }
-        held.AddAcquired(path);
-        return true;
     }
 
     internal void Release(NormalizedPath path, JobId owner)
@@ -110,26 +122,51 @@ public sealed class PathLockRegistry
 }
 
 /// <summary>Releases all held paths (reverse order) on dispose. A Job holds exactly one set for its lifetime.</summary>
+/// <summary>The set of paths one job holds. Guarded internally because per-target placement runs
+/// bounded-parallel (§4.3 step 6), so several target tasks probe and extend the same set at once.</summary>
 public sealed class PathLockSet(PathLockRegistry registry, JobId owner) : IAsyncDisposable
 {
     private readonly List<NormalizedPath> _paths = [];
+    private readonly object _pathsGate = new();
     private bool _disposed;
 
     internal JobId Owner => owner;
 
-    public IReadOnlyList<NormalizedPath> Paths => _paths;
+    /// <summary>A snapshot — the live list is mutated by concurrent target tasks.</summary>
+    public IReadOnlyList<NormalizedPath> Paths
+    {
+        get { lock (_pathsGate) return _paths.ToArray(); }
+    }
 
-    internal void AddAcquired(NormalizedPath path) => _paths.Add(path);
+    internal bool HoldsPath(NormalizedPath path)
+    {
+        lock (_pathsGate) return _paths.Contains(path);
+    }
+
+    internal void AddAcquired(NormalizedPath path)
+    {
+        lock (_pathsGate) _paths.Add(path);
+    }
 
     public ValueTask DisposeAsync()
     {
         if (_disposed)
             return ValueTask.CompletedTask;
         _disposed = true;
+
+        // Snapshot under our own lock and release OUTSIDE it: Release takes the registry's gate, and
+        // TryAcquireAdditional takes the registry gate then ours — holding both here in the opposite
+        // order would be a lock-order inversion.
+        NormalizedPath[] toRelease;
+        lock (_pathsGate)
+        {
+            toRelease = [.. _paths];
+            _paths.Clear();
+        }
         // Reverse order mirrors the ordered acquire — symmetric, though correctness does not
         // require it (releases never block).
-        for (int i = _paths.Count - 1; i >= 0; i--)
-            registry.Release(_paths[i], owner);
+        for (int i = toRelease.Length - 1; i >= 0; i--)
+            registry.Release(toRelease[i], owner);
         return ValueTask.CompletedTask;
     }
 }

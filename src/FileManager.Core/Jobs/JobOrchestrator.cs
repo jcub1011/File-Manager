@@ -38,12 +38,18 @@ public sealed class JobOrchestrator(
     private int _jobsInFlight;
     private volatile string? _lastError;
 
+    // Set when the consume loop died: the pipeline is gone for the rest of this Start/Stop cycle, so
+    // unlike a per-job error this must NOT be cleared by a later success (there won't be one).
+    private volatile bool _pipelineFaulted;
+
     public Result Start()
     {
         if (_consumer is not null)
             return "the job orchestrator is already running";
 
         int maxWorkers = config.MaxWorkers > 0 ? config.MaxWorkers : Environment.ProcessorCount;
+        _lastError = null;   // a stop/start cycle must not resurrect a stale error
+        _pipelineFaulted = false;
         _cts = new CancellationTokenSource();
         _workers = new SemaphoreSlim(maxWorkers, maxWorkers);
         _consumer = Task.Run(() => ConsumeAsync(_cts.Token));
@@ -108,6 +114,11 @@ public sealed class JobOrchestrator(
             // Last-resort catch-and-log: the consumer loop is otherwise unobserved until StopAsync;
             // without this the engine silently stops picking up work.
             logger.LogCritical(ex, "Job orchestrator consumer loop failed unexpectedly; no further jobs will run");
+            // Record it in the status snapshot too. Logging alone left get-status answering
+            // "Paused:false, JobsInFlight:0, LastError:null" forever: every later trigger was accepted
+            // and nothing ran, with the failure visible only in the service log.
+            _pipelineFaulted = true;
+            _lastError = $"the job pipeline stopped and no further jobs will run: {ex.Message}";
         }
     }
 
@@ -115,11 +126,22 @@ public sealed class JobOrchestrator(
     {
         try
         {
+            // A payload whose profile no longer exists OR is inactive is dropped with a logged skip
+            // (§4.3 failure semantics). The lookup stays on catalog.All so the two cases stay
+            // distinguishable in the log — and this is the gate that covers EVERY trigger, not just
+            // run-profile, and closes the window where a profile is deactivated between enqueue and
+            // dequeue (or while a folder scan is still enqueuing).
             Profile? profile = catalog.All.FirstOrDefault(p => p.Id == payload.ProfileId);
             if (profile is null)
             {
                 logger.LogInformation("Dropping payload for {SourcePath}: profile {ProfileId} no longer exists",
                     payload.SourcePath, payload.ProfileId);
+                return;
+            }
+            if (!profile.Active)
+            {
+                logger.LogInformation("Dropping payload for {SourcePath}: profile {ProfileId} ({Name}) is inactive",
+                    payload.SourcePath, profile.Id, profile.Name);
                 return;
             }
 
@@ -141,12 +163,16 @@ public sealed class JobOrchestrator(
             });
             Interlocked.Increment(ref _jobsInFlight);
 
+            // Created AFTER the job-started publish above, so a progress frame can never precede its
+            // own job-started on the wire.
+            JobProgressPublisher progress = new(plan.JobId.Value, eventBus, time);
+
             JobCompletion completion;
             try
             {
                 // CancellationToken.None: a started job is never cancelled by shutdown (I-ATOMIC-JOB);
                 // StopAsync awaits it instead.
-                completion = await executor.ExecuteAsync(plan, CancellationToken.None).ConfigureAwait(false);
+                completion = await executor.ExecuteAsync(plan, progress, CancellationToken.None).ConfigureAwait(false);
             }
             finally
             {
@@ -189,12 +215,19 @@ public sealed class JobOrchestrator(
                 Job = dto,
                 Error = completion.Error?.Message ?? "unknown error",
                 NotifyOnFailure = profile.Logging.NotifyOnFailure,
+                ResidualPaths = completion.ResidualPaths,
             });
             logger.LogWarning("Job {JobId} for {SourcePath} ended {Outcome}: {Error}",
                 plan.JobId.Short, plan.Source.Path, completion.Outcome, completion.Error?.Message);
         }
         else
         {
+            // Sticky-until-recovered: LastError is the status bar's health hint, so one transient
+            // failure must not paint the engine permanently unhealthy. Last-writer-wins across
+            // workers is acceptable for a hint (a stricter scheme needs an error ring, not a field).
+            // A dead pipeline is the exception — it does not recover, so a success must not clear it.
+            if (!_pipelineFaulted)
+                _lastError = null;
             eventBus.Publish(new JobCompletedEvent { AtUtc = now, Job = dto });
             logger.LogInformation("Job {JobId} for {SourcePath} ended {Outcome}",
                 plan.JobId.Short, plan.Source.Path, completion.Outcome);

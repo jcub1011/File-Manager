@@ -1,6 +1,6 @@
-# Implementation Progress & Roadmap: File Manager v1
+﻿# Implementation Progress & Roadmap: File Manager v1
 
-**Last updated:** 2026-07-22
+**Last updated:** 2026-07-30
 **Companion to:** [`architecture-v1.md`](architecture-v1.md) (authoritative shape) and
 [`spec-draft-v3.md`](spec-draft-v3.md) (authoritative behavior).
 
@@ -32,22 +32,38 @@ Three coherent increments are complete:
    the write-ahead journal, in-memory registries, atomic placement + read-back verification,
    rollback, disk preflight, source disposition, and crash recovery — implemented, unit/integration
    tested (incl. the §7.4 fault-injection matrix), and wired into service startup for recovery-first.
-3. **Live single-job vertical (the walking skeleton).** The first time a file moves in normal
-   operation: `IJobExecutor` drives the substrate through the §4.3 phase algorithm (minus transform),
-   fed by `IJobOrchestrator` + `ITriggerQueue` + `IPauseStateService` + `IEngineEventBus` +
+3. **Live single-job vertical (the walking skeleton) — engine *and* UI.** The first time a file moves
+   in normal operation: `IJobExecutor` drives the substrate through the §4.3 phase algorithm (minus
+   transform), fed by `IJobOrchestrator` + `ITriggerQueue` + `IPauseStateService` + `IEngineEventBus` +
    `IJobLogStore` + `IProfileMatcher`; the six previously-unhandled IPC requests (`run-profile`,
    `set-paused`, `subscribe`, `get-matching`, `get-recent-jobs`, `get-job-log`) are live, the event
    stream broadcasts to subscribers, and the Service startup starts the orchestrator's trigger-queue
-   consumer. Manually triggered only — no watcher/scheduler, no transformers yet.
+   consumer. The GUI is now wired to all of it: a **"Run now"** row action (confirmed, since it moves
+   real files), an **activity panel** with live progress and per-job log drill-down, and a **pause
+   toggle** in the status bar. Manually triggered only — no watcher/scheduler, no transformers yet.
 
-**Test status:** 709 tests passing across the solution (Core 350, UI 211, Contracts 120,
-Platform.Windows 14, Service 14). Solution builds with 0 warnings / 0 errors.
+**Test status:** 915 tests passing across the solution (Core 475, UI 284, Contracts 125,
+Platform.Windows 14, Service 17). 0 errors. A clean build emits 18 analyzer warnings, all in test
+projects (xUnit1031/xUnit2031 in Core.Tests, CA1416 platform-guard notices in Platform.Windows.Tests);
+`src/` is warning-free.
 
-**What the app does today:** author/validate profiles, preview a run via dry-run, and — new in this
-set — **actually move a file** on a manual `run-profile` invocation over IPC: lock → journal-open →
-preflight → filter → seal → verified atomic placement → commit → disposition, with a streamed
-`job-started`/`job-completed` event, queryable recent-jobs and per-job logs, and a global pause that
-queues work until resumed. Automatic (watcher/schedule) triggers and transformers are the next sets.
+**File-operation assurance.** The live path now has a dedicated integration suite that drives the real
+substrate (real journal, hasher, conflict resolver, placer, rollback executor, disposition service) over
+a real temp filesystem and asserts against what is actually on disk — `JobExecutorFileOperationTests`
+(topologies, byte fidelity, conflict modes, verification methods, idempotency),
+`JobExecutorDispositionTests` (every OnSuccess action plus the full I-DISPOSE negative matrix),
+`JobExecutorFailureRollbackTests` (a forced failure at each phase, the StageOverwrites restore, the
+retry budget), `JobExecutorConcurrencyTests` (jobs racing one path), and `JobPlanFactoryTests` (target
+path arithmetic). Fault injection lives in `FaultyFileHasher` (wrong-hash vs transient-error, which the
+engine must treat differently) and `FaultyJobJournal` (the only deterministic way to fail *after* a
+target is placed).
+
+**What the app does today:** author/validate profiles, preview a run via dry-run, and **actually move
+a file — from the GUI**: pick a profile, Run now, confirm, and watch it land. Under the hood that is
+lock → journal-open → preflight → filter → seal → verified atomic placement → commit → disposition,
+with streamed `job-started` / `job-progress` / `job-completed` events, queryable recent-jobs and
+per-job logs, and a global pause that queues work until resumed. Automatic (watcher/schedule)
+triggers and transformers are the next sets.
 
 ---
 
@@ -116,12 +132,14 @@ queues work until resumed. Automatic (watcher/schedule) triggers and transformer
 | Handlers: status, list/get/save/delete/validate profile, dry-run(+stream), settings, shutdown | ✅ | `get-status` now sources the real snapshot from `IJobOrchestrator`. |
 | Handlers: `run-profile`, `set-paused`, `get-matching`, `get-recent-jobs`, `get-job-log` | ✅ | Registered in the dispatch table. |
 | `subscribe` + `IIpcServer.Broadcast` | ✅ | Handled by the server directly: ack + open-ended one-way `EngineEvent` stream over a bounded, drop-oldest per-subscriber channel. |
+| Protocol version | ✅ | **6** — adds `job-progress` and `run-queued` events; `run-profile` answers `run-profile-result` (queued count + scanning flag) instead of a bare `ok`. UI and Service must ship together. |
 
 ### §4.10 Dry-run & observability
 | Component | Status | Note |
 | --- | --- | --- |
 | `IDryRunEngine` | ✅ | Transformer profiles report `Unknown (requires transform)`. |
 | `IEngineEventBus` / `IJobLogStore` | ✅ | In-proc pub/sub bridged to IPC broadcast; per-job log files + an in-memory recent-jobs ring. |
+| `JobProgressPublisher` | ✅ | Per-job, throttled to 100 ms, monotonically clamped (distribution reports from parallel target tasks). |
 
 ### §4.11 Platform (Windows)
 | Component | Status | Note |
@@ -135,7 +153,7 @@ queues work until resumed. Automatic (watcher/schedule) triggers and transformer
 | Host | Status | Note |
 | --- | --- | --- |
 | `FileManager.Service` | 🟡 | Runs recovery-first + IPC + the orchestrator/trigger-queue consumer + event-bus→IPC broadcast bridge; watcher/scheduler/shell/tray startup slots still empty (§2.4). |
-| `FileManager.UI` | 🟡 | List/editor/dry-run/settings/status bar; no tray, `--pick`, or `--tray`. |
+| `FileManager.UI` | 🟡 | List/editor/dry-run/settings/status bar **+ activity panel, pause toggle, and "Run now"**; no tray, `--pick`, or `--tray`. |
 | `FileManager.Cli` | ⬜ | Project does not exist yet. |
 
 ---
@@ -153,7 +171,8 @@ queues work until resumed. Automatic (watcher/schedule) triggers and transformer
 
 ### Set 6 — Clients & shell
 - `FileManager.Cli` (`filemanager` executable).
-- UI activity view + tray (`--tray`) + shell picker (`--pick`).
+- Tray (`--tray`) + shell picker (`--pick`). *(The UI activity view landed early, with Set 3, so the
+  walking skeleton is actually walkable from the GUI.)*
 - `IShellIntegration` (Windows) registered idempotently at startup (§2.4 step 5).
 
 ---
@@ -177,6 +196,76 @@ queues work until resumed. Automatic (watcher/schedule) triggers and transformer
   `settings.json` / `GlobalSettings` is deferred.
 - **Source priority** is session-scoped in-memory; across a restart it degrades to arrival order
   (same open design as `ContentHashDedupe`, Appendix B).
+
+### Defects the file-operation suite found (and fixed)
+- **`RenameSuffix` never took the desired name.** A job's lock set already contains every prospective
+  final path, and `PathLockRegistry.TryAcquireAdditional` reported a path the *requesting* set already
+  held as taken. So the suffix probe skipped the free desired name and placed at `name (1).ext` on a
+  first, collision-free run — and because the desired name stayed empty, **every re-delivery suffixed
+  again and grew the target set without bound**, squarely violating spec §12's idempotency criterion.
+  `TryAcquireAdditional` is now idempotent for a path the set already owns (and does not double-record
+  it, which would double-release on dispose). While there, `PathLockSet` was made thread-safe: parallel
+  target tasks extend the same set concurrently, and its backing `List` was unguarded.
+- **Staging was never cleaned up on the success path.** `RollbackExecutor` deletes staging dirs, but it
+  only runs on failure — so under the default `StageOverwrites`, every successful overwrite left a full
+  copy of the replaced file in the user's target root under `.fm_staging/<job>/` **permanently**
+  (recovery cannot sweep `.fm_staging`, as noted below). I-STAGING-KEEP authorizes deleting a staging
+  dir once the job closed `Succeeded`; the executor now does that, after the terminal close is
+  journaled, best-effort.
+- **`MoveToArchive` with no `ArchiveFolder` reported a false success.** `ResolveArchiveDestination` fell
+  back to returning the *source path*, which defeated `Apply`'s null guard: the service did
+  `File.Move(source, source)` — a silent no-op — and recorded a disposition claiming the file had been
+  archived to its own location. Profile validation normally rejects the combination, but the deletion
+  audit trail is the no-loss safety net and must never contain a false entry. The null check moved to
+  the caller so the misconfiguration is reported once, cleanly.
+- **Test-infrastructure defect:** `FakeMetadataPreserver` ignored `MetadataOnConflict` and failed
+  regardless of policy, unlike `WindowsMetadataPreserver` (which fails only under `FailJob`). A
+  regression making best-effort metadata preservation fatal would have passed every test.
+
+### Set 3b decisions (UI connection + engine gap closure)
+- **Protocol 6.** New `job-progress` and `run-queued` events; `run-profile` now answers
+  `run-profile-result` (`QueuedCount`, `Scanning`) rather than a bare `ok`. UI and Service must be
+  packaged together — a mixed pair fails loud with `IPC_VERSION_MISMATCH`, by design.
+- **Progress is a sink parameter, not a bus dependency.** `IJobExecutor.ExecuteAsync` takes an optional
+  `IProgress<JobProgress>` (mirroring `IpcClient.DryRunStreamAsync`), and `JobProgressPublisher` — one
+  per job, created by the orchestrator — turns samples into throttled events. This keeps the wire
+  contract out of the phase algorithm, keeps progress optional for tests, and gives per-job throttle
+  state a home. Publishing is throttled to 100 ms and **monotonically clamped**: distribution reports
+  from parallel target tasks, so without the clamp the UI would visibly count backwards.
+  Byte-level progress is explicitly out of scope — it would need new sinks through `IAtomicPlacer`,
+  `IFileHasher` and the retry policy.
+- **No `RunId` correlation token.** Considered and rejected: `TriggerQueue.Enqueue` coalesces on
+  `(ProfileId, SourcePath)` and keeps the newest payload, so two concurrent runs of the same profile
+  over the same path collapse into one job and a `RunId` would misattribute it to whichever click
+  landed second. `JobStartedEvent` already carries `{ProfileId, SourcePath}`, which is sufficient.
+- **Inactive profiles are refused *and* dropped.** `RunProfileHandler` answers `PROFILE_INACTIVE` so
+  the caller learns why nothing happened; `JobOrchestrator` independently drops an inactive profile's
+  payload (§4.3 failure semantics), which is the gate that covers every trigger and closes the window
+  where a profile is deactivated between enqueue and dequeue.
+- **`JobFailedEvent.ResidualPaths` is now populated** via a new `JobCompletion.ResidualPaths` init
+  property. Note the event's list can legitimately be empty on a `RollbackFailed` outcome — when
+  rollback failed before it could enumerate residuals — so empty is not a bug.
+- **`LastError` is sticky until recovered**, cleared by the next successful/skipped job and on
+  orchestrator start. It is a status-bar health hint; last-writer-wins across workers is acceptable
+  (anything stricter needs an error ring, a different feature).
+- **`profiles-changed` now has a publisher** (an `EngineHost` bridge over `IProfileCatalog.Subscribe`).
+  It must stay below step 3's `catalog.Reload()` or startup would emit a spurious event. The UI
+  suppresses the echo for ~1 s after its own saves/imports, which already refresh.
+- **`engine-warning` still has no publisher** — deliberately. Its real producers (watcher overflow,
+  scheduler missed-run) do not exist yet, and the one candidate (a folder scan that aborts) is served
+  properly by `RunQueuedEvent.Error`.
+- **UI event subscription is split in two.** The gateway exposes a single-attempt
+  `IAsyncEnumerable<Result<EngineEvent, IpcError>>` (preserving its never-throws contract, and echoing
+  `ISourceScanner.Scan`'s stream-of-Results idiom); `EngineEventPump` owns reconnect/backoff and
+  re-seeds via get-recent-jobs + get-status on every attempt, because delivery is drop-oldest lossy.
+  It connects with `IpcClient.ConnectAsync`, **not** `ServiceLauncher.ConnectOrStartAsync`, which
+  would spawn a service process per retry during an outage.
+- **The activity panel docks above the status bar**, not as a third document tab: that tab strip is
+  gated on `Editor.HasProfile`, and engine activity is global state that must stay visible with no
+  profile selected. Its open/closed state is not persisted this slice.
+- **"Run now" always confirms**, naming the source roots and the disposition — it is the only place
+  the user sees the blast radius. It is refused while the editor is dirty for that profile, since
+  `run-profile` resolves against the persisted catalog and would silently ignore unsaved edits.
 
 ### Set 3 decisions & documented simplifications
 - **Free-space query walks up to an existing ancestor.** `WindowsVolumeInfoProvider` disk preflight

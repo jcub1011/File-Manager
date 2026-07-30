@@ -1,4 +1,4 @@
-using CommunityToolkit.Mvvm.ComponentModel;
+﻿using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using FileManager.Contracts;
 using FileManager.Contracts.IPC;
@@ -45,9 +45,14 @@ public sealed partial class MainWindowViewModel : ViewModelBase
         Editor = new ProfileEditorViewModel(gateway, folderPicker);
         DryRun = new DryRunViewModel(gateway, dryRunActions);
         StatusBar = new StatusBarViewModel(gateway);
+        Activity = new ActivityViewModel(gateway);
+        // The wire DTOs carry only profile ids; the list is the only place that knows the names.
+        Activity.ProfileNameLookup = id => List.Profiles.FirstOrDefault(p => p.ProfileId == id)?.Name;
+        Activity.HideCommand = ToggleActivityCommand;
 
         List.CreateProfileCommand = NewProfileCommand;
         List.ExportProfileCommand = ExportProfileCommand;
+        List.RunProfileCommand = RunProfileNowCommand;
         List.CanNavigate = () => !Editor.IsDirty;
         List.NavigationBlocked = () => Editor.ShowUnsavedWarning = true;
         List.SelectionCommitted = item => _ = LoadSelectionSafeAsync(item);
@@ -97,6 +102,12 @@ public sealed partial class MainWindowViewModel : ViewModelBase
     public ProfileEditorViewModel Editor { get; }
     public DryRunViewModel DryRun { get; }
     public StatusBarViewModel StatusBar { get; }
+    public ActivityViewModel Activity { get; }
+
+    /// <summary>Whether the activity panel is showing. It docks above the status bar, OUTSIDE the
+    /// document area's profile gate, because engine activity is global state — not per-profile.</summary>
+    [ObservableProperty]
+    public partial bool ActivityVisible { get; set; }
 
     /// <summary>Whether the profile sidebar is collapsed to the narrow icon rail. The view toggles
     /// this (double-tap on the splitter) and switches the sidebar content off it.</summary>
@@ -135,6 +146,196 @@ public sealed partial class MainWindowViewModel : ViewModelBase
     [RelayCommand]
     public void OpenLogFolder() => _logFolder.OpenLogFolder();
 
+    [RelayCommand]
+    public void ToggleActivity()
+    {
+        ActivityVisible = !ActivityVisible;
+        if (ActivityVisible)
+            _ = Activity.ReconcileAsync();   // the event stream is lossy; re-seed on open
+    }
+
+    /// <summary>Set by the composition root to confirm a manual run before it is submitted. Mirrors
+    /// <see cref="ConfirmClose"/>; a null callback proceeds, so headless tests are not blocked.</summary>
+    public Func<string, Task<bool>>? ConfirmRunProfile { get; set; }
+
+    // Run ids this window started, pending their run-queued event. Bounded: a run whose event never
+    // arrives (service restart mid-scan) would otherwise leak an entry per run for the session.
+    private const int MaxTrackedRuns = 32;
+    private readonly HashSet<Guid> _ownRunIds = [];
+
+    private void RememberOwnRun(Guid runId)
+    {
+        if (_ownRunIds.Count >= MaxTrackedRuns)
+            _ownRunIds.Clear();   // the pending ones are stale by now; a missed notice beats unbounded growth
+        _ownRunIds.Add(runId);
+    }
+
+    /// <summary>Submits a real run of the selected profile (spec §3.2 manual invocation). This MOVES
+    /// FILES and applies the profile's source disposition, so it always confirms first, and the dialog
+    /// is the only place the user sees the blast radius (source roots + disposition) spelled out.</summary>
+    [RelayCommand]
+    public async Task RunProfileNowAsync(ProfileListItem? item)
+    {
+        if (item is null)
+            return;
+        try
+        {
+            // run-profile resolves against the PERSISTED catalog, so unsaved edits would be silently
+            // ignored. Refuse, reusing the editor's existing unsaved-changes affordance.
+            if (Editor.IsDirty && List.UnsavedProfileId == item.ProfileId)
+            {
+                Editor.ShowUnsavedWarning = true;
+                return;
+            }
+
+            var profileResult = await _gateway.GetProfileAsync(item.ProfileId);
+            if (profileResult.IsCanceled)
+                return;
+            if (profileResult.TryGetError(out IpcError? loadError))
+            {
+                List.ErrorMessage = $"Could not run \"{item.Name}\": {loadError.Message}";
+                return;
+            }
+            profileResult.TryGetValue(out Profile? profile);
+
+            if (profile!.Sources.Count == 0)
+            {
+                List.ErrorMessage = $"\"{item.Name}\" has no sources to run.";
+                return;
+            }
+
+            if (ConfirmRunProfile is not null && !await ConfirmRunProfile(BuildRunConfirmation(profile)))
+                return;
+
+            ActivityVisible = true;   // the payoff: the user watches the run land
+            List.ErrorMessage = null;
+
+            // run-profile takes ONE path, but a profile has N sources, and "Run now" means run the
+            // profile — so submit one request per source root (spec §8's stance for the GUI's sibling
+            // operation: never narrow the scan).
+            List<string> problems = [];
+            int accepted = 0;
+            foreach (SourceConfig source in profile.Sources)
+            {
+                var run = await _gateway.RunProfileAsync(profile.Id, source.Path);
+                if (run.IsCanceled)
+                    return;
+                if (run.TryGetError(out IpcError? runError))
+                {
+                    problems.Add($"{source.Path} ({runError.Message})");
+                    continue;
+                }
+                // Remember the run id so the broadcast run-queued event can be recognized as OURS.
+                run.TryGetValue(out RunProfileResponse? started);
+                RememberOwnRun(started!.RunId);
+                accepted++;
+            }
+
+            if (problems.Count > 0)
+                List.ErrorMessage = accepted > 0
+                    ? $"Started {accepted} of {profile.Sources.Count} source(s). Not started: {string.Join("; ", problems)}"
+                    : $"Could not run \"{item.Name}\": {string.Join("; ", problems)}";
+        }
+        catch (Exception ex)
+        {
+            // Last-resort catch-all (directive): a command has no exception boundary of its own.
+            Log.Error(ex, "Running profile {ProfileId} failed", item.ProfileId);
+            List.ErrorMessage = $"Could not run \"{item.Name}\": {ex.Message}";
+        }
+    }
+
+    /// <summary>The confirmation text. This is the ONLY place the user learns which roots will be
+    /// walked and what happens to the source files afterwards, so it names both.</summary>
+    private static string BuildRunConfirmation(Profile profile)
+    {
+        string roots = string.Join(Environment.NewLine, profile.Sources.Select(s => "    " + s.Path));
+        string disposition = profile.Policies.OnSuccess switch
+        {
+            OnSuccessAction.KeepSource => "the source files will be left in place",
+            OnSuccessAction.MoveToArchive => "each source file will then be MOVED to the archive folder",
+            OnSuccessAction.MoveToTrash => "each source file will then be MOVED TO THE RECYCLE BIN",
+            OnSuccessAction.PermanentDelete => "each source file will then be PERMANENTLY DELETED",
+            _ => $"the source disposition is {profile.Policies.OnSuccess}",
+        };
+        return $"Run \"{profile.Name}\" now?" + Environment.NewLine + Environment.NewLine
+            + "This performs a REAL run. Files under:" + Environment.NewLine
+            + roots + Environment.NewLine
+            + $"will be copied to {profile.Targets.Count} target(s), and {disposition}.";
+    }
+
+    /// <summary>Re-seeds everything the lossy event stream cannot be trusted for. Called by the event
+    /// pump on every (re)connect.</summary>
+    public async Task ReconcileEngineStateAsync()
+    {
+        await Activity.ReconcileAsync();
+        await StatusBar.PollOnceAsync();     // authoritative Paused + JobsInFlight
+    }
+
+    /// <summary>Routes one engine event to the child view models. The shell already owns every
+    /// cross-view-model concern, so a separate router service would just duplicate its dependencies.</summary>
+    public void HandleEngineEvent(EngineEvent evt)
+    {
+        if (evt is null)
+            return;
+        switch (evt)
+        {
+            case JobStartedEvent started:
+                Activity.OnJobStarted(started);
+                break;
+            case JobProgressEvent progress:
+                Activity.OnProgress(progress);
+                break;
+            case JobCompletedEvent completed:
+                Activity.OnJobFinished(completed.Job, null, null);
+                break;
+            case JobFailedEvent failed:
+                // failed.NotifyOnFailure is stamped for the tray's native notification (spec §7),
+                // which does not exist yet — read and ignore it here.
+                Activity.OnJobFinished(failed.Job, failed.Error, failed.ResidualPaths);
+                break;
+            case PauseChangedEvent paused:
+                StatusBar.ApplyPauseChanged(paused.Paused);
+                break;
+            case RunQueuedEvent queued:
+                // Only OUR runs. The event bus broadcasts to every subscriber, so without this the
+                // window announced "Queued N file(s) from …" for a run the CLI or another client
+                // started — a notice about an action this user never took.
+                if (_ownRunIds.Remove(queued.RunId))
+                {
+                    Activity.ShowNotice(queued.Error is not null
+                        ? $"Scanning {queued.ScopePath} stopped: {queued.Error} ({queued.QueuedCount} file(s) queued)"
+                        : queued.QueuedCount == 0
+                            ? $"Nothing in {queued.ScopePath} matched this profile."
+                            : $"Queued {queued.QueuedCount} file(s) from {queued.ScopePath}.");
+                }
+                break;
+            case EngineWarningEvent warning:
+                // The activity panel's notice bar, NOT List.ErrorMessage — that danger banner is
+                // reserved for things the user must act on.
+                Activity.ShowNotice(warning.Message);
+                break;
+            case ProfilesChangedEvent:
+                RefreshProfilesFromEvent();
+                break;
+        }
+    }
+
+    // The UI's own saves/imports/deletes mutate the catalog, so profiles-changed echoes straight back
+    // and would double-refresh right after those paths already refreshed. Suppress briefly.
+    private DateTimeOffset _suppressProfilesRefreshUntil = DateTimeOffset.MinValue;
+    private static readonly TimeSpan ProfilesEchoWindow = TimeSpan.FromSeconds(1);
+
+    /// <summary>Call from any path that mutates the catalog itself and refreshes on its own.</summary>
+    private void SuppressNextProfilesEcho() =>
+        _suppressProfilesRefreshUntil = DateTimeOffset.UtcNow + ProfilesEchoWindow;
+
+    private void RefreshProfilesFromEvent()
+    {
+        if (DateTimeOffset.UtcNow < _suppressProfilesRefreshUntil)
+            return;
+        _ = List.RefreshAsync();
+    }
+
     /// <summary>Set by the composition root to show a modal Yes/No confirmation and return the
     /// choice. Kept as a callback so the shell VM stays window-agnostic (mirrors the settings seam).</summary>
     public Func<string, Task<bool>>? ConfirmClose { get; set; }
@@ -156,9 +357,9 @@ public sealed partial class MainWindowViewModel : ViewModelBase
             if (mode != ServiceStartupMode.StartAndStopWithProgram)
                 return true;        // leave the service running
 
-            // Warn if the service reports work in flight. NOTE: JobsInFlight is currently hard-coded
-            // to 0 by the service (real job execution is a future slice), so this guard is dormant
-            // today and activates automatically once the service reports a live count.
+            // Warn if the service reports work in flight. This is a live guard: the orchestrator
+            // reports a real JobsInFlight count, and a started job is never suspended (I-ATOMIC-JOB),
+            // so stopping the service mid-job is exactly what the user needs warning about.
             var statusResult = await _gateway.GetStatusAsync();
             if (statusResult.TryGetValue(out EngineStatusSnapshot? snapshot)
                 && snapshot.JobsInFlight > 0
@@ -340,6 +541,7 @@ public sealed partial class MainWindowViewModel : ViewModelBase
                 imported++;
             }
 
+            SuppressNextProfilesEcho();   // this path refreshes itself
             await List.RefreshAsync();
             // The list banner is danger-styled, so only raise it when something needs the user's
             // attention; a clean import is evident from the new rows appearing in the list.
@@ -388,6 +590,9 @@ public sealed partial class MainWindowViewModel : ViewModelBase
     {
         try
         {
+            // This path refreshes the list itself; the service's profiles-changed echo would only
+            // duplicate it.
+            SuppressNextProfilesEcho();
             await List.RefreshAndSelectAsync(profileId);
             DryRun.SetProfile(profileId, Editor.ProfileName);
             DryRun.ApplySyncSettings(Editor.SyncMode, Editor.ScanDestination);

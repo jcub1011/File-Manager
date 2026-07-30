@@ -1,7 +1,7 @@
 using FileManager.Contracts.Primitives;
+using FileManager.Core.Observability;
 using Microsoft.Extensions.Logging;
 using System;
-using System.Collections.Generic;
 using System.IO;
 using System.Text.Json;
 
@@ -10,19 +10,20 @@ namespace FileManager.Core.Watching;
 /// <summary>The persisted global pause flag (spec §3.2.4). Survives restart via
 /// <c>state/pause.json</c> (§9). Loaded once at construction; <see cref="SetPaused"/> writes
 /// atomically (temp + rename — convenience data, no fsync) and notifies subscribers so the trigger
-/// queue's dequeue gate re-arms. Subscription mirrors <see cref="Profiles.ProfileCatalog"/>.</summary>
+/// queue's dequeue gate re-arms. Subscription is the shared
+/// <see cref="Observability.SubscriberList{T}"/>, as in <see cref="Profiles.ProfileCatalog"/>.</summary>
 public sealed class PauseStateService : IPauseStateService
 {
     private readonly EnginePaths _paths;
     private readonly ILogger<PauseStateService> _logger;
-    private readonly object _gate = new();
-    private readonly List<Subscription> _subscriptions = [];
+    private readonly SubscriberList<bool> _subscribers;
     private volatile bool _paused;
 
     public PauseStateService(EnginePaths paths, ILogger<PauseStateService> logger)
     {
         _paths = paths;
         _logger = logger;
+        _subscribers = new SubscriberList<bool>(logger, "pause-state subscriber");
         _paused = Load();
     }
 
@@ -40,32 +41,11 @@ public sealed class PauseStateService : IPauseStateService
         _paused = paused;
         _logger.LogInformation("Engine pause state set to {Paused}", paused);
 
-        Subscription[] snapshot;
-        lock (_gate)
-            snapshot = [.. _subscriptions];
-        foreach (Subscription subscription in snapshot)
-        {
-            try
-            {
-                subscription.Handler(paused);
-            }
-            catch (Exception ex)
-            {
-                // Last-resort catch-and-log: a bad subscriber must not abort the notification fan-out.
-                _logger.LogError(ex, "A pause-state subscriber threw; continuing with the remaining subscribers");
-            }
-        }
+        _subscribers.Notify(paused);
         return Result.Success();
     }
 
-    public IDisposable Subscribe(Action<bool> pauseHandler)
-    {
-        ArgumentNullException.ThrowIfNull(pauseHandler);
-        Subscription subscription = new(this, pauseHandler);
-        lock (_gate)
-            _subscriptions.Add(subscription);
-        return subscription;
-    }
+    public IDisposable Subscribe(Action<bool> pauseHandler) => _subscribers.Subscribe(pauseHandler);
 
     private string PauseFilePath => Path.Combine(_paths.StateDirectory, "pause.json");
 
@@ -114,16 +94,4 @@ public sealed class PauseStateService : IPauseStateService
         }
     }
 
-    private void Unsubscribe(Subscription subscription)
-    {
-        lock (_gate)
-            _subscriptions.Remove(subscription);
-    }
-
-    private sealed class Subscription(PauseStateService owner, Action<bool> handler) : IDisposable
-    {
-        public Action<bool> Handler { get; } = handler;
-
-        public void Dispose() => owner.Unsubscribe(this);
-    }
 }

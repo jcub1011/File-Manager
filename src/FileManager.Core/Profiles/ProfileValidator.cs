@@ -54,11 +54,19 @@ public sealed class ProfileValidator(
                 archive = archives[0];
         }
 
+        // Two Targets that normalize to the same root give every job two TargetPlans with an identical
+        // ProspectiveFinalPath. The path locks are per-job, so nothing separates them: the two
+        // bounded-parallel placements race the same temp→final move and the job rolls back on every
+        // attempt. A duplicate is never what the user meant — one delivery per root is the maximum.
+        HashSet<NormalizedPath> seenTargets = [];
         foreach (NormalizedPath target in targets)
         {
             if (sources.Contains(target))
                 issues.Add(Error("PROFILE_TARGET_EQUALS_SOURCE",
                     $"Target \"{target.Value}\" equals a Source path of the same profile."));
+            if (!seenTargets.Add(target))
+                issues.Add(Error("PROFILE_TARGET_DUPLICATE",
+                    $"Target \"{target.Value}\" is listed more than once."));
         }
 
         CheckTransformers(candidate, issues);
