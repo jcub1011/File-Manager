@@ -3,6 +3,7 @@ using FileManager.Contracts.Profiles;
 using FileManager.Contracts.Settings;
 using FileManager.UI.Tests.Fakes;
 using FileManager.UI.ViewModels;
+using FileManager.UI.ViewModels.Settings;
 
 namespace FileManager.UI.Tests;
 
@@ -22,16 +23,18 @@ public sealed class SettingsViewModelTests
 
         await vm.LoadAsync();
 
-        Assert.False(vm.MaxScanThreadsAuto);
-        Assert.Equal(4, vm.MaxScanThreadsValue);
-        Assert.True(vm.ShowMaxScanThreadsValue);
+        Assert.False(vm.MaxScanThreads.Auto);
+        Assert.Equal(4, vm.MaxScanThreads.Value);
+        Assert.True(vm.MaxScanThreads.ShowValue);
     }
 
     [Fact]
     public async Task Save_sends_an_explicit_scan_thread_count()
     {
         FakeIpcGateway gateway = new();
-        SettingsViewModel vm = new(gateway, new FakeFolderPicker()) { MaxScanThreadsAuto = false, MaxScanThreadsValue = 7 };
+        SettingsViewModel vm = new(gateway, new FakeFolderPicker());
+        vm.MaxScanThreads.Auto = false;
+        vm.MaxScanThreads.Value = 7;
 
         await vm.SaveCommand.ExecuteAsync(null);
 
@@ -43,7 +46,9 @@ public sealed class SettingsViewModelTests
     public async Task Save_sends_auto_when_checked()
     {
         FakeIpcGateway gateway = new();
-        SettingsViewModel vm = new(gateway, new FakeFolderPicker()) { MaxScanThreadsAuto = true, MaxScanThreadsValue = 7 };
+        SettingsViewModel vm = new(gateway, new FakeFolderPicker());
+        vm.MaxScanThreads.Auto = true;
+        vm.MaxScanThreads.Value = 7;
 
         await vm.SaveCommand.ExecuteAsync(null);
 
@@ -56,8 +61,8 @@ public sealed class SettingsViewModelTests
     {
         FakeIpcGateway gateway = new();
         SettingsViewModel vm = new(gateway, new FakeFolderPicker());
-        vm.DriveTypeOverrides.Add(new DriveTypeOverrideRowViewModel { Class = DriveClass.Network, Value = 2 });
-        vm.DriveTypeOverrides.Add(new DriveTypeOverrideRowViewModel { Class = DriveClass.Network, Value = 4 });
+        vm.DriveOverrides.DriveTypeOverrides.Add(new DriveTypeOverrideRowViewModel { Class = DriveClass.Network, Value = 2 });
+        vm.DriveOverrides.DriveTypeOverrides.Add(new DriveTypeOverrideRowViewModel { Class = DriveClass.Network, Value = 4 });
 
         await vm.SaveCommand.ExecuteAsync(null);
 
@@ -70,8 +75,8 @@ public sealed class SettingsViewModelTests
     {
         FakeIpcGateway gateway = new();
         SettingsViewModel vm = new(gateway, new FakeFolderPicker());
-        vm.SpecificDriveOverrides.Add(new SpecificDriveOverrideRowViewModel { VolumeKey = "C:", Value = 2 });
-        vm.SpecificDriveOverrides.Add(new SpecificDriveOverrideRowViewModel { VolumeKey = " c: ", Value = 4 });
+        vm.DriveOverrides.SpecificDriveOverrides.Add(new SpecificDriveOverrideRowViewModel { VolumeKey = "C:", Value = 2 });
+        vm.DriveOverrides.SpecificDriveOverrides.Add(new SpecificDriveOverrideRowViewModel { VolumeKey = " c: ", Value = 4 });
 
         await vm.SaveCommand.ExecuteAsync(null);
 
@@ -101,9 +106,9 @@ public sealed class SettingsViewModelTests
         SettingsViewModel vm = new(gateway, new FakeFolderPicker());
 
         await vm.LoadAsync();
-        Assert.Equal(ThemeMode.Dark, vm.ThemeMode);
+        Assert.Equal(ThemeMode.Dark, vm.Theme.Value);
 
-        vm.ThemeMode = ThemeMode.Light;
+        vm.Theme.Value = ThemeMode.Light;
         await vm.SaveCommand.ExecuteAsync(null);
 
         GlobalSettings sent = Assert.Single(gateway.SaveSettingsCalls);
@@ -121,7 +126,7 @@ public sealed class SettingsViewModelTests
 
         await vm.LoadAsync();
 
-        Assert.Equal(@"D:\profiles", vm.ProfilesDirectory);
+        Assert.Equal(@"D:\profiles", vm.ProfilesDirectory.Value);
     }
 
     [Fact]
@@ -159,7 +164,7 @@ public sealed class SettingsViewModelTests
         (string dir, bool move) = Assert.Single(gateway.RelocateCalls);
         Assert.Equal(@"E:\moved", dir);
         Assert.True(move);
-        Assert.Equal(@"E:\moved", vm.ProfilesDirectory);
+        Assert.Equal(@"E:\moved", vm.ProfilesDirectory.Value);
     }
 
     [Fact]
@@ -222,8 +227,8 @@ public sealed class SettingsViewModelTests
 
         await vm.ChangeProfilesDirectoryCommand.ExecuteAsync(null);
 
-        Assert.Equal(@"E:\moved", vm.ProfilesDirectory);   // the switch itself succeeded
-        Assert.Null(vm.StatusMessage);                     // ...but it is not reported as a clean success
+        Assert.Equal(@"E:\moved", vm.ProfilesDirectory.Value);   // the switch itself succeeded
+        Assert.Null(vm.StatusMessage);                           // ...but it is not reported as a clean success
         Assert.NotNull(vm.ErrorMessage);
         Assert.Contains("stayed in the old folder", vm.ErrorMessage);
     }
@@ -238,14 +243,15 @@ public sealed class SettingsViewModelTests
                 Settings = new GlobalSettings { ProfilesDirectory = @"E:\recovered" },
             },
         };
-        SettingsViewModel vm = new(gateway, new FakeFolderPicker(@"E:\recovered")) { ProfilesDirectory = "" };
+        SettingsViewModel vm = new(gateway, new FakeFolderPicker(@"E:\recovered"));
+        vm.ProfilesDirectory.Value = "";
 
         // Corrupt settings hand the VM an empty current path; the command must relocate, not throw
         // out of the command boundary (Path.GetFullPath("") is an ArgumentException).
         await vm.ChangeProfilesDirectoryCommand.ExecuteAsync(null);
 
         Assert.Single(gateway.RelocateCalls);
-        Assert.Equal(@"E:\recovered", vm.ProfilesDirectory);
+        Assert.Equal(@"E:\recovered", vm.ProfilesDirectory.Value);
         Assert.Null(vm.ErrorMessage);
     }
 
@@ -254,11 +260,9 @@ public sealed class SettingsViewModelTests
     {
         // Re-choosing a folder should start where the setting already points, not at the OS default.
         FakeFolderPicker picker = new(result: null);
-        SettingsViewModel vm = new(new FakeIpcGateway(), picker)
-        {
-            ScratchDirectory = @"D:\scratch",
-            ProfilesDirectory = @"E:\profiles",
-        };
+        SettingsViewModel vm = new(new FakeIpcGateway(), picker);
+        vm.ScratchDirectory.Value = @"D:\scratch";
+        vm.ProfilesDirectory.Value = @"E:\profiles";
 
         await vm.BrowseScratchDirectoryCommand.ExecuteAsync(null);
         Assert.Equal(@"D:\scratch", picker.LastStartNear);
@@ -288,9 +292,9 @@ public sealed class SettingsViewModelTests
         SettingsViewModel vm = new(gateway, new FakeFolderPicker());
 
         await vm.LoadAsync();
-        Assert.Equal(ServiceStartupMode.RunOnStartup, vm.StartupMode);
+        Assert.Equal(ServiceStartupMode.RunOnStartup, vm.StartupMode.Value);
 
-        vm.StartupMode = ServiceStartupMode.StartOnProgramOpen;
+        vm.StartupMode.Value = ServiceStartupMode.StartOnProgramOpen;
         await vm.SaveCommand.ExecuteAsync(null);
 
         GlobalSettings sent = Assert.Single(gateway.SaveSettingsCalls);

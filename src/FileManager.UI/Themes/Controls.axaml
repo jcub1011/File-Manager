@@ -1,6 +1,7 @@
 <Styles xmlns="https://github.com/avaloniaui"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        xmlns:ctrl="using:FileManager.UI.Controls">
+        xmlns:ctrl="using:FileManager.UI.Controls"
+        xmlns:st="using:FileManager.UI.ViewModels.Settings">
 
     <!-- Status indicator (dry-run): a colour-tinted glyph + optional count. Replaces the old filled
          status pills; the icon carries the meaning (pair with ToolTip.Tip), the text an optional
@@ -381,5 +382,54 @@
     <Style Selector="ToggleButton.statusFilter:checked:pointerover /template/ ContentPresenter">
         <Setter Property="Background" Value="{DynamicResource Brush.Item.Selected}" />
         <Setter Property="BorderBrush" Value="{DynamicResource Brush.Accent}" />
+    </Style>
+
+    <!-- ============================ Settings ============================
+         One setting in the Settings window: a scroll anchor the navigation tree can bring into view.
+         The 3px left border is always present (transparent when unselected) so highlighting the
+         navigated-to setting never shifts the layout. -->
+    <Style Selector="Border.settingCard">
+        <Setter Property="Background" Value="Transparent" />
+        <Setter Property="BorderBrush" Value="Transparent" />
+        <Setter Property="BorderThickness" Value="3,0,0,0" />
+        <Setter Property="CornerRadius" Value="{StaticResource Radius.Control}" />
+        <Setter Property="Padding" Value="9,8" />
+        <Setter Property="Margin" Value="0,0,0,2" />
+    </Style>
+    <!-- Hover reads as the quieter of the two states (Item.Hover is a plainer wash than Item.Selected,
+         and it gets no accent edge), so pointing at a setting never looks like selecting one. -->
+    <Style Selector="Border.settingCard:pointerover">
+        <Setter Property="Background" Value="{DynamicResource Brush.Item.Hover}" />
+    </Style>
+    <!-- Declared after the hover rule so selection wins where they overlap; the third rule keeps the
+         selected look while the pointer is over it, rather than letting hover wash it out. -->
+    <Style Selector="Border.settingCard.selected">
+        <Setter Property="Background" Value="{DynamicResource Brush.Item.Selected}" />
+        <Setter Property="BorderBrush" Value="{DynamicResource Brush.Accent}" />
+    </Style>
+    <Style Selector="Border.settingCard.selected:pointerover">
+        <Setter Property="Background" Value="{DynamicResource Brush.Item.Selected}" />
+        <Setter Property="BorderBrush" Value="{DynamicResource Brush.Accent}" />
+    </Style>
+    <!-- The setting's name; heavier than its description but lighter than a section header. -->
+    <Style Selector="TextBlock.settingTitle">
+        <Setter Property="FontWeight" Value="SemiBold" />
+        <Setter Property="Foreground" Value="{DynamicResource Brush.Text.Primary}" />
+    </Style>
+
+    <!-- Settings navigation tree (VS tool-window look: flat rows, no chrome of its own). Node
+         visibility and expansion are driven from the view model so the search box can filter the tree;
+         hiding the TreeViewItem itself (not the template content) is what stops a filtered-out node
+         leaving a gap behind. -->
+    <Style Selector="TreeView.settingsNav">
+        <Setter Property="Background" Value="Transparent" />
+        <Setter Property="BorderThickness" Value="0" />
+        <Setter Property="Padding" Value="0" />
+    </Style>
+    <Style Selector="TreeView.settingsNav TreeViewItem" x:DataType="st:SettingsNavNodeViewModel">
+        <Setter Property="IsVisible" Value="{Binding IsVisible}" />
+        <Setter Property="IsExpanded" Value="{Binding IsExpanded, Mode=TwoWay}" />
+        <Setter Property="MinHeight" Value="26" />
+        <Setter Property="Padding" Value="4,0" />
     </Style>
 </Styles>

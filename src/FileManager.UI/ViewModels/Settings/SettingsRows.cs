@@ -2,10 +2,11 @@ using CommunityToolkit.Mvvm.ComponentModel;
 using FileManager.Contracts.Settings;
 using System.Collections.Generic;
 
-namespace FileManager.UI.ViewModels;
+namespace FileManager.UI.ViewModels.Settings;
 
-/// <summary>One drive-type per-drive scan-thread override row (Settings → Advanced). Auto defers to
-/// the per-drive default; otherwise the explicit worker count applies to every volume of this class.</summary>
+/// <summary>One drive-type per-drive scan-thread override row (Settings → Per-drive overrides). Auto
+/// defers to the per-drive default; otherwise the explicit worker count applies to every volume of this
+/// class.</summary>
 public sealed partial class DriveTypeOverrideRowViewModel : ViewModelBase
 {
     public static IReadOnlyList<DriveClass> Options { get; } =
@@ -20,8 +21,9 @@ public sealed partial class DriveTypeOverrideRowViewModel : ViewModelBase
     partial void OnAutoChanged(bool value) => OnPropertyChanged(nameof(ShowValue));
 }
 
-/// <summary>One specific-drive per-drive scan-thread override row (Settings → Advanced), keyed by a
-/// volume key ("c:", "\\server\share"). Highest precedence when its key matches a scanned volume.</summary>
+/// <summary>One specific-drive per-drive scan-thread override row (Settings → Per-drive overrides),
+/// keyed by a volume key ("c:", "\\server\share"). Highest precedence when its key matches a scanned
+/// volume.</summary>
 public sealed partial class SpecificDriveOverrideRowViewModel : ViewModelBase
 {
     [ObservableProperty] public partial string VolumeKey { get; set; } = "";
