@@ -115,14 +115,24 @@ public sealed class SourceDispositionService(
         }
     }
 
-    private DispositionAuditRecord Record(Guid jobId, string sourcePath, OnSuccessAction action, string? destination, DateTimeOffset now, bool append)
+    /// <summary>Writes the audit row for a disposition that already happened on disk. An append
+    /// failure is a FAILURE of the disposition even though the file operation itself succeeded: the
+    /// audit trail is the spec's no-loss safety net, so a PermanentDelete whose row could not be
+    /// written has destroyed the file and lost the only record of it. Reporting that as clean is the
+    /// one outcome the safety net must never produce, so it travels back on the same channel as a
+    /// failed move — the caller records it in job-closed and the orchestrator surfaces it.</summary>
+    private Result<DispositionAuditRecord, JobError> Record(
+        Guid jobId, string sourcePath, OnSuccessAction action, string? destination, DateTimeOffset now, bool append)
     {
         var record = new DispositionAuditRecord(jobId, sourcePath, action, destination, now);
         if (append)
         {
             Result appended = audit.Append(record);
             if (appended.TryGetError(out string? auditError))
-                logger.LogError("Audit append failed for {Path}: {Error}", sourcePath, auditError);   // audit failure never blocks disposition
+            {
+                logger.LogError("Audit append failed for {Path}: {Error}", sourcePath, auditError);
+                return Failure(sourcePath, $"{action} completed but the audit record could not be written: {auditError}");
+            }
         }
         return record;
     }

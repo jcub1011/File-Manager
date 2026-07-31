@@ -23,6 +23,8 @@ using FileManager.Core.Settings;
 using FileManager.Core.Scanning;
 using FileManager.Core.Watching;
 using FileManager.Platform.Windows;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging.Abstractions;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -40,14 +42,25 @@ namespace FileManager.Service.Tests;
 public sealed class EndToEndSmokeTests : IAsyncLifetime
 {
     private readonly string _root = Path.Combine(Path.GetTempPath(), "fm-e2e-" + Guid.NewGuid().ToString("N"));
-    private IpcServer? _server;
-    private JobOrchestrator? _orchestrator;
-    private JobJournal? _journal;
+    private ServiceProvider? _provider;
+    private IIpcServer? _server;
+    private IJobOrchestrator? _orchestrator;
     private IDisposable? _eventBridge;
     private IDisposable? _profilesBridge;
 
     private string SourceDir => Path.Combine(_root, "source");
     private string TargetDir => Path.Combine(_root, "target");
+
+    /// <summary>EngineHost is registered as a hosted service by AddEngine and takes this. Nothing here
+    /// runs the host — this test drives the server and orchestrator directly — but the graph must still
+    /// be satisfiable.</summary>
+    private sealed class StubLifetime : IHostApplicationLifetime
+    {
+        public CancellationToken ApplicationStarted => CancellationToken.None;
+        public CancellationToken ApplicationStopping => CancellationToken.None;
+        public CancellationToken ApplicationStopped => CancellationToken.None;
+        public void StopApplication() { }
+    }
 
     public Task InitializeAsync()
     {
@@ -55,78 +68,40 @@ public sealed class EndToEndSmokeTests : IAsyncLifetime
         Directory.CreateDirectory(SourceDir);
         Directory.CreateDirectory(TargetDir);
 
-        // The same graph Program.cs composes, pointed at a temp EnginePaths.
+        // Literally the graph Program.cs composes — EngineComposition.AddEngine — pointed at a temp
+        // EnginePaths, rather than a hand-rebuilt copy of it. The copy this replaced had drifted three
+        // handlers behind production (DryRunStreamHandler, RelocateProfilesHandler, ShutdownHandler),
+        // so the "end to end" test exercised a dispatch table the product never shipped.
         EnginePaths paths = new() { Root = Path.Combine(_root, "engine") };
         foreach (string dir in new[] { paths.ProfilesDirectory, paths.LogsDirectory, paths.JobLogsDirectory, paths.JournalDirectory, paths.AuditDirectory, paths.StateDirectory, paths.WorkDirectory, paths.QuarantineDirectory })
             Directory.CreateDirectory(dir);
 
-        EngineConfig config = new();
-        FileSystemService fileSystem = new(NullLogger<FileSystemService>.Instance);
-        FilterCompiler filterCompiler = new(NullLogger<FilterCompiler>.Instance, TimeProvider.System);
-        ProfileValidator validator = new(NullLogger<ProfileValidator>.Instance, filterCompiler);
-        SettingsService settings = new(NullLogger<SettingsService>.Instance, paths);
-        // The store resolves its directory from settings; pin it under the temp engine root so the
-        // smoke test never touches the real %LOCALAPPDATA% profiles directory.
-        settings.Update(settings.Current with { ProfilesDirectory = Path.Combine(paths.Root, "profiles") });
-        ProfileStore store = new(NullLogger<ProfileStore>.Instance, settings, validator);
-        ProfileCatalog catalog = new(NullLogger<ProfileCatalog>.Instance, store);
-        FileHasher hasher = new(NullLogger<FileHasher>.Instance);
+        ServiceCollection services = new();
+        services.AddLogging();
+        services.AddSingleton<IHostApplicationLifetime, StubLifetime>();
+        EngineComposition.AddEngine(services, paths);
+        // The only two deliberate substitutions, and the reason this cannot just resolve the production
+        // graph as-is: the real implementations would recycle the developer's files and write to their
+        // HKCU Run key. Registered AFTER AddEngine — MSDI is last-registration-wins.
+        services.AddSingleton<ITrashService, NoopTrashService>();
+        services.AddSingleton<IAutostartRegistrar, NoopAutostartRegistrar>();
+        _provider = services.BuildServiceProvider();
 
-        // The lock/priority registries are SHARED by the conflict resolver, the placer, and the
-        // executor — a job's held lock set and the resolver's suffix-probe must hit one registry.
-        PathLockRegistry lockRegistry = new();
-        SourcePriorityRegistry priorities = new();
-        ConflictResolver resolver = new(lockRegistry, priorities, NullLogger<ConflictResolver>.Instance);
-        WindowsVolumeInfoProvider volumes = new(NullLogger<WindowsVolumeInfoProvider>.Instance);
-        ScanScheduler scheduler = new(NullLogger<ScanScheduler>.Instance, fileSystem, settings);
-        SourceScanner scanner = new(TimeProvider.System, scheduler, volumes);
-        DestinationProjector destinationProjector = new(NullLogger<DestinationProjector>.Instance, volumes, scheduler);
-        DryRunEngine dryRun = new(NullLogger<DryRunEngine>.Instance, scanner, filterCompiler, hasher, resolver, settings, TimeProvider.System, destinationProjector);
+        // No hand-written ProfilesDirectory pin here any more: SettingsService rebases both user-data
+        // directories on the injected EnginePaths, so a temp root covers the profile store and the
+        // dry-run scratch directory automatically. The old pin covered only profiles, and every future
+        // harness had to remember to write it — forgetting it silently touched real user data.
+        ISettingsProvider settings = _provider.GetRequiredService<ISettingsProvider>();
+        Assert.StartsWith(paths.Root, settings.Current.ProfilesDirectory, StringComparison.OrdinalIgnoreCase);
+        Assert.StartsWith(paths.Root, settings.Current.ScratchDirectory, StringComparison.OrdinalIgnoreCase);
 
-        // Live single-job vertical.
-        _journal = new JobJournal(paths, config, NullLogger<JobJournal>.Instance);
-        SelfWriteSuppressionRegistry suppression = new(TimeProvider.System);
-        TransientRetryPolicy retry = new(TimeProvider.System, NullLogger<TransientRetryPolicy>.Instance);
-        WindowsMetadataPreserver metadata = new(NullLogger<WindowsMetadataPreserver>.Instance);
-        AtomicPlacer placer = new(hasher, _journal, suppression, retry, metadata, priorities, TimeProvider.System, NullLogger<AtomicPlacer>.Instance);
-        DiskPreflight preflight = new(volumes, config, NullLogger<DiskPreflight>.Instance);
-        RollbackExecutor rollback = new(_journal, hasher, TimeProvider.System, NullLogger<RollbackExecutor>.Instance);
-        DispositionAuditLog audit = new(paths, NullLogger<DispositionAuditLog>.Instance);
-        SourceDispositionService disposition = new(new NoopTrashService(), audit, TimeProvider.System, NullLogger<SourceDispositionService>.Instance);
-
-        PauseStateService pauseState = new(paths, NullLogger<PauseStateService>.Instance);
-        EngineEventBus eventBus = new(NullLogger<EngineEventBus>.Instance);
-        JobLogStore jobLog = new(paths, TimeProvider.System, NullLogger<JobLogStore>.Instance);
-        TriggerQueue triggerQueue = new(pauseState, NullLogger<TriggerQueue>.Instance);
-        ProfileMatcher matcher = new(catalog, filterCompiler, NullLogger<ProfileMatcher>.Instance);
-        JobPlanFactory planFactory = new(paths, config);
-        JobExecutor executor = new(_journal, lockRegistry, preflight, filterCompiler, hasher, resolver, placer, rollback, disposition, jobLog, TimeProvider.System, NullLogger<JobExecutor>.Instance);
-        _orchestrator = new JobOrchestrator(triggerQueue, catalog, executor, planFactory, eventBus, jobLog, pauseState, config, TimeProvider.System, NullLogger<JobOrchestrator>.Instance);
-
-        IIpcRequestHandler[] handlers =
-        [
-            new GetStatusHandler(_orchestrator),
-            new GetMatchingProfilesHandler(matcher),
-            new RunProfileHandler(catalog, triggerQueue, scanner, eventBus, TimeProvider.System, NullLogger<RunProfileHandler>.Instance),
-            new SetPausedHandler(pauseState, NullLogger<SetPausedHandler>.Instance),
-            new GetRecentJobsHandler(jobLog),
-            new GetJobLogHandler(jobLog),
-            new ListProfilesHandler(catalog),
-            new GetProfileHandler(NullLogger<GetProfileHandler>.Instance, catalog),
-            new SaveProfileHandler(NullLogger<SaveProfileHandler>.Instance, store, catalog),
-            new DeleteProfileHandler(NullLogger<DeleteProfileHandler>.Instance, store, catalog),
-            new ValidateProfileHandler(validator, catalog),
-            new DryRunHandler(NullLogger<DryRunHandler>.Instance, dryRun, catalog),
-            new GetSettingsHandler(settings),
-            new UpdateSettingsHandler(NullLogger<UpdateSettingsHandler>.Instance, settings, new NoopAutostartRegistrar()),
-        ];
-        _server = new IpcServer(
-            NullLogger<IpcServer>.Instance,
-            new WindowsIpcEndpointProvider(NullLogger<WindowsIpcEndpointProvider>.Instance),
-            handlers.ToDictionary(h => h.RequestType));
+        IProfileCatalog catalog = _provider.GetRequiredService<IProfileCatalog>();
+        IEngineEventBus eventBus = _provider.GetRequiredService<IEngineEventBus>();
+        _server = _provider.GetRequiredService<IIpcServer>();
+        _orchestrator = _provider.GetRequiredService<IJobOrchestrator>();
 
         _eventBridge = eventBus.Subscribe(_server.Broadcast);
-        // Same bridge Program.cs/EngineHost installs, so profiles-changed round-trips here too.
+        // Same bridge EngineHost installs, so profiles-changed round-trips here too.
         _profilesBridge = catalog.Subscribe(() =>
             eventBus.Publish(new ProfilesChangedEvent { AtUtc = TimeProvider.System.GetUtcNow() }));
         Assert.True(_server.Start().IsSuccess);
@@ -142,7 +117,9 @@ public sealed class EndToEndSmokeTests : IAsyncLifetime
         _eventBridge?.Dispose();
         if (_server is not null)
             await _server.StopAsync(new CancellationTokenSource(TimeSpan.FromSeconds(5)).Token);
-        _journal?.Dispose();
+        // Disposes every singleton the graph owns, including the journal and the scan scheduler.
+        if (_provider is not null)
+            await _provider.DisposeAsync();
         Environment.SetEnvironmentVariable("FILEMANAGER_PIPE_NAME", null);
         if (Directory.Exists(_root))
             Directory.Delete(_root, recursive: true);
@@ -194,6 +171,17 @@ public sealed class EndToEndSmokeTests : IAsyncLifetime
                 PathOf(o).EndsWith("fresh.txt") && o.Kind == OperationKind.Processed);
             Assert.Contains(report.SourceOperations, o =>
                 PathOf(o).EndsWith("same.txt") && o.Kind == OperationKind.SkippedUnchanged);
+
+            // streamed dry run — the route the UI actually uses (IpcGateway sends DryRunStreamRequest).
+            // Its handler was absent from this test's hand-built dispatch table, so this path had never
+            // been driven over a real pipe by the end-to-end suite at all.
+            var streamed = await client.DryRunStreamAsync(new DryRunStreamRequest { ProfileId = profile.Id });
+            Assert.True(streamed.TryGetValue(out DryRunReport? streamedReport));
+            Assert.Equal(report.SourceFiles.Count, streamedReport!.SourceFiles.Count);
+            string[] streamedDirs = DryRunDirectoryTable.Materialize(streamedReport.Directories);
+            Assert.Contains(streamedReport.SourceOperations, o =>
+                Path.Join(streamedDirs[o.DirIndex], o.FileName).EndsWith("fresh.txt")
+                && o.Kind == OperationKind.Processed);
 
             // status now reflects the active profile
             var status2 = await client.RequestAsync<StatusResponse>(new GetStatusRequest());

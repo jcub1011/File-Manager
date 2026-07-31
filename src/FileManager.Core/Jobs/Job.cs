@@ -250,6 +250,13 @@ public sealed record JobCompletion(
     /// Non-empty only for <see cref="JobOutcome.RollbackFailed"/>, and empty even then when rollback
     /// failed before it could enumerate residuals (e.g. its own journal append failed).</summary>
     public IReadOnlyList<string> ResidualPaths { get; init; } = [];
+
+    /// <summary>The Phase-6 <c>OnSuccess</c> failure (§4 Phase 6) when there was one: the copies are
+    /// safe and the job genuinely closed <see cref="JobOutcome.Succeeded"/>, but the source was NOT
+    /// disposed of as the profile asked — or it was, and its audit row could not be written. Set only
+    /// on the Succeeded path. The journal records it in <c>job-closed</c>; this carries it out to the
+    /// orchestrator, which is the only component that can put it in front of the user.</summary>
+    public string? DispositionError { get; init; }
 }
 
 /// <summary>One intra-job progress sample, pushed by the executor at each §4.3 phase boundary and

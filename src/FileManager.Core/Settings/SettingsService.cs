@@ -77,33 +77,83 @@ public sealed class SettingsService : ISettingsProvider
         }
     }
 
+    /// <summary>Fills the two user-data directories from the injected <see cref="EnginePaths"/> when the
+    /// stored file does not name them. Both otherwise resolve from process-global statics under
+    /// %LOCALAPPDATA%\FileManager, so they were the only engine directories the injectable-root seam did
+    /// NOT cover: EngineHost created &lt;Root&gt;\profiles while ProfileStore read somewhere else entirely,
+    /// and a spilling dry run in a test wrote into the developer's real scratch directory — which
+    /// EngineHost's startup purge then swept. Production is unaffected: EnginePaths.Default().Root IS
+    /// %LOCALAPPDATA%\FileManager, so the rebased value equals the static default and
+    /// <see cref="GlobalSettings"/>'s init collapses it straight back to the absent representation,
+    /// leaving settings.json byte-identical.
+    /// <para>Only ABSENT values are rebased — checked through the <c>…Serialized</c> shadows rather than
+    /// the resolved getters — so a directory the user explicitly configured is left alone.</para>
+    /// <para>Must run AFTER <see cref="Normalize"/>: Normalize re-resolves both directories against the
+    /// static defaults, so rebasing first would be undone.</para></summary>
+    private GlobalSettings Rebase(GlobalSettings settings) =>
+        settings with
+        {
+            ProfilesDirectory = settings.ProfilesDirectorySerialized ?? _paths.ProfilesDirectory,
+            ScratchDirectory = settings.ScratchDirectorySerialized ?? _paths.ScratchDirectory,
+        };
+
     private GlobalSettings Load()
     {
         string file = _paths.SettingsFilePath;
         try
         {
             if (!File.Exists(file))
-                return GlobalSettings.Default;
+                return Rebase(GlobalSettings.Default);
 
             byte[] bytes = File.ReadAllBytes(file);
             GlobalSettings? loaded = JsonSerializer.Deserialize(bytes, FileManagerJsonContext.Default.GlobalSettings);
             if (loaded is null)
             {
-                _logger.LogWarning("Settings file {File} deserialized to null; using defaults", file);
-                return GlobalSettings.Default;
+                _logger.LogError("Settings file {File} deserialized to null; using defaults", file);
+                PreserveUnreadable(file);
+                return Rebase(GlobalSettings.Default);
             }
-            return Normalize(MigrateLegacy(loaded, bytes));
+            return Rebase(Normalize(MigrateLegacy(loaded, bytes)));
         }
         catch (Exception ex) when (ex is JsonException or IOException or UnauthorizedAccessException)
         {
-            _logger.LogWarning(ex, "Settings file {File} could not be loaded; using defaults", file);
-            return GlobalSettings.Default;
+            _logger.LogError(ex, "Settings file {File} could not be loaded; using defaults", file);
+            PreserveUnreadable(file);
+            return Rebase(GlobalSettings.Default);
         }
         catch (Exception ex)
         {
             // Last resort: an unexpected exception falls back to defaults rather than faulting startup.
             _logger.LogError(ex, "Loading settings file {File} failed unexpectedly; using defaults", file);
-            return GlobalSettings.Default;
+            PreserveUnreadable(file);
+            return Rebase(GlobalSettings.Default);
+        }
+    }
+
+    /// <summary>Moves a settings.json we could not read out of the way before falling back to defaults.
+    /// Falling back is right — refusing to start the service over a bad settings file is worse — but
+    /// leaving the file in place is not: <see cref="Update"/> renames over it, so the FIRST save after a
+    /// failed load destroys the original bytes. Those bytes hold the user's relocated
+    /// <c>ProfilesDirectory</c>, which <c>ProfileStore</c> resolves live on every read, so losing them
+    /// makes the entire profile list vanish with no way to find out where it had been pointed. A dated
+    /// copy leaves that recoverable by hand.</summary>
+    private void PreserveUnreadable(string file)
+    {
+        try
+        {
+            if (!File.Exists(file))
+                return;
+            string kept = $"{file}.corrupt-{DateTime.UtcNow:yyyyMMddHHmmss}";
+            File.Move(file, kept, overwrite: false);
+            _logger.LogError(
+                "Kept the unreadable settings file as {Kept} so the next save cannot overwrite it; " +
+                "{File} will be recreated from defaults", kept, file);
+        }
+        catch (Exception ex)
+        {
+            // Best-effort by nature: if the copy cannot be made, defaults still load and the service
+            // still starts. Never silent, though — this is the user's configuration.
+            _logger.LogError(ex, "Could not preserve the unreadable settings file {File}", file);
         }
     }
 

@@ -254,6 +254,75 @@ public sealed class Set3HandlersTests : IDisposable
         Assert.Equal(1, queued.QueuedCount);   // partial count of what was queued before the abort
     }
 
+    [Fact]
+    public async Task RunProfile_reports_directories_the_scan_could_not_read()
+    {
+        // SourceScanner downgrades an unopenable subdirectory to a Warning so its siblings are still
+        // walked, and RunQueuedEvent.Error is reserved for a Fatal. Without the warning event the
+        // notice reads "Queued 1 file(s) from ..." over a tree that was only partly covered — and the
+        // user may then approve a run whose OnSuccess is PermanentDelete.
+        string sourceDir = Path.Combine(_root, "source");
+        Directory.CreateDirectory(sourceDir);
+        Profile profile = TestProfiles.Valid(sourceDir, Path.Combine(_root, "target"));
+        Payload one = new(profile.Id, Path.Combine(sourceDir, "a.txt"), sourceDir, TriggerKind.ManualShell, DateTimeOffset.UnixEpoch);
+        FakeSourceScanner scanner = new(
+            new EnumerationFault("subdirectory skipped: access denied", EnumerationSeverity.Warning), one);
+        (RunProfileHandler handler, _, RecordingEventBus bus) = RunHandlerFor(profile, scanner);
+
+        await handler.HandleAsync(new RunProfileRequest { ProfileId = profile.Id, Path = sourceDir });
+
+        RunQueuedEvent queued = await WaitForRunQueuedAsync(bus);
+        Assert.Equal(1, queued.QueuedCount);   // the walk continued past the warning
+        Assert.Null(queued.Error);             // ...so it is not a Fatal, and Error stays null
+
+        EngineWarningEvent warning = Assert.Single(bus.Events.OfType<EngineWarningEvent>());
+        Assert.Contains("1 item(s)", warning.Message);
+        Assert.Contains(sourceDir, warning.Message);
+    }
+
+    /// <summary>Yields payloads until its token is cancelled, so a test can observe what a shutdown does
+    /// to a walk that is still in flight.</summary>
+    private sealed class BlockingScanner(Payload payload, ManualResetEventSlim started) : ISourceScanner
+    {
+        public IEnumerable<Result<Payload, EnumerationFault>> Scan(
+            Profile profile, TriggerKind trigger, string? scopeRoot = null, CancellationToken ct = default)
+        {
+            yield return payload;
+            started.Set();
+            while (true)
+            {
+                ct.ThrowIfCancellationRequested();
+                Thread.Sleep(5);
+            }
+        }
+    }
+
+    [Fact]
+    public async Task Disposing_the_handler_stops_an_in_flight_folder_walk()
+    {
+        // The walk used to run under CancellationToken.None with no owner: closing the app (which shuts
+        // the service down in StartAndStopWithProgram mode) left it enumerating and holding
+        // ScanScheduler's LongRunning threads until the process died.
+        string sourceDir = Path.Combine(_root, "source");
+        Directory.CreateDirectory(sourceDir);
+        Profile profile = TestProfiles.Valid(sourceDir, Path.Combine(_root, "target"));
+        Payload one = new(profile.Id, Path.Combine(sourceDir, "a.txt"), sourceDir, TriggerKind.ManualShell, DateTimeOffset.UnixEpoch);
+        using ManualResetEventSlim started = new(false);
+        (RunProfileHandler handler, _, RecordingEventBus bus) =
+            RunHandlerFor(profile, new BlockingScanner(one, started));
+
+        await handler.HandleAsync(new RunProfileRequest { ProfileId = profile.Id, Path = sourceDir });
+        Assert.True(started.Wait(TimeSpan.FromSeconds(5)), "the walk never started");
+
+        handler.Dispose();
+
+        // The run still terminates — RunQueuedEvent is the only way a caller that got Scanning=true
+        // learns the outcome — carrying the partial count and an error rather than a clean zero.
+        RunQueuedEvent queued = await WaitForRunQueuedAsync(bus);
+        Assert.Equal(1, queued.QueuedCount);
+        Assert.Contains("shut down", queued.Error);
+    }
+
     private (RunProfileHandler Handler, TriggerQueue Queue, RecordingEventBus Bus) RunHandlerFor(
         Profile profile, ISourceScanner? scanner = null)
     {

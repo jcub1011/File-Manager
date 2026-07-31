@@ -244,6 +244,36 @@ public sealed class JobOrchestratorTests : IDisposable
     }
 
     [Fact]
+    public async Task A_succeeded_job_with_a_disposition_failure_warns_and_keeps_LastError()
+    {
+        // The copies are safe so the outcome IS Succeeded and JobCompletedEvent still fires — but the
+        // profile promised to move/trash/delete the source and that did not happen. Before this, the
+        // activity row went green and LastError was cleared, so the only trace was the service log.
+        _executor.OnExecute = plan => new JobCompletion(plan.JobId, JobOutcome.Succeeded, null, null, TimeSpan.Zero)
+        {
+            DispositionError = "MoveToTrash failed: the file is in use by another process",
+        };
+
+        Assert.True(_orchestrator.Start().IsSuccess);
+        _queue.Enqueue(PayloadFor(_profile.Id));
+
+        Assert.True(await WaitForAsync(
+            () => { lock (_events) return _events.Any(e => e is EngineWarningEvent); }, TimeSpan.FromSeconds(5)));
+
+        lock (_events)
+        {
+            Assert.Contains(_events, e => e is JobCompletedEvent);
+            EngineWarningEvent warning = Assert.Single(_events.OfType<EngineWarningEvent>());
+            Assert.Contains("the source disposition did not complete", warning.Message);
+            Assert.Contains("in use by another process", warning.Message);
+            Assert.Contains(_sourceFile, warning.Message);
+        }
+        // Not cleared: the status bar's health hint must show that something needs attention.
+        Assert.Equal("MoveToTrash failed: the file is in use by another process", _orchestrator.GetStatus().LastError);
+        await _orchestrator.StopAsync();
+    }
+
+    [Fact]
     public void GetStatus_reports_active_profiles_and_pause()
     {
         EngineStatusSnapshot status = _orchestrator.GetStatus();

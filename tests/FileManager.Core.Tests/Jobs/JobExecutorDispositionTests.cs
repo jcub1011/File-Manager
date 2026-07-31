@@ -100,6 +100,10 @@ public sealed class JobExecutorDispositionTests
         JobClosedRecord closed = Assert.Single(h.JournalRecords().OfType<JobClosedRecord>());
         Assert.NotNull(closed.DispositionError);
         Assert.Contains("disposition error", string.Join("\n", h.JobLogLines(plan.JobId)));
+
+        // ...and it also travels out on the completion, which is the only route to the user: the
+        // journal and the job log are files nobody reads until something has already gone wrong.
+        Assert.Equal(closed.DispositionError, completion.DispositionError);
     }
 
     [Fact]

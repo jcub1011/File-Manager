@@ -4,6 +4,7 @@ using FileManager.Contracts.Primitives;
 using FileManager.Contracts.Profiles;
 using FileManager.Core.DryRun;
 using FileManager.Core.Jobs;
+using FileManager.Core.Observability;
 using FileManager.Core.Platform;
 using FileManager.Core.Profiles;
 using FileManager.Core.Settings;
@@ -25,7 +26,8 @@ namespace FileManager.Core.IPC.Handlers;
 /// frame (matching DryRunHandler's error codes).</summary>
 public sealed class DryRunStreamHandler(
     ILogger<DryRunStreamHandler> logger, IDryRunEngine engine, IProfileCatalog catalog, TimeProvider time,
-    DestinationProjector destinationProjector, IVolumeInfoProvider volumes, EngineConfig config)
+    DestinationProjector destinationProjector, IVolumeInfoProvider volumes, EngineConfig config,
+    IEngineEventBus eventBus)
     : IIpcStreamingRequestHandler
 {
     /// <summary>Destination sweep entries per streamed frame. Each entry is small (a physical file +
@@ -259,6 +261,17 @@ public sealed class DryRunStreamHandler(
                 typed.ProfileId, totalWatch.ElapsedMilliseconds, engineMs, sweepWatch.ElapsedMilliseconds,
                 sweep.WalkMs, sweep.MergeMs, estimatorWatch.ElapsedMilliseconds, emitted, destinationCount,
                 sweep.Files.Count);
+        // Directories the walk could not open were downgraded to warnings by SourceScanner and dropped
+        // by the engine's pump, so the report below looks complete. DryRunCompleteResponse is frozen and
+        // has no skipped count, so the partiality rides the warning channel the UI already renders in
+        // its notice bar — the same place a truncated report is called out. Without it the user
+        // approves a plan (possibly with OnSuccess = PermanentDelete) over a partial tree.
+        if (progressCounters.Skipped > 0)
+            eventBus.Publish(new EngineWarningEvent
+            {
+                AtUtc = time.GetUtcNow(),
+                Message = $"{progressCounters.Skipped} item(s) under the scanned source(s) could not be read and are missing from this preview (see the service log for details).",
+            });
         yield return new DryRunCompleteResponse { GeneratedAt = time.GetUtcNow(), Truncated = truncated, Space = space };
     }
 

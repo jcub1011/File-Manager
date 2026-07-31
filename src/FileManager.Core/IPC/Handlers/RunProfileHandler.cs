@@ -30,8 +30,16 @@ public sealed class RunProfileHandler(
     ISourceScanner scanner,
     IEngineEventBus eventBus,
     TimeProvider time,
-    ILogger<RunProfileHandler> logger) : IIpcRequestHandler
+    ILogger<RunProfileHandler> logger) : IIpcRequestHandler, IDisposable
 {
+    /// <summary>Cancels the detached folder enumerations this handler starts. The walk used to run under
+    /// <see cref="CancellationToken.None"/> with no owner at all, so nothing in the process could stop it:
+    /// closing the app (which in StartAndStopWithProgram mode shuts the service down) left it walking a
+    /// large tree and holding ScanScheduler's LongRunning worker threads until the process died. The
+    /// handler is a container singleton, so disposal — and therefore this cancel — happens as the host
+    /// tears the graph down.</summary>
+    private readonly CancellationTokenSource _shutdown = new();
+
     public string RequestType => IpcRequestTypes.RunProfile;
 
     public Task<IpcResponse> HandleAsync(IpcRequest request, CancellationToken ct = default)
@@ -82,7 +90,9 @@ public sealed class RunProfileHandler(
         else if (Directory.Exists(typed.Path))
         {
             // Enumerate off the IPC thread so the reply is immediate; captures its own copy of profile.
-            _ = Task.Run(() => ScanAndEnqueue(profile, typed.Path, runId), CancellationToken.None);
+            // Under the handler's own shutdown token, not CancellationToken.None: an unowned walk is one
+            // nothing can stop.
+            _ = Task.Run(() => ScanAndEnqueue(profile, typed.Path, runId), _shutdown.Token);
             logger.LogInformation("Started background enumeration for manual run of profile {ProfileId} at folder {Path}", profile.Id, typed.Path);
             response = new RunProfileResponse { QueuedCount = 0, Scanning = true, RunId = runId };
         }
@@ -97,10 +107,14 @@ public sealed class RunProfileHandler(
     private void ScanAndEnqueue(Profile profile, string folder, Guid runId)
     {
         int queued = 0;
+        int skipped = 0;
         string? error = null;
         try
         {
-            foreach (Result<Payload, EnumerationFault> scanned in scanner.Scan(profile, TriggerKind.ManualShell, folder))
+            // The token reaches the walk itself, so a shutdown stops enumerating rather than only
+            // stopping the Task from being scheduled.
+            foreach (Result<Payload, EnumerationFault> scanned in
+                scanner.Scan(profile, TriggerKind.ManualShell, folder, _shutdown.Token))
             {
                 if (scanned.TryGetError(out EnumerationFault fault))
                 {
@@ -110,6 +124,10 @@ public sealed class RunProfileHandler(
                         error = fault.Message;
                         break;
                     }
+                    // A subdirectory the walk could not open (SourceScanner downgrades that to a
+                    // Warning so siblings still get walked). Counted, not just logged: the notice
+                    // otherwise reads "Queued 812 file(s) from C:\..." over a partial tree.
+                    skipped++;
                     logger.LogWarning("Manual run of profile {ProfileId} enumeration warning: {Message}", profile.Id, fault.Message);
                     continue;
                 }
@@ -117,6 +135,15 @@ public sealed class RunProfileHandler(
                 queue.Enqueue(payload!);
                 queued++;
             }
+        }
+        catch (OperationCanceledException) when (_shutdown.IsCancellationRequested)
+        {
+            // Shutdown cut the walk short. Reported as an error on the terminal event below with the
+            // partial count — the same shape a fatal fault produces — rather than as a clean zero.
+            logger.LogInformation(
+                "Background enumeration for manual run of profile {ProfileId} stopped at shutdown after {Queued} file(s)",
+                profile.Id, queued);
+            error = "the service shut down before the folder had been fully enumerated";
         }
         catch (Exception ex)
         {
@@ -140,11 +167,28 @@ public sealed class RunProfileHandler(
                 Error = error,
                 RunId = runId,
             });
+
+            // Partiality the count alone cannot express. RunQueuedEvent.Error is reserved for a Fatal
+            // fault (the walk stopped), so a tree that was walked but incompletely rides the warning
+            // channel instead — otherwise the user approves a run whose OnSuccess may be
+            // PermanentDelete believing the whole tree was covered.
+            if (skipped > 0)
+                eventBus.Publish(new EngineWarningEvent
+                {
+                    AtUtc = time.GetUtcNow(),
+                    Message = $"{skipped} item(s) under {folder} could not be read and were not queued (see the service log for details).",
+                });
         }
         catch (Exception ex)
         {
             logger.LogError(ex, "Publishing run-queued for profile {ProfileId} failed", profile.Id);
         }
+    }
+
+    public void Dispose()
+    {
+        _shutdown.Cancel();
+        _shutdown.Dispose();
     }
 
     private static string? ResolveSourceRoot(Profile profile, string filePath)

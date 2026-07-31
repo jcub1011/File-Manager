@@ -309,4 +309,31 @@ public sealed class SourceDispositionServiceTests : IDisposable
         var result = service.Dispose(Guid.NewGuid(), source, JobFixtures.Policy(onSuccess: OnSuccessAction.PermanentDelete), anyTargetSkippedConflict: false);
         Assert.True(result.IsSuccess);   // idempotent — no error though the file is absent
     }
+
+    [Fact]
+    public void A_permanent_delete_whose_audit_row_cannot_be_written_is_a_FAILED_disposition()
+    {
+        // The worst silent success in the product: the file is destroyed and the audit trail — the
+        // spec's no-loss safety net — has no record of it. That must not report clean.
+        string source = Path.Combine(_root, "gone-forever.txt");
+        File.WriteAllText(source, "irreplaceable");
+        var trash = new FakeTrashService(Path.Combine(_root, "bin"));
+        var service = new SourceDispositionService(
+            trash, new FailingAuditLog(), new FakeTimeProvider(), NullLogger<SourceDispositionService>.Instance);
+
+        var result = service.Dispose(ExecutionFor(source, OnSuccessAction.PermanentDelete));
+
+        Assert.True(result.TryGetError(out JobError? error));
+        Assert.Equal(JobErrorCode.DispositionFailed, error!.Code);
+        Assert.Contains("audit record could not be written", error.Message);
+        Assert.False(File.Exists(source));   // the delete itself did happen — that is the whole problem
+    }
+
+    private sealed class FailingAuditLog : IDispositionAuditLog
+    {
+        public Result Append(DispositionAuditRecord record) => "the audit file is read-only";
+
+        public Result<IReadOnlyList<DispositionAuditRecord>, string> ReadRecent(int count) =>
+            Result<IReadOnlyList<DispositionAuditRecord>, string>.Success([]);
+    }
 }

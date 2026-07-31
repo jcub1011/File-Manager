@@ -307,7 +307,7 @@ public sealed class AtomicPlacer(
             {
                 // Staging intent was journaled and target state set once by the caller (before this
                 // retried step); here we only perform the idempotent atomic replace.
-                ReplaceWithStaging(tempPath, finalPath, stagedPath);
+                StagedReplace.Execute(tempPath, finalPath, stagedPath, logger);
             }
             else
             {
@@ -338,37 +338,6 @@ public sealed class AtomicPlacer(
                 TargetIndex = request.TargetIndex,
             });
         }
-    }
-
-    private void ReplaceWithStaging(string tempPath, string finalPath, string stagedPath)
-    {
-        try
-        {
-            // One Win32 ReplaceFile: the new file swaps in and the prior version lands at
-            // stagedPath atomically — no window where the final name is absent (I-PRIOR).
-            File.Replace(tempPath, finalPath, stagedPath, ignoreMetadataErrors: true);
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or PlatformNotSupportedException)
-        {
-            // Fallback for volumes that reject ReplaceFile (some SMB servers): journaled two-step.
-            // The crash window between the two moves is covered by the target-staged recovery rows.
-            logger.LogWarning(ex, "File.Replace rejected for {Final}; falling back to two-step move", finalPath);
-            TwoStepReplace(tempPath, finalPath, stagedPath);
-        }
-    }
-
-    /// <summary>The two-step fallback, made idempotent so the retry policy can re-run it safely: if a
-    /// prior attempt already moved the prior version out (final now absent), don't move it again —
-    /// just finish by moving the temp into place. Without this, a retry after the first move succeeded
-    /// but the second failed would throw FileNotFound forever and strand the final name absent.</summary>
-    private static void TwoStepReplace(string tempPath, string finalPath, string stagedPath)
-    {
-        if (File.Exists(finalPath))
-        {
-            Directory.CreateDirectory(Path.GetDirectoryName(stagedPath)!);
-            File.Move(finalPath, stagedPath, overwrite: false);
-        }
-        File.Move(tempPath, finalPath, overwrite: false);
     }
 
     private SuppressionToken RegisterSuppression(string path)

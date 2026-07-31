@@ -22,10 +22,20 @@ public sealed class SettingsServiceTests : IDisposable
 
     private SettingsService NewService() => new(NullLogger<SettingsService>.Instance, _paths);
 
+    /// <summary>Defaults as the service resolves them under the INJECTED root. The two user-data
+    /// directories are rebased on EnginePaths when settings.json does not name them (so a test root
+    /// actually contains them); everything else is GlobalSettings.Default verbatim. In production the
+    /// root IS %LOCALAPPDATA%\FileManager, so this equals GlobalSettings.Default there.</summary>
+    private GlobalSettings DefaultsUnderRoot => GlobalSettings.Default with
+    {
+        ProfilesDirectory = _paths.ProfilesDirectory,
+        ScratchDirectory = _paths.ScratchDirectory,
+    };
+
     [Fact]
     public void Absent_file_yields_defaults()
     {
-        Assert.Equal(GlobalSettings.Default, NewService().Current);
+        Assert.Equal(DefaultsUnderRoot, NewService().Current);
     }
 
     [Fact]
@@ -160,7 +170,9 @@ public sealed class SettingsServiceTests : IDisposable
                 !doc.RootElement.TryGetProperty(key, out var el) || el.ValueKind == System.Text.Json.JsonValueKind.Null,
                 $"{key} must stay absent (null) in settings.json when unset");
 
-        Assert.Equal(GlobalSettings.Default, NewService().Current);
+        // The ON-DISK shape above is the frozen part and is unchanged. In memory the two absent
+        // directories resolve against the injected root rather than %LOCALAPPDATA%.
+        Assert.Equal(DefaultsUnderRoot, NewService().Current);
     }
 
     [Fact]
@@ -173,9 +185,10 @@ public sealed class SettingsServiceTests : IDisposable
         Assert.Equal(scratch, reloaded.ScratchDirectory);
         Assert.Equal(Path.Combine(_root, "my-profiles"), reloaded.ProfilesDirectory);
 
-        // Writing the default value (even with different casing) collapses back to absent.
+        // Writing the default value (even with different casing) collapses back to absent — and an
+        // absent value then resolves against the injected root.
         NewService().Update(new GlobalSettings { ScratchDirectory = GlobalSettings.DefaultScratchDirectory.ToUpperInvariant() });
-        Assert.Equal(GlobalSettings.Default.ScratchDirectory, NewService().Current.ScratchDirectory);
+        Assert.Equal(_paths.ScratchDirectory, NewService().Current.ScratchDirectory);
     }
 
     [Fact]
@@ -202,5 +215,36 @@ public sealed class SettingsServiceTests : IDisposable
     {
         NewService().Update(new GlobalSettings { ThemeMode = ThemeMode.Dark });
         Assert.Equal(ThemeMode.Dark, NewService().Current.ThemeMode);
+    }
+
+    [Fact]
+    public void An_unreadable_settings_file_is_kept_aside_before_defaults_take_over()
+    {
+        // Falling back to defaults is right; leaving the bad file in place is not, because Update
+        // renames over it. Those bytes carry the relocated ProfilesDirectory, and losing them makes the
+        // user's entire profile list vanish with no record of where it had been pointed.
+        string file = _paths.SettingsFilePath;
+        File.WriteAllText(file, "{ garbage");
+
+        SettingsService service = NewService();
+
+        Assert.Equal(DefaultsUnderRoot, service.Current);
+        Assert.False(File.Exists(file));
+        string kept = Assert.Single(Directory.GetFiles(_root, "settings.json.corrupt-*"));
+        Assert.Equal("{ garbage", File.ReadAllText(kept));
+    }
+
+    [Fact]
+    public void A_later_save_cannot_overwrite_the_kept_copy()
+    {
+        string file = _paths.SettingsFilePath;
+        File.WriteAllText(file, "{ garbage");
+        SettingsService service = NewService();
+
+        service.Update(new GlobalSettings { ThemeMode = ThemeMode.Dark });
+
+        Assert.Equal(ThemeMode.Dark, NewService().Current.ThemeMode);   // the fresh file works
+        string kept = Assert.Single(Directory.GetFiles(_root, "settings.json.corrupt-*"));
+        Assert.Equal("{ garbage", File.ReadAllText(kept));               // ...and the original survives
     }
 }

@@ -31,7 +31,12 @@ internal sealed class EngineHost(
     IJobOrchestrator orchestrator,
     IEngineEventBus eventBus,
     IPauseStateService pauseState,
-    TimeProvider time) : BackgroundService
+    TimeProvider time,
+    // Test seam ONLY, and deliberately the last parameter with a default so the DI activation in
+    // EngineComposition is unchanged. The derived name is a frozen cross-process contract, so it stays
+    // here rather than moving out; this exists so a test never contends with a real service running on
+    // the developer's machine.
+    string? instanceMutexName = null) : BackgroundService
 {
     private Mutex? _singleInstanceMutex;
     private IDisposable? _eventBridge;
@@ -63,7 +68,8 @@ internal sealed class EngineHost(
         //    ServiceLauncher) exits immediately and harmlessly.
         _singleInstanceMutex = new Mutex(
             initiallyOwned: false,
-            name: @"Local\FileManager.Service." + IpcEndpoint.SanitizeUserName(Environment.UserName));
+            name: instanceMutexName
+                ?? @"Local\FileManager.Service." + IpcEndpoint.SanitizeUserName(Environment.UserName));
         if (!_singleInstanceMutex.WaitOne(TimeSpan.Zero))
         {
             logger.LogInformation("Another FileManager.Service instance is already running for this user; exiting");
@@ -87,10 +93,37 @@ internal sealed class EngineHost(
         //     its in-memory fast path if it cannot write.
         PurgeScratchDirectory();
 
-        // 3. Load profiles into the catalog.
+        // 3. Load profiles into the catalog. A failure here is non-fatal — the service must still come
+        //    up so the user can fix the cause from the UI — but it must not be SILENT: the catalog is
+        //    left empty, list-profiles then answers successfully with zero profiles, and every trigger
+        //    is dropped at Information level, so the UI is indistinguishable from "you have no
+        //    profiles" on a healthy engine. The message is carried to step 7 and published there,
+        //    because nothing can reach a client until the event bridge exists.
+        string? profileLoadWarning = null;
         Result reload = catalog.Reload();
         if (reload.TryGetError(out string? reloadError))
+        {
             logger.LogError("Initial profile load failed: {Error}", reloadError);
+            profileLoadWarning =
+                $"Profiles could not be loaded from {settings.Current.ProfilesDirectory}: {reloadError}. " +
+                "The profile list is empty and no triggers will run until this is fixed.";
+        }
+        else if (!Directory.Exists(settings.Current.ProfilesDirectory))
+        {
+            // The motivating case, and the one a reload error does NOT cover: ProfileStore.LoadAll
+            // returns SUCCESS with zero profiles when the directory is simply not there. A relocated
+            // ProfilesDirectory on a network share is routinely unmounted at logon, and the service
+            // autostarts from HKCU Run — so the user sees an empty list, re-creates their profiles, and
+            // ends up with duplicates once the share comes back. Step 2 created <Root>\profiles, so this
+            // can only fire for a directory the user configured somewhere else.
+            logger.LogError(
+                "Configured profiles directory {Directory} does not exist; the catalog is empty",
+                settings.Current.ProfilesDirectory);
+            profileLoadWarning =
+                $"The configured profiles directory {settings.Current.ProfilesDirectory} is not available " +
+                "(a disconnected drive or share, or a folder that was moved or removed). The profile list is " +
+                "empty and no triggers will run until it is reachable — do not re-create your profiles yet.";
+        }
 
         // 4. Crash recovery — resolves every OPEN journal entry to CLOSED. MUST run to completion
         //    here, before step 5 starts the IPC server and before any trigger fires
@@ -140,6 +173,13 @@ internal sealed class EngineHost(
         // requesting client's own success response; clients must tolerate that.
         _profilesBridge = catalog.Subscribe(() =>
             eventBus.Publish(new ProfilesChangedEvent { AtUtc = time.GetUtcNow() }));
+
+        // Step 3's failure, published now that the bridge above can carry it to IPC subscribers. A UI
+        // that connects later re-seeds through ReconcileEngineStateAsync rather than replaying this, so
+        // the log line above remains the durable record.
+        if (profileLoadWarning is not null)
+            eventBus.Publish(new EngineWarningEvent { AtUtc = time.GetUtcNow(), Message = profileLoadWarning });
+
         Result orchestratorStarted = orchestrator.Start();
         if (orchestratorStarted.TryGetError(out string? orchestratorError))
         {

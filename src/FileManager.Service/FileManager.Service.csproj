@@ -17,6 +17,13 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!-- So the tests can build EngineComposition's graph and drive EngineHost's startup sequence.
+         Both are internal and were previously unreachable from any test, which is why the smoke
+         test hand-rebuilt the graph (and drifted three handlers behind it). -->
+    <InternalsVisibleTo Include="FileManager.Service.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="..\FileManager.Contracts\FileManager.Contracts.csproj" />
     <ProjectReference Include="..\FileManager.Core\FileManager.Core.csproj" />
     <ProjectReference Include="..\FileManager.Platform.Windows\FileManager.Platform.Windows.csproj" />

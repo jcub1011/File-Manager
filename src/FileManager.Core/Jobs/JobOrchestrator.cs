@@ -220,6 +220,23 @@ public sealed class JobOrchestrator(
             logger.LogWarning("Job {JobId} for {SourcePath} ended {Outcome}: {Error}",
                 plan.JobId.Short, plan.Source.Path, completion.Outcome, completion.Error?.Message);
         }
+        else if (completion.DispositionError is { } dispositionError)
+        {
+            // The copies are safe and the outcome IS Succeeded, so JobCompletedEvent still fires — but
+            // the profile promised to move/trash/delete the source and that did not happen (or its audit
+            // row could not be written). Without this the activity row is green, LastError is cleared,
+            // and the only trace is a line in the service log: the user believes their sources were
+            // disposed of, and the next trigger copies the same file again.
+            _lastError = dispositionError;
+            eventBus.Publish(new JobCompletedEvent { AtUtc = now, Job = dto });
+            eventBus.Publish(new EngineWarningEvent
+            {
+                AtUtc = now,
+                Message = $"{plan.Source.Path}: copied successfully, but the source disposition did not complete — {dispositionError}",
+            });
+            logger.LogWarning("Job {JobId} for {SourcePath} ended {Outcome} with a disposition failure: {Error}",
+                plan.JobId.Short, plan.Source.Path, completion.Outcome, dispositionError);
+        }
         else
         {
             // Sticky-until-recovered: LastError is the status bar's health hint, so one transient

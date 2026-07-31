@@ -29,6 +29,13 @@ public sealed partial class SettingsViewModel : ViewModelBase
     private readonly IIpcGateway _gateway;
     private readonly IFolderPicker _folderPicker;
 
+    /// <summary>Set when <see cref="LoadAsync"/> could not read the stored settings, so the editable
+    /// state is still the constructor's defaults rather than anything the user has. Save refuses while
+    /// it is set: building a complete <see cref="GlobalSettings"/> out of those defaults and persisting
+    /// it would reset a relocated ProfilesDirectory (making the user's whole profile list vanish, since
+    /// ProfileStore resolves that directory live) and drop every per-drive override.</summary>
+    private bool _loadFailed;
+
     public SettingsViewModel(IIpcGateway gateway, IFolderPicker folderPicker, ISystemDrives? drives = null)
     {
         _gateway = gateway;
@@ -433,6 +440,7 @@ public sealed partial class SettingsViewModel : ViewModelBase
             if (result.TryGetError(out IpcError? error))
             {
                 ErrorMessage = $"Could not load settings: {error.Message}";
+                _loadFailed = true;
                 return;
             }
             result.TryGetValue(out GlobalSettings? settings);
@@ -461,12 +469,17 @@ public sealed partial class SettingsViewModel : ViewModelBase
                 (row.VolumeKey, row.Auto, row.Value) = (e.Key, auto, value);
                 DriveOverrides.SpecificDriveOverrides.Add(row);
             }
+
+            // Last: the whole mapping above succeeded, so the editable state is now the stored state
+            // and Save has something real to write.
+            _loadFailed = false;
         }
         catch (Exception ex)
         {
             // Last resort: an unexpected exception becomes an error banner, not an unobserved fault.
             Serilog.Log.Error(ex, "Loading global settings failed unexpectedly");
             ErrorMessage = $"Could not load settings: {ex.Message}";
+            _loadFailed = true;
         }
         finally
         {
@@ -483,6 +496,15 @@ public sealed partial class SettingsViewModel : ViewModelBase
         StatusMessage = null;
         try
         {
+            // A load that failed left every setting at its constructor default, so a save here would
+            // overwrite the stored file with defaults rather than with the user's settings. Refuse
+            // instead: the service is a separate process and can simply be mid-restart.
+            if (_loadFailed)
+            {
+                ErrorMessage = "Settings could not be loaded, so saving would overwrite your stored settings with defaults. Close and reopen this window once the service is reachable.";
+                return;
+            }
+
             // Reject duplicate keys rather than silently collapsing them (last-wins), which would drop a
             // row the user thinks they saved. TryAdd fails on a repeat, so the first conflict aborts.
             Dictionary<DriveClass, ThreadBudget> byType = [];

@@ -58,16 +58,11 @@ namespace FileManager.UI.Views
                 return;
             }
 
-            // Flat list rows: open the file in its default application. Both row types expose the same
-            // OpenFileCommand (guarded by a File.Exists check).
+            // Flat list rows: open the file in its default application. Every row type exposes the same
+            // OpenFileCommand via IDryRunFileRow (guarded by a File.Exists check).
             if (source.FindAncestorOfType<ListBoxItem>(includeSelf: true) is { DataContext: { } dataContext })
             {
-                ICommand? open = dataContext switch
-                {
-                    DryRunFileRow row => row.OpenFileCommand,
-                    DryRunDestinationRow row => row.OpenFileCommand,
-                    _ => null,
-                };
+                ICommand? open = (dataContext as IDryRunFileRow)?.OpenFileCommand;
                 if (open is not null && TryExecute(open))
                     e.Handled = true;
             }
@@ -154,26 +149,15 @@ namespace FileManager.UI.Views
 
         private void HandleRowKey(object item, KeyEventArgs e)
         {
-            // Flat list rows are always files; both row types expose the same command names.
-            ICommand copyPath, copyName, openFile, reveal;
-            switch (item)
-            {
-                case DryRunFileRow r:
-                    (copyPath, copyName, openFile, reveal) =
-                        (r.CopyPathCommand, r.CopyNameCommand, r.OpenFileCommand, r.RevealInExplorerCommand);
-                    break;
-                case DryRunDestinationRow r:
-                    (copyPath, copyName, openFile, reveal) =
-                        (r.CopyPathCommand, r.CopyNameCommand, r.OpenFileCommand, r.RevealInExplorerCommand);
-                    break;
-                default:
-                    return;
-            }
+            // Flat list rows are always files, and IDryRunFileRow is the contract that they expose the
+            // same command names the shared flyout binds.
+            if (item is not IDryRunFileRow row)
+                return;
 
-            if (CopyPathGesture.Matches(e)) TryExecute(copyPath);
-            else if (CopyNameGesture.Matches(e)) TryExecute(copyName);
-            else if (RevealGesture.Matches(e)) TryExecute(reveal);
-            else if (OpenFileGesture.Matches(e)) TryExecute(openFile);
+            if (CopyPathGesture.Matches(e)) TryExecute(row.CopyPathCommand);
+            else if (CopyNameGesture.Matches(e)) TryExecute(row.CopyNameCommand);
+            else if (RevealGesture.Matches(e)) TryExecute(row.RevealInExplorerCommand);
+            else if (OpenFileGesture.Matches(e)) TryExecute(row.OpenFileCommand);
             else return;
 
             e.Handled = true;

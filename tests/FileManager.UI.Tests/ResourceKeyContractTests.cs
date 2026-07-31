@@ -12,19 +12,29 @@ namespace FileManager.UI.Tests;
 public sealed class ResourceKeyContractTests(HeadlessSessionFixture headless)
 {
     /// <summary>Every glyph key <see cref="ViewModels.ActivityRow.StatusIconKey"/> can return, plus the
-    /// two the pause toggle switches between.</summary>
+    /// two the pause toggle switches between, plus the dry-run keys.</summary>
     public static TheoryData<string> IconKeys() =>
     [
         "IconOverwrite", "IconCheckmark", "IconSkip", "IconWarning", "IconQuestion",
         "IconPause", "IconPlay",
         "IconRefresh", "IconClose", "IconDocument",
+        // The DestinationRowKind vocabulary, which the dry-run view models write out across seven
+        // separate sites (StatusIconKey, TreeSpecs, BuildStatusFilters, ...). This list previously
+        // covered ActivityRow's keys only, so a typo in any of those sites shipped as a blank glyph.
+        "IconUntouched", "IconAdd", "IconTrash",
+        // ...and the source-row target-op keys from PrimaryKindIconKey.
+        "IconRename",
     ];
 
-    /// <summary>Every brush key <see cref="ViewModels.ActivityRow.StatusColorKey"/> can return.</summary>
+    /// <summary>Every brush key <see cref="ViewModels.ActivityRow.StatusColorKey"/> can return, plus the
+    /// dry-run status/kind brushes.</summary>
     public static TheoryData<string> BrushKeys() =>
     [
         "Brush.Info", "Brush.Success", "Brush.Muted", "Brush.Danger",
         "Brush.StatusBar.Foreground",
+        // Emitted by DryRunDestinationEntry.StatusColorKey / TreeSpecs / BuildStatusFilters and by
+        // DryRunFileRow.PrimaryKindColorKey, none of which were covered here.
+        "Brush.Warning",
     ];
 
     [Theory]

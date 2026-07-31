@@ -29,13 +29,10 @@ public sealed record DryRunTargetRow(string DirPath, string FileName, string? Ta
     /// string instead of each retaining a full path.</summary>
     public string Path => System.IO.Path.Join(DirPath, FileName);
 
-    public string KindText => Kind.GetTitle();
-
     public bool IsOverwrite => Kind == OperationKind.Overwrite;
     public bool IsRename => Kind == OperationKind.Rename;
     public bool IsWrite => Kind == OperationKind.New;
     public bool IsSkip => Kind is OperationKind.SkipConflict or OperationKind.SkipUnchanged;
-    public bool IsUnknown => Kind == OperationKind.Unknown;
 }
 
 /// <summary>A source file in the Sources tab. Carries its own pills: Untouched (nothing happens to
@@ -50,7 +47,7 @@ public sealed partial record DryRunFileRow(
     string? SourceDisposition,
     IReadOnlyList<DryRunTargetRow> Targets,
     long SizeBytes = 0,
-    string? SourceCommonRoot = null)
+    string? SourceCommonRoot = null) : IDryRunFileRow
 {
     /// <summary>Clipboard/shell actions behind this row's right-click menu; set at build time, null
     /// in headless tests (the commands then no-op).</summary>
@@ -100,10 +97,6 @@ public sealed partial record DryRunFileRow(
 
     public bool HasTargetKind => PrimaryTargetKind is not null;
     public string PrimaryKindText => PrimaryTargetKind?.GetTitle() ?? "";
-    public bool IsPrimaryOverwrite => PrimaryTargetKind == OperationKind.Overwrite;
-    public bool IsPrimaryRename => PrimaryTargetKind == OperationKind.Rename;
-    public bool IsPrimaryWrite => PrimaryTargetKind == OperationKind.New;
-    public bool IsPrimarySkip => PrimaryTargetKind == OperationKind.SkipConflict;
 
     /// <summary>Icon/colour resource keys for the single target-op status glyph (resolved in the view
     /// via IconConverters). Null when the file has no target operation.</summary>
@@ -127,11 +120,6 @@ public sealed partial record DryRunFileRow(
     /// <summary>Anything other than keeping the source is destructive from the source's view.</summary>
     public bool IsSourceDisposalDestructive =>
         SourceDisposition is not null && SourceDisposition != nameof(Contracts.Profiles.OnSuccessAction.KeepSource);
-
-    public bool HasDestructiveAction =>
-        IsSourceDisposalDestructive || Targets.Any(t => t.IsOverwrite);
-
-    public bool HasSourceDisposition => SourceDisposition is not null;
 
     public bool IsProcessed => Disposition == OperationKind.Processed;
     public bool IsFilterSkipped => Disposition == OperationKind.SkippedByFilter;
@@ -210,7 +198,6 @@ public sealed record DryRunDestinationEntry(
     public bool IsNew => Kind == DestinationRowKind.New;
     public bool IsOverwritten => Kind == DestinationRowKind.Overwritten;
     public bool IsDeleted => Kind == DestinationRowKind.Deleted;
-    public bool IsUnknown => Kind == DestinationRowKind.Unknown;
 
     public string StatusText => Kind switch
     {
@@ -252,7 +239,7 @@ public sealed partial record DryRunDestinationRow(
     string? SourceFileName,
     string? SourceRoot,
     string? SourceCommonRoot,
-    IReadOnlyList<DryRunDestinationEntry> Destinations)
+    IReadOnlyList<DryRunDestinationEntry> Destinations) : IDryRunFileRow
 {
     /// <summary>Clipboard/shell actions behind this row's right-click menu; set at build time, null
     /// in headless tests (the commands then no-op).</summary>
@@ -291,10 +278,6 @@ public sealed partial record DryRunDestinationRow(
         DryRunPaths.ParentDisplayFor(SourceDirPath!, SourceCommonRoot) + SourceFileName;
 
     public bool HasSource => SourceFileName is not null;
-
-    /// <summary>True for rows with no source — rendered with the simple filename + status + folder
-    /// layout (their single entry is <see cref="Primary"/>).</summary>
-    public bool IsSingle => !HasSource;
 
     /// <summary>The sole entry of a no-source row (also the first entry generally); the simple
     /// template binds its status and folder off this.</summary>
@@ -348,7 +331,7 @@ internal sealed class DryRunTreeController
 /// building it is cheap even at the streamed cap; TreeDataGrid flattens the forest into a single
 /// virtualized row list and only realizes the rows currently in view, however deep or expanded the
 /// tree is.</summary>
-public sealed partial class DryRunTreeNode : ObservableObject
+public sealed partial class DryRunTreeNode : ObservableObject, IDryRunFileRow
 {
     private static readonly char[] Separators = ['\\', '/'];
 

@@ -56,10 +56,16 @@
              below. One shared flyout serves both folders and files: the folder-navigation items and
              the file-only items toggle on IsDirectory, so a folder shows the nav + folder actions and
              a file shows only the file actions. On open its DataContext is the right-clicked node, so
-             every item binds to that node's commands. CompileBindings off because the row style sits
-             at UserControl (view-model) scope, not the node's; every item carries a leading icon so
-             the right option is quick to spot. -->
-        <MenuFlyout x:Key="NodeContextMenu" x:CompileBindings="False">
+             every item binds to that node's commands; every item carries a leading icon so the right
+             option is quick to spot.
+             DataType pins the compiled-binding type to the node — the ambient x:DataType here is the
+             view model, exactly as it is for the row-background Setter below, which already does this.
+             It must be compiled rather than a ReflectionBinding: the UI publishes with PublishAot, where
+             a reflection binding is both IL3050 (the binding path needs dynamic code) and IL2026 (a
+             member reached ONLY from markup is invisible to the trimmer, so it can be removed and leave
+             a menu item that silently does nothing — the five folder-nav commands here have no C#
+             caller at all). -->
+        <MenuFlyout x:Key="NodeContextMenu" x:DataType="vm:DryRunTreeNode">
             <!-- Folder navigation (folders only) -->
             <MenuItem Header="Open Folder" Command="{Binding OpenFolderCommand}" IsVisible="{Binding IsDirectory}" InputGesture="Enter">
                 <MenuItem.Icon><PathIcon Data="{StaticResource IconAdd}" Width="16" Height="16" /></MenuItem.Icon>
@@ -104,11 +110,13 @@
             </MenuItem>
         </MenuFlyout>
 
-        <!-- Right-click menu for the flat Sources/Destinations list rows (always files). Shared by
-             both lists: DryRunFileRow and DryRunDestinationRow expose the same command names, so on
-             open the items bind against whichever row's DataContext they were shown on. Open File /
-             Open File In Explorer grey out (CanExecute disk check) when the file isn't on disk. -->
-        <MenuFlyout x:Key="FileContextMenu" x:CompileBindings="False">
+        <!-- Right-click menu for the flat Sources/Destinations list rows (always files). Shared by both
+             lists, and the shared TYPE is what lets these be compiled bindings: DryRunFileRow and
+             DryRunDestinationRow both implement IDryRunFileRow, so the five command names are a
+             compile-time contract rather than two independent sets of identically-spelled members held
+             in step by a comment. Open File / Open File In Explorer grey out (CanExecute disk check)
+             when the file isn't on disk. -->
+        <MenuFlyout x:Key="FileContextMenu" x:DataType="vm:IDryRunFileRow">
             <MenuItem Header="Copy Path" Command="{Binding CopyPathCommand}" InputGesture="Ctrl+C">
                 <MenuItem.Icon><PathIcon Data="{StaticResource IconRestore}" Width="16" Height="16" /></MenuItem.Icon>
             </MenuItem>
@@ -503,7 +511,11 @@
                     <ContentControl Grid.Row="3" IsVisible="{Binding Sources.ShowTree}"
                                     Content="{Binding Sources.TreeSource}">
                         <ContentControl.ContentTemplate>
-                            <DataTemplate x:CompileBindings="False">
+                            <!-- ITreeDataGridSource, not the closed generic: the DataContext is a
+                                 HierarchicalTreeDataGridSource<DryRunTreeNode>, which XAML cannot name,
+                                 and the non-generic interface is exactly what TreeDataGrid.Source takes.
+                                 Enough for a compiled pass-through binding of the DataContext. -->
+                            <DataTemplate x:DataType="ITreeDataGridSource">
                                 <TreeDataGrid Classes="rows" Source="{Binding}" />
                             </DataTemplate>
                         </ContentControl.ContentTemplate>
@@ -641,7 +653,11 @@
                     <ContentControl Grid.Row="3" IsVisible="{Binding Destinations.ShowTree}"
                                     Content="{Binding Destinations.TreeSource}">
                         <ContentControl.ContentTemplate>
-                            <DataTemplate x:CompileBindings="False">
+                            <!-- ITreeDataGridSource, not the closed generic: the DataContext is a
+                                 HierarchicalTreeDataGridSource<DryRunTreeNode>, which XAML cannot name,
+                                 and the non-generic interface is exactly what TreeDataGrid.Source takes.
+                                 Enough for a compiled pass-through binding of the DataContext. -->
+                            <DataTemplate x:DataType="ITreeDataGridSource">
                                 <TreeDataGrid Classes="rows" Source="{Binding}" />
                             </DataTemplate>
                         </ContentControl.ContentTemplate>

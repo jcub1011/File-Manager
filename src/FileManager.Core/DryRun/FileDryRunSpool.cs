@@ -233,12 +233,3 @@ internal sealed class FileDryRunSpool : IDryRunSpool
         }
     }
 }
-
-/// <summary>Creates <see cref="FileDryRunSpool"/>s, resolving the scratch directory fresh per run so a
-/// changed setting takes effect on the next dry run.</summary>
-internal sealed class FileDryRunSpoolFactory(
-    Func<string> scratchDirectoryProvider, long spillThresholdBytes, ILogger logger) : IDryRunSpoolFactory
-{
-    public IDryRunSpool Create(EvaluationCarrierPool pool) =>
-        new FileDryRunSpool(scratchDirectoryProvider(), spillThresholdBytes, pool, logger);
-}

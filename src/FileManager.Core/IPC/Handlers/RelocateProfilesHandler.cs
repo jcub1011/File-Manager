@@ -119,14 +119,9 @@ public sealed class RelocateProfilesHandler(
             // Phase 4 — point the in-memory catalog at the new directory. Settings and files already
             // switched, so a reload failure must NOT report success: the catalog would keep serving
             // the old directory's snapshot until some later reload.
-            var reload = catalog.Reload();
-            if (reload.TryGetError(out string? reloadError))
-            {
-                logger.LogError("Catalog reload after relocation failed: {Error}", reloadError);
-                return Fail("PROFILES_RELOCATE_FAILED",
-                    $"the profiles directory was changed to \"{newDir}\", but reloading the profiles failed: {reloadError}; " +
-                    "retry, or restart the service");
-            }
+            if (CatalogReloadGuard.Check(catalog, logger, "PROFILES_RELOCATE_FAILED", $"relocated to \"{newDir}\"")
+                is { } reloadFailure)
+                return Task.FromResult<IpcResponse>(reloadFailure);
 
             logger.LogInformation(
                 "Relocated profiles directory to {NewDir} (moved {Moved}, skipped {Skipped} file(s), MoveExisting={Move})",

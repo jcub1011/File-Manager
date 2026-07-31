@@ -200,10 +200,24 @@ public sealed class DryRunEngine(
         // under budget; an overflow drops the rest and marks the report truncated.
         // AdditiveArchive can skip the sweep when the profile opts out (ScanDestination = false);
         // Mirror always sweeps because the sweep is its only source of Deleted-orphan previews.
+        // The byte budget below bounds the REPORT, not the sweep: without a cap passed in, the projector
+        // first materializes one PhysicalFile plus one VirtualFileOperation for every pre-existing file
+        // under every target root, on the service's heap, and only then does TryAddSweepEntry start
+        // rejecting. A target that is a large existing archive could therefore exhaust service memory —
+        // the exact failure the streamed path was hardened against (DryRunStreamHandler bounds its sweep
+        // by the same overall file budget). Same shape here, using this path's own candidate cap.
         bool scanDestinations = profile.EffectiveScanDestination;
+        int sweepBudget = Math.Max(0, MaxBatchCandidates - builder.DestinationFiles.Count);
         DestinationSweepResult sweep = scanDestinations
-            ? destinationProjector.Sweep(profile, builder.Survivors, truncated, ct)
+            ? destinationProjector.Sweep(profile, builder.Survivors, truncated, ct, sweepBudget)
             : new DestinationSweepResult([], []);
+        if (sweep.Truncated)
+        {
+            logger.LogWarning(
+                "Dry-run destination sweep for profile {ProfileId} hit the {Cap:N0}-entry bound; report truncated",
+                profile.Id, MaxBatchCandidates);
+            truncated = true;
+        }
         for (int i = 0; i < sweep.Files.Count; i++)
         {
             if (!builder.TryAddSweepEntry(sweep.Files[i], sweep.Ops[i]))
@@ -221,11 +235,11 @@ public sealed class DryRunEngine(
         logger.LogInformation(
             "Dry-run completed for profile {ProfileId}: {SourceCount} source files, {DestCount} destination files " +
             "in {ElapsedMs}ms{Truncated} (scan {ScanMs}ms within pipeline {EvalMs}ms — the phases overlap; " +
-            "{Probes} existence probes, {Stats} existing-target stats, {HashCount} files hashed / {HashBytes:N0} bytes)",
+            "{Probes} existence probes, {HashCount} files hashed / {HashBytes:N0} bytes)",
             profile.Id, builder.SourceFiles.Count, builder.DestinationFiles.Count,
             (completedAt - startedAt).TotalMilliseconds, truncated ? " (report truncated)" : "",
             outcome.ScanMs, outcome.EvalMs,
-            counters.ExistenceProbes, counters.ExistingStats, counters.FilesHashed, counters.BytesHashed);
+            counters.ExistenceProbes, counters.FilesHashed, counters.BytesHashed);
 
         return new DryRunReport
         {
@@ -404,10 +418,10 @@ public sealed class DryRunEngine(
             logger.LogInformation(
                 "Dry-run (stream) completed for profile {ProfileId}: {SourceCount} source files in {ElapsedMs}ms " +
                 "(scan {ScanMs}ms within pipeline {EvalMs}ms — the phases overlap; {Probes} existence probes, " +
-                "{Stats} existing-target stats, {HashCount} files hashed / {HashBytes:N0} bytes)",
+                "{HashCount} files hashed / {HashBytes:N0} bytes)",
                 profile.Id, accumulator.TotalSourceFiles, (completedAt - startedAt).TotalMilliseconds,
                 outcome!.ScanMs, outcome.EvalMs,
-                counters.ExistenceProbes, counters.ExistingStats, counters.FilesHashed, counters.BytesHashed);
+                counters.ExistenceProbes, counters.FilesHashed, counters.BytesHashed);
     }
 
     /// <summary>Returns a flushed chunk's entries to the carrier pool. A no-op for original records
@@ -491,6 +505,9 @@ public sealed class DryRunEngine(
                             linked.Cancel();
                             return;
                         }
+                        // Counted as well as logged: the report has no field for "this tree was walked
+                        // incompletely", so the count is what lets the caller say so.
+                        progress?.EntrySkipped();
                         logger.LogWarning("Dry-run enumeration warning: {Message}", fault.Message);
                         continue;
                     }
@@ -611,17 +628,16 @@ public sealed class DryRunEngine(
     private sealed class RunCounters
     {
         private long _existenceProbes;
-        private long _existingStats;
         private long _filesHashed;
         private long _bytesHashed;
 
         public long ExistenceProbes => Interlocked.Read(ref _existenceProbes);
-        public long ExistingStats => Interlocked.Read(ref _existingStats);
         public long FilesHashed => Interlocked.Read(ref _filesHashed);
         public long BytesHashed => Interlocked.Read(ref _bytesHashed);
 
+        // No separate existing-target-stat counter: the metadata read IS the existence probe (see the
+        // comment at the FileMetadataReader.Read call), so counting it twice would double-count one stat.
         public void CountExistenceProbe() => Interlocked.Increment(ref _existenceProbes);
-        public void CountExistingStat() => Interlocked.Increment(ref _existingStats);
 
         public void CountHash(long bytes)
         {

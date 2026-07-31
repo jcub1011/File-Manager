@@ -234,7 +234,11 @@ public sealed class JobExecutor(
         //    if the success path does not clean up, every overwrite leaves a full copy of the replaced
         //    file in the user's target root forever.
         CleanUpPlacementArtifacts(execution);
-        return Completed(plan, JobOutcome.Succeeded, null, null, start);
+        // The disposition error rides out on the completion as well as into job-closed: the journal is
+        // the durable record, but the orchestrator is the only thing that can tell the user, and
+        // reporting a Succeeded with a null Error is how "your sources were not disposed of" used to
+        // reach nobody at all.
+        return Completed(plan, JobOutcome.Succeeded, null, null, start) with { DispositionError = dispositionError };
     }
 
     // ---- phases ----------------------------------------------------------------------------------

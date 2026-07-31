@@ -300,4 +300,42 @@ public sealed class SettingsViewModelTests
         GlobalSettings sent = Assert.Single(gateway.SaveSettingsCalls);
         Assert.Equal(ServiceStartupMode.StartOnProgramOpen, sent.ServiceStartupMode);
     }
+
+    [Fact]
+    public async Task Save_refuses_after_a_failed_load_rather_than_persisting_the_defaults()
+    {
+        // The dialog stays populated after a failed load (the constructor's defaults), so an
+        // unguarded Save would rewrite settings.json with them — resetting a relocated
+        // ProfilesDirectory and deleting every per-drive override.
+        FakeIpcGateway gateway = new()
+        {
+            GetSettingsResult = new IpcError("SERVICE_UNAVAILABLE", "no pipe"),
+        };
+        SettingsViewModel vm = new(gateway, new FakeFolderPicker());
+
+        await vm.LoadAsync();
+        Assert.NotNull(vm.ErrorMessage);
+
+        await vm.SaveCommand.ExecuteAsync(null);
+
+        Assert.Empty(gateway.SaveSettingsCalls);
+        Assert.NotNull(vm.ErrorMessage);
+    }
+
+    [Fact]
+    public async Task Save_is_allowed_again_once_a_load_succeeds()
+    {
+        FakeIpcGateway gateway = new()
+        {
+            GetSettingsResult = new IpcError("SERVICE_UNAVAILABLE", "no pipe"),
+        };
+        SettingsViewModel vm = new(gateway, new FakeFolderPicker());
+        await vm.LoadAsync();
+
+        gateway.GetSettingsResult = new GlobalSettings { ServiceStartupMode = ServiceStartupMode.RunOnStartup };
+        await vm.LoadAsync();
+        await vm.SaveCommand.ExecuteAsync(null);
+
+        Assert.Single(gateway.SaveSettingsCalls);
+    }
 }
