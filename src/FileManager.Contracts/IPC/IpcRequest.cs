@@ -34,9 +34,12 @@ public abstract record IpcRequest
     /// 5 — relocate-profiles request added, answered with a relocate-profiles-result frame;
     /// 6 — job-progress engine events may interleave the job lifecycle stream, run-profile answers
     /// with a run-profile-result frame instead of a bare ok, and a folder run's final queued count
-    /// (including zero for "nothing matched") arrives as a run-queued event.
+    /// (including zero for "nothing matched") arrives as a run-queued event;
+    /// 7 — GlobalSettings dropped ThemeMode (settings.json schema v5): the theme is client-side state
+    /// the engine never read, so it moved to the UI's own client-settings.json. Also adds
+    /// EngineStatusSnapshot.ExecutablePath, so a client can tell WHICH executable is serving it.
     /// A mismatched service/UI pair must fail loud (IPC_VERSION_MISMATCH), never half-parse.</summary>
-    public const int CurrentProtocolVersion = 6;
+    public const int CurrentProtocolVersion = 7;
 
     public int ProtocolVersion { get; init; } = CurrentProtocolVersion;
 }

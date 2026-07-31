@@ -416,6 +416,29 @@
         <Setter Property="FontWeight" Value="SemiBold" />
         <Setter Property="Foreground" Value="{DynamicResource Brush.Text.Primary}" />
     </Style>
+    <!-- Live per-value feedback under a setting's editor ("this path does not exist, the service will
+         start from … instead"). Info reads as ordinary secondary prose; the two louder states are
+         coloured but stay plain text, because a full infoBar per setting would out-shout the window's
+         one real error banner. -->
+    <Style Selector="TextBlock.settingNotice">
+        <Setter Property="Foreground" Value="{DynamicResource Brush.Text.Secondary}" />
+    </Style>
+    <Style Selector="TextBlock.settingNotice.warning">
+        <Setter Property="Foreground" Value="{DynamicResource Brush.Warning}" />
+    </Style>
+    <Style Selector="TextBlock.settingNotice.danger">
+        <Setter Property="Foreground" Value="{DynamicResource Brush.Danger}" />
+    </Style>
+
+    <!-- A setting that cannot be edited right now (a service-owned one while the service is
+         unreachable). Only the card's own text is dimmed here: the editor inside is disabled, which the
+         control themes already grey, while the CARD stays enabled on purpose so it can still show the
+         tooltip explaining why — a disabled Avalonia control receives no pointer input, so a tooltip on
+         it would never appear. Declared AFTER .settingTitle so it wins for the title too; both
+         selectors match, and the later setter is the one that applies. -->
+    <Style Selector="Border.settingCard.disabled > StackPanel > TextBlock">
+        <Setter Property="Foreground" Value="{DynamicResource Brush.Text.Disabled}" />
+    </Style>
 
     <!-- Settings navigation tree (VS tool-window look: flat rows, no chrome of its own). Node
          visibility and expansion are driven from the view model so the search box can filter the tree;

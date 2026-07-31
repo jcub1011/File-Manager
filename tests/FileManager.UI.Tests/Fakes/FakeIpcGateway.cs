@@ -130,7 +130,30 @@ internal sealed class FakeIpcGateway : IIpcGateway
     public Task<Result<bool, IpcError>> ShutdownServiceAsync(CancellationToken ct = default)
     {
         ShutdownCalls++;
+        // A stopped service stops answering. Without this the switchover's verify loop would keep
+        // seeing the service it just shut down, which is precisely the race it exists to catch.
+        if (ShutdownResult.IsSuccess && StopMakesTheServiceUnreachable)
+            StatusResult = new IpcError("SERVICE_UNAVAILABLE", "stopped");
         return Task.FromResult(ShutdownResult);
+    }
+
+    /// <summary>Whether a successful shutdown should make <see cref="GetStatusAsync"/> start failing.
+    /// True by default because that is what really happens; a test wanting to model a service that
+    /// refuses to die sets it false.</summary>
+    public bool StopMakesTheServiceUnreachable { get; set; } = true;
+
+    public int ResetConnectionCalls { get; private set; }
+
+    /// <summary>What <see cref="GetStatusAsync"/> starts answering once the connection is reset —
+    /// i.e. what the newly launched executable reports. Null leaves the current result alone.</summary>
+    public Result<EngineStatusSnapshot, IpcError>? StatusAfterReset { get; set; }
+
+    public Task ResetConnectionAsync()
+    {
+        ResetConnectionCalls++;
+        if (StatusAfterReset is { } next)
+            StatusResult = next;
+        return Task.CompletedTask;
     }
 
     // ---- live single-job surface ------------------------------------------------------------------
@@ -265,4 +288,20 @@ internal sealed class FakeFolderPicker(string? result = null) : IFolderPicker
     }
 
     public Task<IReadOnlyList<string>> PickFilesAsync(string title) => Task.FromResult(FilesResult);
+
+    /// <summary>Path returned by <see cref="PickFileAsync"/> (null = user cancelled). Separate from
+    /// the ctor's <c>result</c> so a test can drive the folder and file pickers independently.</summary>
+    public string? FileResult { get; set; }
+
+    /// <summary>The start file and patterns asked for on the last <see cref="PickFileAsync"/> call.</summary>
+    public string? LastFileStartNear { get; private set; }
+    public IReadOnlyList<string> LastFilePatterns { get; private set; } = [];
+
+    public Task<string?> PickFileAsync(
+        string title, string filterName, IReadOnlyList<string> patterns, string? startNear = null)
+    {
+        LastFileStartNear = startNear;
+        LastFilePatterns = patterns;
+        return Task.FromResult(FileResult);
+    }
 }

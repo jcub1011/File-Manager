@@ -42,8 +42,8 @@ Three coherent increments are complete:
    real files), an **activity panel** with live progress and per-job log drill-down, and a **pause
    toggle** in the status bar. Manually triggered only — no watcher/scheduler, no transformers yet.
 
-**Test status:** 915 tests passing across the solution (Core 475, UI 284, Contracts 125,
-Platform.Windows 14, Service 17). 0 errors. A clean build emits 18 analyzer warnings, all in test
+**Test status:** 1121 tests passing across the solution (Core 509, UI 434, Contracts 135,
+Platform.Windows 14, Service 29). 0 errors. A clean build emits 18 analyzer warnings, all in test
 projects (xUnit1031/xUnit2031 in Core.Tests, CA1416 platform-guard notices in Platform.Windows.Tests);
 `src/` is warning-free.
 
@@ -132,7 +132,7 @@ triggers and transformers are the next sets.
 | Handlers: status, list/get/save/delete/validate profile, dry-run(+stream), settings, shutdown | ✅ | `get-status` now sources the real snapshot from `IJobOrchestrator`. |
 | Handlers: `run-profile`, `set-paused`, `get-matching`, `get-recent-jobs`, `get-job-log` | ✅ | Registered in the dispatch table. |
 | `subscribe` + `IIpcServer.Broadcast` | ✅ | Handled by the server directly: ack + open-ended one-way `EngineEvent` stream over a bounded, drop-oldest per-subscriber channel. |
-| Protocol version | ✅ | **6** — adds `job-progress` and `run-queued` events; `run-profile` answers `run-profile-result` (queued count + scanning flag) instead of a bare `ok`. UI and Service must ship together. |
+| Protocol version | ✅ | **7** — drops `ThemeMode` from `GlobalSettings` (settings.json schema v5); it moved to the UI-owned `client-settings.json`. Prior: 6 added `job-progress` / `run-queued` events and gave `run-profile` a `run-profile-result` reply. UI and Service must ship together. |
 
 ### §4.10 Dry-run & observability
 | Component | Status | Note |
@@ -194,6 +194,32 @@ triggers and transformers are the next sets.
   guard. `.pipeline_tmp` orphans (central) are swept.
 - **`EngineConfig`** is registered with defaults only; reconciling it with the existing
   `settings.json` / `GlobalSettings` is deferred.
+- **Settings are split by ownership** (§2.3): `settings.json` / `GlobalSettings` is engine
+  configuration the service owns, and `client-settings.json` / `ClientSettings` is UI-owned state the
+  engine never reads — the service executable path, the theme, and the sidebar layout. The split is
+  what makes the service executable path fixable *while the service is unreachable*, which is the
+  only moment it matters: the settings window refuses to write `GlobalSettings` after a failed load,
+  so a setting stored there could never recover a service that will not start. Service-owned settings
+  grey out (with a tooltip) whenever the load failed. `client-settings.json` has two independent
+  writers, so every write is read-modify-write; `ui-state.json` and the old `GlobalSettings.ThemeMode`
+  are migrated into it on first run.
+- **Service executable resolution is first-*usable*-wins** (§3.3), so a stale or mistyped path falls
+  back rather than bricking the launcher. Because that means a wrong path keeps working silently, the
+  settings window carries a live notice under the box saying what the value resolves to — found,
+  fell back to *X*, not the service executable, or nothing usable anywhere — recomputed off the UI
+  thread as the user types. Saving an unusable path is allowed (the notice is the telling), but the
+  window stays open while the configured value is not clean, because closing over the top of the
+  warning is exactly how a wrong executable got saved unnoticed.
+- **Two lockout guards** protect the recovery path, learned from an executable that started but never
+  served: `IpcGateway` will not re-spawn the same failed executable for a minute (keyed by path, so a
+  correction retries at once), and `OpenSettings` shows the window without awaiting its IPC load.
+  Together these stop a bad path from starving the connect gate and locking the user out of the only
+  window that can fix it.
+- **Saving a changed executable path switches the running service over** (§3.3): it asks whether to
+  stop the one already running, then reconnects and polls until the service reports the expected
+  `ExecutablePath`. Nothing happens when the running service is already the chosen executable, and
+  declining the stop starts nothing — only one service can hold the pipe, so a second would be both
+  futile and the duplicate the user declined.
 - **Source priority** is session-scoped in-memory; across a restart it degrades to arrival order
   (same open design as `ContentHashDedupe`, Appendix B).
 

@@ -183,6 +183,29 @@ graph BT
 | Profile picker prompt | `FileManager.UI.exe --pick <path>` | Windows context-menu verb (spec §5.3) | Ensures service running (`ServiceLauncher`), fetches matching profiles, **always prompts** (spec §3.2), offers "Create Profile…" when none match, submits `RunProfileRequest`. |
 | CLI | `FileManager.Cli.exe` (`filemanager`) | User/scripts | Thin IPC client (spec §2.2). Doubles as the fallback service launcher. |
 
+**Settings are split by ownership**, across two files under `%LOCALAPPDATA%\FileManager\`:
+
+| File | Owner | Contents | Transport |
+| --- | --- | --- | --- |
+| `settings.json` (`GlobalSettings`) | Service | Service startup mode, scan/hash thread budgets + per-drive overrides, scratch and profiles directories | IPC (`get-settings` / `update-settings`) |
+| `client-settings.json` (`ClientSettings`) | GUI | Service executable path, theme, sidebar layout | none — read/written directly |
+
+The split exists because the settings window cannot write `GlobalSettings` while the service is
+unreachable (a load failure leaves the editor at defaults, and persisting those would reset a
+relocated `ProfilesDirectory` and drop every drive override). Anything needed to *recover* from an
+unreachable service therefore cannot live there — above all the service executable path. The rule
+for placing a new setting: if the engine reads it, it is `GlobalSettings`; otherwise it is
+client-side. `ServiceStartupMode` is engine-side despite sounding like a GUI concern, because
+`AutostartApplier` reconciles the HKCU Run key from the service process (the UI may not reference
+Platform.Windows, §1 rule 3).
+
+In the settings window the client-owned categories come first and are always editable; the
+service-owned ones grey out with an explanatory tooltip whenever the load failed, which also means
+Save can never silently drop an edit to a value it did not load. `client-settings.json` has two
+independent writers (the sidebar on layout change, the settings window on Save), so **every write
+is read-modify-write**. `ClientSettingsStore` migrates the pre-split `ui-state.json` and the old
+`GlobalSettings.ThemeMode` on first run.
+
 **Shell integration is not a project.** The HKCU verb (spec §5.3) invokes
 `FileManager.UI.exe --pick "%1"`. Registration is `IShellIntegration` (§4.11), implemented in
 Platform.Windows, executed **idempotently by the Service at every startup** — self-healing, no
@@ -235,19 +258,62 @@ frame = one serialized `IpcRequest`, `IpcResponse`, or `EngineEvent` (§5.2), se
   the connection becomes a one-way event stream of `EngineEvent` frames until the client
   disconnects. The tray and the GUI activity view each hold one subscription connection.
 - **Versioning:** every request carries `ProtocolVersion` (`IpcRequest.CurrentProtocolVersion`,
-  currently `6`). History: 2 normalized the dry-run wire against a shared directory table; 3 added
+  currently `7`). History: 2 normalized the dry-run wire against a shared directory table; 3 added
   interleaved dry-run progress frames; 4 added inline profile drafts; 5 added `relocate-profiles`;
   6 added the `job-progress` and `run-queued` events and gave `run-profile` a `run-profile-result`
-  reply. The authoritative value is the constant in `IpcRequest.cs` — see its history comment. The
-  server rejects mismatches with `ErrorResponse("IPC_VERSION_MISMATCH", …)`.
+  reply; 7 dropped `ThemeMode` from `GlobalSettings` (settings.json schema v5), which moved to the
+  UI's client-settings.json, and added `EngineStatusSnapshot.ExecutablePath`. The authoritative value
+  is the constant in `IpcRequest.cs` — see its history comment. The server rejects mismatches with
+  `ErrorResponse("IPC_VERSION_MISMATCH", …)`.
 
 ### 3.3 Start-if-not-running handshake
 
 `ServiceLauncher.ConnectOrStartAsync` (Contracts, §4.9): try to connect (short timeout); on
-failure, start `FileManager.Service.exe` (path resolved relative to the calling binary), then
-retry connecting with backoff (250 ms × 20 ≈ 5 s budget) before failing. Used by the CLI, the
-GUI, and the `--pick` path — the spec §2 requirement that a shell invocation starts the service
-and queues the Payload falls out of this plus the ordinary `RunProfileRequest`.
+failure, start `FileManager.Service.exe`, then retry connecting with backoff (250 ms × 20 ≈ 5 s
+budget) before failing. Used by the CLI, the GUI, and the `--pick` path — the spec §2 requirement
+that a shell invocation starts the service and queues the Payload falls out of this plus the
+ordinary `RunProfileRequest`.
+
+**Executable resolution** (`ServiceLauncher.Resolve` → `ServiceExeResolution`) — candidates, highest
+precedence first:
+
+1. The `serviceExePath` argument, which the GUI supplies from the client-side **Service executable
+   path** setting (`ClientSettings.ServiceExecutablePath`, §2.3). Blank means "not set".
+2. The `FILEMANAGER_SERVICE_EXE` environment variable — an F5-development affordance for when the
+   UI and the Service publish to different directories.
+3. `FileManager.Service.exe` beside the calling binary.
+
+**The first USABLE candidate wins** — absolute *and* present on disk — not simply the first one
+named. A stale or mistyped setting therefore falls back instead of leaving the app unable to start
+its own service. The trade is that a wrong path would silently launch something else, so the
+resolution reports `FellBack` and the settings window says so out loud (§2.3); a relative path is
+never usable, since it would bind to the working directory, which in a real launch is Program Files
+or System32. With nothing usable anywhere, the failure names every location checked.
+
+The setting outranks the environment variable deliberately: the not-found message tells the user to
+fix the path *in Settings*, so a stale ambient variable that silently won would make that
+instruction a lie. Contracts takes the path as a parameter and never reads it — it has no knowledge
+of where the UI stores settings. `IpcGateway` supplies a `Func<string?>` rather than a snapshot, so
+a corrected path takes effect on the next connect attempt with no restart.
+
+**Switching executables.** Saving a *changed* service executable path reconciles what is actually
+running, using `EngineStatusSnapshot.ExecutablePath` (§5.2) as the only truthful source for which
+executable is serving — a service started by autostart or a previous session was never resolved by
+this client. If the running service already IS the newly chosen executable, nothing happens: starting
+a second is both futile (one pipe, one single-instance mutex) and what the user asked to avoid.
+Otherwise the settings window asks whether to stop the running one; declining leaves it alone and
+starts nothing, while accepting shuts it down and then reconnects, polling until the service reports
+the expected path. Verifying the *path* rather than merely connecting is load-bearing: the old
+process does not exit the instant it acknowledges a shutdown, so a plain connect can succeed against
+the service on its way out and report a switch that never happened.
+
+**Start cooldown.** `ConnectOrStartAsync` takes `allowStart`; `IpcGateway` passes false while the
+same executable's last start attempt failed under a minute ago. An executable that starts happily
+but never serves (a path pointing at some other program) would otherwise be re-launched on every 2 s
+status poll, each attempt burning the full retry budget while holding the connect gate — starving
+the settings load so the one window that can fix the path never opens. The cooldown is keyed by
+path, so correcting the setting retries immediately. For the same reason `OpenSettings` starts the
+settings load but does **not** await it before showing the window.
 
 **Review checklist** — What is a frame? How does a client receive events? Who may start the
 service process?
@@ -1214,8 +1280,25 @@ public sealed record IpcError(string Code, string Message);
 
 public static class ServiceLauncher
 {
-    /// <summary>Connect; on failure start FileManager.Service.exe and retry (§3.3).</summary>
-    public static Task<Result<IpcClient, string>> ConnectOrStartAsync(CancellationToken ct);
+    /// <summary>Connect; on failure start FileManager.Service.exe and retry (§3.3).
+    /// serviceExePath is the caller's configured override (the GUI's setting). allowStart false
+    /// suppresses the spawn (start-cooldown, §3.3).</summary>
+    public static Task<Result<IpcClient, string>> ConnectOrStartAsync(
+        string? serviceExePath, bool allowStart, CancellationToken ct);
+
+    /// <summary>Every place the executable might be, in precedence order, and whether it is there.
+    /// The first USABLE candidate wins; Chosen is null when none is.</summary>
+    public static ServiceExeResolution Resolve(string? configured);
+}
+
+public enum ServiceExeSource { Setting, Environment, BesideApp }
+public sealed record ServiceExeCandidate(ServiceExeSource Source, string Path, bool IsUsable);
+
+public sealed record ServiceExeResolution(IReadOnlyList&lt;ServiceExeCandidate&gt; Candidates)
+{
+    public ServiceExeCandidate? Chosen { get; }      // first usable
+    public ServiceExeCandidate? Configured { get; }  // the Setting candidate, if any
+    public bool FellBack { get; }                    // configured is unusable and something else won
 }
 
 public static class IpcFrameCodec
@@ -1687,7 +1770,13 @@ Shared read models:
 
 ```csharp
 public sealed record EngineStatusSnapshot(
-    bool Paused, int ActiveProfiles, int JobsInFlight, int QueuedPayloads, string? LastError);
+    bool Paused, int ActiveProfiles, int JobsInFlight, int QueuedPayloads, string? LastError)
+{
+    // Environment.ProcessPath of the serving process. The only truthful answer to "which executable
+    // am I talking to?" — a service started by autostart or a previous session was never resolved by
+    // this client, so the client cannot infer it. Drives the settings window's switchover (§3.3).
+    public string? ExecutablePath { get; init; }
+}
 
 public sealed record ProfileSummary(
     Guid ProfileId, string Name, bool Active, string TriggerSummary);

@@ -22,10 +22,36 @@ namespace FileManager.UI.Services;
 /// <para>The event subscription likewise takes its own connection — mandatory, since subscribing
 /// makes a connection one-way — and is likewise single-attempt: <see cref="EngineEventPump"/> owns
 /// the reconnect loop, keeping this class free of background retry.</para></summary>
-public sealed class IpcGateway : IIpcGateway, IAsyncDisposable
+/// <param name="serviceExePath">Supplies the user-configured service executable path. A delegate, not
+/// a string: this gateway is built once at startup and lives for the whole session, so a snapshot
+/// would go stale the moment the user corrects a bad path. It is invoked only on a connect attempt —
+/// i.e. only while disconnected — where a small file read is invisible next to the launcher's ~5 s
+/// retry budget, and that is what lets a corrected path take effect with no app restart. Null (the
+/// default) means "no configured path", leaving the launcher's original resolution.</param>
+/// <param name="time">Clock for the start-attempt cooldown. Injectable so the cooldown is testable
+/// without waiting a real minute.</param>
+public sealed class IpcGateway(Func<string?>? serviceExePath = null, TimeProvider? time = null)
+    : IIpcGateway, IAsyncDisposable
 {
+    /// <summary>How long a failed start attempt suppresses further start attempts for the SAME
+    /// executable. Long enough that a broken exe is launched at most once a minute instead of on
+    /// every 2 s status poll; short enough that a service which crashed once recovers on its own.</summary>
+    private static readonly TimeSpan StartCooldown = TimeSpan.FromMinutes(1);
+
     private readonly SemaphoreSlim _connectGate = new(1, 1);
+    private readonly Func<string?>? _serviceExePath = serviceExePath;
+    private readonly TimeProvider _time = time ?? TimeProvider.System;
     private IpcClient? _client;
+
+    /// <summary>The executable whose last start attempt failed, and when. Guarded by
+    /// <see cref="_connectGate"/> — the only place either is touched.
+    /// <para>Without this, an executable that starts but never serves (the classic case: the setting
+    /// points at some other program) is re-launched on every poll, forever, each attempt holding the
+    /// connect gate for the launcher's full ~5 s retry budget. That starves every other request —
+    /// including the settings load — so the window the user needs in order to FIX the path never
+    /// opens. Keyed by path so correcting the setting retries immediately.</para></summary>
+    private string? _failedStartPath;
+    private long _failedStartAt;
 
     public Task<Result<EngineStatusSnapshot, IpcError>> GetStatusAsync(CancellationToken ct = default) =>
         RequestAsync<StatusResponse, EngineStatusSnapshot>(
@@ -169,8 +195,11 @@ public sealed class IpcGateway : IIpcGateway, IAsyncDisposable
         Guid profileId, IProgress<DryRunProgress>? progress = null, Profile? draft = null,
         CancellationToken ct = default)
     {
-        // Own connection: cancel = dispose, leaving the shared channel clean.
-        var connected = await ServiceLauncher.ConnectOrStartAsync(ct).ConfigureAwait(false);
+        // Own connection: cancel = dispose, leaving the shared channel clean. May start the service:
+        // this path runs once per explicit user action, so it cannot become the runaway loop the
+        // shared channel's 2 s poll can — that is what the cooldown in EnsureConnectedAsync guards.
+        var connected = await ServiceLauncher
+            .ConnectOrStartAsync(_serviceExePath?.Invoke(), allowStart: true, ct).ConfigureAwait(false);
         if (connected.IsCanceled)
             return Result<DryRunReport, IpcError>.Canceled();
         if (connected.TryGetError(out string? connectError))
@@ -284,18 +313,95 @@ public sealed class IpcGateway : IIpcGateway, IAsyncDisposable
         {
             if (_client is not null)
                 return _client;
-            var connected = await ServiceLauncher.ConnectOrStartAsync(ct).ConfigureAwait(false);
+
+            string? exePath = _serviceExePath?.Invoke();
+            bool allowStart = MayStart(exePath);
+            var connected = await ServiceLauncher
+                .ConnectOrStartAsync(exePath, allowStart, ct).ConfigureAwait(false);
             if (connected.IsCanceled)
                 return Result<IpcClient, IpcError>.Canceled();
             if (connected.TryGetError(out string? error))
+            {
+                if (allowStart)
+                    RecordFailedStart(exePath);
                 return new IpcError("SERVICE_UNAVAILABLE", error);
+            }
             connected.TryGetValue(out IpcClient? client);
             _client = client;
+            // A connection proves whatever is configured works, so the next outage starts clean.
+            _failedStartPath = null;
             return client!;
         }
         finally
         {
             _connectGate.Release();
+        }
+    }
+
+    /// <summary>Whether this attempt may spawn a process. False only while the SAME executable's last
+    /// start attempt failed less than <see cref="StartCooldown"/> ago — a different (or corrected)
+    /// path is always allowed to try immediately. Callers hold <see cref="_connectGate"/>.
+    /// <para>Internal purely as a test seam: the policy is what stops the runaway respawn, but the
+    /// path that exercises it opens real named pipes.</para></summary>
+    internal bool MayStart(string? exePath)
+    {
+        if (_failedStartPath is null)
+            return true;
+        if (!string.Equals(_failedStartPath, exePath ?? "", StringComparison.OrdinalIgnoreCase))
+            return true;
+        return _time.GetElapsedTime(_failedStartAt) >= StartCooldown;
+    }
+
+    internal void RecordFailedStart(string? exePath)
+    {
+        _failedStartPath = exePath ?? "";
+        _failedStartAt = _time.GetTimestamp();
+    }
+
+    /// <summary>Forgets the current connection so the next request reconnects from scratch, starting
+    /// the configured executable if nothing is listening. Also clears the start cooldown, because the
+    /// caller is acting on a deliberate change rather than retrying a failure.
+    /// <para>Used when the service executable path changes: the cached client points at whatever was
+    /// running before, so without this the UI would keep talking to the old service and the new
+    /// setting would look like it did nothing.</para></summary>
+    public async Task ResetConnectionAsync()
+    {
+        IpcClient? stale;
+        try
+        {
+            await _connectGate.WaitAsync().ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            // Shutting down; there is nothing left to reset.
+            Log.Warning(ex, "IPC connect gate unavailable while resetting the connection");
+            return;
+        }
+        try
+        {
+            stale = _client;
+            _client = null;
+            _failedStartPath = null;
+        }
+        finally
+        {
+            _connectGate.Release();
+        }
+
+        if (stale is not null)
+            await DisposeQuietlyAsync(stale).ConfigureAwait(false);
+    }
+
+    private static async Task DisposeQuietlyAsync(IpcClient client)
+    {
+        try
+        {
+            await client.DisposeAsync().ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            // Last-resort catch-all (directive): teardown must never replace a caller's real result.
+            Log.Warning(ex, "Disposing a replaced IPC client failed");
         }
     }
 

@@ -14,9 +14,16 @@ using System.Threading.Tasks;
 
 namespace FileManager.UI.ViewModels;
 
-/// <summary>Edits the machine-level <see cref="GlobalSettings"/> — theme, service startup, and the
-/// scan/hash thread budgets (<see cref="ScanThreadingSettings"/>). Loads from and saves to the service
-/// over IPC. Scan concurrency is global-only now: profiles no longer override it.
+/// <summary>Edits both halves of the settings surface: the client-side <see cref="ClientSettings"/>
+/// (theme, service executable path) and the machine-level <see cref="GlobalSettings"/> (service
+/// startup and the scan/hash thread budgets, <see cref="ScanThreadingSettings"/>). Scan concurrency is
+/// global-only now: profiles no longer override it.
+///
+/// The two halves load and save independently, and that is the point. <see cref="GlobalSettings"/>
+/// belongs to the service and travels over IPC, so when the service is unreachable it can be neither
+/// read nor written — the settings that need it are disabled, and Save leaves them alone. The client
+/// half is a local file, so it always works, which is what makes
+/// <see cref="ServiceExePath"/> able to fix an unreachable service.
 ///
 /// Settings are declared as a catalog of <see cref="SettingItemViewModel"/>s (see
 /// <see cref="BuildCatalog"/>) rather than as loose properties, so the search box, the navigation tree,
@@ -28,24 +35,45 @@ public sealed partial class SettingsViewModel : ViewModelBase
 {
     private readonly IIpcGateway _gateway;
     private readonly IFolderPicker _folderPicker;
+    private readonly string _clientSettingsPath;
 
-    /// <summary>Set when <see cref="LoadAsync"/> could not read the stored settings, so the editable
-    /// state is still the constructor's defaults rather than anything the user has. Save refuses while
-    /// it is set: building a complete <see cref="GlobalSettings"/> out of those defaults and persisting
-    /// it would reset a relocated ProfilesDirectory (making the user's whole profile list vanish, since
-    /// ProfileStore resolves that directory live) and drop every per-drive override.</summary>
+    /// <summary>Set when <see cref="LoadAsync"/> could not read the stored <see cref="GlobalSettings"/>,
+    /// so that half of the editable state is still the constructor's defaults rather than anything the
+    /// user has. Save skips the GlobalSettings write while it is set: building a complete
+    /// <see cref="GlobalSettings"/> out of those defaults and persisting it would reset a relocated
+    /// ProfilesDirectory (making the user's whole profile list vanish, since ProfileStore resolves that
+    /// directory live) and drop every per-drive override. The client-side half is unaffected — it never
+    /// came from the service and is saved regardless.</summary>
     private bool _loadFailed;
 
-    public SettingsViewModel(IIpcGateway gateway, IFolderPicker folderPicker, ISystemDrives? drives = null)
+    /// <summary>The client settings as last read or written, so <see cref="SaveAsync"/> can tell a real
+    /// edit from an untouched value and leave the file alone when nothing changed.</summary>
+    private ClientSettings _storedClient = ClientSettings.Default;
+
+    public SettingsViewModel(IIpcGateway gateway, IFolderPicker folderPicker, ISystemDrives? drives = null,
+        string? clientSettingsPath = null)
     {
         _gateway = gateway;
         _folderPicker = folderPicker;
+        // Test seam, mirroring MainWindowViewModel: tests pass an isolated path so opening the settings
+        // window never reads or writes the developer's real %LOCALAPPDATA% file.
+        _clientSettingsPath = clientSettingsPath ?? UiPaths.ClientSettingsFilePath;
 
         Theme = Setting.Choice(
-            "appearance.theme", "Theme",
+            "application.theme", "Theme",
             "The application theme. System follows the Windows light/dark preference; Light and Dark force a fixed theme.",
             [ThemeMode.System, ThemeMode.Light, ThemeMode.Dark],
             ["appearance", "colour", "color", "dark mode", "light mode"]);
+
+        ServiceExePath = Setting.Text(
+            "application.serviceExePath", "Service executable path",
+            "Full path to FileManager.Service.exe. Leave blank to use the copy installed beside this " +
+            "app. Set it only if the status bar says the service executable could not be found — this " +
+            "setting is saved on this computer and takes effect without restarting the app.",
+            ["service", "executable", "exe", "path", "launch", "start", "missing", "not found",
+             "location", "background", "unreachable", "disconnected"],
+            placeholder: "Leave blank to use the default location",
+            actionButtonText: "Browse…", actionCommand: BrowseServiceExePathCommand);
 
         StartupMode = Setting.Choice(
             "startup.serviceMode", "Startup mode",
@@ -101,6 +129,14 @@ public sealed partial class SettingsViewModel : ViewModelBase
         BuildCatalog();
         BuildNavigation();
         TrackForUndo();      // last: the recorder caches the values the catalog was built with
+
+        // Live verdict on the executable path, so the user sees what a value resolves to while typing
+        // rather than discovering after a save that it silently fell back.
+        ServiceExePath.PropertyChanged += (_, e) =>
+        {
+            if (e.PropertyName == nameof(TextSettingViewModel.Value))
+                _ = RefreshServiceExeNoticeAsync();
+        };
     }
 
     // Shadow "explicit" defaults shown when a budget's Auto is unchecked, matching the engine's auto
@@ -114,6 +150,7 @@ public sealed partial class SettingsViewModel : ViewModelBase
     // never touches these directly, it renders Categories.
 
     public ChoiceSettingViewModel<ThemeMode> Theme { get; }
+    public TextSettingViewModel ServiceExePath { get; }
     public ChoiceSettingViewModel<ServiceStartupMode> StartupMode { get; }
     public AutoNumberSettingViewModel MaxScanThreads { get; }
     public AutoNumberSettingViewModel PerDriveDefault { get; }
@@ -131,18 +168,44 @@ public sealed partial class SettingsViewModel : ViewModelBase
     public ObservableCollection<SettingsNavNodeViewModel> NavNodes { get; } = [];
 
     /// <summary>Declares the categories and the settings in each. This is the only place a new setting
-    /// has to be registered for it to appear in the document, the navigation tree, and the search.</summary>
+    /// has to be registered for it to appear in the document, the navigation tree, and the search.
+    ///
+    /// Categories are grouped by OWNERSHIP, and the order matters: the client-side ones come first so
+    /// that when the service is unreachable the window reads as "these you can still change, everything
+    /// below needs the service" — with the fix for an unreachable service sitting in the part that
+    /// still works. <see cref="SettingsCategoryViewModel.RequiresService"/> is the switch.</summary>
     private void BuildCatalog()
     {
         SettingsCategoryViewModel performance = new(
-            "performance", "Scan performance", "Thread budgets shared across all profiles.");
+            "performance", "Scan performance", "Thread budgets shared across all profiles.")
+        { RequiresService = true };
 
-        Categories.Add(new SettingsCategoryViewModel("appearance", "Appearance").With(Theme));
-        Categories.Add(new SettingsCategoryViewModel("startup", "Service startup").With(StartupMode));
+        Categories.Add(new SettingsCategoryViewModel(
+            "application", "Application")
+            .With(Theme, ServiceExePath));
+        Categories.Add(new SettingsCategoryViewModel("startup", "Service startup") { RequiresService = true }
+            .With(StartupMode));
         Categories.Add(performance.With(MaxScanThreads, PerDriveDefault, MaxHashThreads));
         Categories.Add(new SettingsCategoryViewModel("performance.advanced", "Per-drive overrides", parent: performance)
+            { RequiresService = true }
             .With(DriveOverrides));
-        Categories.Add(new SettingsCategoryViewModel("storage", "Storage").With(ScratchDirectory, ProfilesDirectory));
+        Categories.Add(new SettingsCategoryViewModel("storage", "Storage") { RequiresService = true }
+            .With(ScratchDirectory, ProfilesDirectory));
+    }
+
+    /// <summary>Greys out (or restores) every setting that lives in the service-owned
+    /// <see cref="GlobalSettings"/>. Called after a load so the window can never present a
+    /// service-backed value that was not actually loaded, nor accept an edit that Save would drop.</summary>
+    private void SetServiceSettingsEnabled(bool enabled)
+    {
+        foreach (SettingsCategoryViewModel category in Categories)
+        {
+            foreach (SettingItemViewModel item in category.Items)
+            {
+                if (item.RequiresService)
+                    item.IsEnabled = enabled;
+            }
+        }
     }
 
     /// <summary>Builds the navigation tree from <see cref="Categories"/>: one branch per top-level
@@ -197,6 +260,7 @@ public sealed partial class SettingsViewModel : ViewModelBase
         {
             OnPropertyChanged(nameof(IsDirty));
             OnPropertyChanged(nameof(CloseButtonText));
+            DiscardChangesCommand.NotifyCanExecuteChanged();
         }
     }
 
@@ -204,8 +268,23 @@ public sealed partial class SettingsViewModel : ViewModelBase
     public bool IsDirty => History.IsDirty;
 
     /// <summary>What the close button says. Naming the consequence at the moment of the click is the
-    /// whole point: closing has always discarded pending edits, it just never said so.</summary>
-    public string CloseButtonText => IsDirty ? "Discard changes" : "Close";
+    /// whole point: closing discards pending edits, and should say so. Distinct from the Discard
+    /// button beside it, which reverts the edits and leaves the window open.</summary>
+    public string CloseButtonText => IsDirty ? "Close without saving" : "Close";
+
+    /// <summary>Throws away pending edits by reloading the persisted state, rather than by walking the
+    /// undo stack back to the saved marker. Reloading is unconditionally correct: after a save followed
+    /// by an undo and a fresh edit, the marker has left with the discarded redo branch and the saved
+    /// position is no longer reachable through the stacks at all. It also resets the history, which is
+    /// what "discard" should mean — there is nothing left to step back through.</summary>
+    [RelayCommand(CanExecute = nameof(CanDiscardChanges))]
+    private async Task DiscardChanges()
+    {
+        await LoadAsync();
+        StatusMessage = "Changes discarded.";
+    }
+
+    private bool CanDiscardChanges() => IsDirty && !IsBusy;
 
     // ============================ Search ============================
 
@@ -328,6 +407,7 @@ public sealed partial class SettingsViewModel : ViewModelBase
 
     [ObservableProperty]
     [NotifyCanExecuteChangedFor(nameof(ChangeProfilesDirectoryCommand))]
+    [NotifyCanExecuteChangedFor(nameof(DiscardChangesCommand))]
     public partial bool IsBusy { get; set; }
 
     [RelayCommand]
@@ -420,10 +500,6 @@ public sealed partial class SettingsViewModel : ViewModelBase
             StringComparison.OrdinalIgnoreCase);
     }
 
-    /// <summary>Set by the host so a successful save can close the dialog. Kept as a callback so the
-    /// VM stays window-agnostic (mirrors the folder-picker seam).</summary>
-    public Action? RequestClose { get; set; }
-
     public async Task LoadAsync()
     {
         IsBusy = true;
@@ -436,16 +512,32 @@ public sealed partial class SettingsViewModel : ViewModelBase
         using IDisposable suppressed = History.Suppress();
         try
         {
+            // FIRST, and deliberately outside everything below: these are local, and reading them
+            // before the IPC call is what stops a failed load from presenting a blank service
+            // executable path — which a subsequent Save would then persist, erasing the working
+            // override that is the user's way out of an unreachable service.
+            _storedClient = ClientSettingsStore.Read(_clientSettingsPath);
+            Theme.Value = _storedClient.ThemeMode;
+            ServiceExePath.Value = _storedClient.ServiceExecutablePath ?? "";
+            // Await it here (unlike the fire-and-forget on edit) so a window opened against a stored
+            // path that has since gone missing shows the warning on its first paint.
+            await RefreshServiceExeNoticeAsync();
+
             var result = await _gateway.GetSettingsAsync();
             if (result.TryGetError(out IpcError? error))
             {
-                ErrorMessage = $"Could not load settings: {error.Message}";
+                ErrorMessage = error.Code == "SERVICE_UNAVAILABLE"
+                    ? $"Could not load the service's settings: {error.Message} The settings above can still be changed."
+                    : $"Could not load the service's settings: {error.Message}";
                 _loadFailed = true;
+                // Nothing below was loaded, so nothing below may be edited: an edit the user made here
+                // would be silently dropped by Save, and the value shown would be a default they never
+                // chose. The application settings stay live.
+                SetServiceSettingsEnabled(false);
                 return;
             }
             result.TryGetValue(out GlobalSettings? settings);
-            Theme.Value = settings!.ThemeMode;
-            StartupMode.Value = settings.ServiceStartupMode;
+            StartupMode.Value = settings!.ServiceStartupMode;
             ScratchDirectory.Value = settings.ScratchDirectory;
             ProfilesDirectory.Value = settings.ProfilesDirectory;
 
@@ -473,13 +565,15 @@ public sealed partial class SettingsViewModel : ViewModelBase
             // Last: the whole mapping above succeeded, so the editable state is now the stored state
             // and Save has something real to write.
             _loadFailed = false;
+            SetServiceSettingsEnabled(true);
         }
         catch (Exception ex)
         {
             // Last resort: an unexpected exception becomes an error banner, not an unobserved fault.
             Serilog.Log.Error(ex, "Loading global settings failed unexpectedly");
-            ErrorMessage = $"Could not load settings: {ex.Message}";
+            ErrorMessage = $"Could not load the service's settings: {ex.Message}";
             _loadFailed = true;
+            SetServiceSettingsEnabled(false);
         }
         finally
         {
@@ -496,12 +590,38 @@ public sealed partial class SettingsViewModel : ViewModelBase
         StatusMessage = null;
         try
         {
-            // A load that failed left every setting at its constructor default, so a save here would
-            // overwrite the stored file with defaults rather than with the user's settings. Refuse
-            // instead: the service is a separate process and can simply be mid-restart.
+            // The client half first, and before the _loadFailed gate below. These values are local and
+            // were really loaded, so nothing about an unreachable service makes them unsafe to write —
+            // and refusing would make the service executable path useless at the only moment it
+            // matters. The gate still protects every GlobalSettings value, which is what it is for.
+            // Captured before the write, so the switchover below can tell an actual change from a save
+            // that merely touched other settings — this must only ever trigger on a real edit.
+            string? previousExePath = _storedClient.ServiceExecutablePath;
+            string? exePath = SaveClientSettings();
+            bool exePathChanged = !PathsEqual(previousExePath, exePath);
+            ThemeApplier.Apply(Theme.Value);              // applies whether or not the service is up
+
+            // Re-check the saved path so the notice under the box reflects what was actually stored.
+            // The window stays open after a save regardless, which is what makes a warning here
+            // readable — it used to be dismissed along with the dialog the instant it was set.
+            ServiceExeResolution resolution = await Task.Run(() => ServiceLauncher.Resolve(exePath));
+            ApplyServiceExeNotice(resolution);
+
+            // A load that failed left the service's settings at their constructor defaults, so writing
+            // them here would overwrite the stored file with defaults rather than with the user's
+            // settings. Skip that half instead: the service is a separate process and can simply be
+            // mid-restart. Marking saved is honest here precisely because those settings are disabled
+            // while the load has failed — the user cannot have pending edits to them.
             if (_loadFailed)
             {
-                ErrorMessage = "Settings could not be loaded, so saving would overwrite your stored settings with defaults. Close and reopen this window once the service is reachable.";
+                StatusMessage = "Application settings saved.";
+                ErrorMessage = "The service's own settings could not be loaded and were left unchanged.";
+                History.MarkSaved();
+                // Nothing is connected, so there is nothing to offer to shut down — but the cached
+                // connection state still has to be cleared so the next attempt starts the new path
+                // instead of serving out a cooldown the old one earned.
+                if (exePathChanged)
+                    await _gateway.ResetConnectionAsync();
                 return;
             }
 
@@ -546,7 +666,6 @@ public sealed partial class SettingsViewModel : ViewModelBase
 
             GlobalSettings settings = new()
             {
-                ThemeMode = Theme.Value,
                 ServiceStartupMode = StartupMode.Value,
                 ScratchDirectory = scratch,
                 // The profiles directory is changed transactionally via ChangeProfilesDirectory; carry
@@ -568,11 +687,14 @@ public sealed partial class SettingsViewModel : ViewModelBase
                 return;
             }
             StatusMessage = "Saved.";
-            ThemeApplier.Apply(Theme.Value);      // apply the selected theme app-wide on save
             // Clears the unsaved-changes flag without dropping the history, so the user can still step
             // back through what they just saved.
             History.MarkSaved();
-            RequestClose?.Invoke();
+
+            // LAST, and deliberately after the GlobalSettings write: switching executables can stop the
+            // service, which would make that write fail if it were still pending.
+            if (exePathChanged)
+                await SwitchServiceExecutableAsync(resolution);
         }
         catch (Exception ex)
         {
@@ -584,6 +706,278 @@ public sealed partial class SettingsViewModel : ViewModelBase
         {
             IsBusy = false;
         }
+    }
+
+    /// <summary>Persists the client-side settings and returns the path stored for the service
+    /// executable (null when the setting is blank).
+    ///
+    /// Nothing here can refuse a save. An unusable path is no longer fatal — resolution falls back to
+    /// the next candidate — and refusing would be the wrong shape anyway: the state worth warning
+    /// about ("your path is being ignored, here is what is being used instead") could then never exist,
+    /// and a path that was valid when saved can go missing later regardless. <see cref="ServiceExePath"/>'s
+    /// notice does the telling, and <see cref="SaveAsync"/> keeps the window open when it is not Info.
+    ///
+    /// Writes only on a real change, so a save that never touched these never touches the file — which
+    /// also keeps read-modify-write honest against the sidebar, the other writer of this file.</summary>
+    private string? SaveClientSettings()
+    {
+        string typed = ServiceExePath.Value?.Trim() ?? "";
+
+        // A hand-typed folder is the likeliest near-miss (Browse can only return a file), and it is
+        // unambiguous when the executable is sitting in it — so complete it rather than scold.
+        if (typed.Length > 0
+            && Directory.Exists(typed)
+            && File.Exists(Path.Combine(typed, ServiceLauncher.ServiceExeName)))
+        {
+            typed = Path.Combine(typed, ServiceLauncher.ServiceExeName);
+        }
+
+        // Blank means "no override", stored as absent rather than as an empty string so the file says
+        // what it means and the launcher's IsNullOrWhiteSpace check reads naturally.
+        string? exePath = typed.Length == 0 ? null : typed;
+
+        // Normalisation (trimming, folder completion) is not a user edit, so it must not land on the
+        // undo stack as a step the user then has to undo twice.
+        using (History.Suppress())
+            ServiceExePath.Value = exePath ?? "";
+
+        ClientSettings updated = _storedClient with
+        {
+            ServiceExecutablePath = exePath,
+            ThemeMode = Theme.Value,
+        };
+        if (updated == _storedClient)
+            return exePath;
+
+        // Read-modify-write against the file, not against _storedClient: the sidebar writes its own
+        // half of this file on its own schedule, so the copy read at load time may already be stale.
+        ClientSettingsStore.Write(
+            _clientSettingsPath,
+            ClientSettingsStore.Read(_clientSettingsPath) with
+            {
+                ServiceExecutablePath = exePath,
+                ThemeMode = Theme.Value,
+            });
+        _storedClient = updated;
+        return exePath;
+    }
+
+    // ============================ Switching to a new service executable ============================
+
+    /// <summary>Set by the host to ask (modal Yes/No) whether to stop the service that is already
+    /// running, when the user points the executable path somewhere else. Kept as a callback so the VM
+    /// stays window-agnostic (mirrors <see cref="ConfirmMoveProfiles"/>).</summary>
+    public Func<string, Task<bool>>? ConfirmStopPreviousService { get; set; }
+
+    /// <summary>How long to wait for the newly configured executable to take over. Each poll is cheap
+    /// while the old service is still answering; the one expensive step is the single launch attempt,
+    /// which carries the launcher's own retry budget. Internal purely as a test seam (mirrors
+    /// <c>JobProgressPublisher.Interval</c>) — neither is user-configurable.</summary>
+    internal int SwitchAttempts { get; init; } = 20;
+    internal TimeSpan SwitchPollDelay { get; init; } = TimeSpan.FromMilliseconds(250);
+
+    /// <summary>Makes the running service match the executable the user just chose. Outcomes are
+    /// reported through <see cref="StatusMessage"/> / <see cref="ErrorMessage"/>, which the window
+    /// keeps showing — it no longer closes on save, so there is nothing to gate.
+    ///
+    /// <para>Whatever is serving right now was resolved by whoever started it — which may not have
+    /// been this client at all (autostart, or a previous session), so the only truthful source for
+    /// "which executable is actually running" is the service's own report in the status snapshot.</para></summary>
+    private async Task SwitchServiceExecutableAsync(ServiceExeResolution resolution)
+    {
+        if (resolution.Chosen is not { } desired)
+            return;      // nothing usable to switch TO; the notice already says so
+
+        var status = await _gateway.GetStatusAsync();
+        if (!status.TryGetValue(out EngineStatusSnapshot? running))
+        {
+            // Not connected: nothing to shut down, and the reset lets the next attempt start the newly
+            // configured executable straight away.
+            await _gateway.ResetConnectionAsync();
+            return;
+        }
+
+        if (running.ExecutablePath is { } current && PathsEqual(current, desired.Path))
+            return;      // already the one the user wants — starting a second would duplicate it
+
+        string where = running.ExecutablePath is { Length: > 0 } path ? $"\"{path}\"" : "another location";
+        string jobs = running.JobsInFlight > 0
+            ? $" It currently has {running.JobsInFlight} job(s) running, which stopping it would interrupt."
+            : "";
+        bool stop = ConfirmStopPreviousService is not null
+            && await ConfirmStopPreviousService(
+                $"A service is already running from {where}.{jobs}\n\n" +
+                $"Stop it and start the service from \"{desired.Path}\" instead? " +
+                "Choose Keep running to leave it alone — this app will keep using it until it stops.");
+
+        if (!stop)
+        {
+            // Deliberately does NOT start the new one. Only one service can hold the pipe (and the
+            // single-instance mutex), so a second would exit immediately anyway — and the user just
+            // said they did not want another one.
+            StatusMessage = "Saved. The service already running was left alone, and this app keeps " +
+                            "using it until it stops.";
+            return;
+        }
+
+        var stopped = await _gateway.ShutdownServiceAsync();
+        if (stopped.TryGetError(out IpcError? stopError))
+        {
+            Serilog.Log.Warning("Stopping the previous service failed: {Code} {Message}",
+                stopError.Code, stopError.Message);
+            ErrorMessage = $"Could not stop the service that is already running: {stopError.Message}. " +
+                           "The new executable path is saved, but it will not be used until that " +
+                           "service stops.";
+            return;
+        }
+
+        if (await WaitForServiceAtAsync(desired.Path))
+        {
+            StatusMessage = $"Saved. Now running the service from \"{desired.Path}\".";
+            return;
+        }
+
+        ErrorMessage = $"The previous service was stopped, but the service could not be started from " +
+                       $"\"{desired.Path}\" — check that it is really the service executable.";
+    }
+
+    /// <summary>Reconnects until the service reports it is running from <paramref name="desired"/>.
+    /// <para>Verifying the path rather than merely connecting is the point: the old process does not
+    /// exit the instant it acknowledges a shutdown, so a plain connect can succeed against the very
+    /// service that is on its way out and report a switch that never happened. Resetting each round
+    /// also clears the start cooldown, so a launch attempt that lost the race to the old process's
+    /// single-instance mutex is retried instead of being locked out for a minute.</para></summary>
+    private async Task<bool> WaitForServiceAtAsync(string desired)
+    {
+        for (int attempt = 0; attempt < SwitchAttempts; attempt++)
+        {
+            await _gateway.ResetConnectionAsync();
+            var status = await _gateway.GetStatusAsync();
+            if (status.TryGetValue(out EngineStatusSnapshot? snapshot)
+                && snapshot.ExecutablePath is { } path
+                && PathsEqual(path, desired))
+            {
+                return true;
+            }
+            await Task.Delay(SwitchPollDelay);
+        }
+        return false;
+    }
+
+    /// <summary>File-path equality tolerant of casing, trailing separators and relative spelling. Blank
+    /// equals blank, so "was not set" and "still not set" is not read as a change.</summary>
+    private static bool PathsEqual(string? left, string? right)
+    {
+        bool leftBlank = string.IsNullOrWhiteSpace(left);
+        bool rightBlank = string.IsNullOrWhiteSpace(right);
+        if (leftBlank || rightBlank)
+            return leftBlank && rightBlank;
+        try
+        {
+            return string.Equals(
+                Path.TrimEndingDirectorySeparator(Path.GetFullPath(left!.Trim())),
+                Path.TrimEndingDirectorySeparator(Path.GetFullPath(right!.Trim())),
+                StringComparison.OrdinalIgnoreCase);
+        }
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException)
+        {
+            // A malformed path cannot be normalised; fall back to comparing what was typed rather than
+            // letting a bad string abort a save.
+            return string.Equals(left!.Trim(), right!.Trim(), StringComparison.OrdinalIgnoreCase);
+        }
+    }
+
+    // ============================ Service executable diagnostics ============================
+
+    /// <summary>Recomputes <see cref="ServiceExePath"/>'s notice for the value currently in the box.
+    /// Fire-and-forget from the property change hook, so the user sees the verdict while typing rather
+    /// than only after saving.
+    /// <para>The resolution touches the filesystem, which is why it runs off the UI thread: probing a
+    /// half-typed UNC path can block for seconds on an SMB timeout, and doing that inline would freeze
+    /// the settings window one keystroke at a time. The staleness check drops results the user has
+    /// already typed past, so out-of-order completions cannot leave a wrong verdict on screen.</para></summary>
+    private async Task RefreshServiceExeNoticeAsync()
+    {
+        string configured = ServiceExePath.Value?.Trim() ?? "";
+        ServiceExeResolution resolution = await Task.Run(() => ServiceLauncher.Resolve(configured));
+        if (!string.Equals(ServiceExePath.Value?.Trim() ?? "", configured, StringComparison.Ordinal))
+            return;      // superseded by a later keystroke
+        ApplyServiceExeNotice(resolution);
+    }
+
+    private void ApplyServiceExeNotice(ServiceExeResolution resolution)
+    {
+        (string text, SettingNoticeSeverity severity) = DescribeServiceExe(resolution);
+        ServiceExePath.SetNotice(text, severity);
+    }
+
+    /// <summary>Turns a resolution into the line shown under the box. Pure, so every case is testable
+    /// without a filesystem.</summary>
+    internal static (string Text, SettingNoticeSeverity Severity) DescribeServiceExe(ServiceExeResolution resolution)
+    {
+        ServiceExeCandidate? configured = resolution.Configured;
+        ServiceExeCandidate? chosen = resolution.Chosen;
+
+        if (configured is null)
+        {
+            // Blank: say which copy that actually means, so "leave blank" is not a leap of faith.
+            return chosen is null
+                ? ($"No service executable could be found. {CheckedList(resolution)} The service " +
+                   "cannot be started until one of these exists or a valid path is set here.",
+                   SettingNoticeSeverity.Error)
+                : ($"Using {Describe(chosen.Source)}: \"{chosen.Path}\".", SettingNoticeSeverity.Info);
+        }
+
+        if (!configured.IsUsable)
+        {
+            // The case that prompted all of this: everything keeps working, so without saying it out
+            // loud nothing would ever tell the user their path is being ignored.
+            return chosen is null
+                ? ($"No file at this path, and no service executable could be found anywhere else. " +
+                   $"{CheckedList(resolution)} The service cannot be started.",
+                   SettingNoticeSeverity.Error)
+                : ($"No file at this path — the service will start from {Describe(chosen.Source)} " +
+                   $"instead: \"{chosen.Path}\". Clear this box to use that on purpose.",
+                   SettingNoticeSeverity.Warning);
+        }
+
+        if (!string.Equals(Path.GetFileName(configured.Path), ServiceLauncher.ServiceExeName,
+                StringComparison.OrdinalIgnoreCase))
+        {
+            // A renamed build is legitimate, so this is not an error — but pointing at some unrelated
+            // program is the failure that looks like nothing is wrong: it launches fine and simply
+            // never answers, which reads as "the service won't start" with no clue why.
+            return ($"\"{Path.GetFileName(configured.Path)}\" is not called {ServiceLauncher.ServiceExeName}. " +
+                    "If it is not really the service it will start and then never connect, and the app " +
+                    "will keep reporting the service as unavailable.",
+                    SettingNoticeSeverity.Warning);
+        }
+
+        return ($"Found. The service will start from \"{configured.Path}\".", SettingNoticeSeverity.Info);
+    }
+
+    private static string CheckedList(ServiceExeResolution resolution)
+    {
+        List<string> parts = [];
+        foreach (ServiceExeCandidate candidate in resolution.Candidates)
+            parts.Add($"\"{candidate.Path}\"");
+        return parts.Count == 0 ? "" : $"Checked {string.Join(", ", parts)}.";
+    }
+
+    private static string Describe(ServiceExeSource source) => source switch
+    {
+        ServiceExeSource.Setting => "the path set here",
+        ServiceExeSource.Environment => $"the {ServiceLauncher.ServiceExeOverrideVariable} environment variable",
+        _ => "the copy installed beside this app",
+    };
+
+    [RelayCommand]
+    private async Task BrowseServiceExePath()
+    {
+        string? picked = await _folderPicker.PickFileAsync(
+            $"Choose {ServiceLauncher.ServiceExeName}", "Programs", ["*.exe"], ServiceExePath.Value);
+        if (picked is not null)
+            ServiceExePath.Value = picked;
     }
 
     private static void ApplyBudget(AutoNumberSettingViewModel setting, ThreadBudget budget, int autoDefault) =>

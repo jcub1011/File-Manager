@@ -32,7 +32,7 @@ public sealed class MainWindowViewModelRunProfileTests
         FakeIpcGateway gateway = new() { GetResult = profile ?? TwoSourceProfile() };
         MainWindowViewModel shell = new(
             gateway, new FakeFolderPicker(), new FakeLogFolder(), new FakeDryRunItemActions(),
-            uiStatePath: Path.Combine(Path.GetTempPath(), "fm-ui-" + Guid.NewGuid().ToString("N") + ".json"))
+            clientSettingsPath: Path.Combine(Path.GetTempPath(), "fm-client-" + Guid.NewGuid().ToString("N") + ".json"))
         {
             ConfirmRunProfile = confirm ?? (_ => Task.FromResult(true)),
         };

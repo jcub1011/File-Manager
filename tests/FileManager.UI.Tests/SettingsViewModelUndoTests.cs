@@ -12,8 +12,9 @@ namespace FileManager.UI.Tests;
 /// session itself has to guarantee.</summary>
 public sealed class SettingsViewModelUndoTests
 {
-    private static SettingsViewModel NewVm(FakeIpcGateway? gateway = null) =>
-        new(gateway ?? new FakeIpcGateway(), new FakeFolderPicker(), new FakeSystemDrives());
+    private static SettingsViewModel NewVm(FakeIpcGateway? gateway = null, string? clientSettingsPath = null) =>
+        new(gateway ?? new FakeIpcGateway(), new FakeFolderPicker(), new FakeSystemDrives(),
+            clientSettingsPath ?? TempFiles.ClientSettings());
 
     // ============================ Unsaved changes ============================
 
@@ -22,7 +23,7 @@ public sealed class SettingsViewModelUndoTests
     {
         SettingsViewModel vm = NewVm(new FakeIpcGateway
         {
-            GetSettingsResult = new GlobalSettings { ThemeMode = ThemeMode.Dark, ScratchDirectory = @"D:\scratch" },
+            GetSettingsResult = new GlobalSettings { ScratchDirectory = @"D:\scratch" },
         });
 
         await vm.LoadAsync();
@@ -58,7 +59,9 @@ public sealed class SettingsViewModelUndoTests
         vm.Theme.Value = ThemeMode.Dark;
 
         Assert.True(vm.IsDirty);
-        Assert.Equal("Discard changes", vm.CloseButtonText);
+        // Close still discards, so it still names that; the Discard button beside it is the
+        // non-destructive alternative rather than a replacement for the warning.
+        Assert.Equal("Close without saving", vm.CloseButtonText);
     }
 
     [Fact]
@@ -100,7 +103,7 @@ public sealed class SettingsViewModelUndoTests
                 Settings = new GlobalSettings { ProfilesDirectory = @"E:\moved" },
             },
         };
-        SettingsViewModel vm = new(gateway, new FakeFolderPicker(@"E:\moved"), new FakeSystemDrives())
+        SettingsViewModel vm = new(gateway, new FakeFolderPicker(@"E:\moved"), new FakeSystemDrives(), clientSettingsPath: TempFiles.ClientSettings())
         {
             ConfirmMoveProfiles = _ => Task.FromResult(false),
         };
@@ -118,10 +121,10 @@ public sealed class SettingsViewModelUndoTests
     [Fact]
     public async Task Undo_reverts_a_theme_change()
     {
-        SettingsViewModel vm = NewVm(new FakeIpcGateway
-        {
-            GetSettingsResult = new GlobalSettings { ThemeMode = ThemeMode.Light },
-        });
+        // The theme is loaded from the client file now, not from the service's settings.
+        string clientFile = TempFiles.ClientSettings();
+        ClientSettingsStore.Write(clientFile, ClientSettings.Default with { ThemeMode = ThemeMode.Light });
+        SettingsViewModel vm = NewVm(clientSettingsPath: clientFile);
         await vm.LoadAsync();
 
         vm.Theme.Value = ThemeMode.Dark;
@@ -328,7 +331,7 @@ public sealed class SettingsViewModelUndoTests
     public async Task A_picked_drive_saves_as_the_key_the_engine_looks_up()
     {
         FakeIpcGateway gateway = new();
-        SettingsViewModel vm = new(gateway, new FakeFolderPicker(), new FakeSystemDrives());
+        SettingsViewModel vm = new(gateway, new FakeFolderPicker(), new FakeSystemDrives(), clientSettingsPath: TempFiles.ClientSettings());
         await vm.LoadAsync();
         vm.DriveOverrides.AddSpecificDriveOverrideCommand.Execute(null);
         SpecificDriveOverrideRowViewModel row = Assert.Single(vm.DriveOverrides.SpecificDriveOverrides);
@@ -348,7 +351,7 @@ public sealed class SettingsViewModelUndoTests
     public async Task A_drive_root_typed_with_its_separator_saves_as_the_canonical_key()
     {
         FakeIpcGateway gateway = new();
-        SettingsViewModel vm = new(gateway, new FakeFolderPicker(), new FakeSystemDrives());
+        SettingsViewModel vm = new(gateway, new FakeFolderPicker(), new FakeSystemDrives(), clientSettingsPath: TempFiles.ClientSettings());
         await vm.LoadAsync();
         vm.DriveOverrides.AddSpecificDriveOverrideCommand.Execute(null);
         SpecificDriveOverrideRowViewModel row = Assert.Single(vm.DriveOverrides.SpecificDriveOverrides);
@@ -367,7 +370,7 @@ public sealed class SettingsViewModelUndoTests
     public async Task Two_spellings_of_the_same_drive_are_still_rejected_as_duplicates()
     {
         FakeIpcGateway gateway = new();
-        SettingsViewModel vm = new(gateway, new FakeFolderPicker(), new FakeSystemDrives());
+        SettingsViewModel vm = new(gateway, new FakeFolderPicker(), new FakeSystemDrives(), clientSettingsPath: TempFiles.ClientSettings());
         await vm.LoadAsync();
         vm.DriveOverrides.AddSpecificDriveOverrideCommand.Execute(null);
         vm.DriveOverrides.AddSpecificDriveOverrideCommand.Execute(null);
@@ -378,5 +381,36 @@ public sealed class SettingsViewModelUndoTests
 
         Assert.Empty(gateway.SaveSettingsCalls);
         Assert.Contains("Duplicate", vm.ErrorMessage);
+    }
+
+    [Fact]
+    public async Task Normalizing_the_service_exe_path_on_save_is_not_an_undo_step()
+    {
+        // Save rewrites the box with the completed path. That is the app tidying up, not the user
+        // editing, so it must not land on the undo stack — otherwise Undo after a save steps back
+        // through a change the user never made and the window reads as dirty again.
+        string dir = Path.Combine(Path.GetTempPath(), "fm-exe-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            File.WriteAllText(Path.Combine(dir, "FileManager.Service.exe"), "x");
+            string clientFile = Path.Combine(dir, "client-settings.json");
+            SettingsViewModel vm = NewVm(clientSettingsPath: clientFile);
+            await vm.LoadAsync();
+
+            vm.ServiceExePath.Value = dir;                 // completed to the exe on save
+            await vm.SaveCommand.ExecuteAsync(null);
+
+            Assert.False(vm.IsDirty);
+            // One undo pops the user's own edit, all the way back to the loaded value. Landing on the
+            // typed folder instead — with another step still on the stack — is the bug this pins.
+            vm.History.UndoCommand.Execute(null);
+            Assert.Equal("", vm.ServiceExePath.Value);
+            Assert.False(vm.History.CanUndo);
+        }
+        finally
+        {
+            Directory.Delete(dir, recursive: true);
+        }
     }
 }

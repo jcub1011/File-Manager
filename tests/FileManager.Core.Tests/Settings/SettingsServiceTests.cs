@@ -205,19 +205,6 @@ public sealed class SettingsServiceTests : IDisposable
     }
 
     [Fact]
-    public void Default_theme_mode_is_system()
-    {
-        Assert.Equal(ThemeMode.System, NewService().Current.ThemeMode);
-    }
-
-    [Fact]
-    public void Update_persists_and_reloads_the_theme_mode()
-    {
-        NewService().Update(new GlobalSettings { ThemeMode = ThemeMode.Dark });
-        Assert.Equal(ThemeMode.Dark, NewService().Current.ThemeMode);
-    }
-
-    [Fact]
     public void An_unreadable_settings_file_is_kept_aside_before_defaults_take_over()
     {
         // Falling back to defaults is right; leaving the bad file in place is not, because Update
@@ -241,9 +228,10 @@ public sealed class SettingsServiceTests : IDisposable
         File.WriteAllText(file, "{ garbage");
         SettingsService service = NewService();
 
-        service.Update(new GlobalSettings { ThemeMode = ThemeMode.Dark });
+        service.Update(new GlobalSettings { ServiceStartupMode = ServiceStartupMode.RunOnStartup });
 
-        Assert.Equal(ThemeMode.Dark, NewService().Current.ThemeMode);   // the fresh file works
+        // The fresh file works...
+        Assert.Equal(ServiceStartupMode.RunOnStartup, NewService().Current.ServiceStartupMode);
         string kept = Assert.Single(Directory.GetFiles(_root, "settings.json.corrupt-*"));
         Assert.Equal("{ garbage", File.ReadAllText(kept));               // ...and the original survives
     }

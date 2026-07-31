@@ -34,4 +34,29 @@ internal static class FolderPickerStart
             return null;
         }
     }
+
+    /// <summary>Where a FILE picker should open for a previously chosen file: the folder CONTAINING
+    /// it, so the file itself is the visible entry. A path that is actually a directory opens at
+    /// itself — that is what a half-typed path looks like. Null when nothing usable was chosen, and
+    /// the caller falls back to Downloads.
+    /// <para><see cref="ParentOf"/> is not a substitute: it returns null for a file (it requires
+    /// <see cref="Directory.Exists"/>) and, for a directory, goes one level too high.</para></summary>
+    public static string? DirectoryOf(string? chosenFile)
+    {
+        if (string.IsNullOrWhiteSpace(chosenFile))
+            return null;
+        try
+        {
+            string full = Path.TrimEndingDirectorySeparator(Path.GetFullPath(chosenFile));
+            if (Directory.Exists(full))
+                return full;
+            return File.Exists(full) && Path.GetDirectoryName(full) is { Length: > 0 } dir ? dir : null;
+        }
+        catch (Exception ex)
+        {
+            // Same reasoning as ParentOf: opening at Downloads beats faulting the Browse command.
+            Log.Debug(ex, "Could not resolve a file-picker start folder from {Chosen}", chosenFile);
+            return null;
+        }
+    }
 }

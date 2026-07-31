@@ -60,4 +60,40 @@ public sealed class FolderPickerStartTests : IDisposable
     {
         Assert.Null(FolderPickerStart.ParentOf(chosen));
     }
+
+    // ============================ File pickers ============================
+    // A file picker opens at the folder CONTAINING the chosen file, one level lower than ParentOf —
+    // which is why it needs its own rule rather than reusing that one.
+
+    [Fact]
+    public void An_existing_file_resolves_to_the_folder_containing_it()
+    {
+        string file = Path.Combine(_root, "child", "FileManager.Service.exe");
+        File.WriteAllText(file, "x");
+
+        Assert.Equal(Path.Combine(_root, "child"), FolderPickerStart.DirectoryOf(file));
+    }
+
+    [Fact]
+    public void An_existing_folder_opens_at_itself_rather_than_at_its_parent()
+    {
+        // What a half-typed path looks like: the user has navigated to the folder but not picked a file.
+        Assert.Equal(Path.Combine(_root, "child"), FolderPickerStart.DirectoryOf(Path.Combine(_root, "child")));
+    }
+
+    [Fact]
+    public void A_file_that_no_longer_exists_falls_back()
+    {
+        Assert.Null(FolderPickerStart.DirectoryOf(Path.Combine(_root, "child", "gone.exe")));
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("   ")]
+    [InlineData("\0not a path")]
+    public void Nothing_usable_falls_back_for_files_too(string? chosen)
+    {
+        Assert.Null(FolderPickerStart.DirectoryOf(chosen));
+    }
 }

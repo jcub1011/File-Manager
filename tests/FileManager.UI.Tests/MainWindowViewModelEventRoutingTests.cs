@@ -15,7 +15,7 @@ public sealed class MainWindowViewModelEventRoutingTests
 
     private static MainWindowViewModel NewShell(FakeIpcGateway gateway) =>
         new(gateway, new FakeFolderPicker(), new FakeLogFolder(), new FakeDryRunItemActions(),
-            uiStatePath: Path.Combine(Path.GetTempPath(), "fm-ui-" + Guid.NewGuid().ToString("N") + ".json"));
+            clientSettingsPath: Path.Combine(Path.GetTempPath(), "fm-client-" + Guid.NewGuid().ToString("N") + ".json"));
 
     private static JobSummaryDto Summary(Guid jobId, string outcome = "Succeeded") =>
         new(jobId, ProfileId, @"C:\src\a.txt", outcome, null, DateTimeOffset.UnixEpoch, TimeSpan.FromSeconds(1));

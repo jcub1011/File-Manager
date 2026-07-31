@@ -14,4 +14,11 @@
     <IsAotCompatible>True</IsAotCompatible>
   </PropertyGroup>
 
+  <ItemGroup>
+    <!-- ServiceLauncher's path resolution and failure messages are internal: they are an
+         implementation detail of ConnectOrStartAsync, which cannot be tested directly because it
+         opens a real named pipe and spawns a process. -->
+    <InternalsVisibleTo Include="FileManager.Contracts.Tests" />
+  </ItemGroup>
+
 </Project>

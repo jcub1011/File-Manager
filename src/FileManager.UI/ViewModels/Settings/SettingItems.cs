@@ -50,6 +50,29 @@ public abstract partial class SettingItemViewModel : ViewModelBase
     /// <see cref="TextSettingViewModel"/>.</summary>
     public bool IsUndoable { get; init; } = true;
 
+    /// <summary>Whether this setting is stored in the service-owned <c>GlobalSettings</c>, and so cannot
+    /// be edited while the service is unreachable. Read from the owning category — ownership is what the
+    /// categories group by, so declaring it per setting would just be a chance to get it wrong.</summary>
+    public bool RequiresService => Category is { RequiresService: true };
+
+    /// <summary>False while this setting cannot be edited — today, a service-owned setting whose stored
+    /// values could not be loaded. The editor greys out and <see cref="DisabledTooltip"/> explains why;
+    /// the card around it stays enabled so that tooltip can actually be shown.</summary>
+    [ObservableProperty] public partial bool IsEnabled { get; set; } = true;
+
+    /// <summary>Why this setting is greyed out, or null while it is editable — bound straight to
+    /// <c>ToolTip.Tip</c>, where null means "no tooltip", so an editable setting shows nothing.</summary>
+    public string? DisabledTooltip => IsEnabled ? null : ServiceUnavailableTooltip;
+
+    partial void OnIsEnabledChanged(bool value) => OnPropertyChanged(nameof(DisabledTooltip));
+
+    /// <summary>The only disabled-reason there is so far. Points at the fix rather than just stating the
+    /// problem: the service executable path is the one setting that stays editable, and it is the usual
+    /// cause of an unreachable service.</summary>
+    internal const string ServiceUnavailableTooltip =
+        "The background service could not be reached, so its settings cannot be changed. Check the " +
+        "service executable path above, then reopen this window once the service is running.";
+
     /// <summary>False when the current search query does not match this setting. The view collapses the
     /// item rather than removing it, so no collection churn and no lost focus.</summary>
     [ObservableProperty] public partial bool IsVisible { get; set; } = true;
@@ -150,8 +173,23 @@ public sealed partial class ChoiceSettingViewModel<T> : ChoiceSettingViewModel
     protected override void OnSelectedOptionChangedCore() => OnPropertyChanged(nameof(Value));
 }
 
+/// <summary>How loudly a <see cref="TextSettingViewModel.Notice"/> reads.</summary>
+public enum SettingNoticeSeverity
+{
+    /// <summary>Confirms what the value resolves to. Nothing is wrong.</summary>
+    Info,
+
+    /// <summary>The value is not doing what the user probably expects, but the app still works —
+    /// it fell back, or the file is not the program it should be.</summary>
+    Warning,
+
+    /// <summary>The value cannot work and nothing else covers for it.</summary>
+    Error,
+}
+
 /// <summary>A free-text setting, optionally read-only and optionally paired with a trailing action
-/// button ("Browse…", "Change…").</summary>
+/// button ("Browse…", "Change…"), and optionally carrying a <see cref="Notice"/> — a live line under
+/// the box saying what the value actually resolves to.</summary>
 public sealed partial class TextSettingViewModel : SettingItemViewModel, IUndoTrackable
 {
     public TextSettingViewModel(
@@ -159,6 +197,34 @@ public sealed partial class TextSettingViewModel : SettingItemViewModel, IUndoTr
         : base(id, title, description, keywords) { }
 
     [ObservableProperty] public partial string Value { get; set; } = "";
+
+    /// <summary>Live feedback about what <see cref="Value"/> resolves to, shown under the box. Null
+    /// when there is nothing to say. This is deliberately NOT the same thing as the window's
+    /// save-time error banner: a path can be wrong in a way that is worth telling the user about
+    /// without being worth refusing to save, and the user needs to see it while typing rather than
+    /// only after committing.</summary>
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(HasNotice))]
+    public partial string? Notice { get; set; }
+
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(NoticeIsWarning))]
+    [NotifyPropertyChangedFor(nameof(NoticeIsError))]
+    public partial SettingNoticeSeverity NoticeSeverity { get; set; }
+
+    public bool HasNotice => !string.IsNullOrEmpty(Notice);
+
+    // Bound as style classes. Booleans rather than a converter because compiled bindings want a
+    // concrete member, and two of them are cheaper than a value converter for three states.
+    public bool NoticeIsWarning => NoticeSeverity == SettingNoticeSeverity.Warning;
+    public bool NoticeIsError => NoticeSeverity == SettingNoticeSeverity.Error;
+
+    /// <summary>Sets both halves of the notice in one step.</summary>
+    public void SetNotice(string? text, SettingNoticeSeverity severity = SettingNoticeSeverity.Info)
+    {
+        NoticeSeverity = severity;
+        Notice = text;
+    }
 
     /// <summary>Coalesced: a typed-in path arrives one keystroke at a time and should step back as one
     /// edit, not character by character.</summary>

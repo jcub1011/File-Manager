@@ -70,4 +70,39 @@ public sealed class StorageProviderFolderPicker(Window window) : IFolderPicker
             return [];
         }
     }
+
+    public async Task<string?> PickFileAsync(
+        string title, string filterName, IReadOnlyList<string> patterns, string? startNear = null)
+    {
+        try
+        {
+            FilePickerFileType filter = new(filterName) { Patterns = [.. patterns] };
+            IReadOnlyList<IStorageFile> files = await window.StorageProvider.OpenFilePickerAsync(
+                new FilePickerOpenOptions
+                {
+                    Title = title,
+                    AllowMultiple = false,
+                    FileTypeFilter = [filter],
+                    SuggestedStartLocation = await ResolveFileStartAsync(startNear),
+                });
+            return files.Count == 1 ? files[0].TryGetLocalPath() : null;
+        }
+        catch (Exception ex)
+        {
+            // Last resort: as above — "nothing picked", logged, never a faulted Browse command.
+            Log.Error(ex, "Single-file picker failed unexpectedly");
+            return null;
+        }
+    }
+
+    /// <summary>The file dialog's opening location: the folder containing
+    /// <paramref name="startNear"/>, else Downloads. Distinct from <see cref="ResolveStartAsync"/>,
+    /// which parents a folder — doing that to a file's folder would open one level too high.</summary>
+    private async Task<IStorageFolder?> ResolveFileStartAsync(string? startNear)
+    {
+        if (FolderPickerStart.DirectoryOf(startNear) is { } dir
+            && await window.StorageProvider.TryGetFolderFromPathAsync(dir) is { } folder)
+            return folder;
+        return await window.StorageProvider.TryGetWellKnownFolderAsync(WellKnownFolder.Downloads);
+    }
 }

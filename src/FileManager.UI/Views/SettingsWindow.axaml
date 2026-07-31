@@ -26,13 +26,21 @@
 
       Each setting renders as a Border.settingCard, which doubles as the scroll anchor the code-behind
       brings into view when a tree node is selected.
+
+      Every card follows the same disabled recipe: IsEnabled goes on the INNER StackPanel, while the
+      card border itself stays enabled and carries ToolTip.Tip. That split is load-bearing — a disabled
+      Avalonia control receives no pointer input, so a tooltip placed on it could never be shown, and
+      the whole point of greying a setting is being able to say why. DisabledTooltip is null while the
+      setting is editable, which is exactly how ToolTip.Tip spells "no tooltip".
     -->
     <Window.DataTemplates>
 
         <!-- Pick-one-of-N (enum). Binds the non-generic base so the typed subclass stays a C# concern. -->
         <DataTemplate DataType="st:ChoiceSettingViewModel" x:DataType="st:ChoiceSettingViewModel">
-            <Border Classes="settingCard" Classes.selected="{Binding IsSelected}" IsVisible="{Binding IsVisible}">
-                <StackPanel Spacing="5">
+            <Border Classes="settingCard" Classes.selected="{Binding IsSelected}"
+                    Classes.disabled="{Binding !IsEnabled}" IsVisible="{Binding IsVisible}"
+                    ToolTip.Tip="{Binding DisabledTooltip}">
+                <StackPanel Spacing="5" IsEnabled="{Binding IsEnabled}">
                     <TextBlock Classes="settingTitle" Text="{Binding Title}" />
                     <ComboBox ItemsSource="{Binding Options}" SelectedItem="{Binding SelectedOption}"
                               MinWidth="260" HorizontalAlignment="Left">
@@ -49,8 +57,10 @@
 
         <!-- Free text, optionally read-only and optionally with a trailing action ("Browse…", "Change…"). -->
         <DataTemplate DataType="st:TextSettingViewModel" x:DataType="st:TextSettingViewModel">
-            <Border Classes="settingCard" Classes.selected="{Binding IsSelected}" IsVisible="{Binding IsVisible}">
-                <StackPanel Spacing="5">
+            <Border Classes="settingCard" Classes.selected="{Binding IsSelected}"
+                    Classes.disabled="{Binding !IsEnabled}" IsVisible="{Binding IsVisible}"
+                    ToolTip.Tip="{Binding DisabledTooltip}">
+                <StackPanel Spacing="5" IsEnabled="{Binding IsEnabled}">
                     <TextBlock Classes="settingTitle" Text="{Binding Title}" />
                     <!-- Star column, not a MinWidth: a path box has to give width back when the window
                          narrows, and this card cannot overflow (the document scrolls vertically only). -->
@@ -61,6 +71,12 @@
                                 Command="{Binding ActionCommand}" IsVisible="{Binding HasAction}"
                                 VerticalAlignment="Center" />
                     </Grid>
+                    <!-- Live feedback about what the typed value actually resolves to. Above the
+                         description, because it is about THIS value rather than about the setting. -->
+                    <TextBlock Classes="settingNotice" TextWrapping="Wrap" Text="{Binding Notice}"
+                               Classes.warning="{Binding NoticeIsWarning}"
+                               Classes.danger="{Binding NoticeIsError}"
+                               IsVisible="{Binding HasNotice}" />
                     <TextBlock Classes="secondary" TextWrapping="Wrap" Text="{Binding Description}" />
                 </StackPanel>
             </Border>
@@ -68,8 +84,10 @@
 
         <!-- A number the engine can choose for you: while Auto is checked the spinner is hidden. -->
         <DataTemplate DataType="st:AutoNumberSettingViewModel" x:DataType="st:AutoNumberSettingViewModel">
-            <Border Classes="settingCard" Classes.selected="{Binding IsSelected}" IsVisible="{Binding IsVisible}">
-                <StackPanel Spacing="5">
+            <Border Classes="settingCard" Classes.selected="{Binding IsSelected}"
+                    Classes.disabled="{Binding !IsEnabled}" IsVisible="{Binding IsVisible}"
+                    ToolTip.Tip="{Binding DisabledTooltip}">
+                <StackPanel Spacing="5" IsEnabled="{Binding IsEnabled}">
                     <TextBlock Classes="settingTitle" Text="{Binding Title}" />
                     <StackPanel Orientation="Horizontal" Spacing="10">
                         <CheckBox Content="Auto" IsChecked="{Binding Auto}" VerticalAlignment="Center" />
@@ -83,8 +101,10 @@
 
         <!-- On/off. Unused by the current catalog; here so the first boolean setting needs no XAML. -->
         <DataTemplate DataType="st:BoolSettingViewModel" x:DataType="st:BoolSettingViewModel">
-            <Border Classes="settingCard" Classes.selected="{Binding IsSelected}" IsVisible="{Binding IsVisible}">
-                <StackPanel Spacing="5">
+            <Border Classes="settingCard" Classes.selected="{Binding IsSelected}"
+                    Classes.disabled="{Binding !IsEnabled}" IsVisible="{Binding IsVisible}"
+                    ToolTip.Tip="{Binding DisabledTooltip}">
+                <StackPanel Spacing="5" IsEnabled="{Binding IsEnabled}">
                     <TextBlock Classes="settingTitle" Text="{Binding Title}" />
                     <CheckBox Content="{Binding CheckBoxLabel}" IsChecked="{Binding Value}" HorizontalAlignment="Left" />
                     <TextBlock Classes="secondary" TextWrapping="Wrap" Text="{Binding Description}" />
@@ -96,8 +116,10 @@
              derive from SettingItemViewModel, add one template here, and search / tree navigation /
              scroll anchoring all keep working. -->
         <DataTemplate DataType="st:DriveOverridesSettingViewModel" x:DataType="st:DriveOverridesSettingViewModel">
-            <Border Classes="settingCard" Classes.selected="{Binding IsSelected}" IsVisible="{Binding IsVisible}">
-                <StackPanel Spacing="8">
+            <Border Classes="settingCard" Classes.selected="{Binding IsSelected}"
+                    Classes.disabled="{Binding !IsEnabled}" IsVisible="{Binding IsVisible}"
+                    ToolTip.Tip="{Binding DisabledTooltip}">
+                <StackPanel Spacing="8" IsEnabled="{Binding IsEnabled}">
                     <TextBlock Classes="settingTitle" Text="{Binding Title}" />
                     <TextBlock Classes="secondary" TextWrapping="Wrap" Text="{Binding Description}" />
 
@@ -221,10 +243,15 @@
                         <Button Content="Redo" Command="{Binding History.RedoCommand}" ToolTip.Tip="Redo (Ctrl+Y)" />
                     </StackPanel>
                     <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="8" HorizontalAlignment="Right">
+                        <!-- Save and Discard both leave the window open: this is a settings document,
+                             not a wizard, so committing or abandoning a change should not also decide
+                             that the user is finished. Only Close and the title-bar X close it. -->
                         <Button Content="Save" Command="{Binding SaveCommand}" Classes="accent" IsEnabled="{Binding !IsBusy}" />
+                        <Button Content="Discard changes" Command="{Binding DiscardChangesCommand}"
+                                ToolTip.Tip="Put every setting back the way it was last saved" />
                         <!-- Sized to its label, like every other button here. A MinWidth wide enough to
-                             hold "Discard changes" would leave "Close" swimming in padding; the button
-                             growing when there are unsaved edits is the lesser cost. -->
+                             hold "Close without saving" would leave "Close" swimming in padding; the
+                             button growing when there are unsaved edits is the lesser cost. -->
                         <Button Content="{Binding CloseButtonText}" Click="OnCloseClick" />
                     </StackPanel>
                 </Grid>

@@ -27,6 +27,12 @@ public sealed partial class SettingsCategoryViewModel : ViewModelBase
 
     public SettingsCategoryViewModel? Parent { get; }
 
+    /// <summary>True when this category's settings live in the service-owned <c>GlobalSettings</c> and
+    /// therefore cannot be read or written while the service is unreachable. Declared once per category
+    /// rather than per setting: ownership is exactly what the categories now group by, and each item
+    /// reads it back through <see cref="SettingItemViewModel.RequiresService"/>.</summary>
+    public bool RequiresService { get; init; }
+
     /// <summary>Header text in the document. A nested category reads as "Performance → Per-drive
     /// overrides" so a filtered view still says where the group sits.</summary>
     public string HeaderText => Parent is null ? Title : $"{Parent.Title} → {Title}";

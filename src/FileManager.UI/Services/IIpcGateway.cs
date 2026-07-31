@@ -40,8 +40,15 @@ public interface IIpcGateway
     /// same-name copy already at the destination won, which the caller must surface.</summary>
     Task<Result<RelocateProfilesResponse, IpcError>> RelocateProfilesAsync(
         string newDirectory, bool moveExisting, CancellationToken ct = default);
-    /// <summary>Asks the service to shut itself down (StartAndStopWithProgram mode on UI close).</summary>
+    /// <summary>Asks the service to shut itself down (StartAndStopWithProgram mode on UI close, and
+    /// when the user points the service executable path somewhere else).</summary>
     Task<Result<bool, IpcError>> ShutdownServiceAsync(CancellationToken ct = default);
+
+    /// <summary>Forgets the current connection so the next request reconnects from scratch, starting
+    /// the configured executable if nothing is listening. Needed after the service executable path
+    /// changes: the cached connection points at whatever was running before, so without this the UI
+    /// keeps talking to the old service and the new setting looks like it did nothing.</summary>
+    Task ResetConnectionAsync();
 
     /// <summary>Manually invokes a profile against one file or folder (a folder is walked recursively,
     /// honoring MaxDepth). The service enqueues and answers immediately, so the response means

@@ -13,4 +13,12 @@ public interface IFolderPicker
 
     /// <summary>Opens a multi-select picker for JSON profile files. Empty when the user cancels.</summary>
     Task<IReadOnlyList<string>> PickFilesAsync(string title);
+
+    /// <summary>Opens a single-file picker restricted to <paramref name="patterns"/> (e.g.
+    /// <c>["*.exe"]</c>), labelled <paramref name="filterName"/> in the file-type dropdown. Null when
+    /// the user cancels. <paramref name="startNear"/> is a file the caller already points at: the
+    /// picker opens in its CONTAINING folder, so that file is the visible entry. When it is null,
+    /// blank, or no longer exists the picker opens at the user's Downloads folder.</summary>
+    Task<string?> PickFileAsync(
+        string title, string filterName, IReadOnlyList<string> patterns, string? startNear = null);
 }

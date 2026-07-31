@@ -31,10 +31,10 @@ public sealed partial class MainWindowViewModel : ViewModelBase
     private readonly IFolderPicker _folderPicker;
     private readonly ILogFolderService _logFolder;
     private readonly ISystemDrives? _systemDrives;
-    private readonly string _uiStatePath;
+    private readonly string _clientSettingsPath;
 
     public MainWindowViewModel(IIpcGateway gateway, IFolderPicker folderPicker, ILogFolderService logFolder,
-        IDryRunItemActions dryRunActions, string? uiStatePath = null, ISystemDrives? systemDrives = null)
+        IDryRunItemActions dryRunActions, string? clientSettingsPath = null, ISystemDrives? systemDrives = null)
     {
         _gateway = gateway;
         _folderPicker = folderPicker;
@@ -43,8 +43,8 @@ public sealed partial class MainWindowViewModel : ViewModelBase
         // enumeration, so tests that never open settings need not supply one.
         _systemDrives = systemDrives;
         // Test seam: tests pass an isolated path so constructing the shell VM never reads or writes
-        // the developer's real %LOCALAPPDATA% ui-state file.
-        _uiStatePath = uiStatePath ?? UiPaths.UiStateFilePath;
+        // the developer's real %LOCALAPPDATA% client-settings file.
+        _clientSettingsPath = clientSettingsPath ?? UiPaths.ClientSettingsFilePath;
         List = new ProfileListViewModel(gateway);
         Editor = new ProfileEditorViewModel(gateway, folderPicker);
         DryRun = new DryRunViewModel(gateway, dryRunActions);
@@ -98,9 +98,9 @@ public sealed partial class MainWindowViewModel : ViewModelBase
 
         // Restore the persisted sidebar layout (collapsed state + expanded width). The view applies
         // the column geometry from these once its template is loaded.
-        UiState ui = UiStateStore.Read(_uiStatePath);
-        SidebarCollapsed = ui.SidebarCollapsed;
-        SidebarExpandedWidth = Math.Max(MinExpandedSidebarWidth, ui.SidebarWidth);
+        ClientSettings client = ClientSettingsStore.Read(_clientSettingsPath);
+        SidebarCollapsed = client.SidebarCollapsed;
+        SidebarExpandedWidth = Math.Max(MinExpandedSidebarWidth, client.SidebarWidth);
     }
 
     public ProfileListViewModel List { get; }
@@ -125,9 +125,16 @@ public sealed partial class MainWindowViewModel : ViewModelBase
     public double SidebarExpandedWidth { get; set; } = 280;
 
     /// <summary>Persist the current sidebar layout. Single entry point called by the view whenever the
-    /// collapsed state or expanded width changes.</summary>
+    /// collapsed state or expanded width changes. Read-modify-write, not a fresh record: the settings
+    /// window owns the other half of this file and saves on its own schedule.</summary>
     public void SaveSidebarState() =>
-        UiStateStore.Write(_uiStatePath, new UiState(SidebarCollapsed, SidebarExpandedWidth));
+        ClientSettingsStore.Write(
+            _clientSettingsPath,
+            ClientSettingsStore.Read(_clientSettingsPath) with
+            {
+                SidebarCollapsed = SidebarCollapsed,
+                SidebarWidth = SidebarExpandedWidth,
+            });
 
     public async Task InitializeAsync()
     {
@@ -432,8 +439,16 @@ public sealed partial class MainWindowViewModel : ViewModelBase
                 // the new directory's contents without waiting for the user to hit refresh.
                 ProfilesRelocated = () => List.RefreshAsync(),
             };
-            await settings.LoadAsync();
+            // Start the load but do NOT await it before showing: it makes an IPC call, and when the
+            // service is unreachable that call can take the launcher's full retry budget — repeatedly,
+            // queued behind the status poll on the same connect gate. Awaiting it here is what made an
+            // unreachable service lock the user out of the one window that can fix it. LoadAsync turns
+            // every failure into a banner rather than throwing, populates the client-side settings
+            // before its first await, and never writes the editable state again on the failure path, so
+            // a late completion cannot clobber what the user has started typing.
+            Task loading = settings.LoadAsync();
             await ShowSettingsDialog(settings);
+            await loading;      // observe it; the window has already closed by now
         }
         catch (Exception ex)
         {

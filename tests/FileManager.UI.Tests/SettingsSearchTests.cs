@@ -8,7 +8,8 @@ namespace FileManager.UI.Tests;
 /// catalog. These are pure view-model tests — no headless session needed.</summary>
 public sealed class SettingsSearchTests
 {
-    private static SettingsViewModel New() => new(new FakeIpcGateway(), new FakeFolderPicker());
+    private static SettingsViewModel New() =>
+        new(new FakeIpcGateway(), new FakeFolderPicker(), clientSettingsPath: TempFiles.ClientSettings());
 
     private static SettingItemViewModel Item(SettingsViewModel vm, string id) =>
         vm.Categories.SelectMany(c => c.Items).Single(i => i.Id == id);
@@ -64,12 +65,14 @@ public sealed class SettingsSearchTests
     }
 
     [Theory]
-    [InlineData("theme", "appearance.theme")]              // the title
-    [InlineData("dark", "appearance.theme")]               // an option label, absent from the prose
+    [InlineData("theme", "application.theme")]              // the title
+    [InlineData("dark", "application.theme")]               // an option label, absent from the prose
     [InlineData("run on startup", "startup.serviceMode")]  // an option label spanning several words
     [InlineData("login", "startup.serviceMode")]           // a keyword, absent from the prose
     [InlineData("hashing", "performance.maxHashThreads")]  // a word only the description has
     [InlineData("volume key", "performance.driveOverrides")]
+    [InlineData("service executable", "application.serviceExePath")]
+    [InlineData("not found", "application.serviceExePath")]   // what a stuck user would actually type
     public void A_query_matches_the_setting_it_should(string query, string expectedId)
     {
         SettingsViewModel vm = New();
@@ -87,7 +90,7 @@ public sealed class SettingsSearchTests
 
         vm.SearchText = "DaRk";
 
-        Assert.True(Item(vm, "appearance.theme").IsVisible);
+        Assert.True(Item(vm, "application.theme").IsVisible);
     }
 
     [Fact]
@@ -113,7 +116,7 @@ public sealed class SettingsSearchTests
 
         vm.SearchText = "theme";
 
-        Assert.True(vm.Categories.Single(c => c.Id == "appearance").IsVisible);
+        Assert.True(vm.Categories.Single(c => c.Id == "application").IsVisible);
         Assert.False(vm.Categories.Single(c => c.Id == "storage").IsVisible);
         Assert.False(vm.NavNodes.Single(n => n.Category?.Id == "storage").IsVisible);
     }
@@ -197,10 +200,10 @@ public sealed class SettingsSearchTests
     {
         SettingsViewModel vm = New();
 
-        vm.SelectedNavNode = Leaf(vm, "appearance.theme");
+        vm.SelectedNavNode = Leaf(vm, "application.theme");
         vm.SelectedNavNode = Leaf(vm, "storage.profilesDirectory");
 
-        Assert.False(Item(vm, "appearance.theme").IsSelected);
+        Assert.False(Item(vm, "application.theme").IsSelected);
         Assert.True(Item(vm, "storage.profilesDirectory").IsSelected);
     }
 }

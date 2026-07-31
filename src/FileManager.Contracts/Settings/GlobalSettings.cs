@@ -5,14 +5,19 @@ using System.Text.Json.Serialization;
 
 namespace FileManager.Contracts.Settings;
 
-/// <summary>Machine-level settings edited in the UI and persisted by the service (settings.json).
-/// These are NOT per-profile.</summary>
+/// <summary>Machine-level ENGINE settings edited in the UI and persisted by the service
+/// (settings.json). These are NOT per-profile, and they are not the whole settings surface: anything
+/// the engine never reads (the theme, the sidebar layout, the service executable path) is client-side
+/// state owned by the UI — see <c>FileManager.UI.Services.ClientSettings</c>. The split is what lets
+/// the UI change those while the service is unreachable.</summary>
 public sealed record GlobalSettings
 {
     /// <summary>Independent of <see cref="Profile.SchemaVersion"/>; versions this settings file only.
     /// v2 replaced the dry-run concurrency scalars with <see cref="ScanThreading"/>. v3 added
-    /// <see cref="ScratchDirectory"/>. v4 added <see cref="ProfilesDirectory"/>.</summary>
-    public int SchemaVersion { get; init; } = 4;
+    /// <see cref="ScratchDirectory"/>. v4 added <see cref="ProfilesDirectory"/>. v5 removed ThemeMode,
+    /// which moved to the UI's client-settings.json (the engine never read it); a v4 file's orphaned
+    /// member is ignored here and migrated by the UI on first run.</summary>
+    public int SchemaVersion { get; init; } = 5;
 
     /// <summary>When the worker service is started and stopped relative to the UI. Defaults to
     /// <see cref="Settings.ServiceStartupMode.StartAndStopWithProgram"/> so the service does not
@@ -33,10 +38,6 @@ public sealed record GlobalSettings
         get => _scanThreading ?? ScanThreadingSettings.Default;
         init => _scanThreading = value == ScanThreadingSettings.Default ? null : value;
     }
-
-    /// <summary>The UI theme. Defaults to <see cref="Settings.ThemeMode.System"/> so the app follows the
-    /// OS light/dark preference unless the user picks a fixed theme.</summary>
-    public ThemeMode ThemeMode { get; init; } = ThemeMode.System;
 
     private readonly string? _scratchDirectory;
 

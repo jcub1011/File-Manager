@@ -109,7 +109,7 @@ public sealed class SerializationTests
     [Fact]
     public void Current_protocol_version_is_pinned()
     {
-        Assert.Equal(6, IpcRequest.CurrentProtocolVersion);
+        Assert.Equal(7, IpcRequest.CurrentProtocolVersion);
     }
 
     /// <summary>JobPhase must stay a string on the wire (the context sets UseStringEnumConverter), so
@@ -416,7 +416,6 @@ public sealed class SerializationTests
             Settings = new GlobalSettings
             {
                 ServiceStartupMode = ServiceStartupMode.RunOnStartup,
-                ThemeMode = ThemeMode.Dark,
                 ScanThreading = new ScanThreadingSettings
                 {
                     MaxScanThreads = ThreadBudget.Explicit(6),
@@ -430,7 +429,6 @@ public sealed class SerializationTests
         Assert.True(IpcSerializer.DeserializeResponse(wire).TryGetValue(out IpcResponse? reparsed));
         SettingsResponse roundTripped = Assert.IsType<SettingsResponse>(reparsed);
         Assert.Equal(ServiceStartupMode.RunOnStartup, roundTripped.Settings.ServiceStartupMode);
-        Assert.Equal(ThemeMode.Dark, roundTripped.Settings.ThemeMode);
 
         ScanThreadingSettings st = roundTripped.Settings.ScanThreading;
         Assert.Equal(6, st.MaxScanThreads.Value);
@@ -443,15 +441,18 @@ public sealed class SerializationTests
         using JsonDocument document = JsonDocument.Parse(wire);
         Assert.Equal("RunOnStartup",
             document.RootElement.GetProperty("Settings").GetProperty("ServiceStartupMode").GetString());
-        Assert.Equal("Dark",
-            document.RootElement.GetProperty("Settings").GetProperty("ThemeMode").GetString());
+        // The theme is deliberately absent: it is client-side state (client-settings.json) and never
+        // crosses the wire, so the engine's settings frame must not carry it.
+        Assert.False(document.RootElement.GetProperty("Settings").TryGetProperty("ThemeMode", out _));
     }
 
     [Fact]
     public void GlobalSettings_with_stale_concurrency_fields_still_deserializes()
     {
-        // A settings.json written before v2 carries the removed DryRunConcurrencyMode/DryRunManualWorkers.
-        // The source-gen deserializer skips unknown members, so no migration pass is needed.
+        // A settings.json written before v2 carries the removed DryRunConcurrencyMode/DryRunManualWorkers,
+        // and one written before v5 also carries ThemeMode (which moved to the UI's client-settings.json).
+        // The source-gen deserializer skips unknown members, so no migration pass is needed here — the
+        // theme's own migration is the UI's, in ClientSettingsStore.
         JsonObject obj = new()
         {
             ["SchemaVersion"] = 1,
@@ -464,7 +465,6 @@ public sealed class SerializationTests
         GlobalSettings? parsed = JsonSerializer.Deserialize(obj.ToJsonString(), FileManagerJsonContext.Default.GlobalSettings);
         Assert.NotNull(parsed);
         Assert.Equal(ServiceStartupMode.RunOnStartup, parsed!.ServiceStartupMode);
-        Assert.Equal(ThemeMode.Dark, parsed.ThemeMode);
         Assert.True(parsed.ScanThreading.MaxScanThreads.IsAuto);   // the new field defaults to auto
     }
 

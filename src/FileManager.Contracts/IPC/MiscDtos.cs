@@ -3,7 +3,18 @@
 namespace FileManager.Contracts.IPC;
 
 public sealed record EngineStatusSnapshot(
-    bool Paused, int ActiveProfiles, int JobsInFlight, int QueuedPayloads, string? LastError);
+    bool Paused, int ActiveProfiles, int JobsInFlight, int QueuedPayloads, string? LastError)
+{
+    /// <summary>Full path of the executable this service is running from, as the service itself sees
+    /// it (<c>Environment.ProcessPath</c>). Null when the host cannot determine it.
+    /// <para>Reported so the UI can answer "am I talking to the executable the user configured?" —
+    /// which it otherwise cannot, since a service that was already running (autostart, or a previous
+    /// session) was never resolved by this client at all. The settings window needs the truth to
+    /// decide whether changing the path means anything, and to name what it is offering to shut
+    /// down. An init property rather than a positional member so existing constructions are
+    /// unaffected.</para></summary>
+    public string? ExecutablePath { get; init; }
+}
 
 public sealed record ProfileSummary(
     Guid ProfileId, string Name, bool Active, string TriggerSummary);

@@ -28,7 +28,6 @@ public sealed class JobProgressPublisher(Guid jobId, IEngineEventBus bus, TimePr
 
     public void Report(JobProgress value)
     {
-        JobProgressEvent? toPublish;
         lock (_gate)
         {
             // Distribution is bounded-parallel, so samples can arrive out of order. Clamp both axes
@@ -52,18 +51,25 @@ public sealed class JobProgressPublisher(Guid jobId, IEngineEventBus bus, TimePr
             _lastPublishedAt = now;
             _lastPhase = value.Phase;
             _lastCompleted = completed;
-            toPublish = new JobProgressEvent
+
+            // Publish INSIDE the lock. Clamping the counts is only half the guarantee: the frames also
+            // have to reach the bus in the order they were clamped. Publishing outside meant a thread
+            // could compute a frame, be descheduled before publishing, and have a later thread's higher
+            // frame overtake it — so a subscriber saw exactly the backwards count this class exists to
+            // prevent, even though every frame was individually clamped.
+            //
+            // Nesting the bus's lock inside this one is safe: SubscriberList takes its gate only to
+            // snapshot the subscriber list (it fans out afterwards, unlocked), and nothing on that path
+            // ever acquires this gate, so the two can never be taken in the opposite order. Cost is
+            // negligible — one publisher per job, throttled to ~10 frames/sec.
+            bus.Publish(new JobProgressEvent
             {
                 AtUtc = time.GetUtcNow(),
                 JobId = jobId,
                 Phase = value.Phase,
                 TargetsCompleted = completed,
                 TargetCount = value.TargetCount,
-            };
+            });
         }
-
-        // Publish outside the lock: EngineEventBus.Publish fans out synchronously under its own gate,
-        // so holding ours across it would nest two locks for no reason.
-        bus.Publish(toPublish);
     }
 }

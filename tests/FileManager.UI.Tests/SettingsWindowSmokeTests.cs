@@ -4,6 +4,7 @@ using Avalonia.Headless;
 using Avalonia.Input;
 using Avalonia.VisualTree;
 using FileManager.Contracts.Settings;
+using FileManager.UI.Services;
 using FileManager.UI.Tests.Fakes;
 using FileManager.UI.ViewModels;
 using FileManager.UI.ViewModels.Settings;
@@ -24,13 +25,13 @@ public sealed class SettingsWindowSmokeTests(HeadlessSessionFixture headless)
         {
             FakeIpcGateway gateway = new()
             {
-                GetSettingsResult = new GlobalSettings
-                {
-                    ServiceStartupMode = ServiceStartupMode.RunOnStartup,
-                    ThemeMode = ThemeMode.Dark,
-                },
+                GetSettingsResult = new GlobalSettings { ServiceStartupMode = ServiceStartupMode.RunOnStartup },
             };
-            SettingsViewModel vm = new(gateway, new FakeFolderPicker());
+            // The two halves come from two different places: the startup mode over IPC, the theme from
+            // the client file.
+            string clientFile = TempFiles.ClientSettings();
+            ClientSettingsStore.Write(clientFile, ClientSettings.Default with { ThemeMode = ThemeMode.Dark });
+            SettingsViewModel vm = new(gateway, new FakeFolderPicker(), clientSettingsPath: clientFile);
             await vm.LoadAsync();
 
             SettingsWindow window = new() { DataContext = vm };
@@ -48,7 +49,7 @@ public sealed class SettingsWindowSmokeTests(HeadlessSessionFixture headless)
     {
         await headless.Session.DispatchAsync(async () =>
         {
-            SettingsViewModel vm = new(new FakeIpcGateway(), new FakeFolderPicker());
+            SettingsViewModel vm = new(new FakeIpcGateway(), new FakeFolderPicker(), clientSettingsPath: TempFiles.ClientSettings());
             await vm.LoadAsync();
 
             SettingsWindow window = new() { DataContext = vm };
@@ -80,7 +81,7 @@ public sealed class SettingsWindowSmokeTests(HeadlessSessionFixture headless)
         // deliberately omits App.axaml's geometries. A mistyped key would throw under the real App.)
         await headless.Session.DispatchAsync(async () =>
         {
-            SettingsViewModel vm = new(new FakeIpcGateway(), new FakeFolderPicker());
+            SettingsViewModel vm = new(new FakeIpcGateway(), new FakeFolderPicker(), clientSettingsPath: TempFiles.ClientSettings());
             await vm.LoadAsync();
 
             SettingsWindow window = new() { DataContext = vm };
@@ -93,13 +94,50 @@ public sealed class SettingsWindowSmokeTests(HeadlessSessionFixture headless)
     }
 
     [Fact]
+    public async Task An_unreachable_service_greys_its_own_settings_and_says_why()
+    {
+        // The user-visible half of the split. The editor inside a service-owned card is disabled, while
+        // the card itself stays ENABLED and carries the tooltip — a disabled Avalonia control gets no
+        // pointer input, so a tooltip on it could never be shown.
+        await headless.Session.DispatchAsync(async () =>
+        {
+            FakeIpcGateway gateway = new()
+            {
+                GetSettingsResult = new FileManager.Contracts.IPC.IpcError("SERVICE_UNAVAILABLE", "no pipe"),
+            };
+            SettingsViewModel vm = new(gateway, new FakeFolderPicker(), new FakeSystemDrives(),
+                clientSettingsPath: TempFiles.ClientSettings());
+            await vm.LoadAsync();
+
+            SettingsWindow window = new() { DataContext = vm };
+            window.Show();
+            window.UpdateLayout();
+
+            Border Card(SettingItemViewModel item) => window.GetVisualDescendants().OfType<Border>()
+                .Single(b => b.Classes.Contains("settingCard") && ReferenceEquals(b.DataContext, item));
+
+            Border startup = Card(vm.StartupMode);
+            Assert.Contains("disabled", startup.Classes);
+            Assert.True(startup.IsEnabled);                                    // ...so the tooltip works
+            Assert.Equal(vm.StartupMode.DisabledTooltip, ToolTip.GetTip(startup));
+            Assert.False(startup.GetVisualDescendants().OfType<ComboBox>().Single().IsEffectivelyEnabled);
+
+            // The way out stays usable.
+            Border exePath = Card(vm.ServiceExePath);
+            Assert.DoesNotContain("disabled", exePath.Classes);
+            Assert.Null(ToolTip.GetTip(exePath));
+            Assert.True(exePath.GetVisualDescendants().OfType<TextBox>().First().IsEffectivelyEnabled);
+        }, CancellationToken.None);
+    }
+
+    [Fact]
     public async Task No_setting_is_clipped_at_the_narrowest_allowed_window()
     {
         // The document scrolls vertically only, so a setting whose editor cannot shrink gets cut off at
         // the right edge instead of scrolling into reach. Every editor has to give width back.
         await headless.Session.DispatchAsync(async () =>
         {
-            SettingsViewModel vm = new(new FakeIpcGateway(), new FakeFolderPicker());
+            SettingsViewModel vm = new(new FakeIpcGateway(), new FakeFolderPicker(), clientSettingsPath: TempFiles.ClientSettings());
             await vm.LoadAsync();
             // Populate the override lists so their (widest) editors get measured too.
             vm.DriveOverrides.AddDriveTypeOverrideCommand.Execute(null);
@@ -133,7 +171,7 @@ public sealed class SettingsWindowSmokeTests(HeadlessSessionFixture headless)
         // the surplus empty and every setting flush left.
         await headless.Session.DispatchAsync(async () =>
         {
-            SettingsViewModel vm = new(new FakeIpcGateway(), new FakeFolderPicker());
+            SettingsViewModel vm = new(new FakeIpcGateway(), new FakeFolderPicker(), clientSettingsPath: TempFiles.ClientSettings());
             await vm.LoadAsync();
 
             SettingsWindow window = new() { DataContext = vm, Width = 1800 };
@@ -184,7 +222,7 @@ public sealed class SettingsWindowSmokeTests(HeadlessSessionFixture headless)
     {
         await headless.Session.DispatchAsync(async () =>
         {
-            SettingsViewModel vm = new(new FakeIpcGateway(), new FakeFolderPicker(), new FakeSystemDrives());
+            SettingsViewModel vm = new(new FakeIpcGateway(), new FakeFolderPicker(), new FakeSystemDrives(), clientSettingsPath: TempFiles.ClientSettings());
             await vm.LoadAsync();
             vm.DriveOverrides.AddSpecificDriveOverrideCommand.Execute(null);
 
@@ -209,7 +247,7 @@ public sealed class SettingsWindowSmokeTests(HeadlessSessionFixture headless)
         // and boxes inside them run past the edge.
         await headless.Session.DispatchAsync(async () =>
         {
-            SettingsViewModel vm = new(new FakeIpcGateway(), new FakeFolderPicker(), new FakeSystemDrives());
+            SettingsViewModel vm = new(new FakeIpcGateway(), new FakeFolderPicker(), new FakeSystemDrives(), clientSettingsPath: TempFiles.ClientSettings());
             await vm.LoadAsync();
             vm.DriveOverrides.AddDriveTypeOverrideCommand.Execute(null);
             vm.DriveOverrides.AddSpecificDriveOverrideCommand.Execute(null);
@@ -243,7 +281,7 @@ public sealed class SettingsWindowSmokeTests(HeadlessSessionFixture headless)
         // lines tall and this catches it.
         await headless.Session.DispatchAsync(async () =>
         {
-            SettingsViewModel vm = new(new FakeIpcGateway(), new FakeFolderPicker(), new FakeSystemDrives());
+            SettingsViewModel vm = new(new FakeIpcGateway(), new FakeFolderPicker(), new FakeSystemDrives(), clientSettingsPath: TempFiles.ClientSettings());
             await vm.LoadAsync();
             vm.DriveOverrides.AddSpecificDriveOverrideCommand.Execute(null);
             vm.DriveOverrides.SpecificDriveOverrides[0].Auto = false;
@@ -275,7 +313,7 @@ public sealed class SettingsWindowSmokeTests(HeadlessSessionFixture headless)
         // character-level undo, so undo means the same thing wherever focus happens to be.
         await headless.Session.DispatchAsync(async () =>
         {
-            SettingsViewModel vm = new(new FakeIpcGateway(), new FakeFolderPicker(), new FakeSystemDrives());
+            SettingsViewModel vm = new(new FakeIpcGateway(), new FakeFolderPicker(), new FakeSystemDrives(), clientSettingsPath: TempFiles.ClientSettings());
             await vm.LoadAsync();
             string original = vm.ScratchDirectory.Value;
 
@@ -308,7 +346,7 @@ public sealed class SettingsWindowSmokeTests(HeadlessSessionFixture headless)
     {
         await headless.Session.DispatchAsync(async () =>
         {
-            SettingsViewModel vm = new(new FakeIpcGateway(), new FakeFolderPicker(), new FakeSystemDrives());
+            SettingsViewModel vm = new(new FakeIpcGateway(), new FakeFolderPicker(), new FakeSystemDrives(), clientSettingsPath: TempFiles.ClientSettings());
             await vm.LoadAsync();
 
             SettingsWindow window = new() { DataContext = vm };
@@ -317,14 +355,21 @@ public sealed class SettingsWindowSmokeTests(HeadlessSessionFixture headless)
 
             Button close = window.GetVisualDescendants().OfType<Button>()
                 .Single(b => Equals(b.Content, "Close"));
+            // Its own button, and separate from Close: discarding puts the settings back without
+            // deciding the user is finished with the window.
+            Button discard = window.GetVisualDescendants().OfType<Button>()
+                .Single(b => Equals(b.Content, "Discard changes"));
+            Assert.False(discard.IsEffectivelyEnabled);
 
             vm.Theme.Value = ThemeMode.Dark;
             window.UpdateLayout();
-            Assert.Equal("Discard changes", close.Content);
+            Assert.Equal("Close without saving", close.Content);
+            Assert.True(discard.IsEffectivelyEnabled);
 
             vm.History.UndoCommand.Execute(null);
             window.UpdateLayout();
             Assert.Equal("Close", close.Content);
+            Assert.False(discard.IsEffectivelyEnabled);
         }, CancellationToken.None);
     }
 
