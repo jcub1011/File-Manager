@@ -38,8 +38,14 @@ public sealed partial class WindowsVolumeInfoProvider(ILogger<WindowsVolumeInfoP
         }
     }
 
-    /// <summary>Stable key grouping paths that share a volume: the drive root ("C:\") for local
-    /// paths or the share root ("\\server\share") for UNC, lower-cased.</summary>
+    /// <summary>Stable key grouping paths that share a volume, in the canonical form
+    /// <see cref="VolumeKeys.Normalize"/> defines: the drive root as "c:" for local paths or the share
+    /// root as "\\server\share" for UNC, lower-cased and with no trailing separator.
+    ///
+    /// The trailing-separator strip is not cosmetic. <see cref="Path.GetPathRoot(string)"/> hands back
+    /// "C:\", and <see cref="Path.TrimEndingDirectorySeparator(string)"/> leaves a path that IS a root
+    /// alone — so trimming that way produced "c:\", which never matched the "c:" a user typed into a
+    /// specific-drive override.</summary>
     public Result<string, string> GetVolumeKey(string path)
     {
         try
@@ -47,7 +53,7 @@ public sealed partial class WindowsVolumeInfoProvider(ILogger<WindowsVolumeInfoP
             string? root = Path.GetPathRoot(Path.GetFullPath(path));
             if (string.IsNullOrEmpty(root))
                 return Result<string, string>.Failure($"could not determine the volume root of \"{path}\"");
-            return Result<string, string>.Success(Path.TrimEndingDirectorySeparator(root).ToLowerInvariant());
+            return Result<string, string>.Success(VolumeKeys.Normalize(root));
         }
         catch (Exception ex)
         {

@@ -3,6 +3,7 @@
         xmlns:vm="using:FileManager.UI.ViewModels"
         xmlns:st="using:FileManager.UI.ViewModels.Settings"
         xmlns:conv="using:FileManager.UI.Converters"
+        xmlns:svc="using:FileManager.UI.Services"
         xmlns:settings="using:FileManager.Contracts.Settings"
         xmlns:chrome="using:Avalonia.Controls.Chrome"
         x:Class="FileManager.UI.Views.SettingsWindow"
@@ -104,21 +105,26 @@
                     <ItemsControl ItemsSource="{Binding DriveTypeOverrides}">
                         <ItemsControl.ItemTemplate>
                             <DataTemplate x:DataType="st:DriveTypeOverrideRowViewModel">
-                                <Grid ColumnDefinitions="Auto,Auto,Auto,Auto" Margin="0,2">
-                                    <ComboBox Grid.Column="0" ItemsSource="{Binding Options}" SelectedItem="{Binding Class}" MinWidth="160">
+                                <!-- A WrapPanel, not a Grid: the document is only ~450px wide at the 720px
+                                     minimum window, and a card here cannot scroll sideways, so a row of
+                                     fixed-width controls would simply be cut off at the right edge. Wrapping
+                                     needs no breakpoint — one line when there is room, two when there is not. -->
+                                <WrapPanel Margin="0,2">
+                                    <ComboBox ItemsSource="{Binding Options}" SelectedItem="{Binding Class}"
+                                              Width="170" VerticalAlignment="Center">
                                         <ComboBox.ItemTemplate>
                                             <DataTemplate x:DataType="settings:DriveClass">
                                                 <TextBlock Text="{Binding Converter={x:Static conv:EnumTitleConverters.DriveClass}}" />
                                             </DataTemplate>
                                         </ComboBox.ItemTemplate>
                                     </ComboBox>
-                                    <CheckBox Grid.Column="1" Content="Auto" IsChecked="{Binding Auto}" Margin="10,0" VerticalAlignment="Center" />
-                                    <NumericUpDown Grid.Column="2" Value="{Binding Value}" Minimum="1" Width="130" FormatString="0"
+                                    <CheckBox Content="Auto" IsChecked="{Binding Auto}" Margin="10,0" VerticalAlignment="Center" />
+                                    <NumericUpDown Value="{Binding Value}" Minimum="1" Width="105" FormatString="0"
                                                    VerticalAlignment="Center" IsVisible="{Binding ShowValue}" />
-                                    <Button Grid.Column="3" Content="Remove" Margin="10,0,0,0" VerticalAlignment="Center"
+                                    <Button Content="Remove" Margin="10,0,0,0" VerticalAlignment="Center"
                                             Command="{Binding $parent[ItemsControl].((st:DriveOverridesSettingViewModel)DataContext).RemoveDriveTypeOverrideCommand}"
                                             CommandParameter="{Binding}" />
-                                </Grid>
+                                </WrapPanel>
                             </DataTemplate>
                         </ItemsControl.ItemTemplate>
                     </ItemsControl>
@@ -128,15 +134,35 @@
                     <ItemsControl ItemsSource="{Binding SpecificDriveOverrides}">
                         <ItemsControl.ItemTemplate>
                             <DataTemplate x:DataType="st:SpecificDriveOverrideRowViewModel">
-                                <Grid ColumnDefinitions="Auto,Auto,Auto,Auto" Margin="0,2">
-                                    <TextBox Grid.Column="0" Text="{Binding VolumeKey}" PlaceholderText="c: or \\server\share" MinWidth="160" />
-                                    <CheckBox Grid.Column="1" Content="Auto" IsChecked="{Binding Auto}" Margin="10,0" VerticalAlignment="Center" />
-                                    <NumericUpDown Grid.Column="2" Value="{Binding Value}" Minimum="1" Width="130" FormatString="0"
+                                <!-- Picker AND text box, deliberately: the picker removes any doubt about
+                                     the exact key format for a mounted drive, while the box is the only
+                                     way to name a UNC share or a drive that is not attached right now. The
+                                     box holds the single source of truth (VolumeKey); the picker is a view
+                                     of it, so it reads empty for anything it cannot show — hence the
+                                     placeholder rather than a blank-looking control.
+                                     WrapPanel for the same reason as the drive-type row above: five
+                                     controls do not fit the ~450px document at the minimum window width,
+                                     and this card cannot scroll sideways. -->
+                                <WrapPanel Margin="0,2">
+                                    <ComboBox Width="180" VerticalAlignment="Center"
+                                              ItemsSource="{Binding AvailableDrives}" SelectedItem="{Binding SelectedDrive}"
+                                              PlaceholderText="Pick a drive…"
+                                              ToolTip.Tip="Pick one of this machine's drives, or type a volume key yourself.">
+                                        <ComboBox.ItemTemplate>
+                                            <DataTemplate x:DataType="svc:DriveOption">
+                                                <TextBlock Text="{Binding Label}" />
+                                            </DataTemplate>
+                                        </ComboBox.ItemTemplate>
+                                    </ComboBox>
+                                    <TextBox Margin="8,0,0,0" Width="140" VerticalAlignment="Center"
+                                             Text="{Binding VolumeKey}" PlaceholderText="c: or \\server\share" />
+                                    <CheckBox Content="Auto" IsChecked="{Binding Auto}" Margin="10,0" VerticalAlignment="Center" />
+                                    <NumericUpDown Value="{Binding Value}" Minimum="1" Width="105" FormatString="0"
                                                    VerticalAlignment="Center" IsVisible="{Binding ShowValue}" />
-                                    <Button Grid.Column="3" Content="Remove" Margin="10,0,0,0" VerticalAlignment="Center"
+                                    <Button Content="Remove" Margin="10,0,0,0" VerticalAlignment="Center"
                                             Command="{Binding $parent[ItemsControl].((st:DriveOverridesSettingViewModel)DataContext).RemoveSpecificDriveOverrideCommand}"
                                             CommandParameter="{Binding}" />
-                                </Grid>
+                                </WrapPanel>
                             </DataTemplate>
                         </ItemsControl.ItemTemplate>
                     </ItemsControl>
@@ -164,9 +190,11 @@
                            Foreground="{DynamicResource Brush.Text.Primary}" />
             </StackPanel>
 
+            <!-- The tooltip tracks the footer button's wording so the X tells the same story about
+                 pending edits as the labelled button does. -->
             <Button Grid.Column="2" Classes="caption close"
                     chrome:WindowDecorationProperties.ElementRole="CloseButton"
-                    Click="OnCloseClick" ToolTip.Tip="Close">
+                    Click="OnCloseClick" ToolTip.Tip="{Binding CloseButtonText}">
                 <PathIcon Data="{StaticResource IconClose}" Width="10" Height="10" />
             </Button>
         </Grid>
@@ -184,10 +212,22 @@
                         IsVisible="{Binding StatusMessage, Converter={x:Static ObjectConverters.IsNotNull}}">
                     <TextBlock Text="{Binding StatusMessage}" TextWrapping="Wrap" />
                 </Border>
-                <StackPanel Orientation="Horizontal" Spacing="8" HorizontalAlignment="Right">
-                    <Button Content="Save" Command="{Binding SaveCommand}" Classes="accent" IsEnabled="{Binding !IsBusy}" />
-                    <Button Content="Close" Click="OnCloseClick" />
-                </StackPanel>
+                <!-- Undo/Redo sit on the left, apart from the commit actions on the right: they act on
+                     the edits in progress rather than resolving the dialog. They run the same commands
+                     the Ctrl+Z / Ctrl+Y shortcuts do, so the buttons and the keyboard cannot drift. -->
+                <Grid ColumnDefinitions="Auto,*">
+                    <StackPanel Grid.Column="0" Orientation="Horizontal" Spacing="8">
+                        <Button Content="Undo" Command="{Binding History.UndoCommand}" ToolTip.Tip="Undo (Ctrl+Z)" />
+                        <Button Content="Redo" Command="{Binding History.RedoCommand}" ToolTip.Tip="Redo (Ctrl+Y)" />
+                    </StackPanel>
+                    <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="8" HorizontalAlignment="Right">
+                        <Button Content="Save" Command="{Binding SaveCommand}" Classes="accent" IsEnabled="{Binding !IsBusy}" />
+                        <!-- Sized to its label, like every other button here. A MinWidth wide enough to
+                             hold "Discard changes" would leave "Close" swimming in padding; the button
+                             growing when there are unsaved edits is the lesser cost. -->
+                        <Button Content="{Binding CloseButtonText}" Click="OnCloseClick" />
+                    </StackPanel>
+                </Grid>
             </StackPanel>
         </Border>
 

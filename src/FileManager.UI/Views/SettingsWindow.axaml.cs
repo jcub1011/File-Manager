@@ -7,16 +7,57 @@ using FileManager.UI.ViewModels;
 using FileManager.UI.ViewModels.Settings;
 using System;
 using System.Linq;
+using System.Windows.Input;
 
 namespace FileManager.UI.Views
 {
     public partial class SettingsWindow : Window
     {
+        // Parsed from the same strings the footer buttons show as tooltips, so the display and the
+        // handling cannot drift apart (same recipe as DryRunView's row shortcuts).
+        private static readonly KeyGesture UndoGesture = KeyGesture.Parse("Ctrl+Z");
+        private static readonly KeyGesture RedoGesture = KeyGesture.Parse("Ctrl+Y");
+        private static readonly KeyGesture RedoAltGesture = KeyGesture.Parse("Ctrl+Shift+Z");
+
         public SettingsWindow()
         {
             InitializeComponent();
             DataContextChanged += OnDataContextChanged;
             Closed += OnWindowClosed;
+
+            // Tunnel (preview) routing, so the window sees Ctrl+Z before the focused TextBox does. That
+            // is a deliberate trade: undo always means "undo the last settings change" no matter where
+            // focus is, at the cost of a TextBox's own per-character undo. Coalescing makes a typing run
+            // one settings step, so reverting a path still takes one press.
+            AddHandler(InputElement.KeyDownEvent, OnUndoRedoKeyDown, RoutingStrategies.Tunnel);
+
+            // A field losing focus ends its coalescing run, so coming back to it later starts a fresh
+            // undo step instead of extending an edit the user has moved on from.
+            AddHandler(InputElement.LostFocusEvent, OnEditorLostFocus, RoutingStrategies.Tunnel);
+        }
+
+        private void OnUndoRedoKeyDown(object? sender, KeyEventArgs e)
+        {
+            if (DataContext is not SettingsViewModel vm)
+                return;
+
+            ICommand? command =
+                UndoGesture.Matches(e) ? vm.History.UndoCommand
+                : RedoGesture.Matches(e) || RedoAltGesture.Matches(e) ? vm.History.RedoCommand
+                : null;
+
+            // Only claim the key when there is actually something to undo — otherwise Ctrl+Z on an
+            // untouched window should behave as it always did rather than being swallowed here.
+            if (command is null || !command.CanExecute(null))
+                return;
+            command.Execute(null);
+            e.Handled = true;
+        }
+
+        private void OnEditorLostFocus(object? sender, RoutedEventArgs e)
+        {
+            if (DataContext is SettingsViewModel vm)
+                vm.History.BreakMerge();
         }
 
         private SettingsViewModel? _subscribed;

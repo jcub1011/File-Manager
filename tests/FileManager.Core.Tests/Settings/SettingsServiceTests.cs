@@ -74,6 +74,29 @@ public sealed class SettingsServiceTests : IDisposable
     }
 
     [Fact]
+    public void Update_strips_a_trailing_separator_from_a_specific_drive_key()
+    {
+        // A drive root spelled the way the OS hands it back ("C:\") has to collapse onto the canonical
+        // "c:" the engine looks up with, or the override matches nothing.
+        SettingsService service = NewService();
+        service.Update(new GlobalSettings
+        {
+            ScanThreading = new ScanThreadingSettings
+            {
+                SpecificDriveOverrides = new Dictionary<string, ThreadBudget>
+                {
+                    [@"C:\"] = ThreadBudget.Explicit(3),
+                    [@"\\Server\Share\"] = ThreadBudget.Explicit(2),
+                },
+            },
+        });
+
+        var overrides = service.Current.ScanThreading.SpecificDriveOverrides;
+        Assert.Equal(3, overrides["c:"].Value);
+        Assert.Equal(2, overrides[@"\\server\share"].Value);
+    }
+
+    [Fact]
     public void Legacy_manual_worker_pin_migrates_to_max_hash_threads()
     {
         // A pre-v2 file: scalar dry-run concurrency, no ScanThreading member.

@@ -1,5 +1,6 @@
 using CommunityToolkit.Mvvm.ComponentModel;
 using FileManager.UI.Extensions;
+using FileManager.UI.Undo;
 using System;
 using System.Collections.Generic;
 using System.Diagnostics.CodeAnalysis;
@@ -42,6 +43,13 @@ public abstract partial class SettingItemViewModel : ViewModelBase
     /// search, so "performance" finds every setting under Performance.</summary>
     public SettingsCategoryViewModel Category { get; internal set; } = null!;
 
+    /// <summary>False for a setting whose edit is NOT reversible, which excludes it from both the undo
+    /// stack and the window's unsaved-changes flag. Only the profiles directory needs it: changing that
+    /// moves files on disk immediately, so there is nothing to undo and nothing pending to save. Cannot
+    /// be decided by editor kind — the profiles and scratch directories are both
+    /// <see cref="TextSettingViewModel"/>.</summary>
+    public bool IsUndoable { get; init; } = true;
+
     /// <summary>False when the current search query does not match this setting. The view collapses the
     /// item rather than removing it, so no collection churn and no lost focus.</summary>
     [ObservableProperty] public partial bool IsVisible { get; set; } = true;
@@ -78,7 +86,7 @@ public sealed record ChoiceOption(object? Value, string Label);
 /// <summary>A setting picked from a fixed list of values (rendered as a ComboBox). The non-generic base
 /// exists purely so XAML has something to bind — Avalonia's compiled bindings need a concrete
 /// <c>x:DataType</c>, which a generic type cannot supply.</summary>
-public abstract partial class ChoiceSettingViewModel : SettingItemViewModel
+public abstract partial class ChoiceSettingViewModel : SettingItemViewModel, IUndoTrackable
 {
     protected ChoiceSettingViewModel(
         string id, string title, string description, IReadOnlyList<ChoiceOption> options, IReadOnlyList<string>? keywords)
@@ -88,6 +96,13 @@ public abstract partial class ChoiceSettingViewModel : SettingItemViewModel
     public IReadOnlyList<ChoiceOption> Options { get; }
 
     [ObservableProperty] public partial ChoiceOption? SelectedOption { get; set; }
+
+    /// <summary>Only <see cref="SelectedOption"/>, never the typed <c>Value</c> of the subclass: that is a
+    /// pass-through with no storage of its own, re-announced from
+    /// <see cref="OnSelectedOptionChangedCore"/>, so tracking both would record one pick twice. Never
+    /// coalesced — each pick from the list is a decision worth its own undo step.</summary>
+    public IEnumerable<UndoableProperty> UndoableProperties =>
+        [UndoableProperty.For(nameof(SelectedOption), () => SelectedOption, v => SelectedOption = v)];
 
     /// <summary>Every option label is searchable, so a user can find a setting by the value they want
     /// ("dark", "run on startup") rather than having to know what the setting is called.</summary>
@@ -137,13 +152,18 @@ public sealed partial class ChoiceSettingViewModel<T> : ChoiceSettingViewModel
 
 /// <summary>A free-text setting, optionally read-only and optionally paired with a trailing action
 /// button ("Browse…", "Change…").</summary>
-public sealed partial class TextSettingViewModel : SettingItemViewModel
+public sealed partial class TextSettingViewModel : SettingItemViewModel, IUndoTrackable
 {
     public TextSettingViewModel(
         string id, string title, string description, IReadOnlyList<string>? keywords = null)
         : base(id, title, description, keywords) { }
 
     [ObservableProperty] public partial string Value { get; set; } = "";
+
+    /// <summary>Coalesced: a typed-in path arrives one keystroke at a time and should step back as one
+    /// edit, not character by character.</summary>
+    public IEnumerable<UndoableProperty> UndoableProperties =>
+        [UndoableProperty.For(nameof(Value), () => Value, v => Value = v, coalesce: true)];
 
     public string? PlaceholderText { get; init; }
     public bool IsReadOnly { get; init; }
@@ -158,7 +178,7 @@ public sealed partial class TextSettingViewModel : SettingItemViewModel
 
 /// <summary>A numeric setting with an "Auto" escape hatch: while <see cref="Auto"/> is checked the
 /// engine picks the number and the spinner is hidden. Covers the scan/hash thread budgets.</summary>
-public sealed partial class AutoNumberSettingViewModel : SettingItemViewModel
+public sealed partial class AutoNumberSettingViewModel : SettingItemViewModel, IUndoTrackable
 {
     public AutoNumberSettingViewModel(
         string id, string title, string description, IReadOnlyList<string>? keywords = null)
@@ -172,11 +192,20 @@ public sealed partial class AutoNumberSettingViewModel : SettingItemViewModel
     public bool ShowValue => !Auto;
 
     partial void OnAutoChanged(bool value) => OnPropertyChanged(nameof(ShowValue));
+
+    /// <summary>The checkbox is a discrete decision; the spinner is held down and coalesces.
+    /// <see cref="ShowValue"/> is derived from <see cref="Auto"/> and deliberately absent — recording it
+    /// would double every toggle.</summary>
+    public IEnumerable<UndoableProperty> UndoableProperties =>
+    [
+        UndoableProperty.For(nameof(Auto), () => Auto, v => Auto = v),
+        UndoableProperty.For(nameof(Value), () => Value, v => Value = v, coalesce: true),
+    ];
 }
 
 /// <summary>An on/off setting. Not used by the current catalog — it is here because it is the most
 /// likely next editor kind, and having it keeps the first boolean setting a one-line registration.</summary>
-public sealed partial class BoolSettingViewModel : SettingItemViewModel
+public sealed partial class BoolSettingViewModel : SettingItemViewModel, IUndoTrackable
 {
     public BoolSettingViewModel(
         string id, string title, string description, IReadOnlyList<string>? keywords = null)
@@ -186,6 +215,9 @@ public sealed partial class BoolSettingViewModel : SettingItemViewModel
 
     /// <summary>Text beside the checkbox. Defaults to "Enabled" so a registration can omit it.</summary>
     public string CheckBoxLabel { get; init; } = "Enabled";
+
+    public IEnumerable<UndoableProperty> UndoableProperties =>
+        [UndoableProperty.For(nameof(Value), () => Value, v => Value = v)];
 }
 
 /// <summary>Factories for the stock setting kinds, kept terse so a registration reads as a
@@ -206,16 +238,19 @@ internal static class Setting
         return new ChoiceSettingViewModel<T>(id, title, description, choices, keywords);
     }
 
+    /// <summary>A free-text setting. Pass <paramref name="undoable"/> false for one whose action applies
+    /// immediately and irreversibly — see <see cref="SettingItemViewModel.IsUndoable"/>.</summary>
     public static TextSettingViewModel Text(
         string id, string title, string description, string[]? keywords = null,
         string? placeholder = null, bool readOnly = false,
-        string? actionButtonText = null, ICommand? actionCommand = null) =>
+        string? actionButtonText = null, ICommand? actionCommand = null, bool undoable = true) =>
         new(id, title, description, keywords)
         {
             PlaceholderText = placeholder,
             IsReadOnly = readOnly,
             ActionButtonText = actionButtonText,
             ActionCommand = actionCommand,
+            IsUndoable = undoable,
         };
 
     public static AutoNumberSettingViewModel AutoNumber(

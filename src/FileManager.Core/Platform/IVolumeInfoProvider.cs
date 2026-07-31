@@ -7,7 +7,8 @@ public interface IVolumeInfoProvider
 {
     Result<long, string> GetAvailableFreeBytes(string path);
 
-    /// <summary>Stable key grouping paths that share a volume (drive root or UNC share root).</summary>
+    /// <summary>Stable key grouping paths that share a volume (drive root or UNC share root), in the
+    /// canonical form <see cref="VolumeKeys.Normalize"/> defines — "c:", "\\server\share".</summary>
     Result<string, string> GetVolumeKey(string path);
 
     bool IsNetworkPath(string path);

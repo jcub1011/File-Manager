@@ -3,10 +3,12 @@ using CommunityToolkit.Mvvm.Input;
 using FileManager.Contracts.IPC;
 using FileManager.Contracts.Settings;
 using FileManager.UI.Services;
+using FileManager.UI.Undo;
 using FileManager.UI.ViewModels.Settings;
 using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
+using System.ComponentModel;
 using System.IO;
 using System.Threading.Tasks;
 
@@ -18,15 +20,16 @@ namespace FileManager.UI.ViewModels;
 ///
 /// Settings are declared as a catalog of <see cref="SettingItemViewModel"/>s (see
 /// <see cref="BuildCatalog"/>) rather than as loose properties, so the search box, the navigation tree,
-/// and the scroll anchors are all generated from one declaration. Adding a setting means: a field, one
-/// line in <see cref="BuildCatalog"/>, and a line each in <see cref="LoadAsync"/> and
-/// <see cref="SaveAsync"/> — no view changes unless it needs a brand-new editor kind.</summary>
+/// the scroll anchors, and undo/redo are all generated from one declaration. Adding a setting means: a
+/// field, one line in <see cref="BuildCatalog"/>, and a line each in <see cref="LoadAsync"/> and
+/// <see cref="SaveAsync"/> — no view changes unless it needs a brand-new editor kind, and no undo
+/// wiring at all.</summary>
 public sealed partial class SettingsViewModel : ViewModelBase
 {
     private readonly IIpcGateway _gateway;
     private readonly IFolderPicker _folderPicker;
 
-    public SettingsViewModel(IIpcGateway gateway, IFolderPicker folderPicker)
+    public SettingsViewModel(IIpcGateway gateway, IFolderPicker folderPicker, ISystemDrives? drives = null)
     {
         _gateway = gateway;
         _folderPicker = folderPicker;
@@ -62,6 +65,7 @@ public sealed partial class SettingsViewModel : ViewModelBase
             "performance.driveOverrides", "Per-drive overrides",
             "Override the per-drive budget for a whole drive type, or for a specific volume key (highest precedence). Precedence: specific drive → drive type → per-drive default.",
             PerDriveAutoDefault,
+            drives ?? new SystemDrives(),
             ["performance", "advanced", "drive", "disk", "volume", "network", "removable", "optical", "override"]);
 
         ScratchDirectory = Setting.Text(
@@ -75,7 +79,11 @@ public sealed partial class SettingsViewModel : ViewModelBase
             "Where profile files are stored. Change… applies immediately: it asks whether to move the existing profiles into the new folder (defaulting to no), then switches the service to it.",
             ["storage", "folder", "directory", "path", "profiles", "location", "move"],
             readOnly: true,
-            actionButtonText: "Change…", actionCommand: ChangeProfilesDirectoryCommand);
+            actionButtonText: "Change…", actionCommand: ChangeProfilesDirectoryCommand,
+            // Change… relocates files on disk immediately, so there is nothing to undo and nothing left
+            // pending for Save. Tracking it would also make the window read as dirty right after a
+            // relocation that already succeeded.
+            undoable: false);
 
         ScratchDirectory.Value = GlobalSettings.DefaultScratchDirectory;
         ProfilesDirectory.Value = GlobalSettings.DefaultProfilesDirectory;
@@ -85,6 +93,7 @@ public sealed partial class SettingsViewModel : ViewModelBase
 
         BuildCatalog();
         BuildNavigation();
+        TrackForUndo();      // last: the recorder caches the values the catalog was built with
     }
 
     // Shadow "explicit" defaults shown when a budget's Auto is unchecked, matching the engine's auto
@@ -152,6 +161,44 @@ public sealed partial class SettingsViewModel : ViewModelBase
                 NavNodes.Add(node);
         }
     }
+
+    // ============================ Undo / redo and unsaved changes ============================
+
+    /// <summary>Undo/redo for this editing session, and the source of <see cref="IsDirty"/>. Bound
+    /// directly by the footer's Undo/Redo buttons; the keyboard shortcuts run the same commands.</summary>
+    public UndoHistory History { get; } = new();
+
+    /// <summary>Registers every reversible setting. One loop over the catalog, so a newly declared
+    /// setting is undoable with no extra wiring — the only opt-out is
+    /// <see cref="SettingItemViewModel.IsUndoable"/>.</summary>
+    private void TrackForUndo()
+    {
+        foreach (SettingsCategoryViewModel category in Categories)
+        {
+            foreach (SettingItemViewModel item in category.Items)
+            {
+                if (item is IUndoTrackable trackable && item.IsUndoable)
+                    History.Track(trackable);
+            }
+        }
+        History.PropertyChanged += OnHistoryChanged;
+    }
+
+    private void OnHistoryChanged(object? sender, PropertyChangedEventArgs e)
+    {
+        if (e.PropertyName is nameof(UndoHistory.IsDirty))
+        {
+            OnPropertyChanged(nameof(IsDirty));
+            OnPropertyChanged(nameof(CloseButtonText));
+        }
+    }
+
+    /// <summary>True when there are edits the Save button has not persisted.</summary>
+    public bool IsDirty => History.IsDirty;
+
+    /// <summary>What the close button says. Naming the consequence at the moment of the click is the
+    /// whole point: closing has always discarded pending edits, it just never said so.</summary>
+    public string CloseButtonText => IsDirty ? "Discard changes" : "Close";
 
     // ============================ Search ============================
 
@@ -232,6 +279,9 @@ public sealed partial class SettingsViewModel : ViewModelBase
 
     private void SelectSetting(SettingItemViewModel item)
     {
+        // Jumping elsewhere ends whatever the user was typing, so the next edit starts its own undo step
+        // rather than being folded into an edit they have already moved on from.
+        History.BreakMerge();
         if (SelectedSetting is not null && !ReferenceEquals(SelectedSetting, item))
             SelectedSetting.IsSelected = false;
         SelectedSetting = item;
@@ -372,6 +422,11 @@ public sealed partial class SettingsViewModel : ViewModelBase
         IsBusy = true;
         ErrorMessage = null;
         StatusMessage = null;
+
+        // A load replaces the edited state wholesale; none of it is a user edit. Suppress covers the
+        // whole body (including the early error returns) and Reset in the finally guarantees the window
+        // opens clean even when the load failed part-way.
+        using IDisposable suppressed = History.Suppress();
         try
         {
             var result = await _gateway.GetSettingsAsync();
@@ -402,7 +457,9 @@ public sealed partial class SettingsViewModel : ViewModelBase
             foreach (KeyValuePair<string, ThreadBudget> e in st.SpecificDriveOverrides)
             {
                 (bool auto, int value) = FromBudget(e.Value, PerDriveAutoDefault);
-                DriveOverrides.SpecificDriveOverrides.Add(new SpecificDriveOverrideRowViewModel { VolumeKey = e.Key, Auto = auto, Value = value });
+                SpecificDriveOverrideRowViewModel row = DriveOverrides.NewSpecificRow();
+                (row.VolumeKey, row.Auto, row.Value) = (e.Key, auto, value);
+                DriveOverrides.SpecificDriveOverrides.Add(row);
             }
         }
         catch (Exception ex)
@@ -414,6 +471,7 @@ public sealed partial class SettingsViewModel : ViewModelBase
         finally
         {
             IsBusy = false;
+            History.Reset();     // the loaded state is the baseline: nothing to undo, nothing unsaved
         }
     }
 
@@ -440,9 +498,11 @@ public sealed partial class SettingsViewModel : ViewModelBase
             Dictionary<string, ThreadBudget> specific = [];
             foreach (SpecificDriveOverrideRowViewModel row in DriveOverrides.SpecificDriveOverrides)
             {
-                if (string.IsNullOrWhiteSpace(row.VolumeKey))
+                // Same normalizer the engine looks up with, so "C:\" and "c:" are one key and both match
+                // a real volume.
+                string key = VolumeKeys.Normalize(row.VolumeKey);
+                if (key.Length == 0)
                     continue;
-                string key = row.VolumeKey.Trim().ToLowerInvariant();
                 if (!specific.TryAdd(key, ToBudget(row.Auto, row.Value)))
                 {
                     ErrorMessage = $"Duplicate volume key \"{key}\".";
@@ -487,6 +547,9 @@ public sealed partial class SettingsViewModel : ViewModelBase
             }
             StatusMessage = "Saved.";
             ThemeApplier.Apply(Theme.Value);      // apply the selected theme app-wide on save
+            // Clears the unsaved-changes flag without dropping the history, so the user can still step
+            // back through what they just saved.
+            History.MarkSaved();
             RequestClose?.Invoke();
         }
         catch (Exception ex)

@@ -39,6 +39,8 @@ internal static class ScanThreadResolver
     }
 
     /// <summary>Canonical form of a specific-drive override key so it matches
-    /// <see cref="Platform.IVolumeInfoProvider.GetVolumeKey"/> output ("c:", "\\server\share").</summary>
-    internal static string NormalizeKey(string key) => key.Trim().ToLowerInvariant();
+    /// <see cref="Platform.IVolumeInfoProvider.GetVolumeKey"/> output ("c:", "\\server\share").
+    /// Delegates to <see cref="VolumeKeys.Normalize"/> — the rule lives in Contracts so the settings UI
+    /// (which cannot reference Core) applies exactly the same one.</summary>
+    internal static string NormalizeKey(string key) => VolumeKeys.Normalize(key);
 }

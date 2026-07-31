@@ -1,5 +1,7 @@
 using Avalonia;
 using Avalonia.Controls;
+using Avalonia.Headless;
+using Avalonia.Input;
 using Avalonia.VisualTree;
 using FileManager.Contracts.Settings;
 using FileManager.UI.Tests.Fakes;
@@ -175,6 +177,155 @@ public sealed class SettingsWindowSmokeTests(HeadlessSessionFixture headless)
                 return found;
         }
         return null;
+    }
+
+    [Fact]
+    public async Task The_specific_drive_row_renders_its_drive_picker()
+    {
+        await headless.Session.DispatchAsync(async () =>
+        {
+            SettingsViewModel vm = new(new FakeIpcGateway(), new FakeFolderPicker(), new FakeSystemDrives());
+            await vm.LoadAsync();
+            vm.DriveOverrides.AddSpecificDriveOverrideCommand.Execute(null);
+
+            SettingsWindow window = new() { DataContext = vm };
+            window.Show();
+            window.UpdateLayout();
+
+            // The picker's ItemsSource/ItemTemplate are compiled bindings inside a nested DataTemplate —
+            // a mistake there fails at runtime, not at build, and leaves an empty combo behind.
+            ComboBox picker = window.GetVisualDescendants().OfType<ComboBox>()
+                .Single(c => c.DataContext is SpecificDriveOverrideRowViewModel);
+            Assert.Equal(2, picker.ItemCount);
+        }, CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task No_override_row_control_is_clipped_at_the_narrowest_allowed_window()
+    {
+        // Measures the CONTROLS, not their container. The existing card-level check cannot catch this and
+        // neither could a row-level one: both the card and the row panel live in a width-capped star
+        // column, so they are always exactly as wide as the viewport allows no matter how far the buttons
+        // and boxes inside them run past the edge.
+        await headless.Session.DispatchAsync(async () =>
+        {
+            SettingsViewModel vm = new(new FakeIpcGateway(), new FakeFolderPicker(), new FakeSystemDrives());
+            await vm.LoadAsync();
+            vm.DriveOverrides.AddDriveTypeOverrideCommand.Execute(null);
+            vm.DriveOverrides.AddSpecificDriveOverrideCommand.Execute(null);
+            vm.DriveOverrides.SpecificDriveOverrides[0].Auto = false;    // widest state: the spinner is shown
+            vm.DriveOverrides.DriveTypeOverrides[0].Auto = false;
+
+            SettingsWindow window = new() { DataContext = vm, Width = 720 };
+            window.Show();
+            window.UpdateLayout();
+
+            ScrollViewer scroll = Assert.IsType<ScrollViewer>(window.FindControl<ScrollViewer>("SettingsScroll"));
+            foreach (Control control in window.GetVisualDescendants().OfType<Control>()
+                         .Where(c => c is ComboBox or TextBox or CheckBox or NumericUpDown or Button)
+                         .Where(c => c.DataContext is DriveTypeOverrideRowViewModel or SpecificDriveOverrideRowViewModel))
+            {
+                Point origin = Assert.IsType<Point>(control.TranslatePoint(default, scroll));
+                double right = origin.X + control.Bounds.Width;
+                Assert.True(
+                    right <= scroll.Bounds.Width + 0.5,
+                    $"A {control.GetType().Name} in an override row reaches {right:F0}px, past the "
+                    + $"{scroll.Bounds.Width:F0}px document width — it will be clipped.");
+            }
+        }, CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task An_override_row_still_fits_on_one_line_at_the_default_window_width()
+    {
+        // The flip side of the wrapping check: wrapping is the narrow-window fallback, not the normal
+        // look. If a future control widens the row past the default width, every override becomes two
+        // lines tall and this catches it.
+        await headless.Session.DispatchAsync(async () =>
+        {
+            SettingsViewModel vm = new(new FakeIpcGateway(), new FakeFolderPicker(), new FakeSystemDrives());
+            await vm.LoadAsync();
+            vm.DriveOverrides.AddSpecificDriveOverrideCommand.Execute(null);
+            vm.DriveOverrides.SpecificDriveOverrides[0].Auto = false;
+
+            SettingsWindow window = new() { DataContext = vm };     // default 980 width
+            window.Show();
+            window.UpdateLayout();
+
+            WrapPanel row = window.GetVisualDescendants().OfType<WrapPanel>()
+                .Single(p => p.DataContext is SpecificDriveOverrideRowViewModel);
+            Control[] children = [.. row.GetVisualChildren().OfType<Control>()];
+            Assert.Equal(5, children.Length);
+
+            // One line means the panel is no taller than its tallest child. Comparing each child's Y
+            // would be wrong: they are centre-aligned, so shorter controls legitimately start a couple of
+            // pixels down.
+            double tallest = children.Max(c => c.Bounds.Height + c.Margin.Top + c.Margin.Bottom);
+            Assert.True(
+                row.Bounds.Height <= tallest + 1,
+                $"The specific-drive row is {row.Bounds.Height:F0}px tall against a tallest control of "
+                + $"{tallest:F0}px — it has wrapped onto a second line at the default window width.");
+        }, CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task Ctrl_Z_in_a_text_box_undoes_the_setting_not_the_text_box()
+    {
+        // The window claims the gesture in the tunnel phase, deliberately superseding the TextBox's own
+        // character-level undo, so undo means the same thing wherever focus happens to be.
+        await headless.Session.DispatchAsync(async () =>
+        {
+            SettingsViewModel vm = new(new FakeIpcGateway(), new FakeFolderPicker(), new FakeSystemDrives());
+            await vm.LoadAsync();
+            string original = vm.ScratchDirectory.Value;
+
+            SettingsWindow window = new() { DataContext = vm };
+            window.Show();
+            window.UpdateLayout();
+
+            TextBox box = window.GetVisualDescendants().OfType<TextBox>()
+                .Single(t => ReferenceEquals(t.DataContext, vm.ScratchDirectory));
+            box.Focus();
+            box.Text = @"D:\spill";
+            Assert.True(vm.IsDirty);
+
+            window.KeyPressQwerty(PhysicalKey.Z, RawInputModifiers.Control);
+
+            Assert.Equal(original, vm.ScratchDirectory.Value);
+            Assert.False(vm.IsDirty);
+
+            window.KeyPressQwerty(PhysicalKey.Y, RawInputModifiers.Control);
+            Assert.Equal(@"D:\spill", vm.ScratchDirectory.Value);
+
+            window.KeyPressQwerty(PhysicalKey.Z, RawInputModifiers.Control);
+            window.KeyPressQwerty(PhysicalKey.Z, RawInputModifiers.Control | RawInputModifiers.Shift);
+            Assert.Equal(@"D:\spill", vm.ScratchDirectory.Value);   // Ctrl+Shift+Z redoes too
+        }, CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task The_footer_close_button_names_the_consequence_when_there_are_unsaved_edits()
+    {
+        await headless.Session.DispatchAsync(async () =>
+        {
+            SettingsViewModel vm = new(new FakeIpcGateway(), new FakeFolderPicker(), new FakeSystemDrives());
+            await vm.LoadAsync();
+
+            SettingsWindow window = new() { DataContext = vm };
+            window.Show();
+            window.UpdateLayout();
+
+            Button close = window.GetVisualDescendants().OfType<Button>()
+                .Single(b => Equals(b.Content, "Close"));
+
+            vm.Theme.Value = ThemeMode.Dark;
+            window.UpdateLayout();
+            Assert.Equal("Discard changes", close.Content);
+
+            vm.History.UndoCommand.Execute(null);
+            window.UpdateLayout();
+            Assert.Equal("Close", close.Content);
+        }, CancellationToken.None);
     }
 
     [Fact]

@@ -30,14 +30,18 @@ public sealed partial class MainWindowViewModel : ViewModelBase
     private readonly IIpcGateway _gateway;
     private readonly IFolderPicker _folderPicker;
     private readonly ILogFolderService _logFolder;
+    private readonly ISystemDrives? _systemDrives;
     private readonly string _uiStatePath;
 
     public MainWindowViewModel(IIpcGateway gateway, IFolderPicker folderPicker, ILogFolderService logFolder,
-        IDryRunItemActions dryRunActions, string? uiStatePath = null)
+        IDryRunItemActions dryRunActions, string? uiStatePath = null, ISystemDrives? systemDrives = null)
     {
         _gateway = gateway;
         _folderPicker = folderPicker;
         _logFolder = logFolder;
+        // Only used when the settings dialog opens; null lets SettingsViewModel fall back to the real
+        // enumeration, so tests that never open settings need not supply one.
+        _systemDrives = systemDrives;
         // Test seam: tests pass an isolated path so constructing the shell VM never reads or writes
         // the developer's real %LOCALAPPDATA% ui-state file.
         _uiStatePath = uiStatePath ?? UiPaths.UiStateFilePath;
@@ -422,7 +426,7 @@ public sealed partial class MainWindowViewModel : ViewModelBase
         {
             if (ShowSettingsDialog is null)
                 return;
-            SettingsViewModel settings = new(_gateway, _folderPicker)
+            SettingsViewModel settings = new(_gateway, _folderPicker, _systemDrives)
             {
                 // A relocation changes which profiles the service serves, so refresh the list to reflect
                 // the new directory's contents without waiting for the user to hit refresh.
