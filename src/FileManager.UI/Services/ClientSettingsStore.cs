@@ -10,14 +10,20 @@ namespace FileManager.UI.Services;
 /// missing/corrupt file or IO failure falls back to <see cref="ClientSettings.Default"/>, and a failed
 /// write is logged but never throws.
 ///
-/// IMPORTANT — every write must be read-modify-write:
-/// <code>ClientSettingsStore.Write(path, ClientSettingsStore.Read(path) with { ThemeMode = value });</code>
-/// Two unrelated features share this file and save on completely different triggers (the sidebar
-/// persists on every layout change, the settings window on Save). Constructing a fresh record — which
-/// is what the predecessor <c>UiStateStore</c> did, safely, because it owned its file alone — would
-/// silently erase whichever half the writer does not know about.</summary>
+/// IMPORTANT — every write goes through <see cref="Update(string, Func{ClientSettings, ClientSettings})"/>,
+/// which is read-modify-write under a lock. Two unrelated features share this file and save on
+/// completely different triggers (the sidebar persists on every layout change, the settings window on
+/// Save), so a writer that constructed a fresh record — which is what the predecessor
+/// <c>UiStateStore</c> did, safely, because it owned its file alone — would silently erase whichever
+/// half it does not know about, and two unsynchronised read-modify-writes could interleave and do the
+/// same thing to each other.</summary>
 internal static class ClientSettingsStore
 {
+    /// <summary>Serialises the read-modify-write pairs against each other. Process-wide is enough: this
+    /// file belongs to the UI process alone — the service never reads or writes it, which is the whole
+    /// reason it exists.</summary>
+    private static readonly object Gate = new();
+
     public static ClientSettings Read() => Read(UiPaths.ClientSettingsFilePath);
 
     internal static ClientSettings Read(string path)
@@ -49,23 +55,59 @@ internal static class ClientSettingsStore
     /// next attempt to reach the service, with no app restart.</summary>
     public static string? ReadServiceExecutablePath() => Read().ServiceExecutablePath;
 
-    public static void Write(ClientSettings settings) => Write(UiPaths.ClientSettingsFilePath, settings);
+    /// <summary>Applies <paramref name="edit"/> to the CURRENT stored settings and persists the result,
+    /// returning what was written. The only correct way to change one half of this file: reading and
+    /// writing as separate steps lets the other writer's save land in between and be overwritten.
+    /// <para><paramref name="edit"/> runs under the lock, so it must not block or call back in here.</para>
+    /// </summary>
+    internal static ClientSettings Update(string path, Func<ClientSettings, ClientSettings> edit)
+    {
+        lock (Gate)
+        {
+            ClientSettings updated = edit(Read(path));
+            Write(path, updated);
+            return updated;
+        }
+    }
 
     internal static void Write(string path, ClientSettings settings)
     {
+        // Write-then-rename, never in place. This file now holds the service executable path — the
+        // user's only way out of an unreachable service — so a write torn by a crash or a full disk
+        // would replace a working override with half a JSON document, and the app would come up unable
+        // to start its service and with no record of where it had been pointed. A rename is atomic on
+        // NTFS, so a reader sees either the whole old file or the whole new one.
+        string temp = path + ".tmp";
         try
         {
             string? dir = Path.GetDirectoryName(path);
             if (!string.IsNullOrEmpty(dir))
                 Directory.CreateDirectory(dir);
 
-            using FileStream stream = File.Create(path);
-            JsonSerializer.Serialize(stream, settings, UiJsonContext.Default.ClientSettings);
+            using (FileStream stream = File.Create(temp))
+                JsonSerializer.Serialize(stream, settings, UiJsonContext.Default.ClientSettings);
+            File.Move(temp, path, overwrite: true);
         }
         catch (Exception ex)
         {
             // A failed write costs a preference, never correctness; it must not disrupt the app.
             Serilog.Log.Warning(ex, "Could not write client settings to {File}", path);
+            TryDeleteTemp(temp);
+        }
+    }
+
+    /// <summary>Clears a half-written temp file so a failure does not leave litter beside the real one.
+    /// Best-effort by nature — the write already failed and was already reported.</summary>
+    private static void TryDeleteTemp(string temp)
+    {
+        try
+        {
+            if (File.Exists(temp))
+                File.Delete(temp);
+        }
+        catch (Exception ex)
+        {
+            Serilog.Log.Debug(ex, "Could not remove the partial client-settings file {File}", temp);
         }
     }
 

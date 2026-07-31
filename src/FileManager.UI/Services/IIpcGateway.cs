@@ -44,11 +44,14 @@ public interface IIpcGateway
     /// when the user points the service executable path somewhere else).</summary>
     Task<Result<bool, IpcError>> ShutdownServiceAsync(CancellationToken ct = default);
 
-    /// <summary>Forgets the current connection so the next request reconnects from scratch, starting
-    /// the configured executable if nothing is listening. Needed after the service executable path
-    /// changes: the cached connection points at whatever was running before, so without this the UI
-    /// keeps talking to the old service and the new setting looks like it did nothing.</summary>
-    Task ResetConnectionAsync();
+    /// <summary>Forgets the current connection so the next request reconnects from scratch. Needed
+    /// after the service executable path changes: the cached connection points at whatever was running
+    /// before, so without this the UI keeps talking to the old service and the new setting looks like
+    /// it did nothing.</summary>
+    /// <param name="allowStart">True also clears the start cooldown, so the next request may spawn the
+    /// configured executable. False arms the cooldown instead, leaving a plain reconnect — for a caller
+    /// that resets repeatedly in a loop and must not turn each round into another process launch.</param>
+    Task ResetConnectionAsync(bool allowStart = true);
 
     /// <summary>Manually invokes a profile against one file or folder (a folder is walked recursively,
     /// honoring MaxDepth). The service enqueues and answers immediately, so the response means

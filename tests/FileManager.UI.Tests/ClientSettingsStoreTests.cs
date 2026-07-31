@@ -134,11 +134,33 @@ public sealed class ClientSettingsStoreTests
             });
 
             // ...now the sidebar saves its layout, knowing nothing about the exe path.
-            ClientSettingsStore.Write(file, ClientSettingsStore.Read(file) with { SidebarWidth = 500 });
+            ClientSettingsStore.Update(file, stored => stored with { SidebarWidth = 500 });
 
             ClientSettings persisted = ClientSettingsStore.Read(file);
             Assert.Equal(500, persisted.SidebarWidth);
             Assert.Equal(@"D:\tools\FileManager.Service.exe", persisted.ServiceExecutablePath);
+        }
+        finally
+        {
+            Directory.Delete(dir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void A_write_leaves_no_partial_file_behind()
+    {
+        // Write-then-rename: this file holds the service executable path, so a torn write would leave
+        // the app unable to start its own service with no record of where it had been pointed. The
+        // staging file must not survive a successful write either — it sits next to the real one and
+        // would be mistaken for a backup.
+        string dir = NewDir();
+        try
+        {
+            string file = Path.Combine(dir, "client-settings.json");
+            ClientSettingsStore.Update(file, stored => stored with { ThemeMode = ThemeMode.Dark });
+
+            Assert.Equal(ThemeMode.Dark, ClientSettingsStore.Read(file).ThemeMode);
+            Assert.Equal([Path.GetFileName(file)], Directory.GetFiles(dir).Select(Path.GetFileName));
         }
         finally
         {

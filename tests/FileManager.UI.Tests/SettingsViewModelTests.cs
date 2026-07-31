@@ -454,6 +454,8 @@ public sealed class SettingsViewModelTests
             // The give-up path polls; nothing here is real, so there is nothing to wait for.
             SwitchAttempts = 3,
             SwitchPollDelay = TimeSpan.Zero,
+            // Below SwitchAttempts on purpose, so the later rounds exercise the start-suppressing reset.
+            SwitchStartAttempts = 1,
         };
         return (vm, prompts);
     }
@@ -605,6 +607,11 @@ public sealed class SettingsViewModelTests
 
             Assert.Equal(1, gateway.ShutdownCalls);
             Assert.Contains(newExe, vm.ErrorMessage);
+
+            // The bound that matters: an executable which starts but never serves must be LAUNCHED a
+            // handful of times, not once per poll. Only the first SwitchStartAttempts rounds may ask
+            // the gateway for a start; every later round is a plain reconnect.
+            Assert.Equal([true, false, false], gateway.ResetConnectionAllowStart);
         }
         finally { Directory.Delete(dir, recursive: true); }
     }

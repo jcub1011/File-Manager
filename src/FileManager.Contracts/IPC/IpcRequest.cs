@@ -37,7 +37,9 @@ public abstract record IpcRequest
     /// (including zero for "nothing matched") arrives as a run-queued event;
     /// 7 — GlobalSettings dropped ThemeMode (settings.json schema v5): the theme is client-side state
     /// the engine never read, so it moved to the UI's own client-settings.json. Also adds
-    /// EngineStatusSnapshot.ExecutablePath, so a client can tell WHICH executable is serving it.
+    /// EngineStatusSnapshot.ExecutablePath, so a client can tell WHICH executable is serving it, and
+    /// EngineStatusSnapshot.StartupWarning, which carries a degraded-startup problem to clients that
+    /// connect after the corresponding engine-warning event was published.
     /// A mismatched service/UI pair must fail loud (IPC_VERSION_MISMATCH), never half-parse.</summary>
     public const int CurrentProtocolVersion = 7;
 

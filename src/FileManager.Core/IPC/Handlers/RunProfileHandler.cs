@@ -8,6 +8,7 @@ using FileManager.Core.Profiles;
 using FileManager.Core.Watching;
 using Microsoft.Extensions.Logging;
 using System;
+using System.Collections.Concurrent;
 using System.IO;
 using System.Linq;
 using System.Threading;
@@ -39,6 +40,16 @@ public sealed class RunProfileHandler(
     /// handler is a container singleton, so disposal — and therefore this cancel — happens as the host
     /// tears the graph down.</summary>
     private readonly CancellationTokenSource _shutdown = new();
+
+    /// <summary>The detached walks started so far, so <see cref="Dispose"/> can wait for them to observe
+    /// the cancel before it disposes the source they are still reading the token from. Entries are
+    /// removed as they finish, so a long-lived service does not accumulate one per manual run.</summary>
+    private readonly ConcurrentDictionary<Task, byte> _walks = new();
+
+    /// <summary>How long <see cref="Dispose"/> waits for the walks to unwind. A bound, not a promise:
+    /// teardown must finish even if a walk is wedged on an unresponsive network path, and the process is
+    /// exiting anyway. Matches the drain budget the orchestrator gets.</summary>
+    private static readonly TimeSpan DisposeDrainTimeout = TimeSpan.FromSeconds(5);
 
     public string RequestType => IpcRequestTypes.RunProfile;
 
@@ -91,8 +102,9 @@ public sealed class RunProfileHandler(
         {
             // Enumerate off the IPC thread so the reply is immediate; captures its own copy of profile.
             // Under the handler's own shutdown token, not CancellationToken.None: an unowned walk is one
-            // nothing can stop.
-            _ = Task.Run(() => ScanAndEnqueue(profile, typed.Path, runId), _shutdown.Token);
+            // nothing can stop. Tracked so Dispose can wait for it rather than pulling the token source
+            // out from under a walk that is still reading it.
+            TrackWalk(Task.Run(() => ScanAndEnqueue(profile, typed.Path, runId), _shutdown.Token));
             logger.LogInformation("Started background enumeration for manual run of profile {ProfileId} at folder {Path}", profile.Id, typed.Path);
             response = new RunProfileResponse { QueuedCount = 0, Scanning = true, RunId = runId };
         }
@@ -185,9 +197,45 @@ public sealed class RunProfileHandler(
         }
     }
 
+    /// <summary>Registers a detached walk and self-removes it on completion, so the set holds only what
+    /// is actually still running. The continuation is inline and never faults — <see cref="ScanAndEnqueue"/>
+    /// has its own catch-all — so there is nothing here to observe.</summary>
+    private void TrackWalk(Task walk)
+    {
+        _walks[walk] = 0;
+        _ = walk.ContinueWith(
+            static (finished, state) => ((ConcurrentDictionary<Task, byte>)state!).TryRemove(finished, out _),
+            _walks, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+    }
+
+    /// <summary>Cancels the detached walks and WAITS for them before disposing the token source.
+    /// <para>The wait is the point. Cancel returns as soon as it has run the registered callbacks, but a
+    /// walk is still inside <c>scanner.Scan</c> reading <c>_shutdown.Token</c> — and a token whose source
+    /// has been disposed throws <see cref="ObjectDisposedException"/> from
+    /// <c>CreateLinkedTokenSource</c> and <c>Register</c>. Disposing straight after the cancel therefore
+    /// turned an orderly shutdown into a thrown exception on a background thread, swallowed by
+    /// ScanAndEnqueue's catch-all and reported to the client as an unexplained failure instead of "the
+    /// service shut down".</para></summary>
     public void Dispose()
     {
         _shutdown.Cancel();
+        try
+        {
+            // ToArray: the walks remove themselves as they finish, and WaitAll needs a stable set.
+            Task[] pending = [.. _walks.Keys];
+            if (pending.Length > 0 && !Task.WaitAll(pending, DisposeDrainTimeout))
+            {
+                logger.LogWarning(
+                    "{Count} manual-run enumeration(s) did not stop within {Timeout}; disposing anyway",
+                    pending.Length, DisposeDrainTimeout);
+            }
+        }
+        catch (Exception ex)
+        {
+            // Last-resort catch-all (directive): a faulted walk must not stop teardown. WaitAll wraps
+            // whatever the tasks threw, and every one of them already logged it.
+            logger.LogWarning(ex, "Waiting for manual-run enumerations to stop failed");
+        }
         _shutdown.Dispose();
     }
 

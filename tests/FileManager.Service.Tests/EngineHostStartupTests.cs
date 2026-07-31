@@ -193,7 +193,8 @@ public sealed class EngineHostStartupTests : IDisposable
         EngineHost Host,
         RecordingLifetime Lifetime,
         RecordingIpcServer Server,
-        RecordingEventBus Bus);
+        RecordingEventBus Bus,
+        EngineStartupState Startup);
 
     private Harness NewHost(
         Result? catalogReload = null,
@@ -205,6 +206,7 @@ public sealed class EngineHostStartupTests : IDisposable
         RecordingLifetime lifetime = new();
         RecordingIpcServer server = new(_order, ipcStartError);
         RecordingEventBus bus = new(_order);
+        EngineStartupState startup = new();
         EngineHost host = new(
             NullLogger<EngineHost>.Instance,
             lifetime,
@@ -217,9 +219,10 @@ public sealed class EngineHostStartupTests : IDisposable
             new RecordingOrchestrator(_order),
             bus,
             new RecordingPauseState(_order),
+            startup,
             TimeProvider.System,
             mutexName ?? _mutexName);
-        return new Harness(host, lifetime, server, bus);
+        return new Harness(host, lifetime, server, bus, startup);
     }
 
     [Fact]
@@ -314,6 +317,10 @@ public sealed class EngineHostStartupTests : IDisposable
         EngineWarningEvent warning = Assert.Single(h.Bus.Snapshot().OfType<EngineWarningEvent>());
         Assert.Contains("Profiles could not be loaded", warning.Message);
         Assert.Contains("access denied", warning.Message);
+        // ...and recorded, which is the copy that actually reaches a user: the event above is published
+        // before a UI that launched this service has finished subscribing, so only the status snapshot
+        // still has it by the time anyone can look.
+        Assert.Equal(warning.Message, h.Startup.Warning);
 
         await h.Host.StopAsync(CancellationToken.None);
         h.Host.Dispose();
@@ -338,6 +345,7 @@ public sealed class EngineHostStartupTests : IDisposable
         EngineWarningEvent warning = Assert.Single(h.Bus.Snapshot().OfType<EngineWarningEvent>());
         Assert.Contains("is not available", warning.Message);
         Assert.Contains("do not re-create your profiles yet", warning.Message);
+        Assert.Equal(warning.Message, h.Startup.Warning);
 
         await h.Host.StopAsync(CancellationToken.None);
         h.Host.Dispose();
@@ -352,6 +360,7 @@ public sealed class EngineHostStartupTests : IDisposable
         await SettledOrderAsync(7);
 
         Assert.Empty(h.Bus.Snapshot().OfType<EngineWarningEvent>());
+        Assert.Null(h.Startup.Warning);
 
         await h.Host.StopAsync(CancellationToken.None);
         h.Host.Dispose();

@@ -31,6 +31,7 @@ internal sealed class EngineHost(
     IJobOrchestrator orchestrator,
     IEngineEventBus eventBus,
     IPauseStateService pauseState,
+    Core.EngineStartupState startupState,
     TimeProvider time,
     // Test seam ONLY, and deliberately the last parameter with a default so the DI activation in
     // EngineComposition is unchanged. The derived name is a frozen cross-process contract, so it stays
@@ -174,11 +175,17 @@ internal sealed class EngineHost(
         _profilesBridge = catalog.Subscribe(() =>
             eventBus.Publish(new ProfilesChangedEvent { AtUtc = time.GetUtcNow() }));
 
-        // Step 3's failure, published now that the bridge above can carry it to IPC subscribers. A UI
-        // that connects later re-seeds through ReconcileEngineStateAsync rather than replaying this, so
-        // the log line above remains the durable record.
+        // Step 3's failure. It is recorded on the startup state FIRST and published second, and the
+        // recording is what actually reaches the user: this runs microseconds after step 5 opened the
+        // IPC server, so a UI that launched this service has not finished subscribing yet and the event
+        // is dropped. GetStatusHandler stamps the recorded copy onto every status snapshot, so whenever
+        // a client connects it learns about this on its first poll. The event stays for the client that
+        // is already attached (a second window, a session where the service was already up).
         if (profileLoadWarning is not null)
+        {
+            startupState.Warning = profileLoadWarning;
             eventBus.Publish(new EngineWarningEvent { AtUtc = time.GetUtcNow(), Message = profileLoadWarning });
+        }
 
         Result orchestratorStarted = orchestrator.Start();
         if (orchestratorStarted.TryGetError(out string? orchestratorError))

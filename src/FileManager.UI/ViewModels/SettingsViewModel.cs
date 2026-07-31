@@ -9,6 +9,7 @@ using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.ComponentModel;
+using System.Diagnostics;
 using System.IO;
 using System.Threading.Tasks;
 
@@ -749,16 +750,14 @@ public sealed partial class SettingsViewModel : ViewModelBase
         if (updated == _storedClient)
             return exePath;
 
-        // Read-modify-write against the file, not against _storedClient: the sidebar writes its own
-        // half of this file on its own schedule, so the copy read at load time may already be stale.
-        ClientSettingsStore.Write(
-            _clientSettingsPath,
-            ClientSettingsStore.Read(_clientSettingsPath) with
-            {
-                ServiceExecutablePath = exePath,
-                ThemeMode = Theme.Value,
-            });
-        _storedClient = updated;
+        // Update, not Read-then-Write: the sidebar writes its own half of this file on its own
+        // schedule, so the copy read at load time may already be stale, and doing the read and the
+        // write as separate steps would let a sidebar save land between them and be lost.
+        _storedClient = ClientSettingsStore.Update(_clientSettingsPath, stored => stored with
+        {
+            ServiceExecutablePath = exePath,
+            ThemeMode = Theme.Value,
+        });
         return exePath;
     }
 
@@ -769,12 +768,23 @@ public sealed partial class SettingsViewModel : ViewModelBase
     /// stays window-agnostic (mirrors <see cref="ConfirmMoveProfiles"/>).</summary>
     public Func<string, Task<bool>>? ConfirmStopPreviousService { get; set; }
 
-    /// <summary>How long to wait for the newly configured executable to take over. Each poll is cheap
-    /// while the old service is still answering; the one expensive step is the single launch attempt,
-    /// which carries the launcher's own retry budget. Internal purely as a test seam (mirrors
-    /// <c>JobProgressPublisher.Interval</c>) — neither is user-configurable.</summary>
+    /// <summary>How long to wait for the newly configured executable to take over. Internal purely as a
+    /// test seam (mirrors <c>JobProgressPublisher.Interval</c>) — none of these are user-configurable.</summary>
     internal int SwitchAttempts { get; init; } = 20;
     internal TimeSpan SwitchPollDelay { get; init; } = TimeSpan.FromMilliseconds(250);
+
+    /// <summary>How many of those rounds may spawn a process. Bounded well below
+    /// <see cref="SwitchAttempts"/> and NOT equal to 1: the stopped service does not release its
+    /// single-instance mutex the instant it acknowledges the shutdown, so the first launch can lose that
+    /// race and exit immediately, and one attempt would report a working executable as broken. Every
+    /// later round is a plain reconnect. Without this bound an executable that starts but never serves —
+    /// the exact case the path notice warns about — is launched once per round, each burning the
+    /// launcher's full ~5 s retry budget: twenty stray processes and a Save that hangs for minutes.</summary>
+    internal int SwitchStartAttempts { get; init; } = 3;
+
+    /// <summary>Hard ceiling on the whole wait, independent of the round arithmetic above, so a
+    /// pathologically slow connect attempt cannot leave the window busy indefinitely.</summary>
+    internal TimeSpan SwitchTimeout { get; init; } = TimeSpan.FromSeconds(45);
 
     /// <summary>Makes the running service match the executable the user just chose. Outcomes are
     /// reported through <see cref="StatusMessage"/> / <see cref="ErrorMessage"/>, which the window
@@ -844,20 +854,31 @@ public sealed partial class SettingsViewModel : ViewModelBase
     /// <summary>Reconnects until the service reports it is running from <paramref name="desired"/>.
     /// <para>Verifying the path rather than merely connecting is the point: the old process does not
     /// exit the instant it acknowledges a shutdown, so a plain connect can succeed against the very
-    /// service that is on its way out and report a switch that never happened. Resetting each round
-    /// also clears the start cooldown, so a launch attempt that lost the race to the old process's
-    /// single-instance mutex is retried instead of being locked out for a minute.</para></summary>
+    /// service that is on its way out and report a switch that never happened.</para>
+    /// <para>Only the first <see cref="SwitchStartAttempts"/> rounds are allowed to spawn a process —
+    /// enough to retry a launch that lost the race to the old process's single-instance mutex, few
+    /// enough that an executable which never serves cannot be launched once per round. The remaining
+    /// rounds reset with <c>allowStart: false</c>, which arms the gateway's cooldown so they are plain
+    /// reconnects rather than launches.</para></summary>
     private async Task<bool> WaitForServiceAtAsync(string desired)
     {
+        Stopwatch elapsed = Stopwatch.StartNew();
         for (int attempt = 0; attempt < SwitchAttempts; attempt++)
         {
-            await _gateway.ResetConnectionAsync();
+            await _gateway.ResetConnectionAsync(allowStart: attempt < SwitchStartAttempts);
             var status = await _gateway.GetStatusAsync();
             if (status.TryGetValue(out EngineStatusSnapshot? snapshot)
                 && snapshot.ExecutablePath is { } path
                 && PathsEqual(path, desired))
             {
                 return true;
+            }
+            if (elapsed.Elapsed >= SwitchTimeout)
+            {
+                Serilog.Log.Warning(
+                    "Gave up waiting for the service at {Path} after {Elapsed} and {Attempts} attempt(s)",
+                    desired, elapsed.Elapsed, attempt + 1);
+                return false;
             }
             await Task.Delay(SwitchPollDelay);
         }

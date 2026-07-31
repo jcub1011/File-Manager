@@ -175,4 +175,50 @@ public sealed class StatusBarViewModelTests
         await statusBar.PollOnceAsync();
         Assert.Null(statusBar.LastError);
     }
+
+    /// <summary>The startup warning has to come off the POLL. The service publishes the matching
+    /// engine-warning event microseconds after it opens the pipe, which is before a UI that launched it
+    /// has finished subscribing — so in the flow that matters the event is never seen, and a snapshot
+    /// that carries it is the only way the user hears about an empty profile list.</summary>
+    [Fact]
+    public async Task A_poll_announces_a_startup_warning_once_and_again_only_if_it_changes()
+    {
+        FakeIpcGateway gateway = new()
+        {
+            StatusResult = new EngineStatusSnapshot(false, 0, 0, 0, null)
+            {
+                StartupWarning = "Profiles could not be loaded from D:\\profiles: access denied.",
+            },
+        };
+        List<string> announced = [];
+        StatusBarViewModel statusBar = new(gateway) { StartupWarningObserved = announced.Add };
+
+        await statusBar.PollOnceAsync();
+        await statusBar.PollOnceAsync();
+        await statusBar.PollOnceAsync();
+
+        // The snapshot repeats it on every 2 s poll; the notice bar must not be rewritten every time.
+        Assert.Equal(["Profiles could not be loaded from D:\\profiles: access denied."], announced);
+
+        // A service that restarted with a DIFFERENT problem still gets to say so.
+        gateway.StatusResult = new EngineStatusSnapshot(false, 0, 0, 0, null)
+        {
+            StartupWarning = "The configured profiles directory Z:\\share is not available.",
+        };
+        await statusBar.PollOnceAsync();
+        Assert.Equal(2, announced.Count);
+        Assert.Contains("Z:\\share", announced[1]);
+    }
+
+    [Fact]
+    public async Task A_clean_startup_announces_nothing()
+    {
+        FakeIpcGateway gateway = new() { StatusResult = new EngineStatusSnapshot(false, 1, 0, 0, null) };
+        List<string> announced = [];
+        StatusBarViewModel statusBar = new(gateway) { StartupWarningObserved = announced.Add };
+
+        await statusBar.PollOnceAsync();
+
+        Assert.Empty(announced);
+    }
 }

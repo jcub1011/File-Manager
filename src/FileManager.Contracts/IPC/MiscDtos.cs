@@ -14,6 +14,17 @@ public sealed record EngineStatusSnapshot(
     /// down. An init property rather than a positional member so existing constructions are
     /// unaffected.</para></summary>
     public string? ExecutablePath { get; init; }
+
+    /// <summary>A problem found while the service was starting that leaves it running but degraded —
+    /// today, profiles that could not be loaded. Null when startup was clean.
+    /// <para>Carried on the SNAPSHOT rather than only as an <c>engine-warning</c> event because the
+    /// event cannot reach anyone: it is published microseconds after the IPC server opens, and a UI
+    /// that launched the service does not finish subscribing until well after that, so it is always
+    /// dropped in the one flow that matters. Polled state has no such race — a client picks this up on
+    /// its very first get-status, whenever it connects.</para>
+    /// <para>Distinct from <see cref="LastError"/>, which is per-job health and is cleared by the next
+    /// success. This one is a fact about the process and stays put for its lifetime.</para></summary>
+    public string? StartupWarning { get; init; }
 }
 
 public sealed record ProfileSummary(

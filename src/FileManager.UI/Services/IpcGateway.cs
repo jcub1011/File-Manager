@@ -358,13 +358,16 @@ public sealed class IpcGateway(Func<string?>? serviceExePath = null, TimeProvide
         _failedStartAt = _time.GetTimestamp();
     }
 
-    /// <summary>Forgets the current connection so the next request reconnects from scratch, starting
-    /// the configured executable if nothing is listening. Also clears the start cooldown, because the
-    /// caller is acting on a deliberate change rather than retrying a failure.
+    /// <summary>Forgets the current connection so the next request reconnects from scratch.
     /// <para>Used when the service executable path changes: the cached client points at whatever was
     /// running before, so without this the UI would keep talking to the old service and the new
     /// setting would look like it did nothing.</para></summary>
-    public async Task ResetConnectionAsync()
+    /// <param name="allowStart">True clears the start cooldown, because the caller is acting on a
+    /// deliberate change rather than retrying a failure, so the next request may spawn the configured
+    /// executable. False ARMS the cooldown instead, which is what a caller resetting in a loop needs:
+    /// clearing it every round is what would turn one reconnect poll into one process launch per round,
+    /// each carrying the launcher's full retry budget.</param>
+    public async Task ResetConnectionAsync(bool allowStart = true)
     {
         IpcClient? stale;
         try
@@ -381,7 +384,10 @@ public sealed class IpcGateway(Func<string?>? serviceExePath = null, TimeProvide
         {
             stale = _client;
             _client = null;
-            _failedStartPath = null;
+            if (allowStart)
+                _failedStartPath = null;
+            else
+                RecordFailedStart(_serviceExePath?.Invoke());
         }
         finally
         {

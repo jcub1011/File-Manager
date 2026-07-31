@@ -144,13 +144,18 @@ internal sealed class FakeIpcGateway : IIpcGateway
 
     public int ResetConnectionCalls { get; private set; }
 
+    /// <summary>The <c>allowStart</c> argument of every <see cref="ResetConnectionAsync"/> call, in
+    /// order — how a test asserts that a polling caller stops asking for process launches.</summary>
+    public List<bool> ResetConnectionAllowStart { get; } = [];
+
     /// <summary>What <see cref="GetStatusAsync"/> starts answering once the connection is reset —
     /// i.e. what the newly launched executable reports. Null leaves the current result alone.</summary>
     public Result<EngineStatusSnapshot, IpcError>? StatusAfterReset { get; set; }
 
-    public Task ResetConnectionAsync()
+    public Task ResetConnectionAsync(bool allowStart = true)
     {
         ResetConnectionCalls++;
+        ResetConnectionAllowStart.Add(allowStart);
         if (StatusAfterReset is { } next)
             StatusResult = next;
         return Task.CompletedTask;

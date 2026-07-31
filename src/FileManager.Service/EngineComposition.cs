@@ -64,6 +64,10 @@ internal static class EngineComposition
         // Engine settings (§9). Defaults only for now; reconciling with settings.json is a later concern.
         services.AddSingleton(new EngineConfig());
 
+        // Written by EngineHost during startup, read by GetStatusHandler on every poll — how a
+        // degraded startup reaches a client that connected too late to see the event.
+        services.AddSingleton<EngineStartupState>();
+
         // Durable safety substrate (§4.3, §4.6, §4.7) — the write-ahead journal, in-memory
         // registries, atomic placement, rollback, disposition, and crash recovery. Not yet driven
         // by a live executor; recovery runs at startup (I-RECOVER-FIRST) and the machinery is

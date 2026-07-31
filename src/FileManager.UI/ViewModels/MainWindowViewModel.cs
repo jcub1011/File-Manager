@@ -50,6 +50,11 @@ public sealed partial class MainWindowViewModel : ViewModelBase
         DryRun = new DryRunViewModel(gateway, dryRunActions);
         StatusBar = new StatusBarViewModel(gateway);
         Activity = new ActivityViewModel(gateway);
+        // A degraded engine startup, learned from the status poll rather than from the engine-warning
+        // event — the event is published before any client can have subscribed. Same sink as the event
+        // so the two are indistinguishable to the user, and the poll's own de-duplication keeps it from
+        // being re-announced every 2 seconds.
+        StatusBar.StartupWarningObserved = message => Activity.ShowNotice(message);
         // The wire DTOs carry only profile ids; the list is the only place that knows the names.
         Activity.ProfileNameLookup = id => List.Profiles.FirstOrDefault(p => p.ProfileId == id)?.Name;
         Activity.HideCommand = ToggleActivityCommand;
@@ -128,13 +133,11 @@ public sealed partial class MainWindowViewModel : ViewModelBase
     /// collapsed state or expanded width changes. Read-modify-write, not a fresh record: the settings
     /// window owns the other half of this file and saves on its own schedule.</summary>
     public void SaveSidebarState() =>
-        ClientSettingsStore.Write(
-            _clientSettingsPath,
-            ClientSettingsStore.Read(_clientSettingsPath) with
-            {
-                SidebarCollapsed = SidebarCollapsed,
-                SidebarWidth = SidebarExpandedWidth,
-            });
+        ClientSettingsStore.Update(_clientSettingsPath, stored => stored with
+        {
+            SidebarCollapsed = SidebarCollapsed,
+            SidebarWidth = SidebarExpandedWidth,
+        });
 
     public async Task InitializeAsync()
     {

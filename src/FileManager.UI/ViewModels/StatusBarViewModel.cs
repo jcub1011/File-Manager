@@ -44,6 +44,20 @@ public sealed partial class StatusBarViewModel(IIpcGateway gateway) : ViewModelB
     [ObservableProperty]
     public partial string? LastError { get; set; }
 
+    /// <summary>Raised the first time a poll reports a given <see cref="EngineStatusSnapshot.StartupWarning"/>,
+    /// so the shell can put it in the notice bar. Set by the host; null in tests that do not care.
+    /// <para>The poll is the only surface that can carry this. The service publishes the matching
+    /// <c>engine-warning</c> event microseconds after it opens the pipe, which is before a UI that
+    /// launched it has finished subscribing — so in the flow that matters the event is never seen and
+    /// the snapshot is the only place the warning still exists.</para></summary>
+    public Action<string>? StartupWarningObserved { get; set; }
+
+    /// <summary>The warning already handed to <see cref="StartupWarningObserved"/>. The snapshot repeats
+    /// it on every 2 s poll, so without this the notice bar would be rewritten forever; comparing by
+    /// value (rather than latching a bool) still lets a service that restarted with a DIFFERENT problem
+    /// announce itself.</summary>
+    private string? _reportedStartupWarning;
+
     /// <summary>Applies a <c>pause-changed</c> event so a change made elsewhere (the CLI, another
     /// client) shows up at once rather than up to one poll interval later.</summary>
     public void ApplyPauseChanged(bool paused)
@@ -108,6 +122,15 @@ public sealed partial class StatusBarViewModel(IIpcGateway gateway) : ViewModelB
         StatusText = $"Connected · {snapshot.ActiveProfiles} active profile(s)"
             + (snapshot.Paused ? " · PAUSED" : "")
             + (snapshot.JobsInFlight > 0 ? $" · {snapshot.JobsInFlight} job(s) running" : "");
+
+        // A degraded startup, announced once per distinct message. Deliberately after the status text
+        // above: this is a notice about the engine, not part of the strip's own state.
+        if (snapshot.StartupWarning is { Length: > 0 } startupWarning
+            && !string.Equals(startupWarning, _reportedStartupWarning, StringComparison.Ordinal))
+        {
+            _reportedStartupWarning = startupWarning;
+            StartupWarningObserved?.Invoke(startupWarning);
+        }
     }
 
     /// <summary>UI-thread poll loop (await + Task.Delay, no timer callbacks — §8 cross-thread
