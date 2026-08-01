@@ -84,12 +84,12 @@ public sealed partial class SettingsViewModel : ViewModelBase
 
         MaxScanThreads = Setting.AutoNumber(
             "performance.maxScanThreads", "Max scan threads",
-            $"Caps the total number of directory-enumeration threads across all profiles. Auto uses cores × 8 ({ScanAutoDefault} on this machine).",
+            $"Caps the total number of directory-enumeration threads across all profiles. Auto uses cores × 4 ({ScanAutoDefault} on this machine, capped at 64).",
             ["performance", "concurrency", "parallel", "cpu", "workers", "enumeration", "threads"]);
 
         PerDriveDefault = Setting.AutoNumber(
             "performance.perDriveDefault", "Per-drive default",
-            $"Caps the enumeration threads used on any one drive. Auto uses cores × 4 ({PerDriveAutoDefault} on this machine).",
+            $"Caps the enumeration threads used on any one drive. Auto uses cores × 2 ({PerDriveAutoDefault} on this machine).",
             ["performance", "concurrency", "parallel", "cpu", "workers", "disk", "volume", "threads"]);
 
         MaxHashThreads = Setting.AutoNumber(
@@ -153,9 +153,9 @@ public sealed partial class SettingsViewModel : ViewModelBase
 
     // Shadow "explicit" defaults shown when a budget's Auto is unchecked, matching the engine's auto
     // formulas so the starting number is the value auto would have chosen.
-    private static int ScanAutoDefault => Environment.ProcessorCount * 8;
+    private static int ScanAutoDefault => Math.Min(Environment.ProcessorCount * 4, 64);
     private static int HashAutoDefault => Math.Max(1, Environment.ProcessorCount - 1);
-    private static int PerDriveAutoDefault => Environment.ProcessorCount * 4;
+    private static int PerDriveAutoDefault => Environment.ProcessorCount * 2;
 
     // ============================ The settings themselves ============================
     // Held as strongly-typed handles so the load/save mapping and the tests stay type-safe; the view
