@@ -1,24 +1,30 @@
 # Service dry-run memory reduction — implementation handoff
 
-> **Status: CODE COMPLETE, UNMEASURED.**
-> **Implemented:** Stage 0 (§5.1, §5.2, §5.3, §5.4); **Stage 1** (§6.1–§6.3); **Stage 2** (§7.1 trim
-> coordinator + setting, §7.2 both GC knobs, one commit each); **Stage 3** (streamed sweep — see the
-> deviation note at §8); **Stage 4** (§9.1 concurrency, §9.2 comment). §5.6 skipped — `MemoryProbe`
-> measures the shipped artifact, which is strictly better than an in-process retention proxy.
+> **Status: IMPLEMENTED AND MEASURED (2026-08-01).**
 >
-> **What is NOT done: §5.5's table.** Nobody has run `tools/FileManager.MemoryProbe` against a
-> sweep-heavy workload, so no stage has a before/after footprint number and §12's definition of done
-> is unmet for all of them. Three commits are explicitly provisional and should be **reverted rather
-> than kept** if they do not move the number: `ConcurrentGarbageCollection=false`,
-> `System.GC.ConserveMemory=5`, and the Stage 4.1 concurrency reduction (which additionally needs a
-> wall-time check).
+> **The reported defect is fixed: post-run footprint 348 MB → 12 MB (−97%)** at the reported workload
+> (33,500 source / 357,000 destination files), against an 8 MB idle floor, and the run is 2.2× faster.
+> The baseline row in §5.5 reproduces the original complaint exactly, so this is a before/after on the
+> real bug rather than an inferred improvement.
 >
-> **Workload caveat, from the one real measurement taken so far (§5.5).** The machine this was
-> implemented against runs a *source-heavy* profile — 71,923 source files but only 4,735 swept
-> destination files, a 40 ms sweep — which is the inverse of the 33.5k/357k report this plan was
-> written for. Stage 3's peak reduction scales with sweep size, so it is close to a no-op there and
-> worth ~145 MB on the reported workload. Do not conclude from a source-heavy run that Stage 3 did
-> nothing; measure on a sweep-heavy one.
+> **Implemented:** Stage 0 (§5.1–§5.4); Stage 1 (§6.1–§6.3); Stage 2 (§7.1 trim coordinator + setting;
+> §7.2 `ConcurrentGarbageCollection=false`); Stage 3 (streamed sweep — see the deviation note at §8);
+> Stage 4 (§9.1, §9.2).
+>
+> **Reverted after measurement:** `System.GC.ConserveMemory=5` — a measured no-op (§5.5).
+>
+> **Skipped:** §5.6's in-process retention test. `MemoryProbe` measures the shipped artifact's
+> committed memory, which is what the complaint was about; a managed-heap proxy would need its own
+> doc comment warning it is not that.
+>
+> **Still open — peak.** Peak fell only 10% (363 → 325 MB) and is now dominated by GC burst policy
+> rather than by live bytes (§5.5 explains why, including the ~90 MB of peak deliberately traded for
+> the residual fix). That is the remaining lever if peak matters.
+>
+> **Not done — the human end-to-end check in §12**, in particular re-running a Mirror profile and
+> confirming the `Deleted` orphan set is identical to a pre-change run. Stage 3 changed how orphans are
+> enumerated and deduped; a wrong answer there is a destructive-plan bug, and no automated test
+> substitutes for looking at it.
 >
 > **Workload caveat, from the one real measurement taken so far (§5.5).** The machine this was
 > implemented against runs a *source-heavy* profile — 71,923 source files but only 4,735 swept
@@ -346,29 +352,65 @@ FileManager.MemoryProbe.exe --tree D:\fm-memprobe `
 
 ### 5.5 Record the baseline before touching anything else
 
-Fill this in and keep it updated after every stage. **Still empty — the harness now exists (§5.4) but
-nobody has run it against a sweep-heavy workload, so no stage has an end-to-end footprint number.**
+**Measured 2026-08-01** with `tools/FileManager.MemoryProbe` against the **published AOT binary**,
+33,500 source / 357,000 destination files (all swept — Mirror, disjoint survivor set), sequential runs
+on one machine, `--settle-seconds 35`:
 
-To fill it: check out the commit before `Add the service dry-run memory reduction handoff` for the
-baseline row, then re-run at each subsequent stage's commit.
+| Build | idle | peak | t+0s | t+35s | wall time |
+|---|---|---|---|---|---|
+| **baseline** (`e45194d`, pre-change) | 8 MB | 363 MB | 357 MB | **348 MB** | 7,726 ms |
+| **all stages** | 8 MB | 325 MB | 197 MB | **12 MB** | 3,506 ms |
+
+- **The reported defect is fixed: 348 MB → 12 MB residual (−97%)**, against an 8 MB idle floor. The
+  baseline row reproduces the complaint exactly — "stays at ~340 MB" — so the workload and the bug are
+  confirmed, not inferred.
+- **2.2× faster** (7,726 → 3,506 ms), which also satisfies §12's Stage 4 wall-time gate: the
+  concurrency reduction cost nothing measurable, on this workload it went the other way.
+- **Peak fell only 10%** (363 → 325 MB), far less than §8's estimate. Live bytes clearly did drop —
+  t+0s fell 45% (357 → 197 MB) and the trim reaching 12 MB proves almost nothing is retained — but
+  peak *commit* during a burst is a function of GC policy, not of live set, and the GC knob below
+  deliberately raises it. **Peak is the remaining work if anyone wants it.**
+
+#### Attribution: the two GC knobs, isolated
+
+Three runs varying only `FileManager.Service.csproj`:
+
+| GC configuration | peak | t+0s | t+35s |
+|---|---|---|---|
+| neither knob | 234 MB | 234 MB | **231 MB** |
+| `ConcurrentGarbageCollection=false` only | 326 MB | 197 MB | **12 MB** |
+| both knobs | 325 MB | 197 MB | **12 MB** |
+
+Two conclusions, both acted on:
+
+1. **`ConcurrentGarbageCollection=false` is what makes the trim work at all.** With background GC on,
+   `MemoryTrimCoordinator`'s aggressive compacting collect reclaims essentially nothing (231 MB
+   residual) — the non-compacting concurrent gen2 the docs describe. Without this knob, Stage 2.1 is
+   inert. That was not predicted anywhere in this document.
+2. **`System.GC.ConserveMemory=5` does nothing** once background GC is off — every column within
+   noise. Matches the open no-op report (dotnet/runtime#93914) the plan flagged. **Reverted** per §12.
+
+And the honest cost: turning background GC off **raises peak by ~90 MB** (234 → 326 MB), because
+blocking gen2s let the heap grow further during the burst. Accepted deliberately — a peak during a run
+the user asked for is not what gets reported as a leak; 231 MB retained forever by an always-running
+service is. Anyone optimizing peak later should re-check this trade rather than assume it.
+
+#### Reproducing
 
 ```powershell
-# from a VS Developer PowerShell (the native link needs the MSVC toolchain)
+# from a VS Developer PowerShell, or with vswhere on PATH:
+#   $env:PATH = "C:\Program Files (x86)\Microsoft Visual Studio\Installer;$env:PATH"
+# Without it the ILC native link fails and leaves the publish directory EMPTY.
 dotnet publish src/FileManager.Service -c Release -r win-x64
 dotnet build tools/FileManager.MemoryProbe -c Release
 tools\FileManager.MemoryProbe\bin\Release\net10.0\FileManager.MemoryProbe.exe `
   --tree D:\fm-memprobe `
   --service src\FileManager.Service\bin\Release\net10.0\win-x64\publish\FileManager.Service.exe `
-  --settle-seconds 30 --csv memprobe.csv --label baseline
+  --settle-seconds 35 --csv memprobe.csv --label current
 ```
 
-| Stage | idle | peak | t+0s | t+30s | wall time |
-|---|---|---|---|---|---|
-| baseline | | | | | |
-| 1 (allocation / LOH) | | | | | |
-| 2 (trim + GC knobs) | | | | | |
-| 3 (streamed sweep) | | | | | |
-| 4 (scan concurrency) | | | | | |
+Per-stage rows (Stage 1 alone, Stage 3 alone, …) were **not** measured — only the two endpoints and
+the GC-knob isolation above. Anyone attributing a specific stage should measure at its commit.
 
 #### Findings so far (2026-08-01)
 
