@@ -30,10 +30,6 @@ public sealed class DryRunStreamHandler(
     IEngineEventBus eventBus)
     : IIpcStreamingRequestHandler
 {
-    /// <summary>Destination sweep entries per streamed frame. Each entry is small (a physical file +
-    /// its operation) so a few thousand keep each frame well under the 16 MiB cap.</summary>
-    private const int DestinationChunkSize = 4096;
-
     /// <summary>Spacing of the interleaved <see cref="DryRunProgressResponse"/> frames. The handler
     /// samples the shared counters on this timer while a discovery phase is in flight, so throttling
     /// is structural (at most ~10 frames/sec regardless of file rate) and the hot per-file paths pay
@@ -235,32 +231,69 @@ public sealed class DryRunStreamHandler(
             SourceFiles = progressCounters.Sources,
             DestinationFiles = destinationCount + sweep.Files.Count,
         };
-        for (int start = 0; start < sweep.Files.Count; start += DestinationChunkSize)
+        // Chunk the sweep by BYTES, in the same wire-shape currency the engine's streamed accumulator
+        // uses, rather than by a fixed entry count. The binding constraint is the 85,000-byte Large
+        // Object Heap threshold, not the 16 MiB protocol cap: IpcSerializer allocates a fresh exact-size
+        // byte[] per frame, so an oversized frame is a lasting addition to committed memory, not a
+        // transient write. A fixed count cannot honour that bound because per-entry cost scales with
+        // file-name length — the old 4096 produced ~1.4 MB frames on a ~90-char-path tree, and even 256
+        // would clear the threshold there. DryRunFrameSizeTests holds this.
+        List<PhysicalFile> sliceFiles = [];
+        List<VirtualFileOperation> sliceOps = [];
+        long sliceBytes = 0;
+        for (int i = 0; i < sweep.Files.Count; i++)
         {
-            int count = Math.Min(DestinationChunkSize, sweep.Files.Count - start);
-            var sliceFiles = new List<PhysicalFile>(count);
-            var sliceOps = new List<VirtualFileOperation>(count);
-            for (int i = 0; i < count; i++)
-            {
-                sliceFiles.Add(sweep.Files[start + i]);
-                sliceOps.Add(sweep.Ops[start + i] with { SubjectIndex = destinationCount + start + i });
-            }
+            PhysicalFile file = sweep.Files[i];
+            // The sweep's ops index their own file list 0-based; offset onto the global destination
+            // positions the file phase already consumed.
+            VirtualFileOperation op = sweep.Ops[i] with { SubjectIndex = destinationCount + i };
+            sliceFiles.Add(file);
+            sliceOps.Add(op);
+            sliceBytes += DryRunEngine.WireUpperBoundBytes(file) + DryRunEngine.WireUpperBoundBytes(op);
+            if (sliceBytes < DryRunEngine.WireChunkByteBudget)
+                continue;
             yield return converter.Convert([], sliceFiles, [], sliceOps);
+            sliceFiles = [];
+            sliceOps = [];
+            sliceBytes = 0;
         }
+        if (sliceFiles.Count > 0)
+            yield return converter.Convert([], sliceFiles, [], sliceOps);
 
         // Skip the projection on a truncated report — totals over a partial graph would be unsound.
         estimatorWatch.Start();
         SpaceProjection? space = truncated ? null : estimator.Finalize(config.MaxWorkers);
         estimatorWatch.Stop();
         if (logger.IsEnabled(LogLevel.Information))
+        {
+            // Three-way memory split, sampled right after the run. These are NOT interchangeable and
+            // the whole point of logging all three is that they answer different questions:
+            //   managed  — GC.GetTotalMemory(false), the managed heap as the GC last accounted it.
+            //   heap     — HeapSizeBytes, live+garbage bytes the GC currently tracks.
+            //   committed— TotalCommittedBytes, what the GC has committed from the OS.
+            //   private  — the process's private commit, i.e. what Task Manager and a user report.
+            // committed >> heap means the residual is committed-but-free GC heap (a trim/GC-config
+            // problem); heap >> idle means something is still retained (a lifetime problem). Do not
+            // force a collection here — GC.GetTotalMemory(true) would perturb the very number being
+            // measured and add a blocking gen2 to every run.
+            GCMemoryInfo gcInfo = GC.GetGCMemoryInfo();
+            long managedBytes = GC.GetTotalMemory(false);
+            long privateBytes;
+            using (Process self = Process.GetCurrentProcess())
+                privateBytes = self.PrivateMemorySize64;
             logger.LogInformation(
                 "Dry-run stream timings for profile {ProfileId}: total {TotalMs}ms " +
                 "(engine stream {EngineMs}ms, destination sweep {SweepMs}ms [walk {WalkMs}ms, merge {MergeMs}ms], " +
                 "space estimator {EstimatorMs}ms), " +
-                "{SourceCount} source files, {DestCount} destination files (+{SweepCount} swept)",
+                "{SourceCount} source files, {DestCount} destination files (+{SweepCount} swept); " +
+                "memory managed {ManagedMb}MB, GC heap {HeapMb}MB, GC committed {CommittedMb}MB, " +
+                "process private {PrivateMb}MB",
                 typed.ProfileId, totalWatch.ElapsedMilliseconds, engineMs, sweepWatch.ElapsedMilliseconds,
                 sweep.WalkMs, sweep.MergeMs, estimatorWatch.ElapsedMilliseconds, emitted, destinationCount,
-                sweep.Files.Count);
+                sweep.Files.Count,
+                managedBytes >> 20, gcInfo.HeapSizeBytes >> 20, gcInfo.TotalCommittedBytes >> 20,
+                privateBytes >> 20);
+        }
         // Directories the walk could not open were downgraded to warnings by SourceScanner and dropped
         // by the engine's pump, so the report below looks complete. DryRunCompleteResponse is frozen and
         // has no skipped count, so the partiality rides the warning channel the UI already renders in

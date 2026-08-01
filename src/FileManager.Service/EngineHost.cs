@@ -11,7 +11,9 @@ using FileManager.Core.Watching;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using System;
+using System.Collections.Generic;
 using System.IO;
+using System.Runtime;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -77,6 +79,13 @@ internal sealed class EngineHost(
             lifetime.StopApplication();
             return;
         }
+
+        // 1a. The GC configuration this process actually resolved. NativeAOT has no runtimeconfig.json
+        //     parser — GC knobs arrive from DOTNET_-prefixed environment variables and two ILC-embedded
+        //     blobs — so "the csproj says X" is not evidence that X reached the shipped binary. This is
+        //     the only in-process way to confirm it, and every GC-tuning claim about the service is
+        //     unfalsifiable without it. One ~40-entry dictionary, once per process.
+        LogGcConfiguration();
 
         // 2. On-disk layout (§9).
         Directory.CreateDirectory(paths.ProfilesDirectory);
@@ -213,6 +222,33 @@ internal sealed class EngineHost(
         _pauseBridge?.Dispose();
         _eventBridge?.Dispose();
         await ipcServer.StopAsync(CancellationToken.None);
+    }
+
+    /// <summary>Logs the GC's resolved configuration once at startup, plus the server/concurrent flags
+    /// read back from the runtime itself (the dictionary reports only knobs that were explicitly set, so
+    /// an absent key means "default", which is exactly the ambiguity these two lines remove).</summary>
+    private void LogGcConfiguration()
+    {
+        try
+        {
+            if (!logger.IsEnabled(LogLevel.Information))
+                return;
+            List<string> entries = [];
+            foreach (KeyValuePair<string, object> variable in GC.GetConfigurationVariables())
+                entries.Add($"{variable.Key}={variable.Value}");
+            entries.Sort(StringComparer.Ordinal);
+            // LatencyMode is the readable proxy for background GC: with concurrent GC off it reports
+            // Batch, with it on (the default) Interactive. There is no direct IsConcurrentGC property.
+            logger.LogInformation(
+                "GC configuration: server={Server}, latency={Latency}, explicitly-set variables: {Variables}",
+                GCSettings.IsServerGC, GCSettings.LatencyMode,
+                entries.Count == 0 ? "(none)" : string.Join(", ", entries));
+        }
+        catch (Exception ex)
+        {
+            // Last resort: a diagnostic must never be able to stop the service from starting.
+            logger.LogWarning(ex, "Could not read the GC configuration");
+        }
     }
 
     private void PurgeScratchDirectory()
