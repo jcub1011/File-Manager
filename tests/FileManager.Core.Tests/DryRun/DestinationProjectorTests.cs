@@ -227,8 +227,9 @@ public sealed class DestinationProjectorTests : IDisposable
     [Fact]
     public void Overlapping_target_roots_report_a_shared_file_once()
     {
-        // Two target roots where one is nested under the other, so the parent's walk and the child's
-        // walk both enumerate the files beneath the child. The merge must dedup them to a single entry.
+        // Two target roots where one is nested under the other. The nested root is pruned before the
+        // walk (the parent's walk already covers its subtree), so the file is enumerated once — rather
+        // than enumerated twice and deduped afterwards, which is what this used to assert.
         string child = Path.Combine(_target, "shared");
         Directory.CreateDirectory(child);
         string overlap = Path.Combine(child, "both.txt");
@@ -242,7 +243,173 @@ public sealed class DestinationProjectorTests : IDisposable
         DestinationSweepResult result = Project(profile);
 
         Assert.Single(result.Ops, o => string.Equals(o.Path, overlap, StringComparison.OrdinalIgnoreCase));
-        Assert.Equal(result.Files.Count, result.Ops.Count);   // still index-paired after dedup
+        Assert.Equal(result.Files.Count, result.Ops.Count);   // still index-paired
+    }
+
+    [Fact]
+    public void Nested_target_roots_report_the_outermost_root_deterministically()
+    {
+        // Before nested-root pruning this was a latent bug: the file was enumerated under BOTH roots
+        // and the merge kept whichever copy the sort left first — but List<T>.Sort is an unstable
+        // introsort and the comparison was on Path alone, so the reported Root was arbitrary. Pruning
+        // makes it always the outermost root, and this asserts the Root the old test never looked at.
+        string child = Path.Combine(_target, "shared");
+        Directory.CreateDirectory(child);
+        for (int i = 0; i < 20; i++)
+            File.WriteAllText(Path.Combine(child, $"f{i}.txt"), "x");
+
+        // Declared child-first, so a naive "first root wins" would report the child.
+        Profile profile = Mirror() with
+        {
+            Targets = [new TargetConfig { Path = child }, new TargetConfig { Path = _target }],
+        };
+
+        for (int attempt = 0; attempt < 5; attempt++)
+        {
+            DestinationSweepResult result = Project(profile);
+            Assert.Equal(20, result.Files.Count);
+            Assert.All(result.Files, f => Assert.Equal(_target, f.Root));
+            Assert.All(result.Ops, o => Assert.Equal(_target, o.Root));
+        }
+    }
+
+    // ── Streamed sweep (SweepStreamAsync) ────────────────────────────────────────────────────────
+    // The GUI path. Emits byte-budgeted chunks in discovery order as the walk produces them, instead
+    // of collecting and sorting every entry first, so its live set is one chunk rather than one
+    // record pair per pre-existing file. Order is deliberately NOT part of its contract (the client
+    // re-sorts by path-relative-to-root); the set, the classification, the global SubjectIndex
+    // pairing and the reported Root are.
+
+    private sealed record StreamedSweep(
+        List<PhysicalFile> Files, List<VirtualFileOperation> Ops, bool Capped, List<int> ChunkSizes);
+
+    private static async Task<StreamedSweep> SweepStream(
+        DestinationProjector projector, Profile profile, int maxEntries = int.MaxValue,
+        int indexBase = 0, int chunkByteBudget = DryRunEngine.WireChunkByteBudget, bool truncated = false)
+    {
+        List<PhysicalFile> files = [];
+        List<VirtualFileOperation> ops = [];
+        List<int> chunkSizes = [];
+        bool capped = false;
+        HashSet<NormalizedPath> survivors = [];
+        await foreach (Result<DryRunChunk, string> result in projector.SweepStreamAsync(
+            profile, survivors, truncated, maxEntries, indexBase, chunkByteBudget,
+            progress: null, CancellationToken.None))
+        {
+            Assert.False(result.TryGetError(out string? error), error);
+            result.TryGetValue(out DryRunChunk? chunk);
+            capped |= chunk!.SweepCapped;
+            // Chunks carry destination entries only — there is no source half in a sweep.
+            Assert.Empty(chunk.SourceFiles);
+            Assert.Empty(chunk.SourceOperations);
+            Assert.Equal(chunk.DestinationFiles.Count, chunk.DestinationOperations.Count);
+            if (chunk.DestinationFiles.Count > 0)
+                chunkSizes.Add(chunk.DestinationFiles.Count);
+            foreach (IPhysicalFileView f in chunk.DestinationFiles)
+                files.Add((PhysicalFile)f);
+            foreach (IFileOperationView o in chunk.DestinationOperations)
+                ops.Add((VirtualFileOperation)o);
+        }
+        return new StreamedSweep(files, ops, capped, chunkSizes);
+    }
+
+    [Fact]
+    public async Task Streamed_sweep_reports_the_same_set_and_classification_as_the_batched_sweep()
+    {
+        for (int i = 0; i < 40; i++)
+            TargetFile(Path.Combine($"d{i % 6}", $"f{i}.txt"));
+        TargetFile("top.txt");
+
+        DestinationSweepResult batched = Project(Mirror());
+        StreamedSweep streamed = await SweepStream(NewProjector(Workers), Mirror());
+
+        // Same set, same classification — order is explicitly not compared.
+        Assert.Equal(
+            batched.Ops.Select(o => (o.Path, o.Kind, o.Root)).ToHashSet(),
+            streamed.Ops.Select(o => (o.Path, o.Kind, o.Root)).ToHashSet());
+        Assert.Equal(
+            batched.Files.Select(f => f.Path).ToHashSet(StringComparer.OrdinalIgnoreCase),
+            streamed.Files.Select(f => f.Path).ToHashSet(StringComparer.OrdinalIgnoreCase));
+        Assert.False(streamed.Capped);
+    }
+
+    [Fact]
+    public async Task Streamed_sweep_keeps_subject_indices_global_across_chunk_boundaries()
+    {
+        for (int i = 0; i < 30; i++)
+            TargetFile(Path.Combine($"d{i % 4}", $"f{i}.txt"));
+
+        // A tiny budget forces many chunks, which is the case the index arithmetic can get wrong:
+        // each op's SubjectIndex must address the CONCATENATED destination list, not its own chunk.
+        const int indexBase = 17;
+        StreamedSweep streamed = await SweepStream(
+            NewProjector(Workers), Mirror(), indexBase: indexBase, chunkByteBudget: 800);
+
+        Assert.True(streamed.ChunkSizes.Count > 1, "expected the small budget to split the sweep into several chunks");
+        Assert.Equal(30, streamed.Files.Count);
+        Assert.Equal(30, streamed.Ops.Count);
+        for (int i = 0; i < streamed.Ops.Count; i++)
+        {
+            // Ops[i] references Files[i] once the base is subtracted, and every op is source-less.
+            Assert.Equal(indexBase + i, streamed.Ops[i].SubjectIndex);
+            Assert.Equal(streamed.Files[i].Path, streamed.Ops[i].Path);
+            Assert.Equal(-1, streamed.Ops[i].SourceIndex);
+        }
+    }
+
+    [Fact]
+    public async Task Streamed_sweep_marks_capped_when_the_entry_budget_trips()
+    {
+        for (int i = 0; i < 50; i++)
+            TargetFile(Path.Combine($"d{i % 5}", $"f{i}.txt"));
+
+        const int budget = 10;
+        StreamedSweep streamed = await SweepStream(NewProjector(Workers), Mirror(), maxEntries: budget);
+
+        Assert.True(streamed.Capped);
+        Assert.True(
+            streamed.Files.Count <= budget,
+            $"emitted {streamed.Files.Count} entries against a budget of {budget}");
+        Assert.Equal(streamed.Files.Count, streamed.Ops.Count);   // still whole (file, op) pairs
+    }
+
+    [Fact]
+    public async Task Streamed_sweep_emits_nothing_when_the_source_pass_truncated()
+    {
+        // Same soundness gate as the batched path: a prefix-only survivor set makes every "no source
+        // writes here" judgement untrustworthy, so a Mirror preview must not fabricate deletions.
+        for (int i = 0; i < 5; i++)
+            TargetFile($"orphan{i}.txt");
+
+        StreamedSweep streamed = await SweepStream(NewProjector(Workers), Mirror(), truncated: true);
+
+        Assert.Empty(streamed.Files);
+        Assert.Empty(streamed.Ops);
+        Assert.False(streamed.Capped);
+    }
+
+    [Fact]
+    public async Task Streamed_sweep_reports_the_outermost_root_for_nested_target_roots()
+    {
+        string child = Path.Combine(_target, "shared");
+        Directory.CreateDirectory(child);
+        string overlap = Path.Combine(child, "both.txt");
+        File.WriteAllText(overlap, "x");
+
+        Profile profile = Mirror() with
+        {
+            Targets = [new TargetConfig { Path = child }, new TargetConfig { Path = _target }],
+        };
+
+        StreamedSweep streamed = await SweepStream(NewProjector(Workers), profile);
+
+        // Reported once (the nested root was pruned, so it was never enumerated twice) and under the
+        // outermost root. Streaming cannot afford the merge's per-path dedup set, so pruning is what
+        // makes this correct rather than a post-hoc fix-up.
+        VirtualFileOperation op = Assert.Single(streamed.Ops);
+        Assert.Equal(overlap, op.Path);
+        Assert.Equal(_target, op.Root);
+        Assert.Equal(_target, Assert.Single(streamed.Files).Root);
     }
 
     [Fact]

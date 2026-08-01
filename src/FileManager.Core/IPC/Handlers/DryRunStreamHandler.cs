@@ -98,6 +98,32 @@ public sealed class DryRunStreamHandler(
         // walkers (destinations); sampled on ProgressInterval below so the interleaved progress
         // frames stay throttled no matter how fast files are found.
         DryRunProgressCounters progressCounters = new();
+
+        // The one place a chunk becomes a frame, shared by BOTH phases (the file phase and the
+        // destination sweep now speak the same DryRunChunk currency, so there is no second copy of
+        // this arithmetic to drift). Folds the stringy slice into the estimator — and, for the file
+        // phase, the survivor set — BEFORE converting, because both key on absolute path/root strings
+        // and must consume the engine's shape, never the wire's. Advances the global index bases and
+        // returns the frame: a local function cannot yield on its caller's behalf.
+        DryRunChunkResponse ConsumeSlice(DryRunChunk slice, bool collectSurvivors)
+        {
+            estimatorWatch.Start();
+            estimator.Accumulate(
+                slice.SourceFiles, slice.DestinationFiles, slice.SourceOperations, slice.DestinationOperations,
+                emitted, destinationCount, stageOverwrites);
+            estimatorWatch.Stop();
+            // Survivors come from the FILE phase only — they are what the sweep tests each pre-existing
+            // file against. Feeding the sweep's own output back in could never change an answer (the
+            // sweep is finished with the set by then) and would grow the very structure streaming
+            // exists to keep small: at 357k swept paths that set alone is ~80 MB.
+            if (collectSurvivors)
+                DestinationProjector.AccumulateSurvivors(survivors, slice.DestinationOperations);
+            DryRunChunkResponse response = converter.Convert(slice);
+            destinationCount += slice.DestinationFiles.Count;
+            emitted += slice.SourceFiles.Count;
+            return response;
+        }
+
         await using (IAsyncEnumerator<Result<DryRunChunk, string>> chunks = engine
             .SimulateStreamAsync(profile, typed.ScopePath, progressCounters, ct)
             .GetAsyncEnumerator(ct))
@@ -143,18 +169,8 @@ public sealed class DryRunStreamHandler(
                 // The engine sets ScanTruncated once its candidate scan is cut short. OR it in BEFORE the
                 // sweep so a prefix-only survivor set never drives a (bogus) Mirror-deletion preview.
                 truncated |= slice!.ScanTruncated;
-                // Fold the stringy slice into the estimator and survivor set BEFORE converting: both key
-                // on absolute path/root strings, so they consume the engine's shape, never the wire's.
-                estimatorWatch.Start();
-                estimator.Accumulate(
-                    slice.SourceFiles, slice.DestinationFiles, slice.SourceOperations, slice.DestinationOperations,
-                    emitted, destinationCount, stageOverwrites);
-                estimatorWatch.Stop();
-                DestinationProjector.AccumulateSurvivors(survivors, slice.DestinationOperations);
-                yield return converter.Convert(slice);
-                destinationCount += slice.DestinationFiles.Count;
+                yield return ConsumeSlice(slice, collectSurvivors: true);
 
-                emitted += slice.SourceFiles.Count;
                 if (emitted >= MaxStreamedFiles)
                 {
                     logger.LogWarning(
@@ -168,97 +184,100 @@ public sealed class DryRunStreamHandler(
             }
         }
 
-        // Phase 3: sweep the destination roots for pre-existing/orphan files. Suppressed when
-        // truncated (survivor set incomplete → any orphan call is untrustworthy). The sweep's ops
-        // reference their own files 0-based; offset both the file positions and the ops' SubjectIndex
-        // by the file-phase destination count so indices stay global. Chunked so each frame stays
-        // under the cap.
+        // Phase 3: sweep the destination roots for pre-existing/orphan files, STREAMED. Suppressed when
+        // truncated (survivor set incomplete → any orphan call is untrustworthy).
+        //
+        // The sweep now emits the same byte-budgeted DryRunChunks the file phase does, with global
+        // indices already applied, so this phase is the file phase's loop with a different source. What
+        // it replaces: a blocking Sweep() that built one PhysicalFile + one VirtualFileOperation + one
+        // path string for EVERY pre-existing file under every target root, sorted them, and held the lot
+        // while the handler copied it into frames (~145 MB live plus ~23 MB of copy churn at 357k
+        // entries). Memory is now one chunk regardless of how large the target tree is.
+        //
         // Bound the sweep by the same overall file budget the source phase uses, so a target root
-        // with millions of pre-existing files can't buffer an unbounded op-per-file set service-side.
+        // with millions of pre-existing files can't stream an unbounded set to the client.
         long engineMs = totalWatch.ElapsedMilliseconds;
         int sweepBudget = Math.Max(0, MaxStreamedFiles - destinationCount);
         Stopwatch sweepWatch = Stopwatch.StartNew();
-        // The sweep is a blocking call (it drains its scan session on this thread), so hop it to the
-        // pool and keep the stream alive with throttled progress frames while it runs — same polling
-        // shape as the scan phase above. Live counts ride on top of the file phase's destination total
-        // so the figure the user watches never goes backwards.
+        int sweptCount = 0;
         // AdditiveArchive can skip the sweep when the profile opts out (ScanDestination = false);
         // Mirror always sweeps because the sweep is its only source of Deleted-orphan previews.
-        bool scanDestinations = profile.EffectiveScanDestination;
-        Task<DestinationSweepResult> sweepTask = scanDestinations
-            ? Task.Run(
-                () => destinationProjector.Sweep(
-                    profile, survivors, truncated, ct, sweepBudget, progressCounters))
-            : Task.FromResult(new DestinationSweepResult([], []));
-        long lastDestinations = -1;
-        while (!sweepTask.IsCompleted)
+        // SweepStreamAsync yields nothing when truncated, but short-circuit here too so the (non-trivial)
+        // root resolution and scan-session setup are skipped as well.
+        if (profile.EffectiveScanDestination && !truncated)
         {
-            // Same anti-spin guard as the scan phase: a cancelled token makes Task.Delay(…, ct)
-            // complete instantly, so stop polling and just await the sweep's unwind below.
-            if (ct.IsCancellationRequested)
-                break;
-            await Task.WhenAny(sweepTask, Task.Delay(ProgressInterval, ct)).ConfigureAwait(false);
-            if (!sweepTask.IsCompleted && progressCounters.Destinations != lastDestinations)
+            // The base for the sweep's global SubjectIndex values: every destination file the file
+            // phase already emitted. Fixed for the whole sweep — the projector adds its own running
+            // position on top.
+            int sweepIndexBase = destinationCount;
+            await using IAsyncEnumerator<Result<DryRunChunk, string>> sweepChunks = destinationProjector
+                .SweepStreamAsync(
+                    profile, survivors, truncated, sweepBudget, sweepIndexBase,
+                    DryRunEngine.WireChunkByteBudget, progressCounters, ct)
+                .GetAsyncEnumerator(ct);
+
+            Task<bool> sweepMoveNext = sweepChunks.MoveNextAsync().AsTask();
+            long lastDestinations = -1;
+            while (true)
             {
-                lastDestinations = progressCounters.Destinations;
-                yield return new DryRunProgressResponse
+                // Same throttled-progress poll as the scan phase: the walk can spend seconds between
+                // chunks on a big tree, and the live count is the only sign of life. Data frames now
+                // interleave with these instead of arriving in one burst after a blocking call.
+                while (!sweepMoveNext.IsCompleted)
                 {
-                    Phase = DryRunProgressPhase.SweepingDestinations,
-                    SourceFiles = progressCounters.Sources,
-                    DestinationFiles = destinationCount + lastDestinations,
-                };
+                    // Anti-spin guard: a cancelled token makes Task.Delay(…, ct) complete instantly.
+                    if (ct.IsCancellationRequested)
+                        break;
+                    await Task.WhenAny(sweepMoveNext, Task.Delay(ProgressInterval, ct)).ConfigureAwait(false);
+                    if (!sweepMoveNext.IsCompleted && progressCounters.Destinations != lastDestinations)
+                    {
+                        lastDestinations = progressCounters.Destinations;
+                        yield return new DryRunProgressResponse
+                        {
+                            Phase = DryRunProgressPhase.SweepingDestinations,
+                            SourceFiles = progressCounters.Sources,
+                            DestinationFiles = sweepIndexBase + lastDestinations,
+                        };
+                    }
+                }
+                if (!await sweepMoveNext.ConfigureAwait(false))
+                    break;
+                Result<DryRunChunk, string> sweepChunk = sweepChunks.Current;
+
+                if (sweepChunk.TryGetError(out string? sweepError))
+                {
+                    yield return new ErrorResponse { Code = "DRY_RUN_FAILED", Message = sweepError };
+                    yield break;
+                }
+                sweepChunk.TryGetValue(out DryRunChunk? sweepSlice);
+                if (sweepSlice!.SweepCapped)
+                {
+                    logger.LogWarning(
+                        "Dry-run (stream) destination sweep for profile {ProfileId} hit the {Cap:N0}-entry bound; report truncated",
+                        typed.ProfileId, MaxStreamedFiles);
+                    truncated = true;
+                }
+                sweptCount += sweepSlice.DestinationFiles.Count;
+                // The capped marker is an empty chunk; don't put an empty frame on the wire for it.
+                if (sweepSlice.DestinationFiles.Count == 0)
+                {
+                    sweepMoveNext = sweepChunks.MoveNextAsync().AsTask();
+                    continue;
+                }
+                yield return ConsumeSlice(sweepSlice, collectSurvivors: false);
+
+                sweepMoveNext = sweepChunks.MoveNextAsync().AsTask();
             }
         }
-        DestinationSweepResult sweep = await sweepTask.ConfigureAwait(false);
         sweepWatch.Stop();
-        if (sweep.Truncated)
-        {
-            logger.LogWarning(
-                "Dry-run (stream) destination sweep for profile {ProfileId} hit the {Cap:N0}-entry bound; report truncated",
-                typed.ProfileId, MaxStreamedFiles);
-            truncated = true;
-        }
-        // The sweep's ops index their own file list directly (Ops[i].SubjectIndex == i), so feed it
-        // as a standalone chunk with both bases 0. Deleted orphans free space; Untouched/Unknown don't.
-        estimatorWatch.Start();
-        estimator.Accumulate([], sweep.Files, [], sweep.Ops, 0, 0, stageOverwrites);
-        estimatorWatch.Stop();
         // Discovery is done — one unconditional frame flips the client to its final phase, covering
-        // sweep-chunk transfer, client reassembly, and the UI's report projection.
+        // client reassembly and the UI's report projection.
         yield return new DryRunProgressResponse
         {
             Phase = DryRunProgressPhase.BuildingLists,
             SourceFiles = progressCounters.Sources,
-            DestinationFiles = destinationCount + sweep.Files.Count,
+            DestinationFiles = destinationCount,
         };
-        // Chunk the sweep by BYTES, in the same wire-shape currency the engine's streamed accumulator
-        // uses, rather than by a fixed entry count. The binding constraint is the 85,000-byte Large
-        // Object Heap threshold, not the 16 MiB protocol cap: IpcSerializer allocates a fresh exact-size
-        // byte[] per frame, so an oversized frame is a lasting addition to committed memory, not a
-        // transient write. A fixed count cannot honour that bound because per-entry cost scales with
-        // file-name length — the old 4096 produced ~1.4 MB frames on a ~90-char-path tree, and even 256
-        // would clear the threshold there. DryRunFrameSizeTests holds this.
-        List<PhysicalFile> sliceFiles = [];
-        List<VirtualFileOperation> sliceOps = [];
-        long sliceBytes = 0;
-        for (int i = 0; i < sweep.Files.Count; i++)
-        {
-            PhysicalFile file = sweep.Files[i];
-            // The sweep's ops index their own file list 0-based; offset onto the global destination
-            // positions the file phase already consumed.
-            VirtualFileOperation op = sweep.Ops[i] with { SubjectIndex = destinationCount + i };
-            sliceFiles.Add(file);
-            sliceOps.Add(op);
-            sliceBytes += DryRunEngine.WireUpperBoundBytes(file) + DryRunEngine.WireUpperBoundBytes(op);
-            if (sliceBytes < DryRunEngine.WireChunkByteBudget)
-                continue;
-            yield return converter.Convert([], sliceFiles, [], sliceOps);
-            sliceFiles = [];
-            sliceOps = [];
-            sliceBytes = 0;
-        }
-        if (sliceFiles.Count > 0)
-            yield return converter.Convert([], sliceFiles, [], sliceOps);
 
         // Skip the projection on a truncated report — totals over a partial graph would be unsound.
         estimatorWatch.Start();
@@ -289,14 +308,12 @@ public sealed class DryRunStreamHandler(
                 privateBytes = self.PrivateMemorySize64;
             logger.LogInformation(
                 "Dry-run stream timings for profile {ProfileId}: total {TotalMs}ms " +
-                "(engine stream {EngineMs}ms, destination sweep {SweepMs}ms [walk {WalkMs}ms, merge {MergeMs}ms], " +
-                "space estimator {EstimatorMs}ms), " +
+                "(engine stream {EngineMs}ms, destination sweep {SweepMs}ms, space estimator {EstimatorMs}ms), " +
                 "{SourceCount} source files, {DestCount} destination files (+{SweepCount} swept); " +
                 "memory managed {ManagedMb}MB, GC heap {HeapMb}MB, GC committed {CommittedMb}MB, " +
                 "process private {PrivateMb}MB",
                 typed.ProfileId, totalWatch.ElapsedMilliseconds, engineMs, sweepWatch.ElapsedMilliseconds,
-                sweep.WalkMs, sweep.MergeMs, estimatorWatch.ElapsedMilliseconds, emitted, destinationCount,
-                sweep.Files.Count,
+                estimatorWatch.ElapsedMilliseconds, emitted, destinationCount, sweptCount,
                 managedBytes >> 20, gcInfo.HeapSizeBytes >> 20, gcInfo.TotalCommittedBytes >> 20,
                 privateBytes >> 20);
         }

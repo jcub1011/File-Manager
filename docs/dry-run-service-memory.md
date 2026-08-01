@@ -1,10 +1,18 @@
 # Service dry-run memory reduction — implementation handoff
 
 > **Status: IN PROGRESS.**
-> **Done:** §5.1 (per-run memory log line), §5.2 (GC config at startup), §5.3 (frame-size regression
-> test) and the frame-size half of §6.2 (`WireChunkByteBudget`) — see §5.5's findings for the numbers.
-> **Not done:** §5.4 (`tools/FileManager.MemoryProbe`), §5.6, the rest of Stage 1, and Stages 2–4.
+> **Done:** Stage 0 §5.1 (per-run memory log line) and §5.2 (GC config at startup); §5.3 (frame-size
+> regression test); **all of Stage 1** (§6.1 pooled serialization buffer, §6.2 `WireChunkByteBudget`,
+> §6.3 carrier string clearing); **Stage 3** (streamed sweep — see the deviation note at §8).
+> **Not done:** §5.4 (`tools/FileManager.MemoryProbe`), §5.6, **Stage 2**, **Stage 4**.
 > Stages 2 and 4 are explicitly gated on §5.4's harness and must not ship without it.
+>
+> **Workload caveat, from the one real measurement taken so far (§5.5).** The machine this was
+> implemented against runs a *source-heavy* profile — 71,923 source files but only 4,735 swept
+> destination files, a 40 ms sweep — which is the inverse of the 33.5k/357k report this plan was
+> written for. Stage 3's peak reduction scales with sweep size, so it is close to a no-op there and
+> worth ~145 MB on the reported workload. Do not conclude from a source-heavy run that Stage 3 did
+> nothing; measure on a sweep-heavy one.
 
 **Audience:** the coding agent implementing this. You are expected to read every referenced file before
 touching it. Every file/line reference was accurate at authoring time (2026-07-31, branch
@@ -140,6 +148,16 @@ every entry at once**, and it is why the sweep cannot use the spool as-is.
 
 **Confirm §3.2 yourself before implementing Stage 3.** It is the single load-bearing claim in this
 document. If it does not hold, fall back to the note in §11 on external merge sort.
+
+> **Re-verified 2026-08-01 — it holds.** `DryRunViewModel`'s `_all` is "presorted by `DryRunSort` at
+> load"; `DryRunDestinationsTab.ComputeLoad` sorts an index array by `(RelativeKey OrdinalIgnoreCase,
+> root OrdinalIgnoreCase, original index)`, so the service's absolute-path order is only the final
+> tiebreak and is reachable only when relative key **and** root both match — for swept rows that means
+> two distinct files differing only by case, impossible under the Windows `OrdinalIgnoreCase`
+> comparison. Swept ops (`SourceIndex < 0`) collect into `noSource`, get their own single-entry rows,
+> and run through that same sort. Test blast radius was as predicted: one order-asserting test
+> (`Result_is_identical_across_worker_counts`), and it needed no change because the batched path keeps
+> its sort.
 
 ### 3.3 Where the peak comes from
 
@@ -342,10 +360,28 @@ That is **~353 B per swept entry**, against the ~250–350 B this document assum
   which the chunk estimate does not itself account for) measured **25,013 B** — comfortably inside the
   budget's headroom. Both shapes are pinned by the test.
 
-**Still unanswered — §1.1's question.** Nothing measured here distinguishes committed-but-free heap from
-live retained bytes; that needs §5.4 against the published binary. §5.1's log line now emits the
-three-way split after every real run, so a single UI-driven dry run against the reporter's profile would
-answer it without the harness.
+**One real service run (2026-08-01), source-heavy profile.** 71,923 source files, **4,735** swept
+destination files, 5,249 ms total (sweep 40 ms):
+
+```
+memory managed 40MB, GC heap 47MB, GC committed 70MB, process private 90MB
+```
+
+Read carefully:
+
+- **Committed-but-free is ~23 MB here** (70 committed − 47 heap). Real, and Stage 2's trim targets
+  exactly it — but it is not a 340 MB residual.
+- **This is a NEAR-PEAK sample, not the residual.** §5.1's log fires inside `HandleStreamAsync` while
+  the sweep result, estimator, survivor set and directory table are all still rooted. The code says so;
+  do not quote it as the settled figure. A true post-run reading needs a sample after the iterator tears
+  down — Stage 2's trim coordinator is the natural place.
+- **The workload is the inverse of the report's.** 71.9k source / 4.7k swept, against 33.5k / 357k. The
+  sweep is nearly free here, so the cost concentrates in the source phase, and §3.3's whole
+  sweep-dominated cost table does not apply to this machine.
+
+**Still unanswered — §1.1's question**, for the *reported* 340 MB case: nothing measured yet
+distinguishes committed-but-free heap from live retained bytes on a sweep-heavy run. That needs either
+§5.4's harness or one UI-driven run against a 357k-destination profile.
 
 ### 5.6 Optional companion — a Core-side retention test
 
@@ -595,7 +631,42 @@ Bake at ILC time.
 
 ---
 
-## 8. Stage 3 — Unify the sweep onto the source phase's pipeline (fixes the peak)
+## 8. Stage 3 — Stream the sweep instead of collecting it (fixes the peak)
+
+> **Implemented 2026-08-01, with a deliberate deviation from §8.1/§8.2 below.** §3.2 was re-verified
+> first and holds (see the note at the end of §3.2).
+>
+> **What was built instead of the spool routing.** `DestinationProjector.SweepStreamAsync` emits
+> byte-budgeted `DryRunChunk`s **directly from the walk**, over a 2-deep bounded `Channel<DryRunChunk>`,
+> with global `SubjectIndex` values already applied. It does **not** go through `IDryRunSpool` /
+> `StreamAccumulator` / `EvaluationCarrierPool`.
+>
+> **Why.** The spool routing buys three things — spill-to-disk, chunk-bounded memory, carrier recycling
+> — and only the middle one is a memory win here. Chunk-bounded memory falls out of the bounded channel
+> for free: a full channel parks the walk, which is the same back-pressure the spool would provide.
+> Carrier recycling saves allocation *churn*, not live bytes, and §8 already conceded the 357k path
+> strings are allocated either way ("they die with their chunk"). Spill-to-disk exists in the source
+> phase because the parallel scan+evaluate pipeline must fully drain before chunking can start; the
+> sweep has no evaluation phase and no such ordering constraint, so it has nothing to decouple.
+>
+> Taking the spool route would have meant widening `IEvaluationView.SourceFile`/`SourceOp` to nullable,
+> a `SweptFinding` carrier, `IDryRunSpool.WriteAsync(IEvaluationView)`, an optional-source
+> `DryRunSnapshotFormat` on both halves, `RentDestinationOnly` plus null-tolerant `Return`, and matching
+> guards in `StreamAccumulator`/`BundleUpperBound`/`EstimateBytes` — touching the spilled-replay format
+> and the carrier pool, both of which currently serve the source phase correctly — for **no additional
+> memory reduction**. The direct-streaming version is ~1 file of new logic and leaves the spool,
+> snapshot format and carrier pool untouched.
+>
+> **Result:** sweep live set is one chunk (~25–30 KB) plus a two-chunk buffer, independent of entry
+> count — better than §8's estimated ~6 MB — and the handler's ~23 MB of `with { SubjectIndex = … }`
+> copy churn is gone with it. The rest of §8 (nested-root pruning §8.4, exact `Capped` §8.5, handler
+> collapse §8.3, the batched path staying sorted §8.8, the doc rewrites §8.7) was implemented as
+> written. §8.9's behaviour change stands: a capped streamed sweep now keeps a non-deterministic subset.
+>
+> **Not done:** `DryRunChunk.SweepCapped` was added as specified, but as a **trailing empty marker
+> chunk** rather than a flag on a data chunk — the cap is only known once the walk ends.
+
+### The original plan (unify onto the source phase's pipeline)
 
 Route the streamed sweep through the same `IDryRunSpool` + `StreamAccumulator` + `EvaluationCarrierPool`
 the source phase already uses. It inherits spill-to-disk, chunk-bounded memory and carrier recycling, and
