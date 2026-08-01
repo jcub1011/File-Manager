@@ -219,6 +219,17 @@ public sealed class DryRunStreamHandler(
             // phase already emitted. Fixed for the whole sweep — the projector adds its own running
             // position on top.
             int sweepIndexBase = destinationCount;
+            // One unconditional frame to flip the client into the sweep phase. The throttled poll
+            // below only fires while an advance is PENDING, and now that the sweep streams chunks
+            // continuously each advance completes almost immediately — so without this the phase was
+            // skipped entirely on a fast sweep and the UI jumped straight from scanning to building
+            // (measured: the phase disappeared from the sequence after the sweep was made streaming).
+            yield return new DryRunProgressResponse
+            {
+                Phase = DryRunProgressPhase.SweepingDestinations,
+                SourceFiles = progressCounters.Sources,
+                DestinationFiles = sweepIndexBase,
+            };
             await using IAsyncEnumerator<Result<DryRunChunk, string>> sweepChunks = destinationProjector
                 .SweepStreamAsync(
                     profile, survivors, truncated, sweepBudget, sweepIndexBase,
