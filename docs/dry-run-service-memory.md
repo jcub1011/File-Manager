@@ -1,7 +1,10 @@
 # Service dry-run memory reduction — implementation handoff
 
-> **Status: IN PROGRESS.** Stage 0 (measurement) is the prerequisite for everything else; the
-> ranking of Stages 1–4 may change once it produces numbers. Keep §5.5's table updated as stages land.
+> **Status: IN PROGRESS.**
+> **Done:** §5.1 (per-run memory log line), §5.2 (GC config at startup), §5.3 (frame-size regression
+> test) and the frame-size half of §6.2 (`WireChunkByteBudget`) — see §5.5's findings for the numbers.
+> **Not done:** §5.4 (`tools/FileManager.MemoryProbe`), §5.6, the rest of Stage 1, and Stages 2–4.
+> Stages 2 and 4 are explicitly gated on §5.4's harness and must not ship without it.
 
 **Audience:** the coding agent implementing this. You are expected to read every referenced file before
 touching it. Every file/line reference was accurate at authoring time (2026-07-31, branch
@@ -312,11 +315,37 @@ FileManager.MemoryProbe.exe --tree D:\fm-memprobe `
 
 ### 5.5 Record the baseline before touching anything else
 
-Fill this in and keep it updated after every stage:
+Fill this in and keep it updated after every stage. **Still empty — §5.4's harness does not exist yet,
+so no end-to-end footprint number has been taken.**
 
 | Stage | idle | peak | t+0s | t+30s | GC heap @peak | committed @peak | wall time |
 |---|---|---|---|---|---|---|---|
 | baseline | | | | | | | |
+
+#### Findings so far (2026-08-01)
+
+**Frame size — measured, and worse than this document estimated.** `DryRunFrameSizeTests` (§5.3) drives
+the handler over 20,000 swept entries with ~90-char paths and serializes every yielded frame:
+
+| | largest frame | frames | on the LOH |
+|---|---|---|---|
+| before (`DestinationChunkSize = 4096`) | **1,446,714 B** | 8 | 5 |
+| after (`WireChunkByteBudget = 48 KiB`) | **27,846 B** | 289 | 0 |
+
+That is **~353 B per swept entry**, against the ~250–350 B this document assumed. Consequences:
+
+- §3.3's "~88 sweep frames × ~1.1 MB ≈ 97 MB" of LOH churn is really **~87 × ~1.45 MB ≈ 126 MB** at
+  357k entries — about 30% worse, and the single largest churn item in the diagnosis.
+- §6.2's fallback advice is **wrong**: a fixed `DestinationChunkSize` of 256 lands at ~90 KB, over the
+  85,000-byte line. Only the byte budget works. Do not reintroduce a fixed count.
+- The directory-per-file worst case (every entry dragging a fresh `DryRunDirectory` into its frame,
+  which the chunk estimate does not itself account for) measured **25,013 B** — comfortably inside the
+  budget's headroom. Both shapes are pinned by the test.
+
+**Still unanswered — §1.1's question.** Nothing measured here distinguishes committed-but-free heap from
+live retained bytes; that needs §5.4 against the published binary. §5.1's log line now emits the
+three-way split after every real run, so a single UI-driven dry run against the reporter's profile would
+answer it without the harness.
 
 ### 5.6 Optional companion — a Core-side retention test
 
