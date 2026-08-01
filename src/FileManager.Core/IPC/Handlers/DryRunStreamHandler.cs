@@ -266,8 +266,14 @@ public sealed class DryRunStreamHandler(
         estimatorWatch.Stop();
         if (logger.IsEnabled(LogLevel.Information))
         {
-            // Three-way memory split, sampled right after the run. These are NOT interchangeable and
-            // the whole point of logging all three is that they answer different questions:
+            // Three-way memory split. NOTE THE SAMPLE POINT: this runs at the end of the run but
+            // BEFORE the iterator tears down, so the sweep result, the space estimator, the survivor
+            // set and the wire directory table are all still rooted. It is therefore a NEAR-PEAK
+            // reading, not the post-run residual — do not quote it as "what the service settles at".
+            // The residual needs a sample after this method's frame is gone.
+            //
+            // These are NOT interchangeable; the whole point of logging all four is that they answer
+            // different questions:
             //   managed  — GC.GetTotalMemory(false), the managed heap as the GC last accounted it.
             //   heap     — HeapSizeBytes, live+garbage bytes the GC currently tracks.
             //   committed— TotalCommittedBytes, what the GC has committed from the OS.
