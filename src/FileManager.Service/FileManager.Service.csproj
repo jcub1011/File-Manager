@@ -8,6 +8,24 @@
     <PublishAot>true</PublishAot>
     <!-- Timezone validation (PROFILE_TIMEZONE_INVALID) needs ICU. -->
     <InvariantGlobalization>false</InvariantGlobalization>
+
+    <!-- Background GC OFF. This service is idle almost all the time and then allocates hard for a few
+         seconds during a dry run; what it needs afterwards is for the heap to actually shrink.
+         Background (concurrent) gen2s are non-compacting by design and, per the GC docs, "don't reduce
+         the total heap size by much". Turning it off makes every gen2 blocking and compacting, which
+         is what returns pages. The cost is longer pauses during the burst — an accepted trade for a
+         background service with no UI thread of its own.
+
+         Note this is NOT ServerGarbageCollection: server GC's per-core heaps and much larger gen0
+         budget are the wrong shape here, and it is also the only thing that would enable DATAS.
+
+         Delivery is the subtle part. NativeAOT has no runtimeconfig.json parser; the SDK converts this
+         property into a RuntimeHostConfigurationOption, which the ILC toolchain then embeds as a
+         runtimeknob (System.GC.Concurrent=false). It also lands in the generated runtimeconfig.json,
+         so `dotnet run` and the published AOT binary agree. EngineHost logs the resolved GC
+         configuration at startup — that log line is how you confirm this actually took effect, rather
+         than assuming it because the csproj says so. -->
+    <ConcurrentGarbageCollection>false</ConcurrentGarbageCollection>
   </PropertyGroup>
 
   <ItemGroup>
