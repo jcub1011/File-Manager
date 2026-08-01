@@ -1,4 +1,4 @@
-using FileManager.Contracts.DryRun;
+﻿using FileManager.Contracts.DryRun;
 using FileManager.Contracts.IPC;
 using FileManager.Contracts.Profiles;
 using FileManager.Contracts.Settings;
@@ -58,6 +58,7 @@ public sealed class SerializationTests
         { new ProfileResponse { Profile = SampleProfile() }, "profile" },
         { new ValidationResponse { Issues = [new ValidationIssue(ValidationSeverity.BlockingWarning, "C", "m")] }, "validation" },
         { new MatchingProfilesResponse { Matches = [] }, "matching" },
+        { new RunProfileResponse { QueuedCount = 1, Scanning = false, RunId = SomeId }, "run-profile-result" },
         { new DryRunResponse { Report = SampleReport() }, "dry-run-report" },
         { new DryRunChunkResponse { Directories = SampleDirectories(), SourceFiles = [SampleWireFile()], SourceOperations = [SampleWireSourceOp()] }, "dry-run-chunk" },
         { new DryRunProgressResponse { Phase = DryRunProgressPhase.ScanningSources, SourceFiles = 1, DestinationFiles = 2 }, "dry-run-progress" },
@@ -83,6 +84,8 @@ public sealed class SerializationTests
     public static TheoryData<EngineEvent, string> Events() => new()
     {
         { new JobStartedEvent { AtUtc = DateTimeOffset.UnixEpoch, JobId = SomeId, ProfileId = SomeId, SourcePath = @"C:\x" }, "job-started" },
+        { new JobProgressEvent { AtUtc = DateTimeOffset.UnixEpoch, JobId = SomeId, Phase = JobPhase.Distributing, TargetsCompleted = 1, TargetCount = 2 }, "job-progress" },
+        { new RunQueuedEvent { AtUtc = DateTimeOffset.UnixEpoch, ProfileId = SomeId, ScopePath = "C:/in", QueuedCount = 3, RunId = SomeId }, "run-queued" },
         { new PauseChangedEvent { AtUtc = DateTimeOffset.UnixEpoch, Paused = true }, "pause-changed" },
         { new ProfilesChangedEvent { AtUtc = DateTimeOffset.UnixEpoch }, "profiles-changed" },
         { new EngineWarningEvent { AtUtc = DateTimeOffset.UnixEpoch, Message = "w" }, "engine-warning" },
@@ -99,6 +102,32 @@ public sealed class SerializationTests
 
         Assert.True(IpcSerializer.DeserializeEvent(wire).TryGetValue(out EngineEvent? roundTripped));
         Assert.Equal(evt.GetType(), roundTripped.GetType());
+    }
+
+    /// <summary>A deliberate tripwire: the protocol version gates UI/service compatibility
+    /// (IPC_VERSION_MISMATCH), so it must never move as an incidental side effect of an edit.</summary>
+    [Fact]
+    public void Current_protocol_version_is_pinned()
+    {
+        Assert.Equal(7, IpcRequest.CurrentProtocolVersion);
+    }
+
+    /// <summary>JobPhase must stay a string on the wire (the context sets UseStringEnumConverter), so
+    /// a consumer reading it never depends on the enum's numeric ordering.</summary>
+    [Fact]
+    public void Job_phase_serializes_as_a_string()
+    {
+        byte[] wire = IpcSerializer.SerializeEvent(new JobProgressEvent
+        {
+            AtUtc = DateTimeOffset.UnixEpoch,
+            JobId = SomeId,
+            Phase = JobPhase.Distributing,
+            TargetsCompleted = 1,
+            TargetCount = 2,
+        });
+
+        using JsonDocument document = JsonDocument.Parse(wire);
+        Assert.Equal("Distributing", document.RootElement.GetProperty("Phase").GetString());
     }
 
     [Fact]
@@ -387,7 +416,6 @@ public sealed class SerializationTests
             Settings = new GlobalSettings
             {
                 ServiceStartupMode = ServiceStartupMode.RunOnStartup,
-                ThemeMode = ThemeMode.Dark,
                 ScanThreading = new ScanThreadingSettings
                 {
                     MaxScanThreads = ThreadBudget.Explicit(6),
@@ -401,7 +429,6 @@ public sealed class SerializationTests
         Assert.True(IpcSerializer.DeserializeResponse(wire).TryGetValue(out IpcResponse? reparsed));
         SettingsResponse roundTripped = Assert.IsType<SettingsResponse>(reparsed);
         Assert.Equal(ServiceStartupMode.RunOnStartup, roundTripped.Settings.ServiceStartupMode);
-        Assert.Equal(ThemeMode.Dark, roundTripped.Settings.ThemeMode);
 
         ScanThreadingSettings st = roundTripped.Settings.ScanThreading;
         Assert.Equal(6, st.MaxScanThreads.Value);
@@ -414,15 +441,18 @@ public sealed class SerializationTests
         using JsonDocument document = JsonDocument.Parse(wire);
         Assert.Equal("RunOnStartup",
             document.RootElement.GetProperty("Settings").GetProperty("ServiceStartupMode").GetString());
-        Assert.Equal("Dark",
-            document.RootElement.GetProperty("Settings").GetProperty("ThemeMode").GetString());
+        // The theme is deliberately absent: it is client-side state (client-settings.json) and never
+        // crosses the wire, so the engine's settings frame must not carry it.
+        Assert.False(document.RootElement.GetProperty("Settings").TryGetProperty("ThemeMode", out _));
     }
 
     [Fact]
     public void GlobalSettings_with_stale_concurrency_fields_still_deserializes()
     {
-        // A settings.json written before v2 carries the removed DryRunConcurrencyMode/DryRunManualWorkers.
-        // The source-gen deserializer skips unknown members, so no migration pass is needed.
+        // A settings.json written before v2 carries the removed DryRunConcurrencyMode/DryRunManualWorkers,
+        // and one written before v5 also carries ThemeMode (which moved to the UI's client-settings.json).
+        // The source-gen deserializer skips unknown members, so no migration pass is needed here — the
+        // theme's own migration is the UI's, in ClientSettingsStore.
         JsonObject obj = new()
         {
             ["SchemaVersion"] = 1,
@@ -435,7 +465,6 @@ public sealed class SerializationTests
         GlobalSettings? parsed = JsonSerializer.Deserialize(obj.ToJsonString(), FileManagerJsonContext.Default.GlobalSettings);
         Assert.NotNull(parsed);
         Assert.Equal(ServiceStartupMode.RunOnStartup, parsed!.ServiceStartupMode);
-        Assert.Equal(ThemeMode.Dark, parsed.ThemeMode);
         Assert.True(parsed.ScanThreading.MaxScanThreads.IsAuto);   // the new field defaults to auto
     }
 

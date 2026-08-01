@@ -30,14 +30,14 @@ public readonly record struct ThreadBudget(int? Value)
 /// the independent <see cref="MaxHashThreads"/>.</summary>
 public sealed record ScanThreadingSettings
 {
-    /// <summary>Global ceiling on concurrently-enumerating scan worker threads. Auto = ProcessorCount * 8.</summary>
+    /// <summary>Global ceiling on concurrently-enumerating scan worker threads. Auto = ProcessorCount * 4, capped at 64.</summary>
     public ThreadBudget MaxScanThreads { get; init; } = ThreadBudget.Auto;
 
     /// <summary>Ceiling on dry-run evaluation (stat + hash) workers. Auto = ProcessorCount - 1.</summary>
     public ThreadBudget MaxHashThreads { get; init; } = ThreadBudget.Auto;
 
     /// <summary>Per-volume scan-thread cap when no drive-type or specific-drive override applies.
-    /// Auto = ProcessorCount * 4. Never exceeds <see cref="MaxScanThreads"/> after resolution.</summary>
+    /// Auto = ProcessorCount * 2. Never exceeds <see cref="MaxScanThreads"/> after resolution.</summary>
     public ThreadBudget PerDriveDefault { get; init; } = ThreadBudget.Auto;
 
     private readonly Dictionary<DriveClass, ThreadBudget>? _driveTypeOverrides;

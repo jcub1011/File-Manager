@@ -2,6 +2,7 @@ using FileManager.Contracts.Primitives;
 using FileManager.Contracts.Profiles;
 using FileManager.Core.Audit;
 using FileManager.Core.Disposition;
+using FileManager.Core.Files;
 using FileManager.Core.Jobs;
 using FileManager.Core.Placement;
 using Microsoft.Extensions.Logging;
@@ -469,13 +470,10 @@ public sealed class CrashRecovery(
 
     private void Replace(string temp, string final, string staged)
     {
-        try { File.Replace(temp, final, staged, ignoreMetadataErrors: true); }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or PlatformNotSupportedException)
-        {
-            logger.LogWarning(ex, "File.Replace rejected for \"{Final}\" during recovery; falling back to two-step move", final);
-            File.Move(final, staged);
-            File.Move(temp, final);
-        }
+        // The shared primitive, not a second copy of it: recovery re-runs these journal rows on every
+        // service start, so the fallback's idempotency guard matters here at least as much as it does on
+        // the live path. Only the catch-all below is recovery-specific.
+        try { StagedReplace.Execute(temp, final, staged, logger); }
         catch (Exception ex)
         {
             // Last-resort catch-all (directive): log before the throw reaches RecoverJob's

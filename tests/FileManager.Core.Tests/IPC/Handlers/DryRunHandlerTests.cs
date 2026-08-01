@@ -4,6 +4,7 @@ using FileManager.Contracts.Primitives;
 using FileManager.Contracts.Profiles;
 using FileManager.Core.DryRun;
 using FileManager.Core.IPC.Handlers;
+using FileManager.Core.Observability;
 using FileManager.Core.Profiles;
 using FileManager.Core.Tests.TestSupport;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -36,7 +37,9 @@ public sealed class DryRunHandlerTests
     [Fact]
     public async Task Unknown_profile_is_a_PROFILE_NOT_FOUND_error()
     {
-        DryRunHandler handler = new(NullLogger<DryRunHandler>.Instance, new ThrowingEngine(), new FakeCatalog());
+        DryRunHandler handler = new(
+            NullLogger<DryRunHandler>.Instance, new ThrowingEngine(), new FakeCatalog(),
+            NullMemoryTrimCoordinator.Instance);
 
         IpcResponse response = await handler.HandleAsync(
             new DryRunRequest { ProfileId = Guid.NewGuid(), ScopePath = null });

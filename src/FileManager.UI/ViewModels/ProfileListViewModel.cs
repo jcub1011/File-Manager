@@ -25,6 +25,16 @@ public sealed record ProfileListItem(Guid ProfileId, string Name, bool Active, s
     /// the list is built, so the popup binds directly to its own DataContext (no cross-namescope
     /// ancestor lookup). Takes this row as its parameter.</summary>
     public ICommand? ExportCommand { get; init; }
+
+    /// <summary>Bound by the row's right-click "Run now…" menu item, stamped the same way as
+    /// <see cref="ExportCommand"/>. Takes this row as its parameter. This starts a REAL run that moves
+    /// files, so the shell confirms before submitting.</summary>
+    public ICommand? RunCommand { get; init; }
+
+    /// <summary>Bound by the row's right-click "Delete…" menu item, stamped the same way as
+    /// <see cref="ExportCommand"/>. Takes this row as its parameter. The shell confirms modally
+    /// first — the row itself carries no pending-delete state.</summary>
+    public ICommand? DeleteCommand { get; init; }
 }
 
 public sealed partial class ProfileListViewModel(IIpcGateway gateway) : ViewModelBase
@@ -58,6 +68,14 @@ public sealed partial class ProfileListViewModel(IIpcGateway gateway) : ViewMode
     /// so the right-click "Export" menu works in both the list and the collapsed rail.</summary>
     public ICommand? ExportProfileCommand { get; set; }
 
+    /// <summary>Set by the shell to its manual-run command (takes a <see cref="ProfileListItem"/>),
+    /// stamped onto every row's <see cref="ProfileListItem.RunCommand"/> the same way.</summary>
+    public ICommand? RunProfileCommand { get; set; }
+
+    /// <summary>Set by the shell to its confirming delete command (takes a <see cref="ProfileListItem"/>),
+    /// stamped onto every row's <see cref="ProfileListItem.DeleteCommand"/> the same way.</summary>
+    public ICommand? DeleteProfileCommand { get; set; }
+
     /// <summary>Whether any profiles exist at all (independent of the search filter). Drives the
     /// content-area empty state: false → "no profiles yet, create one"; true → "select a profile".
     /// Maintained by <see cref="RefreshAsync"/>, the sole mutation point of <see cref="Profiles"/>.</summary>
@@ -74,7 +92,17 @@ public sealed partial class ProfileListViewModel(IIpcGateway gateway) : ViewMode
     public Action? NavigationBlocked { get; set; }
 
     [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(CanDeleteSelected))]
+    [NotifyPropertyChangedFor(nameof(CanRunSelected))]
     public partial ProfileListItem? SelectedProfile { get; set; }
+
+    /// <summary>Gates the Profile tab's Delete button: there must be a persisted profile to delete.
+    /// A brand-new unsaved draft has no list row, so this is false for it.</summary>
+    public bool CanDeleteSelected => SelectedProfile is not null;
+
+    /// <summary>Gates the Profile tab's Run button. Mirrors the row menu's <c>IsEnabled="{Binding Active}"</c>:
+    /// the engine refuses an inactive profile, so never offer the button for one.</summary>
+    public bool CanRunSelected => SelectedProfile?.Active == true;
 
     /// <summary>Id of the profile the editor currently has unsaved edits for, or null. The sidebar
     /// row matching this id shows an unsaved-changes marker. Set by the shell from the editor's
@@ -92,9 +120,6 @@ public sealed partial class ProfileListViewModel(IIpcGateway gateway) : ViewMode
     public partial string? ErrorMessage { get; set; }
 
     [ObservableProperty]
-    public partial ProfileListItem? PendingDelete { get; set; }
-
-    [ObservableProperty]
     public partial string? SearchText { get; set; }
 
     partial void OnSelectedProfileChanged(ProfileListItem? oldValue, ProfileListItem? newValue)
@@ -109,7 +134,6 @@ public sealed partial class ProfileListViewModel(IIpcGateway gateway) : ViewMode
             NavigationBlocked?.Invoke();
             return;
         }
-        PendingDelete = null;
         SelectionCommitted?.Invoke(newValue);
 
         // A previously force-included (selected-but-unmatched) row must drop out now that the
@@ -205,6 +229,8 @@ public sealed partial class ProfileListViewModel(IIpcGateway gateway) : ViewMode
                 Profiles.Add(new ProfileListItem(summary.ProfileId, summary.Name, summary.Active, summary.TriggerSummary)
                 {
                     ExportCommand = ExportProfileCommand,
+                    RunCommand = RunProfileCommand,
+                    DeleteCommand = DeleteProfileCommand,
                 });
             HasProfiles = Profiles.Count > 0;
             RebuildFiltered(selectedId);   // build the filtered view before re-selecting into it
@@ -230,21 +256,13 @@ public sealed partial class ProfileListViewModel(IIpcGateway gateway) : ViewMode
         _revertingSelection = false;
     }
 
-    [RelayCommand]
-    public void RequestDelete(ProfileListItem? item) => PendingDelete = item ?? SelectedProfile;
-
-    [RelayCommand]
-    public void CancelDelete() => PendingDelete = null;
-
-    [RelayCommand]
-    public async Task ConfirmDeleteAsync()
+    /// <summary>Deletes a profile. The confirmation is the shell's job (a modal, so it works from the
+    /// collapsed rail too) — by the time this runs the user has already said yes.</summary>
+    public async Task DeleteAsync(ProfileListItem doomed)
     {
-        if (PendingDelete is not { } doomed)
-            return;
         try
         {
             var deleted = await gateway.DeleteProfileAsync(doomed.ProfileId);
-            PendingDelete = null;
             if (deleted.TryGetError(out IpcError? error))
             {
                 ErrorMessage = $"Could not delete \"{doomed.Name}\": {error.Message}";

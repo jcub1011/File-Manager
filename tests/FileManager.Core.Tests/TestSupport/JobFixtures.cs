@@ -47,14 +47,18 @@ internal static class JobFixtures
         MetadataOnConflict = MetadataOnConflict.WarnAndContinue,
     };
 
-    /// <summary>A single-target job whose sealed output is the source file itself (no transformers).</summary>
+    /// <summary>A single-target job whose sealed output is the source file itself (no transformers).
+    /// <paramref name="profile"/> overrides the baseline profile for tests that need specific filters,
+    /// a TargetLayout, or an archive folder — the executor reads all three off the plan's profile.</summary>
     public static JobExecution Execution(
         string sourcePath,
         string sourceRoot,
         IReadOnlyList<string> targetFinalPaths,
         IReadOnlyList<string> targetRoots,
         PolicySnapshot? policy = null,
-        JobId? jobId = null)
+        JobId? jobId = null,
+        Profile? profile = null,
+        int? sourceIndex = null)
     {
         policy ??= Policy();
         var fileInfo = new FileInfo(sourcePath);
@@ -64,7 +68,7 @@ internal static class JobFixtures
         for (int i = 0; i < targets.Length; i++)
             targets[i] = new TargetPlan { TargetIndex = i, TargetRoot = targetRoots[i], ProspectiveFinalPath = targetFinalPaths[i] };
 
-        Profile profile = TestProfiles.Valid(sourceRoot, targetRoots[0]);
+        profile ??= TestProfiles.Valid(sourceRoot, targetRoots[0]);
         var source = new SourceSnapshot
         {
             Path = sourcePath,
@@ -91,6 +95,9 @@ internal static class JobFixtures
             Targets = targets,
             Policies = policy,
             WorkspaceDir = Path.Combine(Path.GetTempPath(), ".pipeline_tmp", id.Value.ToString("N")),
+            // Resolved through production's own helper so a fixture plan ranks exactly as a real one
+            // would; pass sourceIndex explicitly only to exercise a specific M:1 rank.
+            SourceIndex = sourceIndex ?? JobPlanFactory.ResolveSourceIndex(profile, sourceRoot),
         };
 
         return new JobExecution

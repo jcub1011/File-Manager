@@ -67,13 +67,24 @@ public sealed class DryRunEngineTests : IDisposable
         NewEngine(reportByteBudget, GlobalSettings.Default);
 
     private static DryRunEngine NewEngine(int reportByteBudget, GlobalSettings global) =>
-        NewEngine(reportByteBudget, DryRunEngine.ChunkByteThreshold, global);
+        NewEngine(reportByteBudget, DryRunEngine.WireChunkByteBudget, global);
 
     private static DryRunEngine NewEngine(int reportByteBudget, int chunkByteBudget, GlobalSettings global) =>
         NewEngine(reportByteBudget, chunkByteBudget, DryRunEngine.MaxStreamedFiles, global);
 
+    /// <summary>Shrinks the batched path's candidate cap, which also bounds its destination sweep.</summary>
+    private static DryRunEngine NewEngineWithBatchCap(int maxBatchCandidates) =>
+        NewEngine(
+            DryRunEngine.MaxReportBytes, DryRunEngine.WireChunkByteBudget, DryRunEngine.MaxStreamedFiles,
+            GlobalSettings.Default, maxBatchCandidates);
+
     private static DryRunEngine NewEngine(
-        int reportByteBudget, int chunkByteBudget, int maxScannedCandidates, GlobalSettings global)
+        int reportByteBudget, int chunkByteBudget, int maxScannedCandidates, GlobalSettings global) =>
+        NewEngine(reportByteBudget, chunkByteBudget, maxScannedCandidates, global, DryRunEngine.MaxReportedFiles);
+
+    private static DryRunEngine NewEngine(
+        int reportByteBudget, int chunkByteBudget, int maxScannedCandidates, GlobalSettings global,
+        int maxBatchCandidates)
     {
         FileSystemService fileSystem = new(NullLogger<FileSystemService>.Instance);
         FakeSettings settings = new(global);
@@ -87,7 +98,12 @@ public sealed class DryRunEngineTests : IDisposable
             settings,
             TimeProvider.System,
             new DestinationProjector(NullLogger<DestinationProjector>.Instance, new FakeVolumeInfoProvider(), scheduler))
-        { ReportByteBudget = reportByteBudget, ChunkByteBudget = chunkByteBudget, MaxScannedCandidates = maxScannedCandidates };
+        {
+            ReportByteBudget = reportByteBudget,
+            ChunkByteBudget = chunkByteBudget,
+            MaxScannedCandidates = maxScannedCandidates,
+            MaxBatchCandidates = maxBatchCandidates,
+        };
     }
 
     /// <summary>Concatenates a stream's source files with their source operations (paired by the
@@ -549,6 +565,27 @@ public sealed class DryRunEngineTests : IDisposable
     }
 
     [Fact]
+    public async Task The_batched_destination_sweep_is_bounded_and_marks_the_report_truncated()
+    {
+        // The report's BYTE budget bounds the report, not the sweep: without a cap the projector first
+        // materializes a PhysicalFile + VirtualFileOperation for every pre-existing file under every
+        // target root on the service heap, and only then does the byte budget start rejecting. A target
+        // that is a large existing archive could exhaust service memory — the failure the streamed path
+        // was already hardened against.
+        SourceFile("keep.txt", "content");
+        for (int i = 0; i < 8; i++)
+            TargetFile($"preexisting-{i}.txt", $"already here {i}");
+
+        var simulated = await NewEngineWithBatchCap(3)
+            .SimulateAsync(ProfileUnderTest() with { ScanDestination = true }, null);
+
+        Assert.True(simulated.TryGetValue(out DryRunReport? report));
+        Assert.True(report!.Truncated, "a capped sweep must be reported, not silently short");
+        Assert.InRange(report.DestinationFiles.Count, 1, 8);
+        AssertIndicesValid(report);   // no retained operation may reference a dropped file
+    }
+
+    [Fact]
     public async Task Additive_without_scan_skips_the_destination_sweep()
     {
         SourceFile("keep.txt", "content");
@@ -624,7 +661,7 @@ public sealed class DryRunEngineTests : IDisposable
         Profile profile = ProfileUnderTest();
 
         DryRunEngine engine = NewEngine(
-            DryRunEngine.MaxReportBytes, DryRunEngine.ChunkByteThreshold, maxScannedCandidates: 5,
+            DryRunEngine.MaxReportBytes, DryRunEngine.WireChunkByteBudget, maxScannedCandidates: 5,
             GlobalSettings.Default);
         List<(string SourcePath, OperationKind Kind)> streamed = await CollectStream(engine, profile);
 
@@ -824,7 +861,7 @@ public sealed class DryRunEngineTests : IDisposable
         SourceFile("a.txt");
         Profile profile = ProfileUnderTest();
         DryRunEngine engine = BuildEngine(GlobalSettings.Default, chunkByteBudget: 1 << 20,
-            spillThresholdBytes: DryRunEngine.ChunkByteThreshold,
+            spillThresholdBytes: DryRunEngine.WireChunkByteBudget,
             spoolFactory: new ReadFaultingSpoolFactory(), pool: null);
 
         List<Result<DryRunChunk, string>> items = [];
@@ -875,7 +912,7 @@ public sealed class DryRunEngineTests : IDisposable
     /// <summary>An engine whose streamed path uses the in-memory spool (no serialization, no pooling) —
     /// the unpooled baseline the spilled run must match.</summary>
     private DryRunEngine InMemoryStreamEngine(int chunkByteBudget) =>
-        BuildEngine(GlobalSettings.Default, chunkByteBudget, spillThresholdBytes: DryRunEngine.ChunkByteThreshold,
+        BuildEngine(GlobalSettings.Default, chunkByteBudget, spillThresholdBytes: DryRunEngine.WireChunkByteBudget,
             spoolFactory: new InMemoryDryRunSpoolFactory(), pool: null);
 
     private static DryRunEngine BuildEngine(

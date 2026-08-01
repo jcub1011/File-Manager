@@ -1,6 +1,7 @@
 <Styles xmlns="https://github.com/avaloniaui"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        xmlns:ctrl="using:FileManager.UI.Controls">
+        xmlns:ctrl="using:FileManager.UI.Controls"
+        xmlns:st="using:FileManager.UI.ViewModels.Settings">
 
     <!-- Status indicator (dry-run): a colour-tinted glyph + optional count. Replaces the old filled
          status pills; the icon carries the meaning (pair with ToolTip.Tip), the text an optional
@@ -67,6 +68,27 @@
         <Setter Property="Padding" Value="0" />
         <Setter Property="VerticalAlignment" Value="Stretch" />
     </Style>
+
+    <!-- Icon button sitting ON the solid accent status strip. Button.iconButton can't be reused:
+         it takes the theme foreground, which renders near-invisible against the accent fill. -->
+    <Style Selector="Button.statusBar">
+        <Setter Property="Background" Value="Transparent" />
+        <Setter Property="BorderThickness" Value="0" />
+        <Setter Property="CornerRadius" Value="3" />
+        <Setter Property="Padding" Value="6,1" />
+        <Setter Property="MinWidth" Value="0" />
+        <Setter Property="Foreground" Value="{DynamicResource Brush.StatusBar.Foreground}" />
+    </Style>
+    <Style Selector="Button.statusBar:pointerover /template/ ContentPresenter">
+        <Setter Property="Background" Value="#26FFFFFF" />
+    </Style>
+    <Style Selector="Button.statusBar:pressed /template/ ContentPresenter">
+        <Setter Property="Background" Value="#40FFFFFF" />
+    </Style>
+    <Style Selector="Button.statusBar:disabled /template/ ContentPresenter">
+        <Setter Property="Background" Value="Transparent" />
+        <Setter Property="Opacity" Value="0.5" />
+    </Style>
     <Style Selector="Button.caption:pointerover /template/ ContentPresenter">
         <Setter Property="Background" Value="#19808080" />
     </Style>
@@ -104,6 +126,27 @@
     </Style>
     <Style Selector="Button.danger:pressed /template/ ContentPresenter">
         <Setter Property="Background" Value="#B71C1C" />
+        <Setter Property="Foreground" Value="White" />
+    </Style>
+
+    <!-- "Go" action button (green): the manual Run. Same shape as Button.danger, and like it the
+         hover/press shades are literal darker steps of Brush.Success rather than tokens of their
+         own — nothing else needs them. -->
+    <Style Selector="Button.success">
+        <Setter Property="Background" Value="{DynamicResource Brush.Success}" />
+        <Setter Property="Foreground" Value="White" />
+        <Setter Property="BorderThickness" Value="0" />
+    </Style>
+    <Style Selector="Button.success:pointerover /template/ ContentPresenter">
+        <Setter Property="Background" Value="#47825D" />
+        <Setter Property="Foreground" Value="White" />
+    </Style>
+    <Style Selector="Button.success:pressed /template/ ContentPresenter">
+        <Setter Property="Background" Value="#3B6E4E" />
+        <Setter Property="Foreground" Value="White" />
+    </Style>
+    <!-- The Run glyph must follow the button's white foreground, not the theme's icon brush. -->
+    <Style Selector="Button.success PathIcon">
         <Setter Property="Foreground" Value="White" />
     </Style>
 
@@ -228,7 +271,9 @@
         <Setter Property="Padding" Value="0" />
     </Style>
     <Style Selector="ListBox.profiles ListBoxItem">
-        <Setter Property="Padding" Value="8,6" />
+        <!-- Inert: ProfileListView overrides this to 0 and carries the inset on the template's Border
+             instead, so the whole row is right-clickable. Kept in step with that value. -->
+        <Setter Property="Padding" Value="8,3" />
         <Setter Property="Margin" Value="0,1" />
         <Setter Property="CornerRadius" Value="{StaticResource Radius.Control}" />
     </Style>
@@ -337,5 +382,77 @@
     <Style Selector="ToggleButton.statusFilter:checked:pointerover /template/ ContentPresenter">
         <Setter Property="Background" Value="{DynamicResource Brush.Item.Selected}" />
         <Setter Property="BorderBrush" Value="{DynamicResource Brush.Accent}" />
+    </Style>
+
+    <!-- ============================ Settings ============================
+         One setting in the Settings window: a scroll anchor the navigation tree can bring into view.
+         The 3px left border is always present (transparent when unselected) so highlighting the
+         navigated-to setting never shifts the layout. -->
+    <Style Selector="Border.settingCard">
+        <Setter Property="Background" Value="Transparent" />
+        <Setter Property="BorderBrush" Value="Transparent" />
+        <Setter Property="BorderThickness" Value="3,0,0,0" />
+        <Setter Property="CornerRadius" Value="{StaticResource Radius.Control}" />
+        <Setter Property="Padding" Value="9,8" />
+        <Setter Property="Margin" Value="0,0,0,2" />
+    </Style>
+    <!-- Hover reads as the quieter of the two states (Item.Hover is a plainer wash than Item.Selected,
+         and it gets no accent edge), so pointing at a setting never looks like selecting one. -->
+    <Style Selector="Border.settingCard:pointerover">
+        <Setter Property="Background" Value="{DynamicResource Brush.Item.Hover}" />
+    </Style>
+    <!-- Declared after the hover rule so selection wins where they overlap; the third rule keeps the
+         selected look while the pointer is over it, rather than letting hover wash it out. -->
+    <Style Selector="Border.settingCard.selected">
+        <Setter Property="Background" Value="{DynamicResource Brush.Item.Selected}" />
+        <Setter Property="BorderBrush" Value="{DynamicResource Brush.Accent}" />
+    </Style>
+    <Style Selector="Border.settingCard.selected:pointerover">
+        <Setter Property="Background" Value="{DynamicResource Brush.Item.Selected}" />
+        <Setter Property="BorderBrush" Value="{DynamicResource Brush.Accent}" />
+    </Style>
+    <!-- The setting's name; heavier than its description but lighter than a section header. -->
+    <Style Selector="TextBlock.settingTitle">
+        <Setter Property="FontWeight" Value="SemiBold" />
+        <Setter Property="Foreground" Value="{DynamicResource Brush.Text.Primary}" />
+    </Style>
+    <!-- Live per-value feedback under a setting's editor ("this path does not exist, the service will
+         start from … instead"). Info reads as ordinary secondary prose; the two louder states are
+         coloured but stay plain text, because a full infoBar per setting would out-shout the window's
+         one real error banner. -->
+    <Style Selector="TextBlock.settingNotice">
+        <Setter Property="Foreground" Value="{DynamicResource Brush.Text.Secondary}" />
+    </Style>
+    <Style Selector="TextBlock.settingNotice.warning">
+        <Setter Property="Foreground" Value="{DynamicResource Brush.Warning}" />
+    </Style>
+    <Style Selector="TextBlock.settingNotice.danger">
+        <Setter Property="Foreground" Value="{DynamicResource Brush.Danger}" />
+    </Style>
+
+    <!-- A setting that cannot be edited right now (a service-owned one while the service is
+         unreachable). Only the card's own text is dimmed here: the editor inside is disabled, which the
+         control themes already grey, while the CARD stays enabled on purpose so it can still show the
+         tooltip explaining why — a disabled Avalonia control receives no pointer input, so a tooltip on
+         it would never appear. Declared AFTER .settingTitle so it wins for the title too; both
+         selectors match, and the later setter is the one that applies. -->
+    <Style Selector="Border.settingCard.disabled > StackPanel > TextBlock">
+        <Setter Property="Foreground" Value="{DynamicResource Brush.Text.Disabled}" />
+    </Style>
+
+    <!-- Settings navigation tree (VS tool-window look: flat rows, no chrome of its own). Node
+         visibility and expansion are driven from the view model so the search box can filter the tree;
+         hiding the TreeViewItem itself (not the template content) is what stops a filtered-out node
+         leaving a gap behind. -->
+    <Style Selector="TreeView.settingsNav">
+        <Setter Property="Background" Value="Transparent" />
+        <Setter Property="BorderThickness" Value="0" />
+        <Setter Property="Padding" Value="0" />
+    </Style>
+    <Style Selector="TreeView.settingsNav TreeViewItem" x:DataType="st:SettingsNavNodeViewModel">
+        <Setter Property="IsVisible" Value="{Binding IsVisible}" />
+        <Setter Property="IsExpanded" Value="{Binding IsExpanded, Mode=TwoWay}" />
+        <Setter Property="MinHeight" Value="26" />
+        <Setter Property="Padding" Value="4,0" />
     </Style>
 </Styles>

@@ -19,17 +19,33 @@ public static class IpcFrameCodec
     /// the one read failure that is an expected end-of-stream, not a fault.</summary>
     public const string ConnectionClosedMessage = "connection closed";
 
-    private const int HeaderBytes = 4;
+    /// <summary>Size of the length prefix. Public so a caller writing many frames can hold one
+    /// correctly-sized scratch header (see the <c>headerBuffer</c> overload of
+    /// <see cref="WriteFrameAsync(Stream, ReadOnlyMemory{byte}, byte[], CancellationToken)"/>).</summary>
+    public const int HeaderBytes = 4;
 
-    /// <summary>Writes one frame. An oversized payload is a programmer error and throws;
-    /// transport failures are values, never exceptions. Cancellation is returned as
-    /// <see cref="ResultStatus.Canceled"/>, never thrown.</summary>
-    public static async Task<Result> WriteFrameAsync(Stream stream, ReadOnlyMemory<byte> payload, CancellationToken ct = default)
+    /// <summary>Writes one frame, allocating its 4-byte length prefix. An oversized payload is a
+    /// programmer error and throws; transport failures are values, never exceptions. Cancellation is
+    /// returned as <see cref="ResultStatus.Canceled"/>, never thrown.</summary>
+    public static Task<Result> WriteFrameAsync(Stream stream, ReadOnlyMemory<byte> payload, CancellationToken ct = default) =>
+        WriteFrameAsync(stream, payload, new byte[HeaderBytes], ct);
+
+    /// <summary>Writes one frame using a caller-supplied header buffer, so a connection emitting
+    /// thousands of frames does not allocate one 4-byte array per frame.
+    ///
+    /// <para><paramref name="headerBuffer"/> must be exactly <see cref="HeaderBytes"/> long and must
+    /// not be shared across concurrent writers — this method is async, so a static or cross-connection
+    /// buffer would be torn by interleaved writes. One buffer per connection is the intended
+    /// lifetime.</para></summary>
+    public static async Task<Result> WriteFrameAsync(
+        Stream stream, ReadOnlyMemory<byte> payload, byte[] headerBuffer, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(stream);
+        ArgumentNullException.ThrowIfNull(headerBuffer);
+        ArgumentOutOfRangeException.ThrowIfNotEqual(headerBuffer.Length, HeaderBytes, nameof(headerBuffer));
         ArgumentOutOfRangeException.ThrowIfGreaterThan(payload.Length, MaxPayloadBytes, nameof(payload));
 
-        byte[] header = new byte[HeaderBytes];
+        byte[] header = headerBuffer;
         BinaryPrimitives.WriteInt32LittleEndian(header, payload.Length);
         try
         {

@@ -483,6 +483,7 @@ public sealed partial class ProfileEditorViewModel : ViewModelBase
     private SourceRowViewModel NewSourceRow()
     {
         SourceRowViewModel row = new(_folderPicker);
+        row.PreviousRowPath = () => PathAbove(Sources, row, r => r.Path);
         row.PropertyChanged += OnRowPropertyChanged;
         return row;
     }
@@ -490,8 +491,23 @@ public sealed partial class ProfileEditorViewModel : ViewModelBase
     private TargetRowViewModel NewTargetRow()
     {
         TargetRowViewModel row = new(_folderPicker);
+        row.PreviousRowPath = () => PathAbove(Targets, row, r => r.Path);
         row.PropertyChanged += OnRowPropertyChanged;
         return row;
+    }
+
+    /// <summary>The nearest non-empty path ABOVE <paramref name="row"/>, or null when there is none.
+    /// Walks past empty rows rather than stopping at the immediate predecessor: a blank row in
+    /// between must not dead-end the chain. Resolved at click time, so the row's position (and
+    /// whether it is still in the collection at all) is always the current one.</summary>
+    private static string? PathAbove<T>(IList<T> rows, T row, Func<T, string> path) where T : class
+    {
+        for (int i = rows.IndexOf(row) - 1; i >= 0; i--)
+        {
+            if (!string.IsNullOrWhiteSpace(path(rows[i])))
+                return path(rows[i]);
+        }
+        return null;
     }
 
     private void OnRowPropertyChanged(object? sender, PropertyChangedEventArgs e)

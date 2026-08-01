@@ -1,5 +1,6 @@
 using FileManager.Contracts.Primitives;
 using FileManager.Contracts.Profiles;
+using FileManager.Core.Files;
 using FileManager.Core.Jobs;
 using FileManager.Core.Placement;
 using Microsoft.Extensions.Logging;
@@ -116,7 +117,13 @@ public sealed class RollbackExecutor(IJobJournal journal, IFileHasher hasher, Ti
                 continue;
             string stagingDir = StagingDirOf(target.StagedPath);
             if (!keepStagingDirs.Contains(stagingDir))
+            {
                 TryDeleteDirectory(stagingDir);
+                // Same shared-parent sweep the success path does, so a rolled-back job does not leave
+                // an empty .fm_staging in the user's target folder. Non-recursive, so a kept staging
+                // dir (I-STAGING-KEEP) blocks it — which is the intended guard.
+                InfrastructurePaths.TryDropSharedStagingParent(stagingDir);
+            }
         }
 
         // 4. Terminal journal.
@@ -323,13 +330,8 @@ public sealed class RollbackExecutor(IJobJournal journal, IFileHasher hasher, Ti
 
     private void TryDeleteDirectory(string? dir)
     {
-        if (string.IsNullOrEmpty(dir) || !Directory.Exists(dir))
-            return;
-        try { Directory.Delete(dir, recursive: true); }
-        catch (Exception ex)
-        {
+        if (InfrastructurePaths.TryDeleteDirectory(dir) is Exception ex)
             logger.LogWarning(ex, "Could not delete directory {Dir} during rollback", dir);
-        }
     }
 
     private static string StagingDirOf(string stagedPath) => Path.GetDirectoryName(stagedPath) ?? stagedPath;

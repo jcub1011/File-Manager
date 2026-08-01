@@ -91,7 +91,7 @@ public sealed class ProfileImportExportTests : IDisposable
     {
         Guid id = Guid.NewGuid();
         FakeIpcGateway gateway = new() { GetResult = Sample("My Profile", id) };
-        MainWindowViewModel vm = new(gateway, new FakeFolderPicker(_dir), new FakeLogFolder(), new FakeDryRunItemActions(), uiStatePath: Path.Combine(_dir, "ui-state.json"));
+        MainWindowViewModel vm = new(gateway, new FakeFolderPicker(_dir), new FakeLogFolder(), new FakeDryRunItemActions(), clientSettingsPath: Path.Combine(_dir, "client-settings.json"));
         ProfileListItem row = new(id, "My Profile", true, "Manual");
 
         await vm.ExportProfileCommand.ExecuteAsync(row);
@@ -104,7 +104,7 @@ public sealed class ProfileImportExportTests : IDisposable
     public async Task Single_export_does_nothing_when_the_folder_picker_is_cancelled()
     {
         FakeIpcGateway gateway = new() { GetResult = Sample("Alpha") };
-        MainWindowViewModel vm = new(gateway, new FakeFolderPicker(result: null), new FakeLogFolder(), new FakeDryRunItemActions(), uiStatePath: Path.Combine(_dir, "ui-state.json"));
+        MainWindowViewModel vm = new(gateway, new FakeFolderPicker(result: null), new FakeLogFolder(), new FakeDryRunItemActions(), clientSettingsPath: Path.Combine(_dir, "client-settings.json"));
 
         await vm.ExportProfileCommand.ExecuteAsync(new ProfileListItem(Guid.NewGuid(), "Alpha", true, "Manual"));
 
@@ -119,7 +119,7 @@ public sealed class ProfileImportExportTests : IDisposable
             ListResult = Result<IReadOnlyList<ProfileSummary>, IpcError>.Success(
                 [new ProfileSummary(Guid.NewGuid(), "Alpha", true, "Manual")]),
         };
-        MainWindowViewModel shell = new(gateway, new FakeFolderPicker(_dir), new FakeLogFolder(), new FakeDryRunItemActions(), uiStatePath: Path.Combine(_dir, "ui-state.json"));
+        MainWindowViewModel shell = new(gateway, new FakeFolderPicker(_dir), new FakeLogFolder(), new FakeDryRunItemActions(), clientSettingsPath: Path.Combine(_dir, "client-settings.json"));
 
         await shell.List.RefreshAsync();
 
@@ -157,7 +157,7 @@ public sealed class ProfileImportExportTests : IDisposable
 
         Guid id = Guid.NewGuid();
         FakeIpcGateway gateway = new() { GetResult = Sample("My Profile", id) };
-        MainWindowViewModel vm = new(gateway, new FakeFolderPicker(_dir), new FakeLogFolder(), new FakeDryRunItemActions(), uiStatePath: Path.Combine(_dir, "ui-state.json"));
+        MainWindowViewModel vm = new(gateway, new FakeFolderPicker(_dir), new FakeLogFolder(), new FakeDryRunItemActions(), clientSettingsPath: Path.Combine(_dir, "client-settings.json"));
 
         await vm.ExportProfileCommand.ExecuteAsync(new ProfileListItem(id, "My Profile", true, "Manual"));
 
@@ -197,7 +197,7 @@ public sealed class ProfileImportExportTests : IDisposable
 
         FakeIpcGateway gateway = new();   // SaveResult defaults to saved
         FakeFolderPicker picker = new() { FilesResult = [file] };
-        MainWindowViewModel vm = new(gateway, picker, new FakeLogFolder(), new FakeDryRunItemActions(), uiStatePath: Path.Combine(_dir, "ui-state.json"));
+        MainWindowViewModel vm = new(gateway, picker, new FakeLogFolder(), new FakeDryRunItemActions(), clientSettingsPath: Path.Combine(_dir, "client-settings.json"));
 
         await vm.ImportProfilesCommand.ExecuteAsync(null);
 
@@ -221,7 +221,7 @@ public sealed class ProfileImportExportTests : IDisposable
 
         FakeIpcGateway gateway = new();
         FakeFolderPicker picker = new() { FilesResult = [file] };
-        MainWindowViewModel vm = new(gateway, picker, new FakeLogFolder(), new FakeDryRunItemActions(), uiStatePath: Path.Combine(_dir, "ui-state.json"));
+        MainWindowViewModel vm = new(gateway, picker, new FakeLogFolder(), new FakeDryRunItemActions(), clientSettingsPath: Path.Combine(_dir, "client-settings.json"));
 
         ImportPreviewViewModel? shown = null;
         vm.ConfirmImport = preview =>
@@ -251,7 +251,7 @@ public sealed class ProfileImportExportTests : IDisposable
 
         FakeIpcGateway gateway = new();
         FakeFolderPicker picker = new() { FilesResult = [file] };
-        MainWindowViewModel vm = new(gateway, picker, new FakeLogFolder(), new FakeDryRunItemActions(), uiStatePath: Path.Combine(_dir, "ui-state.json"))
+        MainWindowViewModel vm = new(gateway, picker, new FakeLogFolder(), new FakeDryRunItemActions(), clientSettingsPath: Path.Combine(_dir, "client-settings.json"))
         {
             ConfirmImport = _ => Task.FromResult(true),
         };
@@ -270,7 +270,7 @@ public sealed class ProfileImportExportTests : IDisposable
 
         FakeIpcGateway gateway = new();
         FakeFolderPicker picker = new() { FilesResult = [file] };
-        MainWindowViewModel vm = new(gateway, picker, new FakeLogFolder(), new FakeDryRunItemActions(), uiStatePath: Path.Combine(_dir, "ui-state.json"));
+        MainWindowViewModel vm = new(gateway, picker, new FakeLogFolder(), new FakeDryRunItemActions(), clientSettingsPath: Path.Combine(_dir, "client-settings.json"));
 
         await vm.ImportProfilesCommand.ExecuteAsync(null);
 

@@ -35,6 +35,11 @@ public sealed record EnginePaths
     /// auto-deleted: quarantine/&lt;job-id&gt;/.</summary>
     public string QuarantineDirectory => Path.Combine(Root, "quarantine");
 
+    /// <summary>Where a large dry run spills its findings before streaming them (§9). Root-relative like
+    /// every other directory here, so an injected Root actually covers it — <c>GlobalSettings</c>'s own
+    /// default resolves against the process-global %LOCALAPPDATA%, which a test cannot move.</summary>
+    public string ScratchDirectory => Path.Combine(Root, "scratch");
+
     /// <summary>Machine-level settings (§9): a single settings.json at the root.</summary>
     public string SettingsFilePath => Path.Combine(Root, "settings.json");
 

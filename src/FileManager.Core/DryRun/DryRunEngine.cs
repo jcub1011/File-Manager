@@ -5,6 +5,7 @@ using FileManager.Core.Files;
 using FileManager.Core.Filtering;
 using FileManager.Core.Jobs;
 using FileManager.Core.Placement;
+using FileManager.Core.Profiles;
 using FileManager.Core.Scanning;
 using FileManager.Core.Settings;
 using FileManager.Core.Watching;
@@ -48,7 +49,7 @@ public sealed class DryRunEngine(
 {
     /// <summary>Report size guards: a serialized report must fit an IPC frame (16 MiB cap, §3.1).
     /// The byte budget is the guarantee — each record's size is a cheap tight upper-bound estimate
-    /// (<see cref="UpperBoundBytes(PhysicalFile)"/> / <see cref="StringUpperBound"/>, never actual
+    /// (<see cref="UpperBoundBytes(DryRunFile)"/> / <see cref="StringUpperBound(string)"/>, never actual
     /// serialization) and the report truncates when the running total would exceed it (16 MiB minus
     /// the response envelope and headroom for future additive fields). Because the estimate is an
     /// upper bound, the true serialized report is always smaller than the budget. The file-count cap
@@ -56,12 +57,33 @@ public sealed class DryRunEngine(
     internal const int MaxReportBytes = 12 * 1024 * 1024;
     internal const int MaxReportedFiles = 50_000;
 
-    /// <summary>Streaming (<see cref="SimulateStreamAsync"/>) has no report ceiling — the report is
-    /// split across many frames, so a chunk only needs to sit comfortably under the 16 MiB frame
-    /// cap. A traditional ~1 MiB per chunk (bounded by the cheap <see cref="UpperBoundBytes(PhysicalFile)"/>
-    /// estimate, so the true serialized size is always smaller) keeps per-message memory low and
-    /// leaves generous headroom under the cap. On a local pipe the extra frames cost nothing.</summary>
-    internal const int ChunkByteThreshold = 1 * 1024 * 1024;
+    /// <summary>Per-chunk budget for the streamed path, in the WIRE shape's currency
+    /// (<see cref="WireUpperBoundBytes(IPhysicalFileView)"/>) — the same currency the batched
+    /// <c>ReportBuilder</c> already measures in.
+    ///
+    /// <para>The binding constraint is NOT the 16 MiB protocol cap; it is the 85,000-byte Large Object
+    /// Heap threshold. Each response is serialized into a fresh exact-size <c>byte[]</c>, so any frame
+    /// at or above that lands on the LOH — which is not compacted by default and only collected with a
+    /// gen2, i.e. it is a lasting addition to the process's committed footprint rather than a transient
+    /// write. At 48 KiB of (deliberately generous) estimate the measured frames land around 25–35 KB,
+    /// leaving roughly 2.5–3× headroom even for a directory-per-file tree, whose extra
+    /// <c>DryRunDirectory</c> records this estimate does not itself account for.
+    /// <c>DryRunFrameSizeTests</c> is what keeps that true.</para>
+    ///
+    /// <para>The previous 1 MiB was measured against the engine's PRE-normalization shape (a full
+    /// absolute Path plus Root at up to 6 bytes/char), which over-counts the wire form — carrying only
+    /// a file name plus two ints — by roughly 6–10×. So it produced ~100–170 KB frames: over the LOH
+    /// line, and nowhere near the 1 MB it read as.</para></summary>
+    internal const int WireChunkByteBudget = 48 * 1024;
+
+    /// <summary>Bytes the disk-backed spool buffers in memory before spilling to a file.
+    ///
+    /// <para>Deliberately NOT tied to <see cref="WireChunkByteBudget"/>, though it used to share the
+    /// chunk constant. They answer different questions: the chunk budget bounds one IPC frame, this
+    /// bounds the spool's pre-spill buffer. Pinning this to 48 KiB would send almost every run —
+    /// including small ones that comfortably fit in memory today — through a scratch file, which is a
+    /// separate trade needing its own measurement rather than a side effect of a frame-size fix.</para></summary>
+    internal const int SpoolSpillThresholdBytes = 1 * 1024 * 1024;
 
     /// <summary>Streaming lifts the frame-cap ceiling, but not the good sense of an upper limit. The
     /// evaluated results (<see cref="ScanAndEvaluateAsync"/>) have to be fully materialized to sort
@@ -81,9 +103,9 @@ public sealed class DryRunEngine(
     /// truncation is reachable without tens of thousands of real files.</summary>
     internal int ReportByteBudget { get; init; } = MaxReportBytes;
 
-    /// <summary>Test seam: production uses <see cref="ChunkByteThreshold"/>; tests shrink it so a
+    /// <summary>Test seam: production uses <see cref="WireChunkByteBudget"/>; tests shrink it so a
     /// stream splits into several chunks without generating a megabyte of files.</summary>
-    internal int ChunkByteBudget { get; init; } = ChunkByteThreshold;
+    internal int ChunkByteBudget { get; init; } = WireChunkByteBudget;
 
     /// <summary>Test seam: production uses <see cref="MaxStreamedFiles"/>; tests shrink it so the
     /// candidate cap is reachable without generating half a million files.</summary>
@@ -99,8 +121,8 @@ public sealed class DryRunEngine(
     internal IDryRunSpoolFactory? SpoolFactory { get; init; }
 
     /// <summary>Test seam: bytes buffered in memory before the disk-backed spool spills to a file.
-    /// Production uses <see cref="ChunkByteThreshold"/>; tests shrink it to force a spill.</summary>
-    internal long SpillThresholdBytes { get; init; } = ChunkByteThreshold;
+    /// Production uses <see cref="SpoolSpillThresholdBytes"/>; tests shrink it to force a spill.</summary>
+    internal long SpillThresholdBytes { get; init; } = SpoolSpillThresholdBytes;
 
     /// <summary>Test seam: the carrier pool the streamed read-back rents from. Null (production) builds
     /// a fresh pool per run; tests inject one so they can assert every rented carrier was recycled
@@ -199,10 +221,24 @@ public sealed class DryRunEngine(
         // under budget; an overflow drops the rest and marks the report truncated.
         // AdditiveArchive can skip the sweep when the profile opts out (ScanDestination = false);
         // Mirror always sweeps because the sweep is its only source of Deleted-orphan previews.
+        // The byte budget below bounds the REPORT, not the sweep: without a cap passed in, the projector
+        // first materializes one PhysicalFile plus one VirtualFileOperation for every pre-existing file
+        // under every target root, on the service's heap, and only then does TryAddSweepEntry start
+        // rejecting. A target that is a large existing archive could therefore exhaust service memory —
+        // the exact failure the streamed path was hardened against (DryRunStreamHandler bounds its sweep
+        // by the same overall file budget). Same shape here, using this path's own candidate cap.
         bool scanDestinations = profile.EffectiveScanDestination;
+        int sweepBudget = Math.Max(0, MaxBatchCandidates - builder.DestinationFiles.Count);
         DestinationSweepResult sweep = scanDestinations
-            ? destinationProjector.Sweep(profile, builder.Survivors, truncated, ct)
+            ? destinationProjector.Sweep(profile, builder.Survivors, truncated, ct, sweepBudget)
             : new DestinationSweepResult([], []);
+        if (sweep.Truncated)
+        {
+            logger.LogWarning(
+                "Dry-run destination sweep for profile {ProfileId} hit the {Cap:N0}-entry bound; report truncated",
+                profile.Id, MaxBatchCandidates);
+            truncated = true;
+        }
         for (int i = 0; i < sweep.Files.Count; i++)
         {
             if (!builder.TryAddSweepEntry(sweep.Files[i], sweep.Ops[i]))
@@ -220,11 +256,11 @@ public sealed class DryRunEngine(
         logger.LogInformation(
             "Dry-run completed for profile {ProfileId}: {SourceCount} source files, {DestCount} destination files " +
             "in {ElapsedMs}ms{Truncated} (scan {ScanMs}ms within pipeline {EvalMs}ms — the phases overlap; " +
-            "{Probes} existence probes, {Stats} existing-target stats, {HashCount} files hashed / {HashBytes:N0} bytes)",
+            "{Probes} existence probes, {HashCount} files hashed / {HashBytes:N0} bytes)",
             profile.Id, builder.SourceFiles.Count, builder.DestinationFiles.Count,
             (completedAt - startedAt).TotalMilliseconds, truncated ? " (report truncated)" : "",
             outcome.ScanMs, outcome.EvalMs,
-            counters.ExistenceProbes, counters.ExistingStats, counters.FilesHashed, counters.BytesHashed);
+            counters.ExistenceProbes, counters.FilesHashed, counters.BytesHashed);
 
         return new DryRunReport
         {
@@ -244,7 +280,7 @@ public sealed class DryRunEngine(
     /// the single-frame budget reports every file. Reuses the same fused scan+evaluate pipeline, but
     /// spools each finding in discovery (completion) order — no global sort — so the whole evaluated
     /// set is never buffered (the spool spills to disk past a threshold); the replay is buffered into a
-    /// chunk and flushed once its cheap upper-bound size crosses <see cref="ChunkByteThreshold"/>.
+    /// chunk and flushed once its cheap upper-bound size crosses <see cref="WireChunkByteBudget"/>.
     /// Indices are assigned globally across chunks so the consumer can concatenate them; the client
     /// sorts the concatenated report for display. The destination sweep is left to the handler (which
     /// runs it after the file phase). A fatal setup/scan error is a single failure item that ends the
@@ -403,10 +439,10 @@ public sealed class DryRunEngine(
             logger.LogInformation(
                 "Dry-run (stream) completed for profile {ProfileId}: {SourceCount} source files in {ElapsedMs}ms " +
                 "(scan {ScanMs}ms within pipeline {EvalMs}ms — the phases overlap; {Probes} existence probes, " +
-                "{Stats} existing-target stats, {HashCount} files hashed / {HashBytes:N0} bytes)",
+                "{HashCount} files hashed / {HashBytes:N0} bytes)",
                 profile.Id, accumulator.TotalSourceFiles, (completedAt - startedAt).TotalMilliseconds,
                 outcome!.ScanMs, outcome.EvalMs,
-                counters.ExistenceProbes, counters.ExistingStats, counters.FilesHashed, counters.BytesHashed);
+                counters.ExistenceProbes, counters.FilesHashed, counters.BytesHashed);
     }
 
     /// <summary>Returns a flushed chunk's entries to the carrier pool. A no-op for original records
@@ -490,6 +526,9 @@ public sealed class DryRunEngine(
                             linked.Cancel();
                             return;
                         }
+                        // Counted as well as logged: the report has no field for "this tree was walked
+                        // incompletely", so the count is what lets the caller say so.
+                        progress?.EntrySkipped();
                         logger.LogWarning("Dry-run enumeration warning: {Message}", fault.Message);
                         continue;
                     }
@@ -610,17 +649,16 @@ public sealed class DryRunEngine(
     private sealed class RunCounters
     {
         private long _existenceProbes;
-        private long _existingStats;
         private long _filesHashed;
         private long _bytesHashed;
 
         public long ExistenceProbes => Interlocked.Read(ref _existenceProbes);
-        public long ExistingStats => Interlocked.Read(ref _existingStats);
         public long FilesHashed => Interlocked.Read(ref _filesHashed);
         public long BytesHashed => Interlocked.Read(ref _bytesHashed);
 
+        // No separate existing-target-stat counter: the metadata read IS the existence probe (see the
+        // comment at the FileMetadataReader.Read call), so counting it twice would double-count one stat.
         public void CountExistenceProbe() => Interlocked.Increment(ref _existenceProbes);
-        public void CountExistingStat() => Interlocked.Increment(ref _existingStats);
 
         public void CountHash(long bytes)
         {
@@ -840,17 +878,29 @@ public sealed class DryRunEngine(
 
     private static long BundleUpperBound(IEvaluationView bundle)
     {
-        long bytes = UpperBoundBytes(bundle.SourceFile) + UpperBoundBytes(bundle.SourceOp);
-        foreach (IPhysicalFileView f in bundle.DestinationFiles) bytes += UpperBoundBytes(f);
-        foreach (IFileOperationView o in bundle.DestinationOps) bytes += UpperBoundBytes(o);
+        long bytes = WireUpperBoundBytes(bundle.SourceFile) + WireUpperBoundBytes(bundle.SourceOp);
+        foreach (IPhysicalFileView f in bundle.DestinationFiles) bytes += WireUpperBoundBytes(f);
+        foreach (IFileOperationView o in bundle.DestinationOps) bytes += WireUpperBoundBytes(o);
         return bytes;
     }
 
-    private static long UpperBoundBytes(IPhysicalFileView file) =>
-        PhysicalFileStructuralBytes + StringUpperBound(file.Path) + StringUpperBound(file.Root);
+    /// <summary>The serialized upper bound of what an engine-shape file will cost ON THE WIRE, i.e.
+    /// after <c>DryRunDirectoryTableBuilder</c> normalizes it into a <see cref="DryRunFile"/>: the
+    /// directory and root collapse to two ints in a shared table, so the only string left is the file
+    /// name. Measuring the full <c>Path</c> and <c>Root</c> instead — as the streamed path used to —
+    /// over-counts a ~90-char path by roughly 6–10× and silently turns a nominal budget into frames
+    /// several times smaller than intended.
+    ///
+    /// <para>What this does NOT count is the <see cref="DryRunDirectory"/> entries a chunk first
+    /// references; the streamed accumulator does not own the directory table (the handler converts
+    /// after chunking). <see cref="WireChunkByteBudget"/>'s headroom is what absorbs those, and
+    /// <c>DryRunFrameSizeTests</c> exercises the directory-per-file worst case.</para></summary>
+    internal static long WireUpperBoundBytes(IPhysicalFileView file) =>
+        PhysicalFileStructuralBytes + StringUpperBound(Path.GetFileName(file.Path.AsSpan()));
 
-    private static long UpperBoundBytes(IFileOperationView op) =>
-        OperationStructuralBytes + StringUpperBound(op.Path) + StringUpperBound(op.Root) + StringUpperBound(op.Detail);
+    /// <inheritdoc cref="WireUpperBoundBytes(IPhysicalFileView)"/>
+    internal static long WireUpperBoundBytes(IFileOperationView op) =>
+        OperationStructuralBytes + StringUpperBound(Path.GetFileName(op.Path.AsSpan())) + StringUpperBound(op.Detail);
 
     private static long UpperBoundBytes(DryRunFile file) =>
         PhysicalFileStructuralBytes + StringUpperBound(file.FileName);
@@ -877,10 +927,13 @@ public sealed class DryRunEngine(
     // path-dominated strings in a report this sits within a few percent of the exact size, versus
     // the flat 6-bytes-per-char bound it replaces (which forced an exact-serialization fallback
     // near the budget — records were serialized twice, once to measure and once for the wire).
-    internal static long StringUpperBound(string? value)
+    internal static long StringUpperBound(string? value) =>
+        value is null ? 0 : StringUpperBound(value.AsSpan());
+
+    /// <summary>Span overload so a caller can bound a slice of a larger string — notably the file-name
+    /// segment of an absolute path — without allocating the substring just to measure it.</summary>
+    internal static long StringUpperBound(ReadOnlySpan<char> value)
     {
-        if (value is null)
-            return 0;
         long bytes = 2;   // the surrounding quotes
         foreach (char c in value)
             bytes += c < 128 && UnescapedAscii[c] ? 1 : 6;
@@ -922,15 +975,10 @@ public sealed class DryRunEngine(
         };
 
         string relativePath = Path.GetRelativePath(payload.SourceRoot, payload.SourcePath);
-        int depth = SeparatorCount(relativePath);
 
         if (filtersBySourceRoot.TryGetValue(payload.SourceRoot, out CompiledFilterSet? filters))
         {
-            // Normalize once here rather than per pattern rule inside the filter set — but only when
-            // a pattern rule would actually consult it (the attribute filter, always present, does
-            // not), so the common no-glob profile allocates no normalized string.
-            string? normalized = filters.HasPatternRules ? NormalizeSeparators(relativePath) : null;
-            FilterInput input = new(payload.SourcePath, relativePath, depth, metadata, normalized);
+            FilterInput input = FilterInput.For(payload.SourcePath, relativePath, metadata, filters.HasPatternRules);
             FilterDecision decision = filters.Evaluate(in input);
             if (!decision.Matched)
             {
@@ -948,10 +996,9 @@ public sealed class DryRunEngine(
             }
         }
 
-        // M:1 topologies force Flatten (spec §3.1.2); otherwise the profile's TargetLayout rules.
-        bool flatten = profile.TargetLayout == TargetLayout.Flatten || profile.Sources.Count > 1;
-        // Only the flatten branch uses the bare file name; PreserveStructure never allocates it.
-        string? fileName = flatten ? Path.GetFileName(payload.SourcePath) : null;
+        // Same resolution the live plan builder uses — shared so a dry run cannot drift from the run
+        // it is predicting.
+        TargetPathLayout layout = TargetPathLayout.For(profile, payload.SourcePath, relativePath);
 
         List<PhysicalFile> destinationFiles = [];
         List<VirtualFileOperation> destinationOps = [];
@@ -961,9 +1008,7 @@ public sealed class DryRunEngine(
         {
             if (ct.IsCancellationRequested)
                 break;      // SimulateAsync's cancellation catch turns this into Canceled
-            string prospective = flatten
-                ? Path.Combine(target.Path, fileName!)
-                : Path.Combine(target.Path, relativePath);
+            string prospective = layout.Resolve(target.Path);
 
             if (hasTransformers)
             {
@@ -1016,20 +1061,6 @@ public sealed class DryRunEngine(
 
         return new FileEvaluation(sourceFile, sourceOp, destinationFiles, destinationOps);
     }
-
-    private static int SeparatorCount(string value)
-    {
-        int count = 0;
-        foreach (char c in value)
-        {
-            if (c == Path.DirectorySeparatorChar || c == Path.AltDirectorySeparatorChar)
-                count++;
-        }
-        return count;
-    }
-
-    private static string NormalizeSeparators(string relativePath) =>
-        Path.DirectorySeparatorChar == '/' ? relativePath : relativePath.Replace('\\', '/');
 
     /// <summary>One target's evaluation: the operation(s) it produces, the pre-existing destination
     /// file it touches (if any), and the (possibly newly computed) cached source hash. Within

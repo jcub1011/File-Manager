@@ -3,6 +3,7 @@ using FileManager.Contracts.Profiles;
 using FileManager.Core.Filtering.Rules;
 using Microsoft.Extensions.Logging;
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Text.RegularExpressions;
 
@@ -15,7 +16,36 @@ public sealed class FilterCompiler(ILogger<FilterCompiler> logger, TimeProvider 
     private const RegexOptions PatternOptions =
         RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.NonBacktracking;
 
+    /// <summary>Cap on distinct compiled sets held. The live working set is one entry per
+    /// (profile, source) filter pair of the active profiles; the cap only bounds accumulation across a
+    /// long session of profile edits, where clearing wholesale costs one recompile per active pair.</summary>
+    private const int MaxCachedSets = 256;
+
+    // Compiling is expensive — every glob is translated and every Regex built with NonBacktracking,
+    // the costliest construction mode — and the executor compiles ONCE PER FILE (JobExecutor.Screen
+    // runs per job), so a 50k-file folder run built 50k identical sets. Caching is safe because a
+    // CompiledFilterSet is immutable and time-independent at construction: AgeFilter reads the clock
+    // inside Excludes, so a reused set does not freeze its age window.
+    //
+    // Keyed on the FilterSet instances. FilterSet is a record, but its members are IReadOnlyList<string>,
+    // so equality is effectively per-instance — a reloaded profile gets a fresh entry rather than a
+    // stale hit, which is the safe direction to err in.
+    private readonly ConcurrentDictionary<(FilterSet? Profile, FilterSet? Source), Result<CompiledFilterSet, string>> _cache = new();
+
     public Result<CompiledFilterSet, string> Compile(FilterSet? profileFilters, FilterSet? sourceFilters)
+    {
+        (FilterSet? profileFilters, FilterSet? sourceFilters) key = (profileFilters, sourceFilters);
+        if (_cache.TryGetValue(key, out Result<CompiledFilterSet, string> cached))
+            return cached;
+
+        Result<CompiledFilterSet, string> compiled = CompileUncached(profileFilters, sourceFilters);
+        if (_cache.Count >= MaxCachedSets)
+            _cache.Clear();
+        _cache[key] = compiled;
+        return compiled;
+    }
+
+    private Result<CompiledFilterSet, string> CompileUncached(FilterSet? profileFilters, FilterSet? sourceFilters)
     {
         FilterSet merged = Merge(profileFilters, sourceFilters);
         List<IFilter> rules = [];

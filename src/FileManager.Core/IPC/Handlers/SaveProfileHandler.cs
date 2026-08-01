@@ -28,9 +28,8 @@ public sealed class SaveProfileHandler(
         }
         saved.TryGetValue(out IReadOnlyList<ValidationIssue>? issues);
 
-        Result reload = catalog.Reload();
-        if (reload.TryGetError(out string? reloadError))
-            logger.LogWarning("Catalog reload after save failed: {Error}", reloadError);
+        if (CatalogReloadGuard.Check(catalog, logger, "PROFILE_SAVE_FAILED", "saved") is { } reloadFailure)
+            return Task.FromResult<IpcResponse>(reloadFailure);
 
         IpcResponse response = new ValidationResponse { Issues = issues! };
         return Task.FromResult(response);

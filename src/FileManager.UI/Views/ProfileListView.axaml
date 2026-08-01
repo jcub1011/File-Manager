@@ -1,4 +1,4 @@
-<UserControl xmlns="https://github.com/avaloniaui"
+﻿<UserControl xmlns="https://github.com/avaloniaui"
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
              xmlns:vm="using:FileManager.UI.ViewModels"
              xmlns:conv="using:FileManager.UI.Converters"
@@ -11,18 +11,8 @@
             <TextBlock Text="{Binding ErrorMessage}" TextWrapping="Wrap" />
         </Border>
 
-        <Border DockPanel.Dock="Bottom" Classes="infoBar danger" Margin="0,8,0,0"
-                IsVisible="{Binding PendingDelete, Converter={x:Static ObjectConverters.IsNotNull}}">
-            <StackPanel Spacing="8">
-                <TextBlock TextWrapping="Wrap">
-                    <Run Text="Delete profile " /><Run Text="{Binding PendingDelete.Name}" FontWeight="Bold" /><Run Text="?" />
-                </TextBlock>
-                <StackPanel Orientation="Horizontal" Spacing="8">
-                    <Button Content="Delete" Command="{Binding ConfirmDeleteCommand}" Classes="danger" />
-                    <Button Content="Cancel" Command="{Binding CancelDeleteCommand}" />
-                </StackPanel>
-            </StackPanel>
-        </Border>
+        <!-- Deleting confirms in a modal (App.axaml.cs) rather than an inline bar here: delete is also
+             reachable from the collapsed rail, which never renders this view. -->
 
         <ListBox Classes="profiles" ItemsSource="{Binding FilteredProfiles}" SelectedItem="{Binding SelectedProfile}">
             <ListBox.Styles>
@@ -48,35 +38,46 @@
                 <DataTemplate x:DataType="vm:ProfileListItem">
                     <!-- Transparent full-bleed surface carrying the row inset: makes the entire row
                          (not just where text/icons sit) respond to a right-click. -->
-                    <Border Background="Transparent" Padding="8,6">
+                    <Border Background="Transparent" Padding="8,3">
                         <Border.ContextMenu>
                             <ContextMenu x:DataType="vm:ProfileListItem">
-                                <MenuItem Header="Export…" Command="{Binding ExportCommand}" CommandParameter="{Binding}" />
+                                <MenuItem Header="Run now…" Command="{Binding RunCommand}" CommandParameter="{Binding}"
+                                          IsEnabled="{Binding Active}"
+                                          ToolTip.Tip="Performs a real run: moves files and applies the source disposition.">
+                                    <MenuItem.Icon>
+                                        <PathIcon Data="{StaticResource IconPlay}" Width="12" Height="12" />
+                                    </MenuItem.Icon>
+                                </MenuItem>
+                                <MenuItem Header="Export…" Command="{Binding ExportCommand}" CommandParameter="{Binding}">
+                                    <MenuItem.Icon>
+                                        <PathIcon Data="{StaticResource IconExport}" Width="12" Height="12" />
+                                    </MenuItem.Icon>
+                                </MenuItem>
+                                <Separator />
+                                <MenuItem Header="Delete…" Command="{Binding DeleteCommand}" CommandParameter="{Binding}">
+                                    <MenuItem.Icon>
+                                        <PathIcon Data="{StaticResource IconTrash}" Width="12" Height="12" />
+                                    </MenuItem.Icon>
+                                </MenuItem>
                             </ContextMenu>
                         </Border.ContextMenu>
-                        <Grid ColumnDefinitions="*,Auto,Auto">
-                        <StackPanel Grid.Column="0" Spacing="2" VerticalAlignment="Center">
-                            <TextBlock Text="{Binding Name}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" />
-                            <StackPanel Orientation="Horizontal" Spacing="6">
-                                <TextBlock Classes="caption" Text="{Binding ActiveText}" />
-                                <TextBlock Classes="caption" Text="{Binding TriggerSummary}" TextTrimming="CharacterEllipsis" />
+                        <Grid ColumnDefinitions="*,Auto">
+                            <StackPanel Grid.Column="0" Spacing="2" VerticalAlignment="Center">
+                                <TextBlock Text="{Binding Name}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" />
+                                <StackPanel Orientation="Horizontal" Spacing="6">
+                                    <TextBlock Classes="caption" Text="{Binding ActiveText}" />
+                                    <TextBlock Classes="caption" Text="{Binding TriggerSummary}" TextTrimming="CharacterEllipsis" />
+                                </StackPanel>
                             </StackPanel>
-                        </StackPanel>
-                        <TextBlock Grid.Column="1" Text="●" VerticalAlignment="Center" Margin="0,0,2,0"
-                                   Foreground="{DynamicResource Brush.Accent}" ToolTip.Tip="Unsaved changes">
-                            <TextBlock.IsVisible>
-                                <MultiBinding Converter="{x:Static conv:MultiValueConverters.GuidEquals}">
-                                    <Binding Path="ProfileId" />
-                                    <Binding Path="$parent[ListBox].((vm:ProfileListViewModel)DataContext).UnsavedProfileId" />
-                                </MultiBinding>
-                            </TextBlock.IsVisible>
-                        </TextBlock>
-                        <Button Grid.Column="2" Classes="iconButton" Padding="6,4" VerticalAlignment="Center"
-                                ToolTip.Tip="Delete profile"
-                                Command="{Binding $parent[ListBox].((vm:ProfileListViewModel)DataContext).RequestDeleteCommand}"
-                                CommandParameter="{Binding}">
-                            <PathIcon Data="{StaticResource IconTrash}" Width="14" Height="14" />
-                        </Button>
+                            <TextBlock Grid.Column="1" Text="●" VerticalAlignment="Center" Margin="0,0,2,0"
+                                       Foreground="{DynamicResource Brush.Accent}" ToolTip.Tip="Unsaved changes">
+                                <TextBlock.IsVisible>
+                                    <MultiBinding Converter="{x:Static conv:MultiValueConverters.GuidEquals}">
+                                        <Binding Path="ProfileId" />
+                                        <Binding Path="$parent[ListBox].((vm:ProfileListViewModel)DataContext).UnsavedProfileId" />
+                                    </MultiBinding>
+                                </TextBlock.IsVisible>
+                            </TextBlock>
                         </Grid>
                     </Border>
                 </DataTemplate>

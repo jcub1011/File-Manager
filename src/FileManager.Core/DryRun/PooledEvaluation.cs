@@ -93,10 +93,12 @@ internal sealed class PooledEvaluation : IEvaluationView
 /// unaffected — over-recycling never hands the same instance out twice).</summary>
 internal sealed class EvaluationCarrierPool
 {
-    // Comfortably above one ~1 MiB chunk's carrier count (a chunk's cheap upper-bound sizing puts a
-    // few thousand records in a chunk), so a full chunk recycles without dropping, yet idle memory
-    // stays a small constant rather than growing with the run.
-    private const int MaxRetainedPerKind = 16_384;
+    // Comfortably above one chunk's carrier count, so a full chunk recycles without dropping, yet
+    // idle memory stays a small constant rather than growing with the run. Sized against
+    // DryRunEngine.WireChunkByteBudget (48 KiB of wire-shape estimate — a few hundred records), not
+    // the ~1 MiB engine-shape budget this used to be measured against; the old 16,384 was ~50x more
+    // carriers than any chunk can now hold, and every retained carrier pins its path string.
+    private const int MaxRetainedPerKind = 2_048;
 
     private readonly Stack<PooledPhysicalFile> _files = new();
     private readonly Stack<PooledFileOperation> _ops = new();
@@ -159,13 +161,23 @@ internal sealed class EvaluationCarrierPool
         if (_evaluations.Count < MaxRetainedPerKind) _evaluations.Push(e);
     }
 
+    // Clearing the strings BEFORE the cap check is deliberate on both branches. A retained carrier
+    // would otherwise keep its path alive for the rest of the run — every path is unique, so a full
+    // pool pins one string per slot (roots are already deduped by RootInterner, so those cost
+    // nothing). A DROPPED carrier still needs it: the caller's frame holds the reference until the
+    // loop moves on, so clearing here is what makes the drop actually release the path.
     private void ReturnFile(PooledPhysicalFile f)
     {
+        f.Path = "";
+        f.Root = "";
         if (_files.Count < MaxRetainedPerKind) _files.Push(f);
     }
 
     private void ReturnOp(PooledFileOperation o)
     {
+        o.Path = "";
+        o.Root = "";
+        o.Detail = null;
         if (_ops.Count < MaxRetainedPerKind) _ops.Push(o);
     }
 }

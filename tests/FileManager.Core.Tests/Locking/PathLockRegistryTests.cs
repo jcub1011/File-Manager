@@ -1,4 +1,4 @@
-using FileManager.Core.Jobs;
+﻿using FileManager.Core.Jobs;
 using FileManager.Core.Locking;
 
 namespace FileManager.Core.Tests.Locking;
@@ -103,6 +103,51 @@ public sealed class PathLockRegistryTests
             async () => await registry.AcquireAsync([path], JobId.New(), cts.Token));
 
         // The cancelled acquire reserved nothing, so another owner takes the path immediately.
+        ValueTask<PathLockSet> follow = registry.AcquireAsync([path], JobId.New());
+        Assert.True(follow.IsCompleted);
+        await using PathLockSet next = await follow;
+        Assert.Contains(path, next.Paths);
+    }
+
+    [Fact]
+    public async Task TryAcquireAdditional_is_idempotent_for_a_path_the_set_already_holds()
+    {
+        // A job's lock set already contains every prospective final path, so a RenameSuffix probe of
+        // the desired name asks for a lock the probing job itself owns. Reporting that as "taken"
+        // made RenameSuffix skip the free desired name — and, with the desired name left empty,
+        // every re-delivery suffixed again and grew the target set without bound.
+        var registry = new PathLockRegistry();
+        NormalizedPath path = P(@"C:\fm\target\doc.txt");
+        await using PathLockSet held = await registry.AcquireAsync([path], JobId.New());
+
+        Assert.True(registry.TryAcquireAdditional(held, path));
+        // Recorded once, not twice: a duplicate would be released twice on dispose and could hand the
+        // path to a waiter while this job still believed it held it.
+        Assert.Single(held.Paths, p => p == path);
+    }
+
+    [Fact]
+    public async Task A_path_another_job_holds_is_still_refused()
+    {
+        var registry = new PathLockRegistry();
+        NormalizedPath path = P(@"C:\fm\target\doc.txt");
+        await using PathLockSet mine = await registry.AcquireAsync([P(@"C:\fm\target\other.txt")], JobId.New());
+        await using PathLockSet theirs = await registry.AcquireAsync([path], JobId.New());
+
+        Assert.False(registry.TryAcquireAdditional(mine, path));
+    }
+
+    [Fact]
+    public async Task An_idempotent_re_acquire_still_releases_the_path_exactly_once()
+    {
+        var registry = new PathLockRegistry();
+        NormalizedPath path = P(@"C:\fm\target\doc.txt");
+        PathLockSet held = await registry.AcquireAsync([path], JobId.New());
+        Assert.True(registry.TryAcquireAdditional(held, path));
+
+        await held.DisposeAsync();
+
+        // Fully released: a fresh job takes it without waiting.
         ValueTask<PathLockSet> follow = registry.AcquireAsync([path], JobId.New());
         Assert.True(follow.IsCompleted);
         await using PathLockSet next = await follow;

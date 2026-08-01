@@ -1,160 +1,335 @@
 <Window xmlns="https://github.com/avaloniaui"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:vm="using:FileManager.UI.ViewModels"
+        xmlns:st="using:FileManager.UI.ViewModels.Settings"
         xmlns:conv="using:FileManager.UI.Converters"
+        xmlns:svc="using:FileManager.UI.Services"
         xmlns:settings="using:FileManager.Contracts.Settings"
+        xmlns:chrome="using:Avalonia.Controls.Chrome"
         x:Class="FileManager.UI.Views.SettingsWindow"
         x:DataType="vm:SettingsViewModel"
-        Width="560" SizeToContent="Height"
+        Width="980" Height="680" MinWidth="720" MinHeight="460"
         WindowStartupLocation="CenterOwner"
         FontFamily="{StaticResource AppFontFamily}"
         FontSize="{StaticResource Font.Body}"
         Background="{DynamicResource Brush.Window.Background}"
-        Title="Settings">
+        Title="Settings"
+        ExtendClientAreaToDecorationsHint="True"
+        WindowDecorations="BorderOnly">
 
-    <StackPanel Margin="16" Spacing="4">
-        <Border Classes="sectionHeader" Margin="0,0,0,8"><TextBlock Text="Appearance" /></Border>
-        <TextBlock TextWrapping="Wrap" Classes="secondary" Margin="0,0,0,8"
-                   Text="The application theme. System follows the Windows light/dark preference; Light and Dark force a fixed theme." />
+    <!--
+      Visual Studio-style settings: a navigation tree and a search box on the left, a scrolling
+      document of every setting on the right. Both panes are generated from the view model's catalog
+      (SettingsViewModel.BuildCatalog) — there is one DataTemplate per *editor kind* below, not one per
+      setting, so registering a new setting needs no change to this file unless it needs an editor kind
+      that does not exist yet.
 
-        <Grid ColumnDefinitions="140,*" RowDefinitions="Auto" Margin="0,0,0,4">
-            <TextBlock Grid.Row="0" Grid.Column="0" Classes="fieldLabel" Text="Theme" />
-            <ComboBox Grid.Row="0" Grid.Column="1" ItemsSource="{Binding ThemeModeOptions}"
-                      SelectedItem="{Binding ThemeMode}" Margin="0,2" MinWidth="220">
-                <ComboBox.ItemTemplate>
-                    <DataTemplate x:DataType="settings:ThemeMode">
-                        <TextBlock Text="{Binding Converter={x:Static conv:EnumTitleConverters.ThemeMode}}" />
-                    </DataTemplate>
-                </ComboBox.ItemTemplate>
-            </ComboBox>
-        </Grid>
+      Each setting renders as a Border.settingCard, which doubles as the scroll anchor the code-behind
+      brings into view when a tree node is selected.
 
-        <Border Classes="sectionHeader" Margin="0,0,0,8"><TextBlock Text="Service startup" /></Border>
-        <TextBlock TextWrapping="Wrap" Classes="secondary" Margin="0,0,0,8"
-                   Text="When the background service runs. RunOnStartup launches it at Windows login. StartOnProgramOpen starts it when this app opens and leaves it running. StartAndStopWithProgram starts it on open and stops it when the app closes (warning first if jobs are running)." />
+      Every card follows the same disabled recipe: IsEnabled goes on the INNER StackPanel, while the
+      card border itself stays enabled and carries ToolTip.Tip. That split is load-bearing — a disabled
+      Avalonia control receives no pointer input, so a tooltip placed on it could never be shown, and
+      the whole point of greying a setting is being able to say why. DisabledTooltip is null while the
+      setting is editable, which is exactly how ToolTip.Tip spells "no tooltip".
+    -->
+    <Window.DataTemplates>
 
-        <Grid ColumnDefinitions="140,*" RowDefinitions="Auto" Margin="0,0,0,4">
-            <TextBlock Grid.Row="0" Grid.Column="0" Classes="fieldLabel" Text="Startup mode" />
-            <ComboBox Grid.Row="0" Grid.Column="1" ItemsSource="{Binding ServiceStartupModeOptions}"
-                      SelectedItem="{Binding StartupMode}" Margin="0,2" MinWidth="220">
-                <ComboBox.ItemTemplate>
-                    <DataTemplate x:DataType="settings:ServiceStartupMode">
-                        <TextBlock Text="{Binding Converter={x:Static conv:EnumTitleConverters.ServiceStartupMode}}" />
-                    </DataTemplate>
-                </ComboBox.ItemTemplate>
-            </ComboBox>
-        </Grid>
+        <!-- Pick-one-of-N (enum). Binds the non-generic base so the typed subclass stays a C# concern. -->
+        <DataTemplate DataType="st:ChoiceSettingViewModel" x:DataType="st:ChoiceSettingViewModel">
+            <Border Classes="settingCard" Classes.selected="{Binding IsSelected}"
+                    Classes.disabled="{Binding !IsEnabled}" IsVisible="{Binding IsVisible}"
+                    ToolTip.Tip="{Binding DisabledTooltip}">
+                <StackPanel Spacing="5" IsEnabled="{Binding IsEnabled}">
+                    <TextBlock Classes="settingTitle" Text="{Binding Title}" />
+                    <ComboBox ItemsSource="{Binding Options}" SelectedItem="{Binding SelectedOption}"
+                              MinWidth="260" HorizontalAlignment="Left">
+                        <ComboBox.ItemTemplate>
+                            <DataTemplate x:DataType="st:ChoiceOption">
+                                <TextBlock Text="{Binding Label}" />
+                            </DataTemplate>
+                        </ComboBox.ItemTemplate>
+                    </ComboBox>
+                    <TextBlock Classes="secondary" TextWrapping="Wrap" Text="{Binding Description}" />
+                </StackPanel>
+            </Border>
+        </DataTemplate>
 
-        <Border Classes="sectionHeader"><TextBlock Text="Scan performance" /></Border>
-        <TextBlock TextWrapping="Wrap" Classes="secondary" Margin="0,0,0,8"
-                   Text="Thread budgets shared across all profiles. Max scan threads caps total directory-enumeration threads (auto = cores × 8). Per-drive default caps threads on any one drive (auto = cores × 4). Max hash threads caps parallel file hashing in a dry run (auto = cores − 1)." />
+        <!-- Free text, optionally read-only and optionally with a trailing action ("Browse…", "Change…"). -->
+        <DataTemplate DataType="st:TextSettingViewModel" x:DataType="st:TextSettingViewModel">
+            <Border Classes="settingCard" Classes.selected="{Binding IsSelected}"
+                    Classes.disabled="{Binding !IsEnabled}" IsVisible="{Binding IsVisible}"
+                    ToolTip.Tip="{Binding DisabledTooltip}">
+                <StackPanel Spacing="5" IsEnabled="{Binding IsEnabled}">
+                    <TextBlock Classes="settingTitle" Text="{Binding Title}" />
+                    <!-- Star column, not a MinWidth: a path box has to give width back when the window
+                         narrows, and this card cannot overflow (the document scrolls vertically only). -->
+                    <Grid ColumnDefinitions="*,Auto">
+                        <TextBox Grid.Column="0" Text="{Binding Value}" IsReadOnly="{Binding IsReadOnly}"
+                                 PlaceholderText="{Binding PlaceholderText}" MinWidth="200" />
+                        <Button Grid.Column="1" Margin="8,0,0,0" Content="{Binding ActionButtonText}"
+                                Command="{Binding ActionCommand}" IsVisible="{Binding HasAction}"
+                                VerticalAlignment="Center" />
+                    </Grid>
+                    <!-- Live feedback about what the typed value actually resolves to. Above the
+                         description, because it is about THIS value rather than about the setting. -->
+                    <TextBlock Classes="settingNotice" TextWrapping="Wrap" Text="{Binding Notice}"
+                               Classes.warning="{Binding NoticeIsWarning}"
+                               Classes.danger="{Binding NoticeIsError}"
+                               IsVisible="{Binding HasNotice}" />
+                    <TextBlock Classes="secondary" TextWrapping="Wrap" Text="{Binding Description}" />
+                </StackPanel>
+            </Border>
+        </DataTemplate>
 
-        <Grid ColumnDefinitions="160,Auto,*" RowDefinitions="Auto" Margin="0,0,0,4">
-            <TextBlock Grid.Column="0" Classes="fieldLabel" Text="Max scan threads" />
-            <CheckBox Grid.Column="1" Content="Auto" IsChecked="{Binding MaxScanThreadsAuto}" Margin="0,2,8,2" />
-            <NumericUpDown Grid.Column="2" Value="{Binding MaxScanThreadsValue}" Minimum="1" Width="160"
-                           HorizontalAlignment="Left" Margin="0,2" FormatString="0"
-                           IsVisible="{Binding ShowMaxScanThreadsValue}" />
-        </Grid>
-        <Grid ColumnDefinitions="160,Auto,*" RowDefinitions="Auto" Margin="0,0,0,4">
-            <TextBlock Grid.Column="0" Classes="fieldLabel" Text="Per-drive default" />
-            <CheckBox Grid.Column="1" Content="Auto" IsChecked="{Binding PerDriveDefaultAuto}" Margin="0,2,8,2" />
-            <NumericUpDown Grid.Column="2" Value="{Binding PerDriveDefaultValue}" Minimum="1" Width="160"
-                           HorizontalAlignment="Left" Margin="0,2" FormatString="0"
-                           IsVisible="{Binding ShowPerDriveDefaultValue}" />
-        </Grid>
-        <Grid ColumnDefinitions="160,Auto,*" RowDefinitions="Auto" Margin="0,0,0,4">
-            <TextBlock Grid.Column="0" Classes="fieldLabel" Text="Max hash threads" />
-            <CheckBox Grid.Column="1" Content="Auto" IsChecked="{Binding MaxHashThreadsAuto}" Margin="0,2,8,2" />
-            <NumericUpDown Grid.Column="2" Value="{Binding MaxHashThreadsValue}" Minimum="1" Width="160"
-                           HorizontalAlignment="Left" Margin="0,2" FormatString="0"
-                           IsVisible="{Binding ShowMaxHashThreadsValue}" />
-        </Grid>
+        <!-- A number the engine can choose for you: while Auto is checked the spinner is hidden. -->
+        <DataTemplate DataType="st:AutoNumberSettingViewModel" x:DataType="st:AutoNumberSettingViewModel">
+            <Border Classes="settingCard" Classes.selected="{Binding IsSelected}"
+                    Classes.disabled="{Binding !IsEnabled}" IsVisible="{Binding IsVisible}"
+                    ToolTip.Tip="{Binding DisabledTooltip}">
+                <StackPanel Spacing="5" IsEnabled="{Binding IsEnabled}">
+                    <TextBlock Classes="settingTitle" Text="{Binding Title}" />
+                    <StackPanel Orientation="Horizontal" Spacing="10">
+                        <CheckBox Content="Auto" IsChecked="{Binding Auto}" VerticalAlignment="Center" />
+                        <NumericUpDown Value="{Binding Value}" Minimum="{Binding Minimum}" Width="160"
+                                       FormatString="0" IsVisible="{Binding ShowValue}" VerticalAlignment="Center" />
+                    </StackPanel>
+                    <TextBlock Classes="secondary" TextWrapping="Wrap" Text="{Binding Description}" />
+                </StackPanel>
+            </Border>
+        </DataTemplate>
 
-        <Border Classes="sectionHeader" Margin="0,8,0,0"><TextBlock Text="Dry-run scratch directory" /></Border>
-        <TextBlock TextWrapping="Wrap" Classes="secondary" Margin="0,0,0,8"
-                   Text="Where the service spills a large dry run's findings to disk before streaming them to this window. Small runs stay in memory and never touch it. Defaults to a 'scratch' folder in the service's working directory. Leftover snapshots are purged on service startup." />
+        <!-- On/off. Unused by the current catalog; here so the first boolean setting needs no XAML. -->
+        <DataTemplate DataType="st:BoolSettingViewModel" x:DataType="st:BoolSettingViewModel">
+            <Border Classes="settingCard" Classes.selected="{Binding IsSelected}"
+                    Classes.disabled="{Binding !IsEnabled}" IsVisible="{Binding IsVisible}"
+                    ToolTip.Tip="{Binding DisabledTooltip}">
+                <StackPanel Spacing="5" IsEnabled="{Binding IsEnabled}">
+                    <TextBlock Classes="settingTitle" Text="{Binding Title}" />
+                    <CheckBox Content="{Binding CheckBoxLabel}" IsChecked="{Binding Value}" HorizontalAlignment="Left" />
+                    <TextBlock Classes="secondary" TextWrapping="Wrap" Text="{Binding Description}" />
+                </StackPanel>
+            </Border>
+        </DataTemplate>
 
-        <Grid ColumnDefinitions="140,*,Auto" RowDefinitions="Auto" Margin="0,0,0,4">
-            <TextBlock Grid.Column="0" Classes="fieldLabel" Text="Location" />
-            <TextBox Grid.Column="1" Text="{Binding ScratchDirectory}" Margin="0,2" />
-            <Button Grid.Column="2" Content="Browse…" Margin="8,2,0,2"
-                    Command="{Binding BrowseScratchDirectoryCommand}" />
-        </Grid>
+        <!-- A setting whose editor is two editable lists — the worked example of a bespoke editor:
+             derive from SettingItemViewModel, add one template here, and search / tree navigation /
+             scroll anchoring all keep working. -->
+        <DataTemplate DataType="st:DriveOverridesSettingViewModel" x:DataType="st:DriveOverridesSettingViewModel">
+            <Border Classes="settingCard" Classes.selected="{Binding IsSelected}"
+                    Classes.disabled="{Binding !IsEnabled}" IsVisible="{Binding IsVisible}"
+                    ToolTip.Tip="{Binding DisabledTooltip}">
+                <StackPanel Spacing="8" IsEnabled="{Binding IsEnabled}">
+                    <TextBlock Classes="settingTitle" Text="{Binding Title}" />
+                    <TextBlock Classes="secondary" TextWrapping="Wrap" Text="{Binding Description}" />
 
-        <Border Classes="sectionHeader" Margin="0,8,0,0"><TextBlock Text="Profiles storage" /></Border>
-        <TextBlock TextWrapping="Wrap" Classes="secondary" Margin="0,0,0,8"
-                   Text="Where profile files are stored. Change… applies immediately: it asks whether to move the existing profiles into the new folder (defaulting to no), then switches the service to it." />
+                    <TextBlock Classes="fieldLabel" Text="Drive-type overrides" Margin="0,4,0,0" />
+                    <ItemsControl ItemsSource="{Binding DriveTypeOverrides}">
+                        <ItemsControl.ItemTemplate>
+                            <DataTemplate x:DataType="st:DriveTypeOverrideRowViewModel">
+                                <!-- A WrapPanel, not a Grid: the document is only ~450px wide at the 720px
+                                     minimum window, and a card here cannot scroll sideways, so a row of
+                                     fixed-width controls would simply be cut off at the right edge. Wrapping
+                                     needs no breakpoint — one line when there is room, two when there is not. -->
+                                <WrapPanel Margin="0,2">
+                                    <ComboBox ItemsSource="{Binding Options}" SelectedItem="{Binding Class}"
+                                              Width="170" VerticalAlignment="Center">
+                                        <ComboBox.ItemTemplate>
+                                            <DataTemplate x:DataType="settings:DriveClass">
+                                                <TextBlock Text="{Binding Converter={x:Static conv:EnumTitleConverters.DriveClass}}" />
+                                            </DataTemplate>
+                                        </ComboBox.ItemTemplate>
+                                    </ComboBox>
+                                    <CheckBox Content="Auto" IsChecked="{Binding Auto}" Margin="10,0" VerticalAlignment="Center" />
+                                    <NumericUpDown Value="{Binding Value}" Minimum="1" Width="105" FormatString="0"
+                                                   VerticalAlignment="Center" IsVisible="{Binding ShowValue}" />
+                                    <Button Content="Remove" Margin="10,0,0,0" VerticalAlignment="Center"
+                                            Command="{Binding $parent[ItemsControl].((st:DriveOverridesSettingViewModel)DataContext).RemoveDriveTypeOverrideCommand}"
+                                            CommandParameter="{Binding}" />
+                                </WrapPanel>
+                            </DataTemplate>
+                        </ItemsControl.ItemTemplate>
+                    </ItemsControl>
+                    <Button Content="Add drive-type override" Command="{Binding AddDriveTypeOverrideCommand}" HorizontalAlignment="Left" />
 
-        <Grid ColumnDefinitions="140,*,Auto" RowDefinitions="Auto" Margin="0,0,0,4">
-            <TextBlock Grid.Column="0" Classes="fieldLabel" Text="Location" />
-            <TextBox Grid.Column="1" Text="{Binding ProfilesDirectory}" Margin="0,2" IsReadOnly="True" />
-            <Button Grid.Column="2" Content="Change…" Margin="8,2,0,2"
-                    Command="{Binding ChangeProfilesDirectoryCommand}" IsEnabled="{Binding !IsBusy}" />
-        </Grid>
+                    <TextBlock Classes="fieldLabel" Text="Specific-drive overrides" Margin="0,6,0,0" />
+                    <ItemsControl ItemsSource="{Binding SpecificDriveOverrides}">
+                        <ItemsControl.ItemTemplate>
+                            <DataTemplate x:DataType="st:SpecificDriveOverrideRowViewModel">
+                                <!-- Picker AND text box, deliberately: the picker removes any doubt about
+                                     the exact key format for a mounted drive, while the box is the only
+                                     way to name a UNC share or a drive that is not attached right now. The
+                                     box holds the single source of truth (VolumeKey); the picker is a view
+                                     of it, so it reads empty for anything it cannot show — hence the
+                                     placeholder rather than a blank-looking control.
+                                     WrapPanel for the same reason as the drive-type row above: five
+                                     controls do not fit the ~450px document at the minimum window width,
+                                     and this card cannot scroll sideways. -->
+                                <WrapPanel Margin="0,2">
+                                    <ComboBox Width="180" VerticalAlignment="Center"
+                                              ItemsSource="{Binding AvailableDrives}" SelectedItem="{Binding SelectedDrive}"
+                                              PlaceholderText="Pick a drive…"
+                                              ToolTip.Tip="Pick one of this machine's drives, or type a volume key yourself.">
+                                        <ComboBox.ItemTemplate>
+                                            <DataTemplate x:DataType="svc:DriveOption">
+                                                <TextBlock Text="{Binding Label}" />
+                                            </DataTemplate>
+                                        </ComboBox.ItemTemplate>
+                                    </ComboBox>
+                                    <TextBox Margin="8,0,0,0" Width="140" VerticalAlignment="Center"
+                                             Text="{Binding VolumeKey}" PlaceholderText="c: or \\server\share" />
+                                    <CheckBox Content="Auto" IsChecked="{Binding Auto}" Margin="10,0" VerticalAlignment="Center" />
+                                    <NumericUpDown Value="{Binding Value}" Minimum="1" Width="105" FormatString="0"
+                                                   VerticalAlignment="Center" IsVisible="{Binding ShowValue}" />
+                                    <Button Content="Remove" Margin="10,0,0,0" VerticalAlignment="Center"
+                                            Command="{Binding $parent[ItemsControl].((st:DriveOverridesSettingViewModel)DataContext).RemoveSpecificDriveOverrideCommand}"
+                                            CommandParameter="{Binding}" />
+                                </WrapPanel>
+                            </DataTemplate>
+                        </ItemsControl.ItemTemplate>
+                    </ItemsControl>
+                    <Button Content="Add drive override" Command="{Binding AddSpecificDriveOverrideCommand}" HorizontalAlignment="Left" />
+                </StackPanel>
+            </Border>
+        </DataTemplate>
+    </Window.DataTemplates>
 
-        <Expander Header="Advanced: per-drive overrides" Margin="0,8,0,0">
-            <StackPanel Spacing="8" Margin="0,8,0,0">
-                <TextBlock Classes="secondary" TextWrapping="Wrap"
-                           Text="Override the per-drive budget for a whole drive type, or for a specific volume key (highest precedence). Precedence: specific drive → drive type → per-drive default." />
+    <DockPanel LastChildFill="True">
 
-                <Border Classes="sectionHeader"><TextBlock Text="Drive-type overrides" /></Border>
-                <ItemsControl ItemsSource="{Binding DriveTypeOverrides}">
-                    <ItemsControl.ItemTemplate>
-                        <DataTemplate x:DataType="vm:DriveTypeOverrideRowViewModel">
-                            <Grid ColumnDefinitions="*,Auto,Auto,Auto" Margin="0,2">
-                                <ComboBox Grid.Column="0" ItemsSource="{Binding Options}" SelectedItem="{Binding Class}" MinWidth="150">
-                                    <ComboBox.ItemTemplate>
-                                        <DataTemplate x:DataType="settings:DriveClass">
-                                            <TextBlock Text="{Binding Converter={x:Static conv:EnumTitleConverters.DriveClass}}" />
-                                        </DataTemplate>
-                                    </ComboBox.ItemTemplate>
-                                </ComboBox>
-                                <CheckBox Grid.Column="1" Content="Auto" IsChecked="{Binding Auto}" Margin="8,0" VerticalAlignment="Center" />
-                                <NumericUpDown Grid.Column="2" Value="{Binding Value}" Minimum="1" Width="120" FormatString="0"
-                                               VerticalAlignment="Center" IsVisible="{Binding ShowValue}" />
-                                <Button Grid.Column="3" Content="Remove" Margin="8,0,0,0" VerticalAlignment="Center"
-                                        Command="{Binding $parent[ItemsControl].((vm:SettingsViewModel)DataContext).RemoveDriveTypeOverrideCommand}"
-                                        CommandParameter="{Binding}" />
-                            </Grid>
-                        </DataTemplate>
-                    </ItemsControl.ItemTemplate>
-                </ItemsControl>
-                <Button Content="Add drive-type override" Command="{Binding AddDriveTypeOverrideCommand}" HorizontalAlignment="Left" />
-
-                <Border Classes="sectionHeader"><TextBlock Text="Specific-drive overrides" /></Border>
-                <ItemsControl ItemsSource="{Binding SpecificDriveOverrides}">
-                    <ItemsControl.ItemTemplate>
-                        <DataTemplate x:DataType="vm:SpecificDriveOverrideRowViewModel">
-                            <Grid ColumnDefinitions="*,Auto,Auto,Auto" Margin="0,2">
-                                <TextBox Grid.Column="0" Text="{Binding VolumeKey}" PlaceholderText="c: or \\server\share" MinWidth="150" />
-                                <CheckBox Grid.Column="1" Content="Auto" IsChecked="{Binding Auto}" Margin="8,0" VerticalAlignment="Center" />
-                                <NumericUpDown Grid.Column="2" Value="{Binding Value}" Minimum="1" Width="120" FormatString="0"
-                                               VerticalAlignment="Center" IsVisible="{Binding ShowValue}" />
-                                <Button Grid.Column="3" Content="Remove" Margin="8,0,0,0" VerticalAlignment="Center"
-                                        Command="{Binding $parent[ItemsControl].((vm:SettingsViewModel)DataContext).RemoveSpecificDriveOverrideCommand}"
-                                        CommandParameter="{Binding}" />
-                            </Grid>
-                        </DataTemplate>
-                    </ItemsControl.ItemTemplate>
-                </ItemsControl>
-                <Button Content="Add drive override" Command="{Binding AddSpecificDriveOverrideCommand}" HorizontalAlignment="Left" />
+        <!-- Custom title bar, same recipe as MainWindow: the OS keeps the resizable frame but draws no
+             system caption, so the bar follows the app theme instead of the Windows default. The
+             ElementRole markers are load-bearing — TitleBar makes the grid the drag region, and the close
+             button needs its own role or the drag region swallows its clicks. -->
+        <Grid DockPanel.Dock="Top" Height="32" ColumnDefinitions="Auto,*,Auto"
+              Background="{DynamicResource Brush.Chrome.Background}"
+              chrome:WindowDecorationProperties.ElementRole="TitleBar">
+            <StackPanel Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Center" Margin="10,0,0,0">
+                <Border Width="18" Height="18" CornerRadius="4" Background="{DynamicResource Brush.Accent}">
+                    <PathIcon Data="{StaticResource IconGear}" Width="11" Height="11" Foreground="White" />
+                </Border>
+                <TextBlock Text="Settings" VerticalAlignment="Center"
+                           Margin="8,0,0,0" FontSize="{StaticResource Font.Title}"
+                           Foreground="{DynamicResource Brush.Text.Primary}" />
             </StackPanel>
-        </Expander>
 
-        <Border Classes="infoBar danger" Margin="0,8,0,0"
-                IsVisible="{Binding ErrorMessage, Converter={x:Static ObjectConverters.IsNotNull}}">
-            <TextBlock Text="{Binding ErrorMessage}" TextWrapping="Wrap" />
-        </Border>
-        <Border Classes="infoBar success" Margin="0,8,0,0"
-                IsVisible="{Binding StatusMessage, Converter={x:Static ObjectConverters.IsNotNull}}">
-            <TextBlock Text="{Binding StatusMessage}" TextWrapping="Wrap" />
+            <!-- The tooltip tracks the footer button's wording so the X tells the same story about
+                 pending edits as the labelled button does. -->
+            <Button Grid.Column="2" Classes="caption close"
+                    chrome:WindowDecorationProperties.ElementRole="CloseButton"
+                    Click="OnCloseClick" ToolTip.Tip="{Binding CloseButtonText}">
+                <PathIcon Data="{StaticResource IconClose}" Width="10" Height="10" />
+            </Button>
+        </Grid>
+
+        <!-- Footer: pinned so Save and any message stay visible no matter how far the document scrolls. -->
+        <Border DockPanel.Dock="Bottom" Padding="16,10"
+                Background="{DynamicResource Brush.Chrome.Background}"
+                BorderBrush="{DynamicResource Brush.Panel.Border}" BorderThickness="0,1,0,0">
+            <StackPanel Spacing="8">
+                <Border Classes="infoBar danger"
+                        IsVisible="{Binding ErrorMessage, Converter={x:Static ObjectConverters.IsNotNull}}">
+                    <TextBlock Text="{Binding ErrorMessage}" TextWrapping="Wrap" />
+                </Border>
+                <Border Classes="infoBar success"
+                        IsVisible="{Binding StatusMessage, Converter={x:Static ObjectConverters.IsNotNull}}">
+                    <TextBlock Text="{Binding StatusMessage}" TextWrapping="Wrap" />
+                </Border>
+                <!-- Undo/Redo sit on the left, apart from the commit actions on the right: they act on
+                     the edits in progress rather than resolving the dialog. They run the same commands
+                     the Ctrl+Z / Ctrl+Y shortcuts do, so the buttons and the keyboard cannot drift. -->
+                <Grid ColumnDefinitions="Auto,*">
+                    <StackPanel Grid.Column="0" Orientation="Horizontal" Spacing="8">
+                        <Button Content="Undo" Command="{Binding History.UndoCommand}" ToolTip.Tip="Undo (Ctrl+Z)" />
+                        <Button Content="Redo" Command="{Binding History.RedoCommand}" ToolTip.Tip="Redo (Ctrl+Y)" />
+                    </StackPanel>
+                    <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="8" HorizontalAlignment="Right">
+                        <!-- Save and Discard both leave the window open: this is a settings document,
+                             not a wizard, so committing or abandoning a change should not also decide
+                             that the user is finished. Only Close and the title-bar X close it. -->
+                        <Button Content="Save" Command="{Binding SaveCommand}" Classes="accent" IsEnabled="{Binding !IsBusy}" />
+                        <Button Content="Discard changes" Command="{Binding DiscardChangesCommand}"
+                                ToolTip.Tip="Put every setting back the way it was last saved" />
+                        <!-- Sized to its label, like every other button here. A MinWidth wide enough to
+                             hold "Close without saving" would leave "Close" swimming in padding; the
+                             button growing when there are unsaved edits is the lesser cost. -->
+                        <Button Content="{Binding CloseButtonText}" Click="OnCloseClick" />
+                    </StackPanel>
+                </Grid>
+            </StackPanel>
         </Border>
 
-        <StackPanel Orientation="Horizontal" Spacing="8" HorizontalAlignment="Right" Margin="0,12,0,0">
-            <Button Content="Save" Command="{Binding SaveCommand}" Classes="accent" IsEnabled="{Binding !IsBusy}" />
-            <Button Content="Close" Click="OnCloseClick" />
-        </StackPanel>
-    </StackPanel>
+        <Grid ColumnDefinitions="260,Auto,*">
+
+            <!-- Navigation pane: search filters both this tree and the document beside it. -->
+            <Border Grid.Column="0" Padding="10"
+                    Background="{DynamicResource Brush.Panel.Background}"
+                    BorderBrush="{DynamicResource Brush.Panel.Border}" BorderThickness="0,0,1,0">
+                <DockPanel LastChildFill="True">
+                    <TextBox DockPanel.Dock="Top" x:Name="SearchBox" Margin="0,0,0,8"
+                             Text="{Binding SearchText}" PlaceholderText="Search settings (Ctrl+F)">
+                        <TextBox.InnerLeftContent>
+                            <PathIcon Data="{StaticResource IconSearch}" Width="14" Height="14"
+                                      Margin="8,0,0,0" Foreground="{DynamicResource Brush.Text.Secondary}" />
+                        </TextBox.InnerLeftContent>
+                    </TextBox>
+                    <ScrollViewer HorizontalScrollBarVisibility="Disabled">
+                        <TreeView Classes="settingsNav" ItemsSource="{Binding NavNodes}"
+                                  SelectedItem="{Binding SelectedNavNode, Mode=TwoWay}">
+                            <TreeView.ItemTemplate>
+                                <TreeDataTemplate x:DataType="st:SettingsNavNodeViewModel" ItemsSource="{Binding Children}">
+                                    <TextBlock Text="{Binding Title}" TextTrimming="CharacterEllipsis" VerticalAlignment="Center" />
+                                </TreeDataTemplate>
+                            </TreeView.ItemTemplate>
+                        </TreeView>
+                    </ScrollViewer>
+                </DockPanel>
+            </Border>
+
+            <GridSplitter Grid.Column="1" Width="4" Background="Transparent" ResizeDirection="Columns" />
+
+            <!-- The document. SettingsHost is searched by the code-behind for the anchor to scroll to.
+                 The inset is the content's Margin, NOT the ScrollViewer's Padding: Padding is measured
+                 into the extent but not out of the child's available width, so the settings (and their
+                 selection highlight) would run past the right edge and be clipped. -->
+            <ScrollViewer Grid.Column="2" x:Name="SettingsScroll" HorizontalScrollBarVisibility="Disabled">
+                <!-- The readable-width cap lives here, as a MaxWidth on a star COLUMN, so it is applied
+                     once for every setting. Putting MaxWidth on the settings themselves centres them in
+                     the leftover space (that is what Stretch + MaxWidth does), which reads as the content
+                     drifting away from the left edge as the window widens. A capped star column keeps
+                     everything anchored left and simply leaves the surplus width empty. -->
+                <Grid Margin="16,4,16,16">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*" MaxWidth="900" />
+                    </Grid.ColumnDefinitions>
+                    <StackPanel>
+                        <ItemsControl x:Name="SettingsHost" ItemsSource="{Binding Categories}">
+                            <ItemsControl.ItemTemplate>
+                                <DataTemplate x:DataType="st:SettingsCategoryViewModel">
+                                    <StackPanel IsVisible="{Binding IsVisible}">
+                                        <Border Classes="sectionHeader"><TextBlock Text="{Binding HeaderText}" /></Border>
+                                        <TextBlock Classes="secondary" TextWrapping="Wrap" Margin="9,0,0,8"
+                                                   Text="{Binding Description}"
+                                                   IsVisible="{Binding Description, Converter={x:Static StringConverters.IsNotNullOrEmpty}}" />
+                                        <!-- No ItemTemplate: each setting picks up the per-kind template above. -->
+                                        <ItemsControl ItemsSource="{Binding Items}" />
+                                    </StackPanel>
+                                </DataTemplate>
+                            </ItemsControl.ItemTemplate>
+                        </ItemsControl>
+
+                        <StackPanel Spacing="10" Margin="9,24,0,0" HorizontalAlignment="Left"
+                                    IsVisible="{Binding !HasVisibleSettings}">
+                            <TextBlock Classes="secondary" Text="No settings match your search." />
+                            <Button Content="Clear search" Command="{Binding ClearSearchCommand}" HorizontalAlignment="Left" />
+                        </StackPanel>
+
+                        <!-- Trailing space so the last setting can still be scrolled up to the top of the
+                             viewport when the navigation tree jumps to it. -->
+                        <Border Height="240" />
+                    </StackPanel>
+                </Grid>
+            </ScrollViewer>
+        </Grid>
+    </DockPanel>
 
 </Window>

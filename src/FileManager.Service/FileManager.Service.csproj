@@ -8,12 +8,50 @@
     <PublishAot>true</PublishAot>
     <!-- Timezone validation (PROFILE_TIMEZONE_INVALID) needs ICU. -->
     <InvariantGlobalization>false</InvariantGlobalization>
+
+    <!-- Background GC OFF. MEASURED, and it is the single most load-bearing line in the memory work:
+         it is what makes MemoryTrimCoordinator's post-run collection able to return memory at all.
+         tools/FileManager.MemoryProbe against the published binary, 33,500 source / 357,000
+         destination files:
+
+             background GC on   peak 234 MB   settled t+35s  231 MB
+             background GC off  peak 326 MB   settled t+35s   12 MB
+
+         Note the trade is real and goes BOTH ways: turning it off costs ~90 MB of transient peak,
+         because blocking gen2s let the heap grow further during the burst. That is accepted here —
+         a peak during a run the user asked for is not what gets reported as a leak; 231 MB retained
+         forever by an always-running service is.
+
+         This service is idle almost all the time and then allocates hard for a few
+         seconds during a dry run; what it needs afterwards is for the heap to actually shrink.
+         Background (concurrent) gen2s are non-compacting by design and, per the GC docs, "don't reduce
+         the total heap size by much". Turning it off makes every gen2 blocking and compacting, which
+         is what returns pages. The cost is longer pauses during the burst — an accepted trade for a
+         background service with no UI thread of its own.
+
+         Note this is NOT ServerGarbageCollection: server GC's per-core heaps and much larger gen0
+         budget are the wrong shape here, and it is also the only thing that would enable DATAS.
+
+         Delivery is the subtle part. NativeAOT has no runtimeconfig.json parser; the SDK converts this
+         property into a RuntimeHostConfigurationOption, which the ILC toolchain then embeds as a
+         runtimeknob (System.GC.Concurrent=false). It also lands in the generated runtimeconfig.json,
+         so `dotnet run` and the published AOT binary agree. EngineHost logs the resolved GC
+         configuration at startup — that log line is how you confirm this actually took effect, rather
+         than assuming it because the csproj says so. -->
+    <ConcurrentGarbageCollection>false</ConcurrentGarbageCollection>
   </PropertyGroup>
 
   <ItemGroup>
     <PackageReference Include="Microsoft.Extensions.Hosting" Version="10.0.9" />
     <PackageReference Include="Serilog.Extensions.Hosting" Version="10.0.0" />
     <PackageReference Include="Serilog.Sinks.File" Version="7.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- So the tests can build EngineComposition's graph and drive EngineHost's startup sequence.
+         Both are internal and were previously unreachable from any test, which is why the smoke
+         test hand-rebuilt the graph (and drifted three handlers behind it). -->
+    <InternalsVisibleTo Include="FileManager.Service.Tests" />
   </ItemGroup>
 
   <ItemGroup>

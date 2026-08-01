@@ -5,14 +5,20 @@ using System.Text.Json.Serialization;
 
 namespace FileManager.Contracts.Settings;
 
-/// <summary>Machine-level settings edited in the UI and persisted by the service (settings.json).
-/// These are NOT per-profile.</summary>
+/// <summary>Machine-level ENGINE settings edited in the UI and persisted by the service
+/// (settings.json). These are NOT per-profile, and they are not the whole settings surface: anything
+/// the engine never reads (the theme, the sidebar layout, the service executable path) is client-side
+/// state owned by the UI — see <c>FileManager.UI.Services.ClientSettings</c>. The split is what lets
+/// the UI change those while the service is unreachable.</summary>
 public sealed record GlobalSettings
 {
     /// <summary>Independent of <see cref="Profile.SchemaVersion"/>; versions this settings file only.
     /// v2 replaced the dry-run concurrency scalars with <see cref="ScanThreading"/>. v3 added
-    /// <see cref="ScratchDirectory"/>. v4 added <see cref="ProfilesDirectory"/>.</summary>
-    public int SchemaVersion { get; init; } = 4;
+    /// <see cref="ScratchDirectory"/>. v4 added <see cref="ProfilesDirectory"/>. v5 removed ThemeMode,
+    /// which moved to the UI's client-settings.json (the engine never read it); a v4 file's orphaned
+    /// member is ignored here and migrated by the UI on first run. v6 added
+    /// <see cref="ReleaseMemoryAfterLargeOperations"/>.</summary>
+    public int SchemaVersion { get; init; } = 6;
 
     /// <summary>When the worker service is started and stopped relative to the UI. Defaults to
     /// <see cref="Settings.ServiceStartupMode.StartAndStopWithProgram"/> so the service does not
@@ -33,10 +39,6 @@ public sealed record GlobalSettings
         get => _scanThreading ?? ScanThreadingSettings.Default;
         init => _scanThreading = value == ScanThreadingSettings.Default ? null : value;
     }
-
-    /// <summary>The UI theme. Defaults to <see cref="Settings.ThemeMode.System"/> so the app follows the
-    /// OS light/dark preference unless the user picks a fixed theme.</summary>
-    public ThemeMode ThemeMode { get; init; } = ThemeMode.System;
 
     private readonly string? _scratchDirectory;
 
@@ -110,6 +112,37 @@ public sealed record GlobalSettings
     public static string DefaultProfilesDirectory => Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
         "FileManager", "profiles");
+
+    private readonly bool? _releaseMemoryAfterLargeOperations;
+
+    /// <summary>Whether the service compacts and returns memory to the OS after a large operation
+    /// settles. A dry run over hundreds of thousands of files leaves the GC holding its high-water
+    /// commit — uncompacted Large Object Heap included — so an always-running service keeps showing
+    /// that peak in Task Manager long after the work finished. On (the default) the engine asks for it
+    /// back once nothing has run for a while; the cost is a brief blocking collection, only ever while
+    /// idle. Turn it off if you run dry runs back to back and would rather keep the warm heap.
+    ///
+    /// <para>Nullable backing field for the same reason as the directories above: an existing
+    /// settings.json predating this field deserializes with no value, and the source generator does not
+    /// run property initializers for absent members — so a plain <c>bool</c> would silently read back
+    /// as <c>false</c> and disable the feature for every upgrading user. The setter collapses the
+    /// default (true) to the absent representation so an omitted field and an explicit <c>true</c>
+    /// compare equal under the record's value-equality.</para></summary>
+    [JsonIgnore]
+    public bool ReleaseMemoryAfterLargeOperations
+    {
+        get => _releaseMemoryAfterLargeOperations ?? true;
+        init => _releaseMemoryAfterLargeOperations = value ? null : false;
+    }
+
+    /// <summary>Serialization surface for <see cref="ReleaseMemoryAfterLargeOperations"/>: carries the
+    /// nullable backing representation so the default stays ABSENT in settings.json and on the wire.</summary>
+    [JsonInclude, JsonPropertyName("ReleaseMemoryAfterLargeOperations")]
+    public bool? ReleaseMemoryAfterLargeOperationsSerialized
+    {
+        get => _releaseMemoryAfterLargeOperations;
+        init => _releaseMemoryAfterLargeOperations = value is true ? null : value;
+    }
 
     public static GlobalSettings Default { get; } = new();
 }

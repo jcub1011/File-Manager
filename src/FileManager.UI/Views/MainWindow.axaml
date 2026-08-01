@@ -45,6 +45,10 @@
                     <PathIcon Data="{StaticResource IconExport}" Width="16" Height="16" />
                 </Button>
                 <Button Classes="iconButton" chrome:WindowDecorationProperties.ElementRole="User"
+                        Command="{Binding ToggleActivityCommand}" ToolTip.Tip="Activity">
+                    <PathIcon Data="{StaticResource IconDocument}" Width="16" Height="16" />
+                </Button>
+                <Button Classes="iconButton" chrome:WindowDecorationProperties.ElementRole="User"
                         Command="{Binding OpenLogFolderCommand}" ToolTip.Tip="Open log folder">
                     <PathIcon Data="{StaticResource IconFolder}" Width="16" Height="16" />
                 </Button>
@@ -70,6 +74,14 @@
         </Grid>
 
         <v:StatusBarView DockPanel.Dock="Bottom" DataContext="{Binding StatusBar}" />
+
+        <!-- Activity panel. Declared AFTER the status bar so it docks above it, and deliberately
+             outside the document grid below — that grid is gated on Editor.HasProfile, and engine
+             activity is global state that must stay visible with no profile selected. The IsVisible
+             sits on this wrapper because the child's DataContext is swapped to Activity. -->
+        <ContentControl DockPanel.Dock="Bottom" Height="220" IsVisible="{Binding ActivityVisible}">
+            <v:ActivityView DataContext="{Binding Activity}" />
+        </ContentControl>
 
         <Grid x:Name="ContentGrid">
             <Grid.ColumnDefinitions>
@@ -138,6 +150,29 @@
                         <Button Content="Save" Command="{Binding SaveCommand}" Classes="accent" />
                         <Button Content="Discard changes" Command="{Binding DiscardCommand}"
                                 IsVisible="{Binding IsDirty}" />
+                    </StackPanel>
+
+                    <!-- Delete + Run act on the PERSISTED profile, not the draft, so this group stays
+                         at shell scope (no DataContext override) and takes the selected list row as its
+                         parameter. Both disable when there is no saved row (a brand-new draft). -->
+                    <StackPanel Orientation="Horizontal" Spacing="8"
+                                IsVisible="{Binding #ProfileTab.IsSelected}">
+                        <Button Content="Delete" Classes="danger"
+                                Command="{Binding DeleteProfileCommand}"
+                                CommandParameter="{Binding List.SelectedProfile}"
+                                IsEnabled="{Binding List.CanDeleteSelected}"
+                                ToolTip.Tip="Delete this profile" />
+                        <Button Classes="success"
+                                Command="{Binding RunProfileNowCommand}"
+                                CommandParameter="{Binding List.SelectedProfile}"
+                                IsEnabled="{Binding List.CanRunSelected}"
+                                ToolTip.Tip="Performs a real run: moves files and applies the source disposition.">
+                            <StackPanel Orientation="Horizontal" Spacing="6">
+                                <PathIcon Data="{StaticResource IconPlay}" Width="11" Height="11"
+                                          VerticalAlignment="Center" />
+                                <TextBlock Text="Run" />
+                            </StackPanel>
+                        </Button>
                     </StackPanel>
 
                     <StackPanel Orientation="Horizontal" Spacing="6"

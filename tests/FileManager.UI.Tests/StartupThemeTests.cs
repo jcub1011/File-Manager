@@ -1,12 +1,11 @@
-using FileManager.Contracts;
 using FileManager.Contracts.Settings;
 using FileManager.UI.Services;
-using System.Text.Json;
 
 namespace FileManager.UI.Tests;
 
-/// <summary>Verifies <see cref="StartupTheme"/> reads the persisted theme straight from settings.json
-/// so the correct variant can be applied before the first paint (no light-to-dark startup flash).</summary>
+/// <summary>Verifies <see cref="StartupTheme"/> reads the persisted theme straight from
+/// client-settings.json so the correct variant can be applied before the first paint (no
+/// light-to-dark startup flash) and with no running service.</summary>
 public sealed class StartupThemeTests
 {
     [Theory]
@@ -17,11 +16,10 @@ public sealed class StartupThemeTests
     {
         string dir = Path.Combine(Path.GetTempPath(), "fm-theme-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(dir);
-        string file = Path.Combine(dir, "settings.json");
+        string file = Path.Combine(dir, "client-settings.json");
         try
         {
-            GlobalSettings settings = new() { ThemeMode = mode };
-            File.WriteAllText(file, JsonSerializer.Serialize(settings, FileManagerJsonContext.Default.GlobalSettings));
+            ClientSettingsStore.Write(file, ClientSettings.Default with { ThemeMode = mode });
 
             Assert.Equal(mode, StartupTheme.Read(file));
         }
@@ -34,7 +32,8 @@ public sealed class StartupThemeTests
     [Fact]
     public void Read_returns_System_when_the_file_is_missing()
     {
-        string missing = Path.Combine(Path.GetTempPath(), "fm-theme-" + Guid.NewGuid().ToString("N"), "settings.json");
+        string missing = Path.Combine(
+            Path.GetTempPath(), "fm-theme-" + Guid.NewGuid().ToString("N"), "client-settings.json");
 
         Assert.Equal(ThemeMode.System, StartupTheme.Read(missing));
     }
@@ -44,7 +43,7 @@ public sealed class StartupThemeTests
     {
         string dir = Path.Combine(Path.GetTempPath(), "fm-theme-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(dir);
-        string file = Path.Combine(dir, "settings.json");
+        string file = Path.Combine(dir, "client-settings.json");
         try
         {
             File.WriteAllText(file, "{ this is not valid json");

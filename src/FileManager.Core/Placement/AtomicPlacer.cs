@@ -160,10 +160,20 @@ public sealed class AtomicPlacer(
             if (journalError is not null) return journalError;
             tp.State = TargetState.Verified;
 
-            // Apply best-effort metadata to the temp before the rename (spec §6.4).
-            Result metaResult = metadata.Apply(execution.Plan.Source.Path, tempPath, execution.Plan.Policies.MetadataOnConflict);
+            // Apply best-effort metadata to the temp before the rename (spec §6.4). The POLICY decides
+            // what a failure means — "best-effort" is exactly what MetadataOnConflict.WarnAndContinue
+            // asks for, and failing the job regardless of the setting made the policy meaningless: a
+            // verified copy was thrown away over an attribute the profile said to warn about.
+            MetadataOnConflict metadataPolicy = execution.Plan.Policies.MetadataOnConflict;
+            Result metaResult = metadata.Apply(execution.Plan.Source.Path, tempPath, metadataPolicy);
             if (metaResult.TryGetError(out string? metaError))
-                return new JobError { Code = JobErrorCode.MetadataConflict, Message = metaError, Path = finalPath, TargetIndex = index };
+            {
+                if (metadataPolicy == MetadataOnConflict.FailJob)
+                    return new JobError { Code = JobErrorCode.MetadataConflict, Message = metaError, Path = finalPath, TargetIndex = index };
+                logger.LogWarning(
+                    "Job {JobId} target {Index}: metadata could not be applied to \"{Final}\" ({Error}); continuing per MetadataOnConflict={Policy}",
+                    jobShort, index, finalPath, metaError, metadataPolicy);
+            }
 
             // 5. Place. For a staged overwrite the staging intent is journaled and state set ONCE
             //    here — before the retried move — so a transient replace failure can never emit
@@ -297,7 +307,7 @@ public sealed class AtomicPlacer(
             {
                 // Staging intent was journaled and target state set once by the caller (before this
                 // retried step); here we only perform the idempotent atomic replace.
-                ReplaceWithStaging(tempPath, finalPath, stagedPath);
+                StagedReplace.Execute(tempPath, finalPath, stagedPath, logger);
             }
             else
             {
@@ -330,37 +340,6 @@ public sealed class AtomicPlacer(
         }
     }
 
-    private void ReplaceWithStaging(string tempPath, string finalPath, string stagedPath)
-    {
-        try
-        {
-            // One Win32 ReplaceFile: the new file swaps in and the prior version lands at
-            // stagedPath atomically — no window where the final name is absent (I-PRIOR).
-            File.Replace(tempPath, finalPath, stagedPath, ignoreMetadataErrors: true);
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or PlatformNotSupportedException)
-        {
-            // Fallback for volumes that reject ReplaceFile (some SMB servers): journaled two-step.
-            // The crash window between the two moves is covered by the target-staged recovery rows.
-            logger.LogWarning(ex, "File.Replace rejected for {Final}; falling back to two-step move", finalPath);
-            TwoStepReplace(tempPath, finalPath, stagedPath);
-        }
-    }
-
-    /// <summary>The two-step fallback, made idempotent so the retry policy can re-run it safely: if a
-    /// prior attempt already moved the prior version out (final now absent), don't move it again —
-    /// just finish by moving the temp into place. Without this, a retry after the first move succeeded
-    /// but the second failed would throw FileNotFound forever and strand the final name absent.</summary>
-    private static void TwoStepReplace(string tempPath, string finalPath, string stagedPath)
-    {
-        if (File.Exists(finalPath))
-        {
-            Directory.CreateDirectory(Path.GetDirectoryName(stagedPath)!);
-            File.Move(finalPath, stagedPath, overwrite: false);
-        }
-        File.Move(tempPath, finalPath, overwrite: false);
-    }
-
     private SuppressionToken RegisterSuppression(string path)
     {
         // Suppression keys are normalized; an unnormalizable path just isn't suppressed (the
@@ -374,23 +353,9 @@ public sealed class AtomicPlacer(
     {
         Result<NormalizedPath, JobError> normalized = NormalizedPath.Create(finalPath);
         if (normalized.TryGetValue(out NormalizedPath key))
-            priorities.RecordPlacement(plan.ProfileId, key, SourceIndexOf(plan));
-    }
-
-    /// <summary>The index of the payload's originating Source within the profile — the M:1 priority
-    /// rank (spec §3.4). Falls back to 0 (highest priority) when it cannot be matched.</summary>
-    private static int SourceIndexOf(JobPlan plan)
-    {
-        Result<NormalizedPath, JobError> root = NormalizedPath.Create(plan.Payload.SourceRoot);
-        if (!root.TryGetValue(out NormalizedPath rootPath))
-            return 0;
-        for (int i = 0; i < plan.Profile.Sources.Count; i++)
-        {
-            Result<NormalizedPath, JobError> src = NormalizedPath.Create(plan.Profile.Sources[i].Path);
-            if (src.TryGetValue(out NormalizedPath sp) && sp.Equals(rootPath))
-                return i;
-        }
-        return 0;
+            // plan.PriorityIndex, not a locally re-derived rank: the resolver reads the registry with
+            // the same value, and two independent derivations are how the two sides drifted apart.
+            priorities.RecordPlacement(plan.ProfileId, key, plan.PriorityIndex);
     }
 
     private JobError? Journal(JournalRecord record)

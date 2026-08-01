@@ -18,11 +18,16 @@ public sealed class WindowsVolumeInfoProviderTests
     }
 
     [Fact]
-    public void Volume_key_is_the_drive_root()
+    public void Volume_key_is_the_drive_root_with_no_trailing_separator()
     {
+        // Asserted exactly, not with a defensive TrimEnd on both sides: the trailing separator is the
+        // whole point. GetPathRoot returns "C:\" and Path.TrimEndingDirectorySeparator leaves a root
+        // alone, so the key used to come back as "c:\" and never matched the "c:" a user types into a
+        // specific-drive override.
         Result<string, string> result = _provider.GetVolumeKey(Path.GetTempPath());
         Assert.True(result.TryGetValue(out string? key));
-        Assert.Equal(Path.GetPathRoot(Path.GetTempPath())!.ToLowerInvariant().TrimEnd('\\'), key.TrimEnd('\\'));
+        Assert.Equal(Path.GetPathRoot(Path.GetTempPath())!.ToLowerInvariant().TrimEnd('\\'), key);
+        Assert.DoesNotContain('\\', key);
     }
 
     [Fact]

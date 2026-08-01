@@ -79,6 +79,28 @@ public sealed class IpcRobustnessTests : IAsyncLifetime
         }
     }
 
+    /// <summary>An unregistered request type answers NOT_IMPLEMENTED rather than dropping the
+    /// connection or hanging the caller. This fixture registers exactly one handler, which makes it the
+    /// natural place to pin that branch: the assertion used to live in the end-to-end smoke test against
+    /// run-profile, and when run-profile was implemented the branch was left with no coverage at all.</summary>
+    [Fact]
+    public async Task An_unregistered_request_type_answers_not_implemented()
+    {
+        var connected = await IpcClient.ConnectAsync();
+        Assert.True(connected.TryGetValue(out IpcClient? client));
+        await using (client)
+        {
+            // No handler for list-profiles is registered on this server.
+            var answered = await client!.RequestAsync<ProfileListResponse>(new ListProfilesRequest());
+            Assert.True(answered.TryGetError(out IpcError? error));
+            Assert.Equal("NOT_IMPLEMENTED", error!.Code);
+
+            // The connection stays usable — an unknown type is a per-request answer, not a fault.
+            var ok = await client.RequestAsync<StatusResponse>(new GetStatusRequest());
+            Assert.True(ok.TryGetValue(out _));
+        }
+    }
+
     [Fact]
     public async Task Disposing_the_client_under_an_in_flight_request_yields_a_failure_value_not_a_throw()
     {

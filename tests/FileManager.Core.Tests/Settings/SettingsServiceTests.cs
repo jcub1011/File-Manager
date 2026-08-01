@@ -22,10 +22,20 @@ public sealed class SettingsServiceTests : IDisposable
 
     private SettingsService NewService() => new(NullLogger<SettingsService>.Instance, _paths);
 
+    /// <summary>Defaults as the service resolves them under the INJECTED root. The two user-data
+    /// directories are rebased on EnginePaths when settings.json does not name them (so a test root
+    /// actually contains them); everything else is GlobalSettings.Default verbatim. In production the
+    /// root IS %LOCALAPPDATA%\FileManager, so this equals GlobalSettings.Default there.</summary>
+    private GlobalSettings DefaultsUnderRoot => GlobalSettings.Default with
+    {
+        ProfilesDirectory = _paths.ProfilesDirectory,
+        ScratchDirectory = _paths.ScratchDirectory,
+    };
+
     [Fact]
     public void Absent_file_yields_defaults()
     {
-        Assert.Equal(GlobalSettings.Default, NewService().Current);
+        Assert.Equal(DefaultsUnderRoot, NewService().Current);
     }
 
     [Fact]
@@ -71,6 +81,29 @@ public sealed class SettingsServiceTests : IDisposable
         var overrides = service.Current.ScanThreading.SpecificDriveOverrides;
         Assert.True(overrides.ContainsKey("c:"));   // trimmed + lower-cased to the volume-key form
         Assert.Equal(1, overrides["c:"].Value);      // explicit value clamped to >= 1
+    }
+
+    [Fact]
+    public void Update_strips_a_trailing_separator_from_a_specific_drive_key()
+    {
+        // A drive root spelled the way the OS hands it back ("C:\") has to collapse onto the canonical
+        // "c:" the engine looks up with, or the override matches nothing.
+        SettingsService service = NewService();
+        service.Update(new GlobalSettings
+        {
+            ScanThreading = new ScanThreadingSettings
+            {
+                SpecificDriveOverrides = new Dictionary<string, ThreadBudget>
+                {
+                    [@"C:\"] = ThreadBudget.Explicit(3),
+                    [@"\\Server\Share\"] = ThreadBudget.Explicit(2),
+                },
+            },
+        });
+
+        var overrides = service.Current.ScanThreading.SpecificDriveOverrides;
+        Assert.Equal(3, overrides["c:"].Value);
+        Assert.Equal(2, overrides[@"\\server\share"].Value);
     }
 
     [Fact]
@@ -137,7 +170,9 @@ public sealed class SettingsServiceTests : IDisposable
                 !doc.RootElement.TryGetProperty(key, out var el) || el.ValueKind == System.Text.Json.JsonValueKind.Null,
                 $"{key} must stay absent (null) in settings.json when unset");
 
-        Assert.Equal(GlobalSettings.Default, NewService().Current);
+        // The ON-DISK shape above is the frozen part and is unchanged. In memory the two absent
+        // directories resolve against the injected root rather than %LOCALAPPDATA%.
+        Assert.Equal(DefaultsUnderRoot, NewService().Current);
     }
 
     [Fact]
@@ -150,9 +185,43 @@ public sealed class SettingsServiceTests : IDisposable
         Assert.Equal(scratch, reloaded.ScratchDirectory);
         Assert.Equal(Path.Combine(_root, "my-profiles"), reloaded.ProfilesDirectory);
 
-        // Writing the default value (even with different casing) collapses back to absent.
+        // Writing the default value (even with different casing) collapses back to absent — and an
+        // absent value then resolves against the injected root.
         NewService().Update(new GlobalSettings { ScratchDirectory = GlobalSettings.DefaultScratchDirectory.ToUpperInvariant() });
-        Assert.Equal(GlobalSettings.Default.ScratchDirectory, NewService().Current.ScratchDirectory);
+        Assert.Equal(_paths.ScratchDirectory, NewService().Current.ScratchDirectory);
+    }
+
+    [Fact]
+    public void A_settings_file_predating_the_memory_release_flag_keeps_the_feature_on()
+    {
+        // The upgrade case, and the reason the field has a nullable backing store. The source
+        // generator does not run property initializers for absent members, so a plain `bool` would
+        // deserialize to false here and silently disable memory release for every existing install.
+        File.WriteAllText(_paths.SettingsFilePath,
+            """
+            {"SchemaVersion":5,"ServiceStartupMode":"StartAndStopWithProgram"}
+            """);
+
+        Assert.True(NewService().Current.ReleaseMemoryAfterLargeOperations);
+    }
+
+    [Fact]
+    public void Memory_release_round_trips_off_and_stays_absent_when_left_on()
+    {
+        NewService().Update(new GlobalSettings { ReleaseMemoryAfterLargeOperations = false });
+        Assert.False(NewService().Current.ReleaseMemoryAfterLargeOperations);
+
+        // Back to the default: it collapses to the absent representation rather than pinning `true`,
+        // so an omitted field and an explicit default stay value-equal (the record's equality is what
+        // the settings window's dirty flag is built on).
+        NewService().Update(new GlobalSettings { ReleaseMemoryAfterLargeOperations = true });
+        using var doc = System.Text.Json.JsonDocument.Parse(File.ReadAllText(_paths.SettingsFilePath));
+        Assert.True(
+            !doc.RootElement.TryGetProperty("ReleaseMemoryAfterLargeOperations", out var el)
+                || el.ValueKind == System.Text.Json.JsonValueKind.Null,
+            "the default (on) must stay absent in settings.json");
+        Assert.True(NewService().Current.ReleaseMemoryAfterLargeOperations);
+        Assert.Equal(GlobalSettings.Default, new GlobalSettings { ReleaseMemoryAfterLargeOperations = true });
     }
 
     [Fact]
@@ -169,15 +238,34 @@ public sealed class SettingsServiceTests : IDisposable
     }
 
     [Fact]
-    public void Default_theme_mode_is_system()
+    public void An_unreadable_settings_file_is_kept_aside_before_defaults_take_over()
     {
-        Assert.Equal(ThemeMode.System, NewService().Current.ThemeMode);
+        // Falling back to defaults is right; leaving the bad file in place is not, because Update
+        // renames over it. Those bytes carry the relocated ProfilesDirectory, and losing them makes the
+        // user's entire profile list vanish with no record of where it had been pointed.
+        string file = _paths.SettingsFilePath;
+        File.WriteAllText(file, "{ garbage");
+
+        SettingsService service = NewService();
+
+        Assert.Equal(DefaultsUnderRoot, service.Current);
+        Assert.False(File.Exists(file));
+        string kept = Assert.Single(Directory.GetFiles(_root, "settings.json.corrupt-*"));
+        Assert.Equal("{ garbage", File.ReadAllText(kept));
     }
 
     [Fact]
-    public void Update_persists_and_reloads_the_theme_mode()
+    public void A_later_save_cannot_overwrite_the_kept_copy()
     {
-        NewService().Update(new GlobalSettings { ThemeMode = ThemeMode.Dark });
-        Assert.Equal(ThemeMode.Dark, NewService().Current.ThemeMode);
+        string file = _paths.SettingsFilePath;
+        File.WriteAllText(file, "{ garbage");
+        SettingsService service = NewService();
+
+        service.Update(new GlobalSettings { ServiceStartupMode = ServiceStartupMode.RunOnStartup });
+
+        // The fresh file works...
+        Assert.Equal(ServiceStartupMode.RunOnStartup, NewService().Current.ServiceStartupMode);
+        string kept = Assert.Single(Directory.GetFiles(_root, "settings.json.corrupt-*"));
+        Assert.Equal("{ garbage", File.ReadAllText(kept));               // ...and the original survives
     }
 }

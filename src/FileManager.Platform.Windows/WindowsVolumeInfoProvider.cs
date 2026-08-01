@@ -38,8 +38,14 @@ public sealed partial class WindowsVolumeInfoProvider(ILogger<WindowsVolumeInfoP
         }
     }
 
-    /// <summary>Stable key grouping paths that share a volume: the drive root ("C:\") for local
-    /// paths or the share root ("\\server\share") for UNC, lower-cased.</summary>
+    /// <summary>Stable key grouping paths that share a volume, in the canonical form
+    /// <see cref="VolumeKeys.Normalize"/> defines: the drive root as "c:" for local paths or the share
+    /// root as "\\server\share" for UNC, lower-cased and with no trailing separator.
+    ///
+    /// The trailing-separator strip is not cosmetic. <see cref="Path.GetPathRoot(string)"/> hands back
+    /// "C:\", and <see cref="Path.TrimEndingDirectorySeparator(string)"/> leaves a path that IS a root
+    /// alone — so trimming that way produced "c:\", which never matched the "c:" a user typed into a
+    /// specific-drive override.</summary>
     public Result<string, string> GetVolumeKey(string path)
     {
         try
@@ -47,7 +53,7 @@ public sealed partial class WindowsVolumeInfoProvider(ILogger<WindowsVolumeInfoP
             string? root = Path.GetPathRoot(Path.GetFullPath(path));
             if (string.IsNullOrEmpty(root))
                 return Result<string, string>.Failure($"could not determine the volume root of \"{path}\"");
-            return Result<string, string>.Success(Path.TrimEndingDirectorySeparator(root).ToLowerInvariant());
+            return Result<string, string>.Success(VolumeKeys.Normalize(root));
         }
         catch (Exception ex)
         {
@@ -127,8 +133,15 @@ public sealed partial class WindowsVolumeInfoProvider(ILogger<WindowsVolumeInfoP
     private static string DirectoryOf(string path)
     {
         string full = Path.GetFullPath(path);
-        // GetDiskFreeSpaceEx wants a directory; if the path is (or looks like) a file, use its parent.
-        string dir = Directory.Exists(full) ? full : Path.GetDirectoryName(full) ?? full;
+        // GetDiskFreeSpaceEx wants an EXISTING directory. A job's workspace/target directory may not
+        // exist yet — disk preflight (§4.3) runs before the workspace is created — so walk up to the
+        // nearest existing ancestor. Free space is a per-volume answer, so any existing ancestor on
+        // the same volume gives the right number; bottom out at the volume root.
+        string? dir = Directory.Exists(full) ? full : Path.GetDirectoryName(full);
+        while (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
+            dir = Path.GetDirectoryName(dir);
+        if (string.IsNullOrEmpty(dir))
+            dir = Path.GetPathRoot(full) ?? full;
         return ExtendIfLong(dir);
     }
 

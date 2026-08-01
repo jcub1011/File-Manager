@@ -3,24 +3,32 @@ using FileManager.Contracts.Primitives;
 using FileManager.Core.Platform;
 using Microsoft.Extensions.Logging;
 using System;
+using System.Buffers;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Threading;
+using System.Threading.Channels;
 using System.Threading.Tasks;
 
 namespace FileManager.Core.IPC;
 
 /// <summary>The IPC server (§4.9): one accept loop, one task per connection, requests on a
 /// connection handled strictly sequentially (§3.2). Dispatch is a table keyed by the wire
-/// discriminator — an unregistered request type answers NOT_IMPLEMENTED, which is how every
-/// out-of-scope request (run-profile, subscribe, …) responds in this slice.</summary>
+/// discriminator — an unregistered request type answers NOT_IMPLEMENTED, so a request this build does
+/// not serve gets a per-request answer rather than a dropped connection.</summary>
 public sealed class IpcServer(
     ILogger<IpcServer> logger,
     IIpcEndpointProvider endpoint,
     IReadOnlyDictionary<string, IIpcRequestHandler> handlers) : IIpcServer
 {
+    // A slow/dead event subscriber must never block the publisher (§8): each holds a bounded channel
+    // of pre-serialized frames, dropping the oldest under back-pressure (event delivery is
+    // best-effort — the activity view/tray tolerate a gap).
+    private const int SubscriberQueueCapacity = 1024;
+
     private readonly ConcurrentDictionary<Task, byte> _connections = new();
+    private readonly ConcurrentDictionary<Subscriber, byte> _subscribers = new();
     private CancellationTokenSource? _cts;
     private Task? _acceptLoop;
 
@@ -54,11 +62,28 @@ public sealed class IpcServer(
         logger.LogInformation("IPC server stopped");
     }
 
-    /// <summary>Structural no-op in this slice: the subscriber registry exists so event
-    /// subscription (SubscribeEventsRequest) slots in without reshaping the class, but nothing
-    /// registers yet — the dispatch table answers "subscribe" with NOT_IMPLEMENTED.</summary>
+    /// <summary>Fans an engine event out to every subscribed connection (§4.9, §4.10). Serializes
+    /// once, then non-blocking-writes the frame to each subscriber's bounded channel — a per-connection
+    /// writer task drains it. Never blocks on a slow/dead subscriber (§8).</summary>
     public void Broadcast(EngineEvent evt)
     {
+        if (_subscribers.IsEmpty)
+            return;
+
+        byte[] frame;
+        try
+        {
+            frame = IpcSerializer.SerializeEvent(evt);
+        }
+        catch (Exception ex)
+        {
+            // Last-resort catch-and-log: a serialization fault must not take down the publisher.
+            logger.LogError(ex, "Failed to serialize engine event {Type}; dropping it", evt.GetType().Name);
+            return;
+        }
+
+        foreach (Subscriber subscriber in _subscribers.Keys)
+            subscriber.Channel.Writer.TryWrite(frame);   // DropOldest — always accepts, never blocks
     }
 
     private async Task AcceptLoopAsync(CancellationToken ct)
@@ -119,6 +144,11 @@ public sealed class IpcServer(
 
     private async Task ServeConnectionAsync(Stream stream, CancellationToken ct)
     {
+        // One reusable serialization buffer for this connection's whole lifetime. Requests on a
+        // connection are handled strictly sequentially (§3.2) and a streamed response's frames are
+        // written one at a time, so there is never more than one writer here — which is exactly why
+        // this can be per-connection state rather than per-frame allocation.
+        FrameScratch scratch = new();
         await using (stream)
         {
             try
@@ -145,22 +175,30 @@ public sealed class IpcServer(
                     if (resolution.Error is not null)
                     {
                         // Parse / version / not-implemented failure: one frame, then keep serving.
-                        if (!await TryWriteResponseFrameAsync(stream, resolution.RequestType, resolution.Error, ct).ConfigureAwait(false))
+                        if (!await TryWriteResponseFrameAsync(stream, scratch, resolution.RequestType, resolution.Error, ct).ConfigureAwait(false))
                             return;
                         continue;
+                    }
+
+                    if (resolution.IsSubscribe)
+                    {
+                        // Event subscription (§3.2): ack once, then this connection becomes a one-way
+                        // event stream until the client disconnects or the server stops.
+                        await ServeEventSubscriptionAsync(stream, scratch, ct).ConfigureAwait(false);
+                        return;
                     }
 
                     if (resolution.Handler is IIpcStreamingRequestHandler streaming)
                     {
                         // One request, many response frames (§ streamed dry-run). The connection
                         // survives a normal or errored stream; only a transport fault ends it.
-                        if (!await ServeStreamAsync(stream, resolution.RequestType, streaming, resolution.Request!, ct).ConfigureAwait(false))
+                        if (!await ServeStreamAsync(stream, scratch, resolution.RequestType, streaming, resolution.Request!, ct).ConfigureAwait(false))
                             return;
                         continue;
                     }
 
                     IpcResponse response = await InvokeAsync(resolution.RequestType, resolution.Handler!, resolution.Request!, ct).ConfigureAwait(false);
-                    if (!await TryWriteResponseFrameAsync(stream, resolution.RequestType, response, ct).ConfigureAwait(false))
+                    if (!await TryWriteResponseFrameAsync(stream, scratch, resolution.RequestType, response, ct).ConfigureAwait(false))
                         return;
                 }
             }
@@ -186,7 +224,8 @@ public sealed class IpcServer(
 
     /// <summary>The outcome of parsing + routing one request frame: either an <see cref="Error"/>
     /// response to send once, or a resolved <see cref="Handler"/> and <see cref="Request"/> to serve.</summary>
-    private readonly record struct Resolution(string RequestType, IpcRequest? Request, IIpcRequestHandler? Handler, IpcResponse? Error);
+    private readonly record struct Resolution(
+        string RequestType, IpcRequest? Request, IIpcRequestHandler? Handler, IpcResponse? Error, bool IsSubscribe = false);
 
     /// <summary>Parses the frame, checks the protocol version, and looks up the handler — the shared
     /// front half of both the single-response and streaming paths.</summary>
@@ -208,6 +247,11 @@ public sealed class IpcServer(
                 Code = "IPC_VERSION_MISMATCH",
                 Message = $"this service speaks protocol version {IpcRequest.CurrentProtocolVersion}, the client sent {request.ProtocolVersion}",
             });
+
+        // Event subscription is served by the connection loop directly (open-ended, Broadcast-driven),
+        // not through the request/response dispatch table.
+        if (discriminator == IpcRequestTypes.Subscribe)
+            return new Resolution(discriminator, request, null, null, IsSubscribe: true);
 
         if (!handlers.TryGetValue(discriminator, out IIpcRequestHandler? handler))
             return new Resolution(discriminator, null, null, new ErrorResponse
@@ -243,7 +287,8 @@ public sealed class IpcServer(
     /// cancellation (shutdown) propagates. Returns false only when the connection must close (a
     /// transport write failed or was cancelled).</summary>
     private async Task<bool> ServeStreamAsync(
-        Stream stream, string requestType, IIpcStreamingRequestHandler handler, IpcRequest request, CancellationToken ct)
+        Stream stream, FrameScratch scratch, string requestType, IIpcStreamingRequestHandler handler,
+        IpcRequest request, CancellationToken ct)
     {
         IAsyncEnumerator<IpcResponse> enumerator = handler.HandleStreamAsync(request, ct).GetAsyncEnumerator(ct);
         try
@@ -265,12 +310,12 @@ public sealed class IpcServer(
                 {
                     logger.LogError(ex, "Streaming handler for {RequestType} threw", requestType);
                     // Best-effort terminal error frame; the result is moot (we stop either way).
-                    await TryWriteResponseFrameAsync(stream, requestType,
+                    await TryWriteResponseFrameAsync(stream, scratch, requestType,
                         new ErrorResponse { Code = "INTERNAL_ERROR", Message = ex.Message }, ct).ConfigureAwait(false);
                     return true;
                 }
 
-                if (!await TryWriteResponseFrameAsync(stream, requestType, response, ct).ConfigureAwait(false))
+                if (!await TryWriteResponseFrameAsync(stream, scratch, requestType, response, ct).ConfigureAwait(false))
                     return false;                   // transport write failed/cancelled — close
             }
         }
@@ -280,27 +325,131 @@ public sealed class IpcServer(
         }
     }
 
-    /// <summary>Serializes and writes one response frame, swapping an oversized payload for a
-    /// readable IPC_RESPONSE_TOO_LARGE error (WriteFrameAsync would otherwise throw). Returns false
-    /// when the connection should close (write failed or was cancelled).</summary>
-    private async Task<bool> TryWriteResponseFrameAsync(Stream stream, string requestType, IpcResponse response, CancellationToken ct)
+    /// <summary>Serves an event subscription: acknowledges with an <see cref="OkResponse"/> (the
+    /// client contract), then drains this subscriber's bounded channel to the wire as one event frame
+    /// each until the client disconnects (a write fails) or the server stops. A subscriber left idle
+    /// after a client vanishes is reaped on the next event's failed write, or at shutdown.</summary>
+    private async Task ServeEventSubscriptionAsync(Stream stream, FrameScratch scratch, CancellationToken ct)
     {
-        byte[] responseBytes = IpcSerializer.SerializeResponse(response);
-        if (responseBytes.Length > IpcFrameCodec.MaxPayloadBytes)
+        if (!await TryWriteResponseFrameAsync(stream, scratch, IpcRequestTypes.Subscribe, new OkResponse(), ct).ConfigureAwait(false))
+            return;
+
+        Subscriber subscriber = new();
+        _subscribers.TryAdd(subscriber, 0);
+        try
         {
-            logger.LogWarning(
-                "IPC response to \"{RequestType}\" is {Size:N0} bytes, over the {Cap:N0}-byte frame cap; replying IPC_RESPONSE_TOO_LARGE",
-                requestType, responseBytes.Length, IpcFrameCodec.MaxPayloadBytes);
-            responseBytes = IpcSerializer.SerializeResponse(new ErrorResponse
+            await foreach (byte[] frame in subscriber.Channel.Reader.ReadAllAsync(ct).ConfigureAwait(false))
             {
-                Code = "IPC_RESPONSE_TOO_LARGE",
-                Message = $"the response to \"{requestType}\" was {responseBytes.Length:N0} bytes, over the " +
-                    $"{IpcFrameCodec.MaxPayloadBytes:N0}-byte IPC frame limit — narrow the request " +
-                    "(for a dry run, set a scope folder) and retry",
-            });
+                Result write = await IpcFrameCodec.WriteFrameAsync(stream, frame, scratch.Header, ct).ConfigureAwait(false);
+                if (write.IsCanceled)
+                    return;
+                if (write.TryGetError(out string? writeError))
+                {
+                    logger.LogDebug("Event subscription ended: {Reason}", writeError);
+                    return;
+                }
+            }
+        }
+        finally
+        {
+            _subscribers.TryRemove(subscriber, out _);
+        }
+    }
+
+    /// <summary>Per-connection scratch for writing frames: one growable serialization buffer plus one
+    /// length-prefix header array, both reused for every frame this connection writes.
+    ///
+    /// <para>Not shared across connections and not static — <c>WriteFrameAsync</c> is async, so a
+    /// shared header would be torn by interleaved writes. Safe as per-connection state because a
+    /// connection serves its requests strictly sequentially (§3.2).</para>
+    ///
+    /// <para><see cref="ArrayBufferWriter{T}"/> never shrinks, so one unusually large response would
+    /// otherwise pin its peak for the connection's whole life. <see cref="BeginFrame"/> drops a buffer
+    /// that grew past <see cref="MaxRetainedCapacityBytes"/> and starts fresh; steady-state frames sit
+    /// far below that and keep reusing the same array.</para></summary>
+    private sealed class FrameScratch
+    {
+        /// <summary>Comfortably above a normal frame (the streamed dry run budgets its chunks well
+        /// under the 85,000-byte Large Object Heap threshold), low enough that a one-off multi-megabyte
+        /// response does not stay resident.</summary>
+        private const int MaxRetainedCapacityBytes = 256 * 1024;
+
+        /// <summary>Sized so a typical frame never triggers a growth copy, while an idle connection
+        /// (the UI holds one open) costs a few KB rather than a few hundred.</summary>
+        private const int InitialCapacityBytes = 16 * 1024;
+
+        private ArrayBufferWriter<byte> _buffer = new(InitialCapacityBytes);
+
+        public byte[] Header { get; } = new byte[IpcFrameCodec.HeaderBytes];
+
+        /// <summary>Returns the buffer to serialize the next frame into, emptied.</summary>
+        public ArrayBufferWriter<byte> BeginFrame()
+        {
+            if (_buffer.Capacity > MaxRetainedCapacityBytes)
+                _buffer = new ArrayBufferWriter<byte>(InitialCapacityBytes);
+            else
+                _buffer.ResetWrittenCount();
+            return _buffer;
         }
 
-        Result writeResult = await IpcFrameCodec.WriteFrameAsync(stream, responseBytes, ct).ConfigureAwait(false);
+        /// <summary>Discards a buffer that grew past the frame cap and returns a fresh one. Separate
+        /// from <see cref="BeginFrame"/> because the oversize reply is written within the same frame,
+        /// after the payload that overflowed has already been measured.</summary>
+        public ArrayBufferWriter<byte> ResetOversized()
+        {
+            _buffer = new ArrayBufferWriter<byte>(InitialCapacityBytes);
+            return _buffer;
+        }
+    }
+
+    /// <summary>One event-subscription connection: a bounded, drop-oldest channel of pre-serialized
+    /// event frames the connection's writer task drains.</summary>
+    private sealed class Subscriber
+    {
+        public Channel<byte[]> Channel { get; } = System.Threading.Channels.Channel.CreateBounded<byte[]>(
+            new BoundedChannelOptions(SubscriberQueueCapacity)
+            {
+                FullMode = BoundedChannelFullMode.DropOldest,
+                SingleReader = true,
+                SingleWriter = false,
+            });
+    }
+
+    /// <summary>Serializes and writes one response frame, swapping an oversized payload for a
+    /// readable IPC_RESPONSE_TOO_LARGE error (WriteFrameAsync would otherwise throw). Returns false
+    /// when the connection should close (write failed or was cancelled).
+    ///
+    /// <para>Serializes into the connection's reusable buffer rather than a fresh <c>byte[]</c> per
+    /// frame. A streamed dry run emits thousands of frames on one connection, and every array from
+    /// 85,000 bytes up lands on the uncompacted Large Object Heap — churn that shows up as lasting
+    /// committed memory, not a transient write. The oversize guard reads <c>WrittenCount</c>, so the
+    /// normal path still serializes exactly once.</para></summary>
+    private async Task<bool> TryWriteResponseFrameAsync(
+        Stream stream, FrameScratch scratch, string requestType, IpcResponse response, CancellationToken ct)
+    {
+        ArrayBufferWriter<byte> buffer = scratch.BeginFrame();
+        IpcSerializer.SerializeResponse(response, buffer);
+        if (buffer.WrittenCount > IpcFrameCodec.MaxPayloadBytes)
+        {
+            int oversize = buffer.WrittenCount;
+            logger.LogWarning(
+                "IPC response to \"{RequestType}\" is {Size:N0} bytes, over the {Cap:N0}-byte frame cap; replying IPC_RESPONSE_TOO_LARGE",
+                requestType, oversize, IpcFrameCodec.MaxPayloadBytes);
+            // Drop the oversized payload before writing the replacement — otherwise the reply would be
+            // appended to it. ResetOversized also releases the buffer that grew past the cap instead of
+            // pinning 16+ MB for this connection's remaining life.
+            buffer = scratch.ResetOversized();
+            IpcSerializer.SerializeResponse(new ErrorResponse
+            {
+                Code = "IPC_RESPONSE_TOO_LARGE",
+                Message = $"the response to \"{requestType}\" was {oversize:N0} bytes, over the " +
+                    $"{IpcFrameCodec.MaxPayloadBytes:N0}-byte IPC frame limit — narrow the request " +
+                    "(for a dry run, set a scope folder) and retry",
+            }, buffer);
+        }
+
+        Result writeResult = await IpcFrameCodec
+            .WriteFrameAsync(stream, buffer.WrittenMemory, scratch.Header, ct).ConfigureAwait(false);
         if (writeResult.IsCanceled)
             return false;                           // shutdown
         if (writeResult.TryGetError(out string? writeError))

@@ -22,9 +22,8 @@ public sealed class DeleteProfileHandler(
             return Task.FromResult(failure);
         }
 
-        Result reload = catalog.Reload();
-        if (reload.TryGetError(out string? reloadError))
-            logger.LogWarning("Catalog reload after delete failed: {Error}", reloadError);
+        if (CatalogReloadGuard.Check(catalog, logger, "PROFILE_DELETE_FAILED", "deleted") is { } reloadFailure)
+            return Task.FromResult<IpcResponse>(reloadFailure);
 
         IpcResponse response = new OkResponse();
         return Task.FromResult(response);
