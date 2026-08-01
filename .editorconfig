@@ -1,0 +1,7 @@
+# Root EditorConfig. Keeps C# sources UTF-8 WITHOUT a byte-order mark ("utf-8" here means no BOM;
+# the BOM variant is "utf-8-bom") — the repo has a mix today, and this stops edits from flipping a
+# file's encoding back and forth and polluting diffs. third_party/ submodules carry their own config.
+root = true
+
+[*.cs]
+charset = utf-8

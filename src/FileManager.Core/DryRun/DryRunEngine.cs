@@ -49,7 +49,7 @@ public sealed class DryRunEngine(
 {
     /// <summary>Report size guards: a serialized report must fit an IPC frame (16 MiB cap, §3.1).
     /// The byte budget is the guarantee — each record's size is a cheap tight upper-bound estimate
-    /// (<see cref="UpperBoundBytes(PhysicalFile)"/> / <see cref="StringUpperBound"/>, never actual
+    /// (<see cref="UpperBoundBytes(DryRunFile)"/> / <see cref="StringUpperBound(string)"/>, never actual
     /// serialization) and the report truncates when the running total would exceed it (16 MiB minus
     /// the response envelope and headroom for future additive fields). Because the estimate is an
     /// upper bound, the true serialized report is always smaller than the budget. The file-count cap
@@ -57,12 +57,33 @@ public sealed class DryRunEngine(
     internal const int MaxReportBytes = 12 * 1024 * 1024;
     internal const int MaxReportedFiles = 50_000;
 
-    /// <summary>Streaming (<see cref="SimulateStreamAsync"/>) has no report ceiling — the report is
-    /// split across many frames, so a chunk only needs to sit comfortably under the 16 MiB frame
-    /// cap. A traditional ~1 MiB per chunk (bounded by the cheap <see cref="UpperBoundBytes(PhysicalFile)"/>
-    /// estimate, so the true serialized size is always smaller) keeps per-message memory low and
-    /// leaves generous headroom under the cap. On a local pipe the extra frames cost nothing.</summary>
-    internal const int ChunkByteThreshold = 1 * 1024 * 1024;
+    /// <summary>Per-chunk budget for the streamed path, in the WIRE shape's currency
+    /// (<see cref="WireUpperBoundBytes(IPhysicalFileView)"/>) — the same currency the batched
+    /// <c>ReportBuilder</c> already measures in.
+    ///
+    /// <para>The binding constraint is NOT the 16 MiB protocol cap; it is the 85,000-byte Large Object
+    /// Heap threshold. Each response is serialized into a fresh exact-size <c>byte[]</c>, so any frame
+    /// at or above that lands on the LOH — which is not compacted by default and only collected with a
+    /// gen2, i.e. it is a lasting addition to the process's committed footprint rather than a transient
+    /// write. At 48 KiB of (deliberately generous) estimate the measured frames land around 25–35 KB,
+    /// leaving roughly 2.5–3× headroom even for a directory-per-file tree, whose extra
+    /// <c>DryRunDirectory</c> records this estimate does not itself account for.
+    /// <c>DryRunFrameSizeTests</c> is what keeps that true.</para>
+    ///
+    /// <para>The previous 1 MiB was measured against the engine's PRE-normalization shape (a full
+    /// absolute Path plus Root at up to 6 bytes/char), which over-counts the wire form — carrying only
+    /// a file name plus two ints — by roughly 6–10×. So it produced ~100–170 KB frames: over the LOH
+    /// line, and nowhere near the 1 MB it read as.</para></summary>
+    internal const int WireChunkByteBudget = 48 * 1024;
+
+    /// <summary>Bytes the disk-backed spool buffers in memory before spilling to a file.
+    ///
+    /// <para>Deliberately NOT tied to <see cref="WireChunkByteBudget"/>, though it used to share the
+    /// chunk constant. They answer different questions: the chunk budget bounds one IPC frame, this
+    /// bounds the spool's pre-spill buffer. Pinning this to 48 KiB would send almost every run —
+    /// including small ones that comfortably fit in memory today — through a scratch file, which is a
+    /// separate trade needing its own measurement rather than a side effect of a frame-size fix.</para></summary>
+    internal const int SpoolSpillThresholdBytes = 1 * 1024 * 1024;
 
     /// <summary>Streaming lifts the frame-cap ceiling, but not the good sense of an upper limit. The
     /// evaluated results (<see cref="ScanAndEvaluateAsync"/>) have to be fully materialized to sort
@@ -82,9 +103,9 @@ public sealed class DryRunEngine(
     /// truncation is reachable without tens of thousands of real files.</summary>
     internal int ReportByteBudget { get; init; } = MaxReportBytes;
 
-    /// <summary>Test seam: production uses <see cref="ChunkByteThreshold"/>; tests shrink it so a
+    /// <summary>Test seam: production uses <see cref="WireChunkByteBudget"/>; tests shrink it so a
     /// stream splits into several chunks without generating a megabyte of files.</summary>
-    internal int ChunkByteBudget { get; init; } = ChunkByteThreshold;
+    internal int ChunkByteBudget { get; init; } = WireChunkByteBudget;
 
     /// <summary>Test seam: production uses <see cref="MaxStreamedFiles"/>; tests shrink it so the
     /// candidate cap is reachable without generating half a million files.</summary>
@@ -100,8 +121,8 @@ public sealed class DryRunEngine(
     internal IDryRunSpoolFactory? SpoolFactory { get; init; }
 
     /// <summary>Test seam: bytes buffered in memory before the disk-backed spool spills to a file.
-    /// Production uses <see cref="ChunkByteThreshold"/>; tests shrink it to force a spill.</summary>
-    internal long SpillThresholdBytes { get; init; } = ChunkByteThreshold;
+    /// Production uses <see cref="SpoolSpillThresholdBytes"/>; tests shrink it to force a spill.</summary>
+    internal long SpillThresholdBytes { get; init; } = SpoolSpillThresholdBytes;
 
     /// <summary>Test seam: the carrier pool the streamed read-back rents from. Null (production) builds
     /// a fresh pool per run; tests inject one so they can assert every rented carrier was recycled
@@ -259,7 +280,7 @@ public sealed class DryRunEngine(
     /// the single-frame budget reports every file. Reuses the same fused scan+evaluate pipeline, but
     /// spools each finding in discovery (completion) order — no global sort — so the whole evaluated
     /// set is never buffered (the spool spills to disk past a threshold); the replay is buffered into a
-    /// chunk and flushed once its cheap upper-bound size crosses <see cref="ChunkByteThreshold"/>.
+    /// chunk and flushed once its cheap upper-bound size crosses <see cref="WireChunkByteBudget"/>.
     /// Indices are assigned globally across chunks so the consumer can concatenate them; the client
     /// sorts the concatenated report for display. The destination sweep is left to the handler (which
     /// runs it after the file phase). A fatal setup/scan error is a single failure item that ends the
@@ -857,17 +878,29 @@ public sealed class DryRunEngine(
 
     private static long BundleUpperBound(IEvaluationView bundle)
     {
-        long bytes = UpperBoundBytes(bundle.SourceFile) + UpperBoundBytes(bundle.SourceOp);
-        foreach (IPhysicalFileView f in bundle.DestinationFiles) bytes += UpperBoundBytes(f);
-        foreach (IFileOperationView o in bundle.DestinationOps) bytes += UpperBoundBytes(o);
+        long bytes = WireUpperBoundBytes(bundle.SourceFile) + WireUpperBoundBytes(bundle.SourceOp);
+        foreach (IPhysicalFileView f in bundle.DestinationFiles) bytes += WireUpperBoundBytes(f);
+        foreach (IFileOperationView o in bundle.DestinationOps) bytes += WireUpperBoundBytes(o);
         return bytes;
     }
 
-    private static long UpperBoundBytes(IPhysicalFileView file) =>
-        PhysicalFileStructuralBytes + StringUpperBound(file.Path) + StringUpperBound(file.Root);
+    /// <summary>The serialized upper bound of what an engine-shape file will cost ON THE WIRE, i.e.
+    /// after <c>DryRunDirectoryTableBuilder</c> normalizes it into a <see cref="DryRunFile"/>: the
+    /// directory and root collapse to two ints in a shared table, so the only string left is the file
+    /// name. Measuring the full <c>Path</c> and <c>Root</c> instead — as the streamed path used to —
+    /// over-counts a ~90-char path by roughly 6–10× and silently turns a nominal budget into frames
+    /// several times smaller than intended.
+    ///
+    /// <para>What this does NOT count is the <see cref="DryRunDirectory"/> entries a chunk first
+    /// references; the streamed accumulator does not own the directory table (the handler converts
+    /// after chunking). <see cref="WireChunkByteBudget"/>'s headroom is what absorbs those, and
+    /// <c>DryRunFrameSizeTests</c> exercises the directory-per-file worst case.</para></summary>
+    internal static long WireUpperBoundBytes(IPhysicalFileView file) =>
+        PhysicalFileStructuralBytes + StringUpperBound(Path.GetFileName(file.Path.AsSpan()));
 
-    private static long UpperBoundBytes(IFileOperationView op) =>
-        OperationStructuralBytes + StringUpperBound(op.Path) + StringUpperBound(op.Root) + StringUpperBound(op.Detail);
+    /// <inheritdoc cref="WireUpperBoundBytes(IPhysicalFileView)"/>
+    internal static long WireUpperBoundBytes(IFileOperationView op) =>
+        OperationStructuralBytes + StringUpperBound(Path.GetFileName(op.Path.AsSpan())) + StringUpperBound(op.Detail);
 
     private static long UpperBoundBytes(DryRunFile file) =>
         PhysicalFileStructuralBytes + StringUpperBound(file.FileName);
@@ -894,10 +927,13 @@ public sealed class DryRunEngine(
     // path-dominated strings in a report this sits within a few percent of the exact size, versus
     // the flat 6-bytes-per-char bound it replaces (which forced an exact-serialization fallback
     // near the budget — records were serialized twice, once to measure and once for the wire).
-    internal static long StringUpperBound(string? value)
+    internal static long StringUpperBound(string? value) =>
+        value is null ? 0 : StringUpperBound(value.AsSpan());
+
+    /// <summary>Span overload so a caller can bound a slice of a larger string — notably the file-name
+    /// segment of an absolute path — without allocating the substring just to measure it.</summary>
+    internal static long StringUpperBound(ReadOnlySpan<char> value)
     {
-        if (value is null)
-            return 0;
         long bytes = 2;   // the surrounding quotes
         foreach (char c in value)
             bytes += c < 128 && UnescapedAscii[c] ? 1 : 6;

@@ -1,5 +1,6 @@
 using FileManager.Contracts.Primitives;
 using System;
+using System.Buffers;
 using System.Text.Json;
 
 namespace FileManager.Contracts.IPC;
@@ -18,6 +19,24 @@ public static class IpcSerializer
 
     public static byte[] SerializeEvent(EngineEvent evt) =>
         JsonSerializer.SerializeToUtf8Bytes(evt, FileManagerJsonContext.Default.EngineEvent);
+
+    /// <summary>Serializes into a caller-owned buffer instead of a fresh exact-size <c>byte[]</c>.
+    ///
+    /// <para>Exists for the server's response path, where one connection can emit thousands of frames
+    /// in a single streamed dry run. <see cref="SerializeResponse(IpcResponse)"/> allocates a new array
+    /// per frame; anything from 85,000 bytes lands on the Large Object Heap, which is uncompacted by
+    /// default and only collected with a gen2, so the churn becomes lasting committed memory rather
+    /// than a transient write. A reused writer turns all of it into one buffer that grows once.</para>
+    ///
+    /// <para>Goes through the BASE-type <c>JsonTypeInfo</c> for the same reason the whole class does:
+    /// serializing as the derived type would drop the <c>"type"</c> discriminator under source
+    /// generation and silently break the wire format.</para></summary>
+    public static void SerializeResponse(IpcResponse response, IBufferWriter<byte> destination)
+    {
+        ArgumentNullException.ThrowIfNull(destination);
+        using Utf8JsonWriter writer = new(destination);
+        JsonSerializer.Serialize(writer, response, FileManagerJsonContext.Default.IpcResponse);
+    }
 
     /// <summary>Failure on malformed JSON or an unknown discriminator, carrying the parse detail
     /// so callers can log why the frame was rejected (never throws for bad input from the wire).</summary>

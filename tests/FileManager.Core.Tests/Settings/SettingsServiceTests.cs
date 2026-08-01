@@ -192,6 +192,39 @@ public sealed class SettingsServiceTests : IDisposable
     }
 
     [Fact]
+    public void A_settings_file_predating_the_memory_release_flag_keeps_the_feature_on()
+    {
+        // The upgrade case, and the reason the field has a nullable backing store. The source
+        // generator does not run property initializers for absent members, so a plain `bool` would
+        // deserialize to false here and silently disable memory release for every existing install.
+        File.WriteAllText(_paths.SettingsFilePath,
+            """
+            {"SchemaVersion":5,"ServiceStartupMode":"StartAndStopWithProgram"}
+            """);
+
+        Assert.True(NewService().Current.ReleaseMemoryAfterLargeOperations);
+    }
+
+    [Fact]
+    public void Memory_release_round_trips_off_and_stays_absent_when_left_on()
+    {
+        NewService().Update(new GlobalSettings { ReleaseMemoryAfterLargeOperations = false });
+        Assert.False(NewService().Current.ReleaseMemoryAfterLargeOperations);
+
+        // Back to the default: it collapses to the absent representation rather than pinning `true`,
+        // so an omitted field and an explicit default stay value-equal (the record's equality is what
+        // the settings window's dirty flag is built on).
+        NewService().Update(new GlobalSettings { ReleaseMemoryAfterLargeOperations = true });
+        using var doc = System.Text.Json.JsonDocument.Parse(File.ReadAllText(_paths.SettingsFilePath));
+        Assert.True(
+            !doc.RootElement.TryGetProperty("ReleaseMemoryAfterLargeOperations", out var el)
+                || el.ValueKind == System.Text.Json.JsonValueKind.Null,
+            "the default (on) must stay absent in settings.json");
+        Assert.True(NewService().Current.ReleaseMemoryAfterLargeOperations);
+        Assert.Equal(GlobalSettings.Default, new GlobalSettings { ReleaseMemoryAfterLargeOperations = true });
+    }
+
+    [Fact]
     public void Default_startup_mode_is_start_and_stop_with_program()
     {
         Assert.Equal(ServiceStartupMode.StartAndStopWithProgram, NewService().Current.ServiceStartupMode);

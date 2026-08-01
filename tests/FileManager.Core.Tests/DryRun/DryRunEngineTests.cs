@@ -67,7 +67,7 @@ public sealed class DryRunEngineTests : IDisposable
         NewEngine(reportByteBudget, GlobalSettings.Default);
 
     private static DryRunEngine NewEngine(int reportByteBudget, GlobalSettings global) =>
-        NewEngine(reportByteBudget, DryRunEngine.ChunkByteThreshold, global);
+        NewEngine(reportByteBudget, DryRunEngine.WireChunkByteBudget, global);
 
     private static DryRunEngine NewEngine(int reportByteBudget, int chunkByteBudget, GlobalSettings global) =>
         NewEngine(reportByteBudget, chunkByteBudget, DryRunEngine.MaxStreamedFiles, global);
@@ -75,7 +75,7 @@ public sealed class DryRunEngineTests : IDisposable
     /// <summary>Shrinks the batched path's candidate cap, which also bounds its destination sweep.</summary>
     private static DryRunEngine NewEngineWithBatchCap(int maxBatchCandidates) =>
         NewEngine(
-            DryRunEngine.MaxReportBytes, DryRunEngine.ChunkByteThreshold, DryRunEngine.MaxStreamedFiles,
+            DryRunEngine.MaxReportBytes, DryRunEngine.WireChunkByteBudget, DryRunEngine.MaxStreamedFiles,
             GlobalSettings.Default, maxBatchCandidates);
 
     private static DryRunEngine NewEngine(
@@ -661,7 +661,7 @@ public sealed class DryRunEngineTests : IDisposable
         Profile profile = ProfileUnderTest();
 
         DryRunEngine engine = NewEngine(
-            DryRunEngine.MaxReportBytes, DryRunEngine.ChunkByteThreshold, maxScannedCandidates: 5,
+            DryRunEngine.MaxReportBytes, DryRunEngine.WireChunkByteBudget, maxScannedCandidates: 5,
             GlobalSettings.Default);
         List<(string SourcePath, OperationKind Kind)> streamed = await CollectStream(engine, profile);
 
@@ -861,7 +861,7 @@ public sealed class DryRunEngineTests : IDisposable
         SourceFile("a.txt");
         Profile profile = ProfileUnderTest();
         DryRunEngine engine = BuildEngine(GlobalSettings.Default, chunkByteBudget: 1 << 20,
-            spillThresholdBytes: DryRunEngine.ChunkByteThreshold,
+            spillThresholdBytes: DryRunEngine.WireChunkByteBudget,
             spoolFactory: new ReadFaultingSpoolFactory(), pool: null);
 
         List<Result<DryRunChunk, string>> items = [];
@@ -912,7 +912,7 @@ public sealed class DryRunEngineTests : IDisposable
     /// <summary>An engine whose streamed path uses the in-memory spool (no serialization, no pooling) —
     /// the unpooled baseline the spilled run must match.</summary>
     private DryRunEngine InMemoryStreamEngine(int chunkByteBudget) =>
-        BuildEngine(GlobalSettings.Default, chunkByteBudget, spillThresholdBytes: DryRunEngine.ChunkByteThreshold,
+        BuildEngine(GlobalSettings.Default, chunkByteBudget, spillThresholdBytes: DryRunEngine.WireChunkByteBudget,
             spoolFactory: new InMemoryDryRunSpoolFactory(), pool: null);
 
     private static DryRunEngine BuildEngine(

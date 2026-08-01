@@ -43,19 +43,27 @@ public interface IDryRunEngine
 /// synchronously before pulling the next). No consumer may retain a chunk's files/ops — or an object
 /// reachable from them — past its own iteration step. Copy out anything you keep (paths, sizes),
 /// exactly as the existing consumers do.</para></summary>
+/// <para><paramref name="SweepCapped"/> is the destination sweep's counterpart, set on a trailing
+/// marker chunk when <c>DestinationProjector.SweepStreamAsync</c> hit its entry bound. It needs its own
+/// flag because <paramref name="ScanTruncated"/> is ORed in by the handler BEFORE the sweep runs (it is
+/// what suppresses the sweep entirely), so it cannot carry a signal the sweep discovers afterwards.</para>
 public sealed record DryRunChunk(
     IReadOnlyList<IPhysicalFileView> SourceFiles,
     IReadOnlyList<IPhysicalFileView> DestinationFiles,
     IReadOnlyList<IFileOperationView> SourceOperations,
     IReadOnlyList<IFileOperationView> DestinationOperations,
-    bool ScanTruncated = false);
+    bool ScanTruncated = false,
+    bool SweepCapped = false);
 
-/// <summary>The destination sweep's output: pre-existing files under the target roots that no source
+/// <summary>The BATCHED destination sweep's output (<c>DestinationProjector.Sweep</c>/<c>Project</c>).
+/// No longer the streamed path's currency — <c>SweepStreamAsync</c> emits <see cref="DryRunChunk"/>s
+/// directly, precisely so it never has to materialize these two full lists.
+/// <para>Pre-existing files under the target roots that no source
 /// writes to, each paired with its operation. <see cref="Ops"/>[i] references <see cref="Files"/>[i]
 /// (its <c>SubjectIndex</c> is <c>i</c>); a caller merging this into a larger report offsets those
 /// indices by the count of destination files already collected. <see cref="WalkMs"/>/<see cref="MergeMs"/>
-/// split the sweep's own wall time (parallel directory walk vs. the serial sort/dedup merge) for the
-/// timing audit; both are 0 on the early-return (truncated / no target) paths.</summary>
+/// split the sweep's own wall time (parallel directory walk vs. the serial sort merge) for the
+/// timing audit; both are 0 on the early-return (truncated / no target) paths.</para></summary>
 public readonly record struct DestinationSweepResult(
     IReadOnlyList<PhysicalFile> Files,
     IReadOnlyList<VirtualFileOperation> Ops,

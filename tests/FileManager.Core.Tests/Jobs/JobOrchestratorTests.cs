@@ -41,7 +41,8 @@ public sealed class JobOrchestratorTests : IDisposable
         _eventSub = _bus.Subscribe(e => { lock (_events) _events.Add(e); });
 
         _orchestrator = new JobOrchestrator(_queue, catalog, _executor, planFactory, _bus, jobLog,
-            new FakePauseState(), config, TimeProvider.System, NullLogger<JobOrchestrator>.Instance);
+            new FakePauseState(), config, TimeProvider.System, NullMemoryTrimCoordinator.Instance,
+            NullLogger<JobOrchestrator>.Instance);
     }
 
     private Payload PayloadFor(Guid profileId) =>
@@ -240,7 +241,8 @@ public sealed class JobOrchestratorTests : IDisposable
         return new JobOrchestrator(
             queue, new FakeProfileCatalog(profile), executor, new JobPlanFactory(paths, config), _bus,
             new JobLogStore(paths, TimeProvider.System, NullLogger<JobLogStore>.Instance),
-            new FakePauseState(), config, TimeProvider.System, NullLogger<JobOrchestrator>.Instance);
+            new FakePauseState(), config, TimeProvider.System, NullMemoryTrimCoordinator.Instance,
+            NullLogger<JobOrchestrator>.Instance);
     }
 
     [Fact]
