@@ -29,6 +29,18 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <!-- Trade some throughput for a smaller footprint, and auto-compact a fragmented Large Object
+         Heap. There is no MSBuild property for this one, so it goes in as a raw host configuration
+         option; the AOT toolchain turns it into a runtimeknob exactly as it does for the properties
+         above, and it also reaches the generated runtimeconfig.json for the JIT dev loop.
+
+         Confirm it took effect from EngineHost's startup GC-configuration log line rather than from
+         this file: there is an open report (dotnet/runtime#93914) of a correctly-set ConserveMemory
+         producing no observable change. Revert if it does not move the measured number. -->
+    <RuntimeHostConfigurationOption Include="System.GC.ConserveMemory" Value="5" />
+  </ItemGroup>
+
+  <ItemGroup>
     <PackageReference Include="Microsoft.Extensions.Hosting" Version="10.0.9" />
     <PackageReference Include="Serilog.Extensions.Hosting" Version="10.0.0" />
     <PackageReference Include="Serilog.Sinks.File" Version="7.0.0" />
