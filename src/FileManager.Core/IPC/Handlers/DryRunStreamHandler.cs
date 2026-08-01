@@ -27,7 +27,7 @@ namespace FileManager.Core.IPC.Handlers;
 public sealed class DryRunStreamHandler(
     ILogger<DryRunStreamHandler> logger, IDryRunEngine engine, IProfileCatalog catalog, TimeProvider time,
     DestinationProjector destinationProjector, IVolumeInfoProvider volumes, EngineConfig config,
-    IEngineEventBus eventBus)
+    IEngineEventBus eventBus, IMemoryTrimCoordinator trimCoordinator)
     : IIpcStreamingRequestHandler
 {
     /// <summary>Spacing of the interleaved <see cref="DryRunProgressResponse"/> frames. The handler
@@ -69,6 +69,12 @@ public sealed class DryRunStreamHandler(
             yield return new ErrorResponse { Code = "PROFILE_NOT_FOUND", Message = $"no profile with id {typed.ProfileId}" };
             yield break;
         }
+
+        // Marks the run as in flight (which suppresses any memory trim while it is), and on disposal
+        // arms the debounce that eventually returns this run's peak to the OS. Disposal happens when
+        // the async iterator is torn down, so it covers the early yield-break paths and cancellation
+        // too, not just the happy path.
+        using IMemoryTrimScope trimScope = trimCoordinator.BeginOperation();
 
         int emitted = 0;
         // Destination files seen across the file phase — the running offset applied to the sweep's
@@ -121,6 +127,9 @@ public sealed class DryRunStreamHandler(
             DryRunChunkResponse response = converter.Convert(slice);
             destinationCount += slice.DestinationFiles.Count;
             emitted += slice.SourceFiles.Count;
+            // Updated per chunk rather than once at the end so a run that is cancelled or errors out
+            // half way still reports the memory it actually churned.
+            trimScope.Units = emitted + destinationCount;
             return response;
         }
 

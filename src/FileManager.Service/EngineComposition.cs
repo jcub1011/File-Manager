@@ -92,6 +92,10 @@ internal static class EngineComposition
         // store, profile matcher, plan factory, executor, and orchestrator that drive the substrate.
         services.AddSingleton<IPauseStateService, PauseStateService>();
         services.AddSingleton<IEngineEventBus, EngineEventBus>();
+        // Process-wide by necessity: it debounces across every operation and gates on a
+        // whole-process GC reading, so a per-request instance could not do either.
+        services.AddSingleton<MemoryTrimCoordinator>();
+        services.AddSingleton<IMemoryTrimCoordinator>(sp => sp.GetRequiredService<MemoryTrimCoordinator>());
         services.AddSingleton<IJobLogStore, JobLogStore>();
         services.AddSingleton<ITriggerQueue, TriggerQueue>();
         services.AddSingleton<IProfileMatcher, ProfileMatcher>();

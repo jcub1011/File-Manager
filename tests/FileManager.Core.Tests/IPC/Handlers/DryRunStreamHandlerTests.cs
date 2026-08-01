@@ -1,4 +1,4 @@
-using FileManager.Contracts.DryRun;
+﻿using FileManager.Contracts.DryRun;
 using FileManager.Contracts.IPC;
 using FileManager.Contracts.Primitives;
 using FileManager.Contracts.Profiles;
@@ -74,7 +74,7 @@ public sealed class DryRunStreamHandlerTests
         return new(NullLogger<DryRunStreamHandler>.Instance, engine, new FakeCatalog(profile), TimeProvider.System,
             new DestinationProjector(NullLogger<DestinationProjector>.Instance, new FakeVolumeInfoProvider(), scheduler),
             new FakeVolumeInfoProvider(), new EngineConfig(),
-            eventBus ?? new EngineEventBus(NullLogger<EngineEventBus>.Instance))
+            eventBus ?? new EngineEventBus(NullLogger<EngineEventBus>.Instance), NullMemoryTrimCoordinator.Instance)
         { MaxStreamedFiles = maxStreamedFiles };
     }
 
@@ -97,7 +97,7 @@ public sealed class DryRunStreamHandlerTests
         return new(NullLogger<DryRunStreamHandler>.Instance, engine, new FakeCatalog(), TimeProvider.System,
             new DestinationProjector(NullLogger<DestinationProjector>.Instance, new FakeVolumeInfoProvider(), scheduler),
             new FakeVolumeInfoProvider(), new EngineConfig(),
-            new EngineEventBus(NullLogger<EngineEventBus>.Instance))
+            new EngineEventBus(NullLogger<EngineEventBus>.Instance), NullMemoryTrimCoordinator.Instance)
         { MaxStreamedFiles = maxStreamedFiles };
     }
 

@@ -1,4 +1,4 @@
-using FileManager.Contracts.DryRun;
+﻿using FileManager.Contracts.DryRun;
 using FileManager.Contracts.IPC;
 using FileManager.Contracts.Primitives;
 using FileManager.Contracts.Profiles;
@@ -158,7 +158,7 @@ public sealed class DryRunFrameSizeTests
                 NullLogger<DestinationProjector>.Instance, new FakeVolumeInfoProvider(),
                 new SyntheticScanScheduler(sweptFiles, filesPerDirectory)),
             new FakeVolumeInfoProvider(), new EngineConfig(),
-            new EngineEventBus(NullLogger<EngineEventBus>.Instance))
+            new EngineEventBus(NullLogger<EngineEventBus>.Instance), NullMemoryTrimCoordinator.Instance)
         { MaxStreamedFiles = 1_000_000 };
 
     private static async Task<List<(IpcResponse Frame, int Bytes)>> CollectWithSizes(

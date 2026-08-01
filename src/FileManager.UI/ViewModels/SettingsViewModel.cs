@@ -1,4 +1,4 @@
-using CommunityToolkit.Mvvm.ComponentModel;
+﻿using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using FileManager.Contracts.IPC;
 using FileManager.Contracts.Settings;
@@ -110,6 +110,16 @@ public sealed partial class SettingsViewModel : ViewModelBase
             ["storage", "folder", "directory", "path", "temp", "spill", "dry run", "location"],
             actionButtonText: "Browse…", actionCommand: BrowseScratchDirectoryCommand);
 
+        ReleaseMemoryAfterLargeOperations = Setting.Bool(
+            "performance.releaseMemory", "Release memory after large operations",
+            "After a large dry run settles, ask the service to compact and hand its peak memory back " +
+            "to Windows. Without this the service keeps showing that peak in Task Manager until it " +
+            "restarts. The collection is brief and only ever runs while the service is idle. Turn it " +
+            "off if you run dry runs back to back and would rather keep the warm heap.",
+            ["performance", "memory", "ram", "footprint", "gc", "garbage", "collect", "compact",
+             "release", "trim", "leak", "usage", "task manager"],
+            checkBoxLabel: "Release memory when idle");
+
         ProfilesDirectory = Setting.Text(
             "storage.profilesDirectory", "Profiles storage",
             "Where profile files are stored. Change… applies immediately: it asks whether to move the existing profiles into the new folder (defaulting to no), then switches the service to it.",
@@ -121,6 +131,7 @@ public sealed partial class SettingsViewModel : ViewModelBase
             // relocation that already succeeded.
             undoable: false);
 
+        ReleaseMemoryAfterLargeOperations.Value = GlobalSettings.Default.ReleaseMemoryAfterLargeOperations;
         ScratchDirectory.Value = GlobalSettings.DefaultScratchDirectory;
         ProfilesDirectory.Value = GlobalSettings.DefaultProfilesDirectory;
         MaxScanThreads.Value = ScanAutoDefault;
@@ -157,6 +168,7 @@ public sealed partial class SettingsViewModel : ViewModelBase
     public AutoNumberSettingViewModel PerDriveDefault { get; }
     public AutoNumberSettingViewModel MaxHashThreads { get; }
     public DriveOverridesSettingViewModel DriveOverrides { get; }
+    public BoolSettingViewModel ReleaseMemoryAfterLargeOperations { get; }
     public TextSettingViewModel ScratchDirectory { get; }
     public TextSettingViewModel ProfilesDirectory { get; }
 
@@ -186,7 +198,8 @@ public sealed partial class SettingsViewModel : ViewModelBase
             .With(Theme, ServiceExePath));
         Categories.Add(new SettingsCategoryViewModel("startup", "Service startup") { RequiresService = true }
             .With(StartupMode));
-        Categories.Add(performance.With(MaxScanThreads, PerDriveDefault, MaxHashThreads));
+        Categories.Add(performance.With(
+            MaxScanThreads, PerDriveDefault, MaxHashThreads, ReleaseMemoryAfterLargeOperations));
         Categories.Add(new SettingsCategoryViewModel("performance.advanced", "Per-drive overrides", parent: performance)
             { RequiresService = true }
             .With(DriveOverrides));
@@ -540,6 +553,7 @@ public sealed partial class SettingsViewModel : ViewModelBase
             result.TryGetValue(out GlobalSettings? settings);
             StartupMode.Value = settings!.ServiceStartupMode;
             ScratchDirectory.Value = settings.ScratchDirectory;
+            ReleaseMemoryAfterLargeOperations.Value = settings.ReleaseMemoryAfterLargeOperations;
             ProfilesDirectory.Value = settings.ProfilesDirectory;
 
             ScanThreadingSettings st = settings.ScanThreading;
@@ -669,6 +683,7 @@ public sealed partial class SettingsViewModel : ViewModelBase
             {
                 ServiceStartupMode = StartupMode.Value,
                 ScratchDirectory = scratch,
+                ReleaseMemoryAfterLargeOperations = ReleaseMemoryAfterLargeOperations.Value,
                 // The profiles directory is changed transactionally via ChangeProfilesDirectory; carry
                 // the current value through so a generic Save never resets it to the default.
                 ProfilesDirectory = ProfilesDirectory.Value,
