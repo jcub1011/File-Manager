@@ -41,6 +41,17 @@ internal static class Program
             return 0;
         }
 
+        // Checked BEFORE the trees, which take minutes to build: a mistyped or unpublished service
+        // path should cost a second, not a tree generation followed by a bare Win32Exception from
+        // Process.Start. The publish-directory hint is the common cause — `dotnet publish` leaves the
+        // exe under bin/<config>/<tfm>/<rid>/publish, and its native link silently no-ops without the
+        // MSVC toolchain, leaving that directory empty.
+        if (!options.GenerateOnly && ValidateServiceExe(options.ServiceExePath!) is { } serviceError)
+        {
+            Console.Error.WriteLine($"error: {serviceError}");
+            return 2;
+        }
+
         try
         {
             TreeBuilder.EnsureTrees(options);
@@ -55,6 +66,40 @@ internal static class Program
             Console.Error.WriteLine($"probe failed: {ex}");
             return 3;
         }
+    }
+
+    /// <summary>Null when the path is usable, else a message that names the likely cause. Returning a
+    /// message rather than throwing keeps the "bad input" exit code (2) distinct from "the run
+    /// failed" (3+), which is what makes this usable in a script.</summary>
+    private static string? ValidateServiceExe(string path)
+    {
+        string full;
+        try
+        {
+            full = Path.GetFullPath(path);
+        }
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException)
+        {
+            return $"--service is not a usable path: {ex.Message}";
+        }
+
+        if (File.Exists(full))
+            return null;
+
+        string directory = Path.GetDirectoryName(full) ?? "";
+        if (directory.EndsWith(Path.DirectorySeparatorChar + "publish", StringComparison.OrdinalIgnoreCase)
+            && Directory.Exists(directory)
+            && Directory.GetFileSystemEntries(directory).Length == 0)
+        {
+            return $"the publish directory {directory} exists but is EMPTY — `dotnet publish` did not " +
+                "complete. A NativeAOT publish needs the MSVC/C++ toolchain: run it from a Visual " +
+                "Studio Developer PowerShell, or put vswhere.exe on PATH " +
+                "(C:\\Program Files (x86)\\Microsoft Visual Studio\\Installer). Without it the ILC " +
+                "native link fails and leaves this directory empty.";
+        }
+
+        return $"the service executable {full} does not exist. Publish it first:\n" +
+            "  dotnet publish src/FileManager.Service -c Release -r win-x64";
     }
 
     private static async Task<int> MeasureAsync(Options options)
