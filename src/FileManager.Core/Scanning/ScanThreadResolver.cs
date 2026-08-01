@@ -9,10 +9,21 @@ namespace FileManager.Core.Scanning;
 /// per-drive default. Kept pure/stateless so it is trivially unit-testable without I/O.</summary>
 internal static class ScanThreadResolver
 {
-    /// <summary>Absolute ceiling on the <em>auto</em> scan-thread formula. Each scan worker is a
-    /// dedicated LongRunning thread (~1 MB of stack), so ProcessorCount * 8 would spawn 512 threads on
-    /// a 64-core box. This caps the derived value; an explicit user pin is honored as-is (floored at 1).
-    /// No effect at or below 32 cores.</summary>
+    /// <summary>Absolute ceiling on the <em>auto</em> scan-thread formula, so the derived value cannot
+    /// spawn a pathological worker count on a many-core box. An explicit user pin is honored as-is
+    /// (floored at 1).
+    ///
+    /// <para>The cost this bounds is NOT thread stacks, despite what this comment used to say. The
+    /// shipped FileManager.Service.exe reserves 1.5 MB of stack per thread but COMMITS 4 KB
+    /// (<c>SizeOfStackReserve</c> = 1,572,864, <c>SizeOfStackCommit</c> = 4,096); Windows reserves
+    /// address space and commits lazily, and the walk is iterative (<c>ScanWorkState</c> queues, not
+    /// recursion), so realistic private commit is tens of KB per thread. Reading "~1 MB of stack each"
+    /// sends you optimizing the wrong thing.</para>
+    ///
+    /// <para>What actually scales with this number is directory materialization:
+    /// <c>ScanScheduler</c> holds an entire directory level per in-flight worker, and a parked
+    /// directory keeps that queue alive. At ~320 B per entry a 1,000-entry directory is ~320 KB, so
+    /// the in-flight plus parked set is the real memory term.</para></summary>
     private const int MaxAutoScanThreads = 256;
 
     /// <summary>Global ceiling on concurrently-enumerating scan workers. Auto = ProcessorCount * 8
