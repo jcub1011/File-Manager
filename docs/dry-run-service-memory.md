@@ -1,11 +1,24 @@
 # Service dry-run memory reduction — implementation handoff
 
-> **Status: IN PROGRESS.**
-> **Done:** Stage 0 §5.1 (per-run memory log line) and §5.2 (GC config at startup); §5.3 (frame-size
-> regression test); **all of Stage 1** (§6.1 pooled serialization buffer, §6.2 `WireChunkByteBudget`,
-> §6.3 carrier string clearing); **Stage 3** (streamed sweep — see the deviation note at §8).
-> **Not done:** §5.4 (`tools/FileManager.MemoryProbe`), §5.6, **Stage 2**, **Stage 4**.
-> Stages 2 and 4 are explicitly gated on §5.4's harness and must not ship without it.
+> **Status: CODE COMPLETE, UNMEASURED.**
+> **Implemented:** Stage 0 (§5.1, §5.2, §5.3, §5.4); **Stage 1** (§6.1–§6.3); **Stage 2** (§7.1 trim
+> coordinator + setting, §7.2 both GC knobs, one commit each); **Stage 3** (streamed sweep — see the
+> deviation note at §8); **Stage 4** (§9.1 concurrency, §9.2 comment). §5.6 skipped — `MemoryProbe`
+> measures the shipped artifact, which is strictly better than an in-process retention proxy.
+>
+> **What is NOT done: §5.5's table.** Nobody has run `tools/FileManager.MemoryProbe` against a
+> sweep-heavy workload, so no stage has a before/after footprint number and §12's definition of done
+> is unmet for all of them. Three commits are explicitly provisional and should be **reverted rather
+> than kept** if they do not move the number: `ConcurrentGarbageCollection=false`,
+> `System.GC.ConserveMemory=5`, and the Stage 4.1 concurrency reduction (which additionally needs a
+> wall-time check).
+>
+> **Workload caveat, from the one real measurement taken so far (§5.5).** The machine this was
+> implemented against runs a *source-heavy* profile — 71,923 source files but only 4,735 swept
+> destination files, a 40 ms sweep — which is the inverse of the 33.5k/357k report this plan was
+> written for. Stage 3's peak reduction scales with sweep size, so it is close to a no-op there and
+> worth ~145 MB on the reported workload. Do not conclude from a source-heavy run that Stage 3 did
+> nothing; measure on a sweep-heavy one.
 >
 > **Workload caveat, from the one real measurement taken so far (§5.5).** The machine this was
 > implemented against runs a *source-heavy* profile — 71,923 source files but only 4,735 swept
@@ -333,12 +346,29 @@ FileManager.MemoryProbe.exe --tree D:\fm-memprobe `
 
 ### 5.5 Record the baseline before touching anything else
 
-Fill this in and keep it updated after every stage. **Still empty — §5.4's harness does not exist yet,
-so no end-to-end footprint number has been taken.**
+Fill this in and keep it updated after every stage. **Still empty — the harness now exists (§5.4) but
+nobody has run it against a sweep-heavy workload, so no stage has an end-to-end footprint number.**
 
-| Stage | idle | peak | t+0s | t+30s | GC heap @peak | committed @peak | wall time |
-|---|---|---|---|---|---|---|---|
-| baseline | | | | | | | |
+To fill it: check out the commit before `Add the service dry-run memory reduction handoff` for the
+baseline row, then re-run at each subsequent stage's commit.
+
+```powershell
+# from a VS Developer PowerShell (the native link needs the MSVC toolchain)
+dotnet publish src/FileManager.Service -c Release -r win-x64
+dotnet build tools/FileManager.MemoryProbe -c Release
+tools\FileManager.MemoryProbe\bin\Release\net10.0\FileManager.MemoryProbe.exe `
+  --tree D:\fm-memprobe `
+  --service src\FileManager.Service\bin\Release\net10.0\win-x64\publish\FileManager.Service.exe `
+  --settle-seconds 30 --csv memprobe.csv --label baseline
+```
+
+| Stage | idle | peak | t+0s | t+30s | wall time |
+|---|---|---|---|---|---|
+| baseline | | | | | |
+| 1 (allocation / LOH) | | | | | |
+| 2 (trim + GC knobs) | | | | | |
+| 3 (streamed sweep) | | | | | |
+| 4 (scan concurrency) | | | | | |
 
 #### Findings so far (2026-08-01)
 
