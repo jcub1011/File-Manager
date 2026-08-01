@@ -28,6 +28,7 @@ public sealed class JobOrchestrator(
     IPauseStateService pauseState,
     EngineConfig config,
     TimeProvider time,
+    IMemoryTrimCoordinator trimCoordinator,
     ILogger<JobOrchestrator> logger) : IJobOrchestrator
 {
     private readonly ConcurrentDictionary<Task, byte> _running = new();
@@ -170,6 +171,12 @@ public sealed class JobOrchestrator(
             JobCompletion completion;
             try
             {
+                // The trim scope's job here is mostly its IN-FLIGHT gate: without it the coordinator
+                // only sees dry runs, so a debounced post-preview trim could fire in the middle of a
+                // real copy and suspend the job's threads behind a blocking compacting gen2. One unit
+                // per job (a job is one payload); enough jobs accumulate to a trim like anything else.
+                using IMemoryTrimScope trimScope = trimCoordinator.BeginOperation();
+                trimScope.Units = 1;
                 // CancellationToken.None: a started job is never cancelled by shutdown (I-ATOMIC-JOB);
                 // StopAsync awaits it instead.
                 completion = await executor.ExecuteAsync(plan, progress, CancellationToken.None).ConfigureAwait(false);

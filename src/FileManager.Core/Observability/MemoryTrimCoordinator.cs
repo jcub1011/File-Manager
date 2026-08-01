@@ -60,7 +60,7 @@ public sealed class MemoryTrimCoordinator : IMemoryTrimCoordinator, IDisposable
 
     private long _pendingUnits;
     private int _inFlight;
-    private bool _disposed;
+    private volatile bool _disposed;
 
     /// <summary>Test seam: production compacts and collects. Tests substitute a recorder so the
     /// DECISION logic can be asserted without actually pausing the test host — and so a passing test
@@ -93,8 +93,26 @@ public sealed class MemoryTrimCoordinator : IMemoryTrimCoordinator, IDisposable
     {
         Interlocked.Add(ref _pendingUnits, units);
         Interlocked.Decrement(ref _inFlight);
-        if (!_disposed)
+        ArmQuietTimer();
+    }
+
+    /// <summary>(Re)arms the quiet-period debounce. The disposed check alone is a race — a scope
+    /// finishing while the service shuts down can dispose the timer between the check and the Change —
+    /// and a scope's Dispose runs inside handler teardown, where a throw would surface as a handler
+    /// fault. There is nothing left to trim at that point, so the losing side of the race is simply
+    /// swallowed.</summary>
+    private void ArmQuietTimer()
+    {
+        if (_disposed)
+            return;
+        try
+        {
             _timer.Change(QuietPeriod, Timeout.InfiniteTimeSpan);
+        }
+        catch (ObjectDisposedException)
+        {
+            // shutdown raced the re-arm; nothing left to trim
+        }
     }
 
     private void OnQuietPeriodElapsed()
@@ -105,8 +123,7 @@ public sealed class MemoryTrimCoordinator : IMemoryTrimCoordinator, IDisposable
             // this is the case condition 4 exists for.
             if (Volatile.Read(ref _inFlight) > 0)
             {
-                if (!_disposed)
-                    _timer.Change(QuietPeriod, Timeout.InfiniteTimeSpan);
+                ArmQuietTimer();
                 return;
             }
 

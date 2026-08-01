@@ -167,12 +167,20 @@ public sealed class DestinationProjector(
                 FullMode = BoundedChannelFullMode.Wait,
             });
 
+        // The producer gets a LINKED token, not the caller's: an abandoned consumer (the caller
+        // disposed this enumerator early, without cancelling ct — e.g. the client disconnected and the
+        // server tore the stream down) leaves the producer parked on the full channel with nobody ever
+        // reading again. The finally below cancels this to unpark it; awaiting it with only the
+        // caller's token would hang the dispose chain until service shutdown.
+        using CancellationTokenSource producerStop = CancellationTokenSource.CreateLinkedTokenSource(ct);
+
         // The walk runs on a pool thread because IScanSession.Consume() blocks the calling thread by
         // contract. It writes whole chunks, so the async side never touches a blocking enumerable and
         // the bounded channel is what stops a fast walk outrunning a slow pipe.
         Task producer = Task.Run(
             () => ProduceChunksAsync(
-                plan, channel.Writer, budget, maxEntries, destinationIndexBase, chunkByteBudget, progress, ct),
+                plan, channel.Writer, budget, maxEntries, destinationIndexBase, chunkByteBudget, progress,
+                producerStop.Token),
             CancellationToken.None);
 
         IAsyncEnumerator<DryRunChunk> chunks = channel.Reader.ReadAllAsync(ct).GetAsyncEnumerator(ct);
@@ -213,6 +221,12 @@ public sealed class DestinationProjector(
         finally
         {
             await chunks.DisposeAsync().ConfigureAwait(false);
+            // Unpark an abandoned producer BEFORE observing it: with the consumer gone the bounded
+            // channel never drains, so a producer mid-WriteAsync would otherwise keep this await (and
+            // the whole dispose chain above it) waiting until the caller's token finally fires — which
+            // for the IPC server is service shutdown, not client disconnect. A no-op when the producer
+            // already completed.
+            producerStop.Cancel();
             // Always observe the producer: an abandoned enumerator (the consumer broke early) would
             // otherwise leave the walk running with nobody reading its fault.
             try { await producer.ConfigureAwait(false); }

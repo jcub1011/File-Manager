@@ -413,6 +413,33 @@ public sealed class DestinationProjectorTests : IDisposable
     }
 
     [Fact]
+    public async Task Streamed_sweep_teardown_completes_when_the_consumer_abandons_early()
+    {
+        // The IPC server's real failure mode: a client disconnect disposes the enumerator WITHOUT
+        // cancelling the token (that token is the server's, and only fires on shutdown). At that
+        // point the producer is parked mid-WriteAsync on the full bounded channel with nobody ever
+        // reading again, so the sweep must unpark it itself — otherwise DisposeAsync (and with it the
+        // connection task and the open scan session) hangs until the service stops.
+        for (int i = 0; i < 60; i++)
+            TargetFile(Path.Combine($"d{i % 4}", $"f{i}.txt"));
+
+        // The tiny budget splits the sweep into many chunks, so after one read the producer still has
+        // chunks to write and is parked on the (capacity 2) channel — the abandoned state under test.
+        IAsyncEnumerator<Result<DryRunChunk, string>> stream = NewProjector(Workers)
+            .SweepStreamAsync(
+                Mirror(), new HashSet<NormalizedPath>(), truncated: false,
+                maxEntries: int.MaxValue, destinationIndexBase: 0, chunkByteBudget: 800,
+                progress: null, CancellationToken.None)
+            .GetAsyncEnumerator(CancellationToken.None);
+
+        Assert.True(await stream.MoveNextAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(30)),
+            "expected at least one sweep chunk before abandoning");
+
+        // Abandon: no cancellation, no draining. Hangs forever without the producer-side unpark.
+        await stream.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(10));
+    }
+
+    [Fact]
     public void The_entry_budget_is_respected_under_parallelism()
     {
         for (int i = 0; i < 50; i++)

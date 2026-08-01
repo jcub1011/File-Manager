@@ -228,8 +228,9 @@ internal static class Program
 
         DryRunOutcome outcome = new(
             report!.SourceFiles.Count, report.DestinationFiles.Count, report.Truncated, phases, null);
-        // report goes out of scope here; the collect below makes the harness's own footprint
-        // irrelevant to the service readings that follow.
+        // report goes out of scope here (this frame is deliberately not inlined into the caller's),
+        // so the harness's own footprint never enters the readings — every figure this tool prints is
+        // sampled from the SERVICE process, not this one.
         return outcome;
     }
 

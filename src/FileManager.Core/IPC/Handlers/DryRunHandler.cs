@@ -1,6 +1,7 @@
 using FileManager.Contracts.DryRun;
 using FileManager.Contracts.IPC;
 using FileManager.Core.DryRun;
+using FileManager.Core.Observability;
 using FileManager.Core.Profiles;
 using Microsoft.Extensions.Logging;
 using System.Linq;
@@ -9,7 +10,9 @@ using System.Threading.Tasks;
 
 namespace FileManager.Core.IPC.Handlers;
 
-public sealed class DryRunHandler(ILogger<DryRunHandler> logger, IDryRunEngine engine, IProfileCatalog catalog) : IIpcRequestHandler
+public sealed class DryRunHandler(
+    ILogger<DryRunHandler> logger, IDryRunEngine engine, IProfileCatalog catalog,
+    IMemoryTrimCoordinator trimCoordinator) : IIpcRequestHandler
 {
     public string RequestType => IpcRequestTypes.DryRun;
 
@@ -27,6 +30,10 @@ public sealed class DryRunHandler(ILogger<DryRunHandler> logger, IDryRunEngine e
             return new ErrorResponse { Code = "PROFILE_NOT_FOUND", Message = $"no profile with id {typed.ProfileId}" };
         }
 
+        // Same trim participation as the streamed handler: suppress the trim while the run is in
+        // flight, and arm the post-run debounce on disposal (which covers the error returns too).
+        using IMemoryTrimScope trimScope = trimCoordinator.BeginOperation();
+
         var simulated = await engine.SimulateAsync(profile, typed.ScopePath, ct).ConfigureAwait(false);
 
         if (simulated.IsCanceled)
@@ -36,6 +43,7 @@ public sealed class DryRunHandler(ILogger<DryRunHandler> logger, IDryRunEngine e
         if (simulated.TryGetError(out string? error))
             return new ErrorResponse { Code = "DRY_RUN_FAILED", Message = error };
         simulated.TryGetValue(out DryRunReport? report);
+        trimScope.Units = report!.SourceFiles.Count + report.DestinationFiles.Count;
         return new DryRunResponse { Report = report! };
     }
 }

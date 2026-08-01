@@ -202,6 +202,26 @@ public sealed class MemoryTrimCoordinatorTests
     }
 
     [Fact]
+    public void A_scope_finishing_after_the_coordinator_is_disposed_does_not_throw()
+    {
+        // The shutdown race: a run's trim scope is disposed inside handler teardown while the DI
+        // container is disposing the coordinator (and with it the timer). Re-arming then must be a
+        // silent no-op — a scope's Dispose runs in teardown paths where a throw would surface as a
+        // handler fault, and there is nothing left to trim anyway.
+        FakeTimeProvider time = new();
+        (MemoryTrimCoordinator coordinator, List<long> trims) = NewCoordinator(time);
+
+        IMemoryTrimScope scope = coordinator.BeginOperation();
+        scope.Units = BigRun;
+        coordinator.Dispose();
+
+        scope.Dispose();   // must not throw
+
+        time.Advance(PastQuietPeriod);
+        Assert.Empty(trims);
+    }
+
+    [Fact]
     public void An_idle_coordinator_never_trims()
     {
         // Nothing has run, so the timer must not even be armed — an always-on background service

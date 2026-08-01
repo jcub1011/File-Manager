@@ -76,6 +76,13 @@ public sealed class DryRunStreamHandler(
         // too, not just the happy path.
         using IMemoryTrimScope trimScope = trimCoordinator.BeginOperation();
 
+        // The run's own cancellation authority, cancelled ONLY when this iterator is torn down while a
+        // phase advance is still in flight (see ObserveAbandonedAdvanceAsync). ct is the SERVER's
+        // token — it fires on shutdown, never on client disconnect — so when the server abandons this
+        // stream (a frame write failed mid-run) nothing else would ever stop the engine pipeline or
+        // the sweep's producer. Both phase enumerators run on this token so that teardown can.
+        using CancellationTokenSource runCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+
         int emitted = 0;
         // Destination files seen across the file phase — the running offset applied to the sweep's
         // SubjectIndex values so they stay global once the sweep frames are appended after the file
@@ -134,62 +141,72 @@ public sealed class DryRunStreamHandler(
         }
 
         await using (IAsyncEnumerator<Result<DryRunChunk, string>> chunks = engine
-            .SimulateStreamAsync(profile, typed.ScopePath, progressCounters, ct)
-            .GetAsyncEnumerator(ct))
+            .SimulateStreamAsync(profile, typed.ScopePath, progressCounters, runCts.Token)
+            .GetAsyncEnumerator(runCts.Token))
         {
             // The engine's whole scan+evaluate pipeline runs inside the FIRST MoveNextAsync (no chunk
             // exists before the full evaluated set is sorted), so scan progress is merged into the
             // stream by polling the counters while each advance is pending. Only a changed count is
             // worth a frame — a stalled scan goes quiet instead of repeating itself.
             Task<bool> moveNext = chunks.MoveNextAsync().AsTask();
-            long lastSources = -1;
-            while (true)
+            try
             {
-                while (!moveNext.IsCompleted)
+                long lastSources = -1;
+                while (true)
                 {
-                    // Once ct fires, Task.Delay(…, ct) completes instantly and this poll would spin
-                    // a core until the engine finishes unwinding — just await the phase task (it
-                    // observes ct) instead of polling for progress nobody will see.
-                    if (ct.IsCancellationRequested)
-                        break;
-                    await Task.WhenAny(moveNext, Task.Delay(ProgressInterval, ct)).ConfigureAwait(false);
-                    if (!moveNext.IsCompleted && progressCounters.Sources != lastSources)
+                    while (!moveNext.IsCompleted)
                     {
-                        lastSources = progressCounters.Sources;
-                        yield return new DryRunProgressResponse
+                        // Once ct fires, Task.Delay(…, ct) completes instantly and this poll would spin
+                        // a core until the engine finishes unwinding — just await the phase task (it
+                        // observes ct) instead of polling for progress nobody will see.
+                        if (ct.IsCancellationRequested)
+                            break;
+                        await Task.WhenAny(moveNext, Task.Delay(ProgressInterval, ct)).ConfigureAwait(false);
+                        if (!moveNext.IsCompleted && progressCounters.Sources != lastSources)
                         {
-                            Phase = DryRunProgressPhase.ScanningSources,
-                            SourceFiles = lastSources,
-                            DestinationFiles = destinationCount,
-                        };
+                            lastSources = progressCounters.Sources;
+                            yield return new DryRunProgressResponse
+                            {
+                                Phase = DryRunProgressPhase.ScanningSources,
+                                SourceFiles = lastSources,
+                                DestinationFiles = destinationCount,
+                            };
+                        }
                     }
-                }
-                // Propagates engine faults and cancellation exactly as the plain foreach did.
-                if (!await moveNext.ConfigureAwait(false))
-                    break;
-                Result<DryRunChunk, string> chunk = chunks.Current;
+                    // Propagates engine faults and cancellation exactly as the plain foreach did.
+                    if (!await moveNext.ConfigureAwait(false))
+                        break;
+                    Result<DryRunChunk, string> chunk = chunks.Current;
 
-                if (chunk.TryGetError(out string? error))
-                {
-                    yield return new ErrorResponse { Code = "DRY_RUN_FAILED", Message = error };
-                    yield break;
-                }
-                chunk.TryGetValue(out DryRunChunk? slice);
-                // The engine sets ScanTruncated once its candidate scan is cut short. OR it in BEFORE the
-                // sweep so a prefix-only survivor set never drives a (bogus) Mirror-deletion preview.
-                truncated |= slice!.ScanTruncated;
-                yield return ConsumeSlice(slice, collectSurvivors: true);
+                    if (chunk.TryGetError(out string? error))
+                    {
+                        yield return new ErrorResponse { Code = "DRY_RUN_FAILED", Message = error };
+                        yield break;
+                    }
+                    chunk.TryGetValue(out DryRunChunk? slice);
+                    // The engine sets ScanTruncated once its candidate scan is cut short. OR it in BEFORE the
+                    // sweep so a prefix-only survivor set never drives a (bogus) Mirror-deletion preview.
+                    truncated |= slice!.ScanTruncated;
+                    yield return ConsumeSlice(slice, collectSurvivors: true);
 
-                if (emitted >= MaxStreamedFiles)
-                {
-                    logger.LogWarning(
-                        "Dry-run (stream) for profile {ProfileId} hit the {Cap:N0}-file safety bound; report truncated",
-                        typed.ProfileId, MaxStreamedFiles);
-                    truncated = true;
-                    break;
-                }
+                    if (emitted >= MaxStreamedFiles)
+                    {
+                        logger.LogWarning(
+                            "Dry-run (stream) for profile {ProfileId} hit the {Cap:N0}-file safety bound; report truncated",
+                            typed.ProfileId, MaxStreamedFiles);
+                        truncated = true;
+                        break;
+                    }
 
-                moveNext = chunks.MoveNextAsync().AsTask();
+                    moveNext = chunks.MoveNextAsync().AsTask();
+                }
+            }
+            finally
+            {
+                // Ordered before the await-using's dispose: it must never run against an in-flight
+                // MoveNextAsync (a pending advance is the NORMAL state at the progress yields above,
+                // so a torn-down stream is routinely suspended exactly there).
+                await ObserveAbandonedAdvanceAsync(moveNext, runCts).ConfigureAwait(false);
             }
         }
 
@@ -233,60 +250,70 @@ public sealed class DryRunStreamHandler(
             await using IAsyncEnumerator<Result<DryRunChunk, string>> sweepChunks = destinationProjector
                 .SweepStreamAsync(
                     profile, survivors, truncated, sweepBudget, sweepIndexBase,
-                    DryRunEngine.WireChunkByteBudget, progressCounters, ct)
-                .GetAsyncEnumerator(ct);
+                    DryRunEngine.WireChunkByteBudget, progressCounters, runCts.Token)
+                .GetAsyncEnumerator(runCts.Token);
 
             Task<bool> sweepMoveNext = sweepChunks.MoveNextAsync().AsTask();
-            long lastDestinations = -1;
-            while (true)
+            try
             {
-                // Same throttled-progress poll as the scan phase: the walk can spend seconds between
-                // chunks on a big tree, and the live count is the only sign of life. Data frames now
-                // interleave with these instead of arriving in one burst after a blocking call.
-                while (!sweepMoveNext.IsCompleted)
+                long lastDestinations = -1;
+                while (true)
                 {
-                    // Anti-spin guard: a cancelled token makes Task.Delay(…, ct) complete instantly.
-                    if (ct.IsCancellationRequested)
-                        break;
-                    await Task.WhenAny(sweepMoveNext, Task.Delay(ProgressInterval, ct)).ConfigureAwait(false);
-                    if (!sweepMoveNext.IsCompleted && progressCounters.Destinations != lastDestinations)
+                    // Same throttled-progress poll as the scan phase: the walk can spend seconds between
+                    // chunks on a big tree, and the live count is the only sign of life. Data frames now
+                    // interleave with these instead of arriving in one burst after a blocking call.
+                    while (!sweepMoveNext.IsCompleted)
                     {
-                        lastDestinations = progressCounters.Destinations;
-                        yield return new DryRunProgressResponse
+                        // Anti-spin guard: a cancelled token makes Task.Delay(…, ct) complete instantly.
+                        if (ct.IsCancellationRequested)
+                            break;
+                        await Task.WhenAny(sweepMoveNext, Task.Delay(ProgressInterval, ct)).ConfigureAwait(false);
+                        if (!sweepMoveNext.IsCompleted && progressCounters.Destinations != lastDestinations)
                         {
-                            Phase = DryRunProgressPhase.SweepingDestinations,
-                            SourceFiles = progressCounters.Sources,
-                            DestinationFiles = sweepIndexBase + lastDestinations,
-                        };
+                            lastDestinations = progressCounters.Destinations;
+                            yield return new DryRunProgressResponse
+                            {
+                                Phase = DryRunProgressPhase.SweepingDestinations,
+                                SourceFiles = progressCounters.Sources,
+                                DestinationFiles = sweepIndexBase + lastDestinations,
+                            };
+                        }
                     }
-                }
-                if (!await sweepMoveNext.ConfigureAwait(false))
-                    break;
-                Result<DryRunChunk, string> sweepChunk = sweepChunks.Current;
+                    if (!await sweepMoveNext.ConfigureAwait(false))
+                        break;
+                    Result<DryRunChunk, string> sweepChunk = sweepChunks.Current;
 
-                if (sweepChunk.TryGetError(out string? sweepError))
-                {
-                    yield return new ErrorResponse { Code = "DRY_RUN_FAILED", Message = sweepError };
-                    yield break;
-                }
-                sweepChunk.TryGetValue(out DryRunChunk? sweepSlice);
-                if (sweepSlice!.SweepCapped)
-                {
-                    logger.LogWarning(
-                        "Dry-run (stream) destination sweep for profile {ProfileId} hit the {Cap:N0}-entry bound; report truncated",
-                        typed.ProfileId, MaxStreamedFiles);
-                    truncated = true;
-                }
-                sweptCount += sweepSlice.DestinationFiles.Count;
-                // The capped marker is an empty chunk; don't put an empty frame on the wire for it.
-                if (sweepSlice.DestinationFiles.Count == 0)
-                {
+                    if (sweepChunk.TryGetError(out string? sweepError))
+                    {
+                        yield return new ErrorResponse { Code = "DRY_RUN_FAILED", Message = sweepError };
+                        yield break;
+                    }
+                    sweepChunk.TryGetValue(out DryRunChunk? sweepSlice);
+                    if (sweepSlice!.SweepCapped)
+                    {
+                        logger.LogWarning(
+                            "Dry-run (stream) destination sweep for profile {ProfileId} hit the {Cap:N0}-entry bound; report truncated",
+                            typed.ProfileId, MaxStreamedFiles);
+                        truncated = true;
+                    }
+                    sweptCount += sweepSlice.DestinationFiles.Count;
+                    // The capped marker is an empty chunk; don't put an empty frame on the wire for it.
+                    if (sweepSlice.DestinationFiles.Count == 0)
+                    {
+                        sweepMoveNext = sweepChunks.MoveNextAsync().AsTask();
+                        continue;
+                    }
+                    yield return ConsumeSlice(sweepSlice, collectSurvivors: false);
+
                     sweepMoveNext = sweepChunks.MoveNextAsync().AsTask();
-                    continue;
                 }
-                yield return ConsumeSlice(sweepSlice, collectSurvivors: false);
-
-                sweepMoveNext = sweepChunks.MoveNextAsync().AsTask();
+            }
+            finally
+            {
+                // Same ordering as the file phase: never let the await-using dispose the sweep
+                // enumerator while an advance is in flight, and unpark the sweep's producer so its
+                // own dispose (which awaits the producer) can complete.
+                await ObserveAbandonedAdvanceAsync(sweepMoveNext, runCts).ConfigureAwait(false);
             }
         }
         sweepWatch.Stop();
@@ -349,6 +376,35 @@ public sealed class DryRunStreamHandler(
                 Message = $"{progressCounters.Skipped} item(s) under the scanned source(s) could not be read and are missing from this preview (see the service log for details).",
             });
         yield return new DryRunCompleteResponse { GeneratedAt = time.GetUtcNow(), Truncated = truncated, Space = space };
+    }
+
+    /// <summary>Makes a phase's teardown safe when this iterator is disposed with an advance still in
+    /// flight — the NORMAL suspension state at the interleaved progress yields, and one the server
+    /// reaches routinely (a failed frame write on client disconnect disposes the handler without
+    /// cancelling its token, which is the server-lifetime token).
+    ///
+    /// <para>Two hazards, one ordering: disposing a compiler-generated async iterator while its
+    /// MoveNextAsync is pending throws (abandoning the underlying pipeline/producer entirely), and the
+    /// sweep enumerator's own dispose awaits a producer that only unparks on cancellation. So: cancel
+    /// the run's linked token, then await the pending advance — only after that may the enclosing
+    /// await-using dispose the enumerator. On every non-abandonment path the advance is already
+    /// consumed and this is a completed-task no-op that cancels nothing.</para></summary>
+    private async Task ObserveAbandonedAdvanceAsync(Task<bool> pendingAdvance, CancellationTokenSource runCts)
+    {
+        if (!pendingAdvance.IsCompleted)
+            runCts.Cancel();
+        try
+        {
+            await pendingAdvance.ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            // Last resort (this runs in a finally and must not throw): the expected shape is the
+            // OperationCanceledException from the cancel above; a genuine fault was either already
+            // surfaced as a failure item on the normal path or belongs to a stream nobody is
+            // consuming anymore.
+            logger.LogDebug(ex, "Dry-run stream advance abandoned during teardown");
+        }
     }
 
     /// <summary>Converts the engine's stringy slices to the normalized wire shape. One instance owns
