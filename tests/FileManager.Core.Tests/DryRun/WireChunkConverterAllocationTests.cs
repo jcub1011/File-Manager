@@ -1,4 +1,5 @@
 using FileManager.Contracts.DryRun;
+using FileManager.Contracts.IPC;
 using FileManager.Core.DryRun;
 using FileManager.Core.IPC.Handlers;
 using Xunit.Abstractions;
@@ -23,12 +24,12 @@ namespace FileManager.Core.Tests.DryRun;
 public sealed class WireChunkConverterAllocationTests(ITestOutputHelper output)
 {
     /// <summary>Steady-state ceiling per (file, op) pair, with the pair sharing one path string —
-    /// the destination-sweep shape, which is the volume case. Baseline measurement of the current
-    /// converter is ~650-700 B/pair (two <c>GetDirectoryName</c> strings, two <c>GetFileName</c>
-    /// strings, two wire records, list slots) at ~90-char paths; the headroom above that is for
-    /// runtime/layout variation across machines, not for new allocations. Stage 1 of the
-    /// allocation-avoidance work is expected to LOWER this — tighten the constant with it.</summary>
-    private const int MaxBytesPerEntryPair = 900;
+    /// the destination-sweep shape, which is the volume case. Measured at ~90-char paths: 627 B/pair
+    /// before the span-probe/memo pass (two throwaway <c>GetDirectoryName</c> strings, two
+    /// <c>GetFileName</c> strings), 254 B/pair after (two wire records, ONE file-name string, list
+    /// slots, amortized directory-table misses). The headroom above 254 is for runtime/layout
+    /// variation across machines, not for new allocations.</summary>
+    private const int MaxBytesPerEntryPair = 400;
 
     private const int EntriesPerChunk = 300;   // ~ one WireChunkByteBudget chunk's worth
     private const int Chunks = 60;
@@ -59,6 +60,39 @@ public sealed class WireChunkConverterAllocationTests(ITestOutputHelper output)
             perPair <= MaxBytesPerEntryPair,
             $"wire conversion allocated {perPair:F0} B per (file, op) pair (ceiling {MaxBytesPerEntryPair} B). " +
             "Something on the per-entry conversion path has started allocating; find it rather than raising the ceiling.");
+    }
+
+    /// <summary>The memo is an allocation shortcut, never a semantic one: an op whose Path/Root are
+    /// the same string INSTANCES as its file's (the sweep shape) must convert to exactly what it
+    /// would have without the sharing. Distinct-but-equal strings take the non-memo path; both must
+    /// land on the same wire values.</summary>
+    [Fact]
+    public void Shared_reference_ops_convert_identically_to_distinct_equal_strings()
+    {
+        const string root = @"C:\fm-gauge\destination-tree";
+        const string path = root + @"\sub\file.dat";
+        PhysicalFile file = new() { Path = path, Root = root, Length = 7, LastWritten = DateTimeOffset.UnixEpoch };
+        VirtualFileOperation sharedOp = new()
+        {
+            Path = path,                                         // same instances → memo hit
+            Root = root,
+            Kind = OperationKind.Untouched,
+            SubjectIndex = 0,
+        };
+        VirtualFileOperation distinctOp = sharedOp with
+        {
+            Path = new string(path.AsSpan()),                    // equal, different instances → memo miss
+            Root = new string(root.AsSpan()),
+        };
+
+        DryRunStreamHandler.WireChunkConverter viaMemo = new();
+        DryRunChunkResponse hit = viaMemo.Convert(new DryRunChunk([], [file], [], [sharedOp]));
+        DryRunStreamHandler.WireChunkConverter viaFull = new();
+        DryRunChunkResponse miss = viaFull.Convert(new DryRunChunk([], [file], [], [distinctOp]));
+
+        Assert.Equal(hit.Directories, miss.Directories);
+        Assert.Equal(hit.DestinationFiles, miss.DestinationFiles);
+        Assert.Equal(hit.DestinationOperations, miss.DestinationOperations);
     }
 
     /// <summary>Chunks in the destination sweep's shape: destination files + destination ops only,

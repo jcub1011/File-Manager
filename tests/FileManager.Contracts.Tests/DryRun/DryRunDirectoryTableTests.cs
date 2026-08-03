@@ -94,6 +94,103 @@ public sealed class DryRunDirectoryTableTests
     }
 
     [Fact]
+    public void GetOrAdd_span_and_string_overloads_agree()
+    {
+        DryRunDirectoryTableBuilder builder = new();
+
+        int viaString = builder.GetOrAdd(@"C:\src\photos");
+        int viaSpan = builder.GetOrAdd(@"C:\src\photos".AsSpan());
+        int trailing = builder.GetOrAdd(@"C:\src\photos\".AsSpan());
+        int root = builder.GetOrAdd(@"C:\".AsSpan());
+
+        Assert.Equal(viaString, viaSpan);
+        Assert.Equal(viaString, trailing);                       // span probe trims like the string path
+        Assert.Equal(0, root);                                   // drive root keeps its C:\ form
+        Assert.Equal(3, builder.Count);                          // C:\, src, photos — no duplicates
+    }
+
+    [Fact]
+    public void GetOrAdd_span_is_ordinal_case_sensitive_like_the_string_path()
+    {
+        DryRunDirectoryTableBuilder builder = new();
+
+        int lower = builder.GetOrAdd(@"C:\data\logs");
+        int upper = builder.GetOrAdd(@"C:\data\LOGS".AsSpan());
+
+        Assert.NotEqual(lower, upper);
+    }
+
+    [Fact]
+    public void Convert_dedupes_directories_across_entries_and_unc_roots_round_trip()
+    {
+        DryRunDirectoryTableBuilder builder = new();
+
+        (int dirA, _, int rootA) = builder.Convert(@"\\server\share\team\a.jpg", @"\\server\share");
+        (int dirB, _, int rootB) = builder.Convert(@"\\server\share\team\b.jpg", @"\\server\share");
+        int countAfter = builder.Count;
+
+        Assert.Equal(dirA, dirB);
+        Assert.Equal(rootA, rootB);
+        string[] paths = DryRunDirectoryTable.Materialize(builder.Entries);
+        Assert.Equal(@"\\server\share\team", paths[dirA]);
+        Assert.Equal(@"\\server\share", paths[rootA]);
+        // A third file in the same directory adds nothing.
+        builder.Convert(@"\\server\share\team\c.jpg", @"\\server\share");
+        Assert.Equal(countAfter, builder.Count);
+    }
+
+    [Fact]
+    public void Convert_trims_a_roots_trailing_separator_like_GetOrAdd_does()
+    {
+        DryRunDirectoryTableBuilder builder = new();
+
+        (_, _, int viaConvert) = builder.Convert(@"C:\src\a.txt", @"C:\src\");
+        int direct = builder.GetOrAdd(@"C:\src");
+
+        Assert.Equal(direct, viaConvert);
+        Assert.Equal(@"C:\src", DryRunDirectoryTable.Materialize(builder.Entries)[viaConvert]);
+    }
+
+    [Fact]
+    public void Convert_resolves_more_roots_than_the_memo_holds()
+    {
+        DryRunDirectoryTableBuilder builder = new();
+        string[] roots = [@"C:\r1", @"C:\r2", @"C:\r3"];
+
+        // Interleave three distinct root instances so every memo shape (hit, second-slot hit, miss)
+        // is exercised; each root must keep resolving to its own entry.
+        int[][] seen = new int[3][];
+        for (int i = 0; i < 3; i++)
+            seen[i] = new int[3];
+        for (int pass = 0; pass < 3; pass++)
+            for (int r = 0; r < roots.Length; r++)
+                (_, _, seen[pass][r]) = builder.Convert($@"{roots[r]}\file-{pass}.txt", roots[r]);
+
+        string[] paths = DryRunDirectoryTable.Materialize(builder.Entries);
+        for (int r = 0; r < roots.Length; r++)
+        {
+            Assert.Equal(seen[0][r], seen[1][r]);
+            Assert.Equal(seen[0][r], seen[2][r]);
+            Assert.Equal(roots[r], paths[seen[0][r]]);
+        }
+    }
+
+    [Fact]
+    public void RollbackTo_invalidates_the_root_memo()
+    {
+        DryRunDirectoryTableBuilder builder = new();
+        string root = @"C:\newroot";
+        int mark = builder.Mark();
+
+        builder.Convert($@"{root}\a.txt", root);                 // memoizes the root's index
+        builder.RollbackTo(mark);
+
+        // Same root INSTANCE again: a stale memo would resurrect the removed index. It must re-add.
+        (_, _, int again) = builder.Convert($@"{root}\b.txt", root);
+        Assert.Equal(root, DryRunDirectoryTable.Materialize(builder.Entries)[again]);
+    }
+
+    [Fact]
     public void Convert_projects_contract_records_field_for_field()
     {
         DryRunDirectoryTableBuilder builder = new();

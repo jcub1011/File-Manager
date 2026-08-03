@@ -429,6 +429,17 @@ public sealed class DryRunStreamHandler(
     internal sealed class WireChunkConverter
     {
         private readonly DryRunDirectoryTableBuilder _dirs = new();
+        /// <summary>Reference-keyed (path → converted triple + root) memo, cleared per chunk. An op's
+        /// <c>Path</c>/<c>Root</c> are usually the SAME string instances as its file's — every sweep
+        /// pair shares them by construction, and source file/op pairs share the payload's path — so
+        /// the ops loop can reuse the files loop's conversion instead of re-deriving (and
+        /// re-allocating) the file name. A miss (e.g. a New/Rename op whose resulting path exists on
+        /// no file) just pays the normal conversion. Reference equality is the point, not an
+        /// optimization shortcut: it is what makes a hit PROVABLY the same string without comparing
+        /// characters. Cleared per chunk so the memo never outlives the strings it keys on (pooled
+        /// carriers swap their strings out between chunks).</summary>
+        private readonly Dictionary<string, (int DirIndex, string FileName, int RootDirIndex, string Root)> _sharedPathMemo =
+            new(ReferenceEqualityComparer.Instance);
 
         public DryRunChunkResponse Convert(DryRunChunk slice) =>
             Convert(slice.SourceFiles, slice.DestinationFiles, slice.SourceOperations, slice.DestinationOperations);
@@ -437,18 +448,20 @@ public sealed class DryRunStreamHandler(
             IReadOnlyList<IPhysicalFileView> sourceFiles, IReadOnlyList<IPhysicalFileView> destinationFiles,
             IReadOnlyList<IFileOperationView> sourceOps, IReadOnlyList<IFileOperationView> destinationOps)
         {
+            // Files convert BEFORE ops (memo fill order), matching the wire lists' order anyway.
+            _sharedPathMemo.Clear();
             List<DryRunFile> wireSourceFiles = new(sourceFiles.Count);
             foreach (IPhysicalFileView f in sourceFiles)
-                wireSourceFiles.Add(_dirs.Convert(f));
+                wireSourceFiles.Add(ConvertFile(f));
             List<DryRunFile> wireDestinationFiles = new(destinationFiles.Count);
             foreach (IPhysicalFileView f in destinationFiles)
-                wireDestinationFiles.Add(_dirs.Convert(f));
+                wireDestinationFiles.Add(ConvertFile(f));
             List<DryRunOperation> wireSourceOps = new(sourceOps.Count);
             foreach (IFileOperationView o in sourceOps)
-                wireSourceOps.Add(_dirs.Convert(o));
+                wireSourceOps.Add(ConvertOp(o));
             List<DryRunOperation> wireDestinationOps = new(destinationOps.Count);
             foreach (IFileOperationView o in destinationOps)
-                wireDestinationOps.Add(_dirs.Convert(o));
+                wireDestinationOps.Add(ConvertOp(o));
 
             return new DryRunChunkResponse
             {
@@ -457,6 +470,43 @@ public sealed class DryRunStreamHandler(
                 DestinationFiles = wireDestinationFiles,
                 SourceOperations = wireSourceOps,
                 DestinationOperations = wireDestinationOps,
+            };
+        }
+
+        private DryRunFile ConvertFile(IPhysicalFileView f)
+        {
+            (int dirIndex, string fileName, int rootDirIndex) = _dirs.Convert(f.Path, f.Root);
+            _sharedPathMemo[f.Path] = (dirIndex, fileName, rootDirIndex, f.Root);
+            return new DryRunFile
+            {
+                DirIndex = dirIndex,
+                FileName = fileName,
+                RootDirIndex = rootDirIndex,
+                Length = f.Length,
+                LastWritten = f.LastWritten,
+                IsReparsePoint = f.IsReparsePoint,
+            };
+        }
+
+        private DryRunOperation ConvertOp(IFileOperationView o)
+        {
+            // Both Path AND Root must be the file's instances — a same-path op under a different
+            // root (nothing produces one today) would need its own root resolution, so it misses.
+            if (!_sharedPathMemo.TryGetValue(o.Path, out (int DirIndex, string FileName, int RootDirIndex, string Root) hit)
+                || !ReferenceEquals(hit.Root, o.Root))
+            {
+                (hit.DirIndex, hit.FileName, hit.RootDirIndex) = _dirs.Convert(o.Path, o.Root);
+            }
+            return new DryRunOperation
+            {
+                DirIndex = hit.DirIndex,
+                FileName = hit.FileName,
+                RootDirIndex = hit.RootDirIndex,
+                Kind = o.Kind,
+                SourceIndex = o.SourceIndex,
+                SubjectIndex = o.SubjectIndex,
+                SourceDisposition = o.SourceDisposition,
+                Detail = o.Detail,
             };
         }
     }
