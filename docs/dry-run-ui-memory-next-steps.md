@@ -86,6 +86,62 @@
 > **(2)** cut the ingest/deserialize allocation, after instrumenting it separately from `PrepareReport`;
 > **(3)** candidate C (the ~147 MB sort-key arrays at the cap) — real, but third.
 > Candidates A, B and D-as-a-csproj-knob are closed.
+>
+> **9. Item (1) implemented, and the ambiguity in finding 8 is resolved.** The log could not distinguish
+> "the post-clear 214 MB is garbage nobody collected" from "it is still live and there is a lifetime
+> bug" — no gen2 had run, so both stories fit. A `WeakReference` settles it deterministically:
+> `Clearing_the_preview_releases_the_row_store` builds a preview, drops the only strong reference to the
+> store into a weak one, calls `ClearProfile()`, collects, and asserts the store is dead. **It passes** —
+> so the cleared preview's memory is genuinely garbage and a trim is the right treatment, not a lifetime
+> fix. That test now guards the conclusion: if something ever re-roots the store, it fails and says so.
+>
+> `UiMemoryTrim.AfterPreviewClosed()` runs at the end of `ClearReport` (gated on a preview having
+> actually been loaded) and logs committed/heap before → after plus elapsed. It reuses
+> `MemoryTrimCoordinator`'s two-pass shape — a single aggressive collect is reported not to decommit with
+> LOH allocations (dotnet/runtime#78679), and `LargeObjectHeapCompactionMode` reverts after every blocking
+> GC so it is set inside the loop. It is a re-implementation, not reuse: that type lives in
+> `FileManager.Core`, which the UI does not reference.
+>
+> Note the second trigger this picks up for free: `RunAsync` clears before it starts, so a *second*
+> consecutive run now trims before allocating rather than starting on the previous run's uncollected
+> floor — which is the mechanism behind the 300 → 354 MB climb in finding 8.
+>
+> **10. The trim verified on the published exe — it works, and there is no retention bug.**
+> Second run of `ui-20260803.log` (15:07 onward), same profile:
+>
+> | Sample | managed | GC heap | GC committed | **private** |
+> |---|---:|---:|---:|---:|
+> | idle | 8 MB | 8 MB | 13 MB | **108 MB** |
+> | run 1, preview loaded | 174 MB | 182 MB | 183 MB | **291 MB** |
+> | at clear, before trim | 185 MB | 189 MB | 204 MB | **316 MB** |
+> | **after trim (104 ms)** | — | **62 MB** | **62 MB** | **173 MB** |
+> | +10 s, idle | 64 MB | 62 MB | 62 MB | 177 MB |
+>
+> **committed 204 → 62 MB, private 316 → 173 MB, in 104 ms, and it stays down.** Before the trim the
+> process sat at 214 MB indefinitely. The stall is 104 ms rather than the service's 14 ms — a bigger heap
+> and two compacting passes — which is perceptible but lands on a transition the user initiated. If it
+> ever needs to be invisible, post it at `DispatcherPriority.Background` so the cleared state paints
+> first.
+>
+> **Correction to a claim made mid-investigation.** The remaining 62 MB against an 8 MB startup idle was
+> read as a ~54 MB retention bug, and an early version of
+> `Clearing_the_preview_returns_the_retained_heap_at_streamed_cap` appeared to confirm it at 94 MB / 78%
+> retained. That probe was measuring itself: it awaited the tree rebuilds in the test body, and an
+> `async Task` method's state machine lives inside its Task object, so the test's own frame pinned the
+> `RebuildInput` (store) and `RebuildResult` (forest). With the awaits moved into a helper frame that
+> dies before the clear, the residual is **0.3 MB** — the view models release the entire preview, store
+> and forest included, at the cap with both trees built. The probe now asserts reachability next to the
+> byte figure so that failure mode is visible rather than convincing.
+>
+> So the shipped exe's 62 MB floor is **UI layer** — Avalonia realized containers, TreeDataGrid rows,
+> text/glyph and font-atlas caches — none of which headless has and none of which is preview data. It
+> also explains run 2's higher peak (218 vs 174 MB managed) with no retention at all: run 2 starts from
+> that floor rather than from startup idle. Whether Avalonia's post-grid steady state is worth chasing is
+> a separate question from this document's.
+>
+> Two things tried and reverted rather than shipped as neutral diffs: resetting `PendingRebuild` in
+> `Clear()` (the completed Task does release its state machine) and a `GC.WaitForPendingFinalizers()`
+> between the trim's two passes (nothing is blocked on finalization).
 
 > **Status: RESEARCH BRIEF, not a plan.** Nothing here is approved work. The deliverable is a
 > recommendation with numbers behind it — including "stop here", which is a legitimate and

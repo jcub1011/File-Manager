@@ -2954,16 +2954,20 @@ public sealed partial class DryRunViewModel : ViewModelBase
         TruncationNotice = "";
         if (!hadReport)
             return;
-        // Two samples, and the pair is the point. The immediate one reads with the rows unrooted but
-        // NOT yet collected — nothing is forced here (a blocking gen2 on the UI thread is exactly the
-        // jank this app must not have), so it will look barely changed and that is correct, not a bug.
-        // The deferred one, several seconds later, is the settled figure: compare it against the "idle"
-        // line to answer whether the preview's pages actually came back. If they never do, that is a
-        // worse problem than the retained byte count and a different fix (GC configuration / trim),
-        // which is precisely what this instrumentation exists to distinguish.
+        // The rows are unrooted but not yet collected, so this reads barely changed from
+        // preview-applied — that is correct, not a bug, and it is the baseline the trim is measured
+        // against.
         UiMemoryLog.Sample("preview-cleared (not yet collected)");
+        // Then actually give the pages back. Measured before this existed: ten seconds after a clear the
+        // process still held 214 MB against a 108 MB idle, with no gen2 having run — an idle UI
+        // allocates nothing, so nothing is ever collected until the next run's burst, which is why
+        // consecutive runs climbed. See UiMemoryTrim for why a collect is acceptable at this one moment
+        // and nowhere else.
+        UiMemoryTrim.AfterPreviewClosed();
+        // Ten seconds on, with the app idle: confirms the trim's effect persists rather than the
+        // allocator immediately re-committing what it just released.
         Avalonia.Threading.DispatcherTimer.RunOnce(
-            static () => UiMemoryLog.Sample("preview-cleared (settled)"),
+            static () => UiMemoryLog.Sample("preview-cleared (+10s)"),
             TimeSpan.FromSeconds(10));
     }
 }

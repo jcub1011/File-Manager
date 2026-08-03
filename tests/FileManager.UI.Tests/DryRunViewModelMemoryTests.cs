@@ -218,6 +218,163 @@ public sealed class DryRunViewModelMemoryTests(ITestOutputHelper output)
         GC.KeepAlive(store);
     }
 
+    /// <summary>How many bytes survive clearing a preview at the cap, with both trees having been
+    /// toggled on first — the strongest version of the question
+    /// <see cref="Clearing_the_preview_releases_the_row_store"/> only asks about the store.
+    ///
+    /// <para>Why it exists: on the published exe the trim drops committed 204 → 62 MB and it stays down,
+    /// but 62 MB of managed heap remains against an 8 MB startup idle. This probe answers where that
+    /// belongs. It measures <strong>0.3 MB</strong> — the view models release the entire preview, store
+    /// and forest included, at the cap and with both trees built. So the shipped exe's residual is UI
+    /// layer (Avalonia realized containers, TreeDataGrid rows, text/glyph and font-atlas caches), none
+    /// of which headless has, and none of which is preview data. It also explains the second run's
+    /// higher peak without any retention: run 2 starts from that raised floor, not from startup idle.</para>
+    ///
+    /// <para><strong>Read the helper's comment before touching this.</strong> An earlier version awaited
+    /// the tree rebuilds in the test body and reported 94 MB / 78% retained, which was the probe
+    /// measuring its own state machine rather than the app. Reachability is asserted alongside the byte
+    /// figure here specifically so that failure mode is visible rather than convincing.</para></summary>
+    /// <param name="withTree">Both variants matter, and running them as a pair is the bisect: the flat
+    /// list and the tree forest are separate retention paths, and knowing which one holds is the
+    /// difference between a one-line fix and a hunt.</param>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    [Trait("Category", "Memory")]
+    public async Task Clearing_the_preview_returns_the_retained_heap_at_streamed_cap(bool withTree)
+    {
+        long idle = GC.GetTotalMemory(forceFullCollection: true);
+        // The tree toggles are awaited inside a NoInlining helper on purpose. Awaiting RebuildAsync in
+        // THIS frame would leave the test's own state machine holding the awaited Task — and an
+        // `async Task` method's state machine lives inside its Task object, so that alone pins the
+        // RebuildInput (store) and RebuildResult (forest) and the probe would measure its own scaffolding
+        // instead of the app.
+        (DryRunViewModel vm, WeakReference report, WeakReference store, WeakReference? forestRoot) =
+            await BuildApplyAndMaybeShowTrees(withTree);
+        long loaded = GC.GetTotalMemory(forceFullCollection: true);
+        Assert.False(report.IsAlive);
+
+        // ClearProfile runs UiMemoryTrim's two aggressive compacting passes itself, so what follows is
+        // measured after exactly what the app does at this moment.
+        vm.ClearProfile();
+        long cleared = GC.GetTotalMemory(forceFullCollection: true);
+        long residual = cleared - idle;
+        GCMemoryInfo info = GC.GetGCMemoryInfo();
+
+        output.WriteLine(
+            $"Clear at cap ({FileCount:N0} deep-path files, trees {(withTree ? "built" : "never toggled")}): " +
+            $"idle {idle / (1024.0 * 1024.0):F1} MB → loaded {loaded / (1024.0 * 1024.0):F1} MB → " +
+            $"cleared {cleared / (1024.0 * 1024.0):F1} MB; residual above idle {residual / (1024.0 * 1024.0):F1} MB " +
+            $"({100.0 * residual / (loaded - idle):F0}% of the preview held on to); " +
+            $"GC heap {info.HeapSizeBytes / (1024.0 * 1024.0):F1} MB, committed {info.TotalCommittedBytes / (1024.0 * 1024.0):F1} MB, " +
+            $"fragmented {info.FragmentedBytes / (1024.0 * 1024.0):F1} MB; " +
+            $"store {(store.IsAlive ? "STILL REACHABLE" : "released")}, " +
+            $"forest {(withTree ? forestRoot!.IsAlive ? "STILL REACHABLE" : "released" : "n/a")}");
+
+        Assert.False(store.IsAlive, "the row store is still reachable after clearing the preview");
+        if (forestRoot is { } root)
+            Assert.False(root.IsAlive, "the tree forest is still reachable after clearing the preview");
+        Assert.True(residual < 8L * 1024 * 1024,
+            $"clearing the preview left {residual / (1024.0 * 1024.0):F1} MB above idle — the view models are " +
+            "retaining part of the preview, so a second run starts from a raised floor");
+
+        GC.KeepAlive(vm);
+    }
+
+    /// <summary>Clearing the preview must make the whole row store collectable — nothing may outlive it.
+    ///
+    /// <para>This is the test that settles what the shipped-exe log could not. Measured there
+    /// (<c>docs/dry-run-ui-memory-next-steps.md</c> finding 8): ten seconds after a clear the process
+    /// still held 214 MB against a 108 MB idle, with the gen2 counter unmoved — which is ambiguous
+    /// between "that heap is garbage nobody collected" and "that heap is still live, and there is a
+    /// lifetime bug". A log cannot distinguish them; a <see cref="WeakReference"/> can. If this test
+    /// fails, <c>UiMemoryTrim</c> is treating a leak, and the fix is a lifetime fix instead.</para>
+    ///
+    /// <para>Deliberately small (10k files, not the 500k cap): this asserts reachability, which is
+    /// scale-independent, and it is the one probe here worth running outside the Memory category.</para></summary>
+    [Fact]
+    public void Clearing_the_preview_releases_the_row_store()
+    {
+        (DryRunViewModel vm, WeakReference store) = ApplyThenExposeStore(10_000);
+        Assert.True(store.IsAlive, "the store must be alive while the preview is loaded, or this test proves nothing");
+
+        vm.ClearProfile();
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+        GC.Collect();
+
+        Assert.False(store.IsAlive,
+            "the row store is still reachable after clearing the preview — the memory a cleared preview " +
+            "holds is LIVE, not uncollected garbage, so UiMemoryTrim cannot release it and the real fix " +
+            "is whatever still roots the store");
+        GC.KeepAlive(vm);
+    }
+
+    /// <summary>Which of the tree's parts survives a clear. Splits the 94 MB residual
+    /// <see cref="Clearing_the_preview_returns_the_retained_heap_at_streamed_cap"/> reports into named
+    /// suspects, so the fix targets a root rather than a symptom. Small fixture — reachability does not
+    /// depend on scale.</summary>
+    /// <param name="fileCount">Straddles <c>DryRunRebuild.SyncThreshold</c> (5,000) deliberately: below
+    /// it the rebuild runs inline, above it it hops to the thread pool via <c>Task.Run</c>, and those are
+    /// different retention paths.</param>
+    [Theory]
+    [InlineData(4_000)]
+    [InlineData(20_000)]
+    public async Task Clearing_the_preview_releases_the_tree_forest(int fileCount)
+    {
+        (DryRunViewModel vm, WeakReference store, WeakReference[] parts) =
+            await ApplyWithTreeThenExposeParts(fileCount);
+        Assert.All(parts, p => Assert.True(p.IsAlive, "every part must be alive while the trees are shown, or this test proves nothing"));
+
+        vm.ClearProfile();
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+        GC.Collect();
+
+        string[] names = ["Sources forest", "Sources grid source", "Destinations forest", "Destinations grid source"];
+        string[] survivors = [.. names.Where((_, i) => parts[i].IsAlive)];
+        Assert.True(survivors.Length == 0, $"these outlived the clear: {string.Join(", ", survivors)}");
+        Assert.False(store.IsAlive, "the row store outlived the clear (a forest's leaf factories hold it)");
+        GC.KeepAlive(vm);
+    }
+
+    /// <summary>Both tabs, because they build their forests through different selectors
+    /// (<c>SourceDirPath</c>/<c>SourceFileName</c> vs <c>OpDirPath</c>/<c>OpFileName</c> over CSR
+    /// positions) and are therefore separate retention paths.</summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static async Task<(DryRunViewModel Vm, WeakReference Store, WeakReference[] Parts)>
+        ApplyWithTreeThenExposeParts(int fileCount)
+    {
+        DryRunReport report = BuildDeepReport(fileCount);
+        DryRunRowStore store = DryRunRowStore.FromReport(report);
+        DryRunViewModel vm = new(gateway: null!);
+        vm.ApplyPrepared(DryRunViewModel.PrepareReport(
+            store, new DryRunCompletion(DateTimeOffset.UnixEpoch, Truncated: false, Space: null)));
+        vm.Sources.ShowTree = true;
+        await vm.Sources.PendingRebuild;
+        vm.Destinations.ShowTree = true;
+        await vm.Destinations.PendingRebuild;
+        WeakReference[] parts =
+        [
+            new(vm.Sources.Tree[0]), new(vm.Sources.TreeSource),
+            new(vm.Destinations.Tree[0]), new(vm.Destinations.TreeSource),
+        ];
+        return (vm, new WeakReference(store), parts);
+    }
+
+    /// <summary>NoInlining, and the store is returned only as a <see cref="WeakReference"/>, so the sole
+    /// strong path to it is whatever the view model itself holds.</summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static (DryRunViewModel Vm, WeakReference Store) ApplyThenExposeStore(int fileCount)
+    {
+        DryRunReport report = BuildDeepReport(fileCount);
+        DryRunRowStore store = DryRunRowStore.FromReport(report);
+        DryRunViewModel vm = new(gateway: null!);
+        vm.ApplyPrepared(DryRunViewModel.PrepareReport(
+            store, new DryRunCompletion(DateTimeOffset.UnixEpoch, Truncated: false, Space: null)));
+        return (vm, new WeakReference(store));
+    }
+
     /// <summary>Retained heap of a completed store alone (no view model, no tabs), so a name-storage
     /// change can be attributed without the tabs' key arrays in the way. NoInlining, and the store dies
     /// with this frame so the next call's forced collection starts from a clean baseline.</summary>
@@ -249,6 +406,37 @@ public sealed class DryRunViewModelMemoryTests(ITestOutputHelper output)
         DryRunViewModel vm = new(gateway: null!);
         vm.ApplyReport(report);
         return (vm, new WeakReference(report));
+    }
+
+    /// <summary>Builds, applies and optionally shows both trees, returning only weak references — so
+    /// every strong path to the store and the forest is one the view model itself holds, and the awaited
+    /// rebuild Tasks die with this frame.</summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static async Task<(DryRunViewModel Vm, WeakReference Report, WeakReference Store, WeakReference? ForestRoot)>
+        BuildApplyAndMaybeShowTrees(bool withTree)
+    {
+        (DryRunViewModel vm, WeakReference report, WeakReference store) = BuildAndApplyDeepTracked();
+        if (!withTree)
+            return (vm, report, store, null);
+        vm.Sources.ShowTree = true;
+        await vm.Sources.PendingRebuild;
+        vm.Destinations.ShowTree = true;
+        await vm.Destinations.PendingRebuild;
+        return (vm, report, store, new WeakReference(vm.Sources.Tree[0]));
+    }
+
+    /// <summary>As <see cref="BuildAndApplyDeep"/>, but also weak-references the store the view model
+    /// built internally, so a probe can report byte residual and reachability from the same run rather
+    /// than inferring across two tests.</summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static (DryRunViewModel Vm, WeakReference Report, WeakReference Store) BuildAndApplyDeepTracked()
+    {
+        DryRunReport report = BuildDeepReport(FileCount);
+        DryRunRowStore store = DryRunRowStore.FromReport(report);
+        DryRunViewModel vm = new(gateway: null!);
+        vm.ApplyPrepared(DryRunViewModel.PrepareReport(
+            store, new DryRunCompletion(report.GeneratedAt, Truncated: false, Space: null)));
+        return (vm, new WeakReference(report), new WeakReference(store));
     }
 
     [MethodImpl(MethodImplOptions.NoInlining)]
