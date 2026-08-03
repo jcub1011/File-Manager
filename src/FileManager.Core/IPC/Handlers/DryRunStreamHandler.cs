@@ -58,6 +58,12 @@ public sealed class DryRunStreamHandler(
         IpcRequest request, [EnumeratorCancellation] CancellationToken ct = default)
     {
         var typed = (DryRunStreamRequest)request;
+        // Total managed bytes allocated by the process before this run, so the end-of-run log line
+        // can report the run's allocation CHURN (rate), not just the heap snapshot (retention). The
+        // two answer different questions: churn is what the GC must absorb during the burst and is
+        // what drives in-run peak commit; the snapshot is what's left. Process-wide is acceptable
+        // because the service serializes dry runs behind the single-instance mutex.
+        long allocatedBefore = GC.GetTotalAllocatedBytes();
         // An inline draft (unsaved edits) is previewed directly; otherwise resolve the persisted
         // catalog. PROFILE_NOT_FOUND is only reachable on the non-inline path. Accepting a
         // client-supplied profile grants no new authority: the dry run is read-only (I-DRYRUN-RO)
@@ -353,16 +359,20 @@ public sealed class DryRunStreamHandler(
             long privateBytes;
             using (Process self = Process.GetCurrentProcess())
                 privateBytes = self.PrivateMemorySize64;
+            // Churn, not retention: everything this run allocated, nearly all of it dead by now.
+            // This is the number the allocation-avoidance work (pooling, span probing) moves, and
+            // in-run peak commit tracks it — the snapshot numbers above cannot show that.
+            long allocatedBytes = GC.GetTotalAllocatedBytes() - allocatedBefore;
             logger.LogInformation(
                 "Dry-run stream timings for profile {ProfileId}: total {TotalMs}ms " +
                 "(engine stream {EngineMs}ms, destination sweep {SweepMs}ms, space estimator {EstimatorMs}ms), " +
                 "{SourceCount} source files, {DestCount} destination files (+{SweepCount} swept); " +
                 "memory managed {ManagedMb}MB, GC heap {HeapMb}MB, GC committed {CommittedMb}MB, " +
-                "process private {PrivateMb}MB",
+                "process private {PrivateMb}MB, allocated {AllocatedMb}MB",
                 typed.ProfileId, totalWatch.ElapsedMilliseconds, engineMs, sweepWatch.ElapsedMilliseconds,
                 estimatorWatch.ElapsedMilliseconds, emitted, destinationCount, sweptCount,
                 managedBytes >> 20, gcInfo.HeapSizeBytes >> 20, gcInfo.TotalCommittedBytes >> 20,
-                privateBytes >> 20);
+                privateBytes >> 20, allocatedBytes >> 20);
         }
         // Directories the walk could not open were downgraded to warnings by SourceScanner and dropped
         // by the engine's pump, so the report below looks complete. DryRunCompleteResponse is frozen and
@@ -412,8 +422,11 @@ public sealed class DryRunStreamHandler(
     /// chunks extend the same table, so every index stays a valid position into the client's
     /// concatenated <c>Directories</c> list. Each outgoing chunk carries exactly the directory
     /// entries it references first (<see cref="DryRunDirectoryTableBuilder.FlushNew"/>), before the
-    /// files/ops that use them.</summary>
-    private sealed class WireChunkConverter
+    /// files/ops that use them.
+    /// Internal (not private) for one reason: the per-entry allocation gauge test brackets
+    /// <see cref="Convert(DryRunChunk)"/> with <see cref="GC.GetAllocatedBytesForCurrentThread"/> —
+    /// the CI regression gate for the converter's allocation budget.</summary>
+    internal sealed class WireChunkConverter
     {
         private readonly DryRunDirectoryTableBuilder _dirs = new();
 
