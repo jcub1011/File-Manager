@@ -75,7 +75,9 @@ public sealed class DryRunStreamHandlerTests
             new DestinationProjector(NullLogger<DestinationProjector>.Instance, new FakeVolumeInfoProvider(), scheduler),
             new FakeVolumeInfoProvider(), new EngineConfig(),
             eventBus ?? new EngineEventBus(NullLogger<EngineEventBus>.Instance), NullMemoryTrimCoordinator.Instance)
-        { MaxStreamedFiles = maxStreamedFiles };
+        // These tests buffer whole-stream frame lists (Collect) and inspect chunk contents after the
+        // fact, so wire-DTO recycling must be off; Wire_frames_are_byte_identical... covers on-vs-off.
+        { MaxStreamedFiles = maxStreamedFiles, RecycleWireRecords = false };
     }
 
     private static async Task<List<IpcResponse>> Collect(DryRunStreamHandler handler, Guid profileId) =>
@@ -98,7 +100,49 @@ public sealed class DryRunStreamHandlerTests
             new DestinationProjector(NullLogger<DestinationProjector>.Instance, new FakeVolumeInfoProvider(), scheduler),
             new FakeVolumeInfoProvider(), new EngineConfig(),
             new EngineEventBus(NullLogger<EngineEventBus>.Instance), NullMemoryTrimCoordinator.Instance)
-        { MaxStreamedFiles = maxStreamedFiles };
+        { MaxStreamedFiles = maxStreamedFiles, RecycleWireRecords = false };
+    }
+
+    /// <summary>The load-bearing guard for wire-DTO recycling: with recycling ON (production — the
+    /// server serializes each frame before advancing) every serialized chunk frame must be
+    /// byte-identical to the run with recycling OFF. A recycled record leaking a previous chunk's
+    /// value, a missed field reassignment, or a stale list would all show up here as a byte
+    /// difference. Only chunk frames are compared — progress frames are timer-interleaved and the
+    /// completion frame carries a wall-clock timestamp.</summary>
+    [Fact]
+    public async Task Wire_frames_are_byte_identical_with_and_without_dto_recycling()
+    {
+        Profile profile = TestProfiles.Valid();
+
+        async Task<List<byte[]>> SerializedChunkFrames(bool recycle)
+        {
+            FileSystemService fileSystem = new(NullLogger<FileSystemService>.Instance);
+            ScanScheduler scheduler = new(NullLogger<ScanScheduler>.Instance, fileSystem, new FakeSettingsProvider());
+            DryRunStreamHandler handler = new(
+                NullLogger<DryRunStreamHandler>.Instance, new FakeStreamEngine(totalFiles: 100, chunkSize: 7),
+                new FakeCatalog(profile), TimeProvider.System,
+                new DestinationProjector(NullLogger<DestinationProjector>.Instance, new FakeVolumeInfoProvider(), scheduler),
+                new FakeVolumeInfoProvider(), new EngineConfig(),
+                new EngineEventBus(NullLogger<EngineEventBus>.Instance), NullMemoryTrimCoordinator.Instance)
+            { MaxStreamedFiles = 1_000, RecycleWireRecords = recycle };
+
+            // Serialize IMMEDIATELY, per frame — the production consumption shape. Nothing may hold
+            // a frame object across an advance when recycling is on.
+            List<byte[]> serialized = [];
+            await foreach (IpcResponse frame in handler.HandleStreamAsync(new DryRunStreamRequest { ProfileId = profile.Id }))
+                if (frame is DryRunChunkResponse)
+                    serialized.Add(IpcSerializer.SerializeResponse(frame));
+            return serialized;
+        }
+
+        List<byte[]> withRecycling = await SerializedChunkFrames(recycle: true);
+        List<byte[]> withoutRecycling = await SerializedChunkFrames(recycle: false);
+
+        Assert.NotEmpty(withRecycling);
+        Assert.Equal(withoutRecycling.Count, withRecycling.Count);
+        for (int i = 0; i < withRecycling.Count; i++)
+            Assert.True(withoutRecycling[i].AsSpan().SequenceEqual(withRecycling[i]),
+                $"chunk frame {i} differs between recycling on and off");
     }
 
     [Fact]
@@ -557,7 +601,7 @@ public sealed class DryRunStreamHandlerTests
             new DestinationProjector(NullLogger<DestinationProjector>.Instance, new FakeVolumeInfoProvider(), scheduler),
             new FakeVolumeInfoProvider(), new EngineConfig(),
             new EngineEventBus(NullLogger<EngineEventBus>.Instance), NullMemoryTrimCoordinator.Instance)
-        { MaxStreamedFiles = 1_000_000 };
+        { MaxStreamedFiles = 1_000_000, RecycleWireRecords = false };
 
     [Fact]
     public async Task Teardown_completes_when_the_stream_is_abandoned_mid_sweep()

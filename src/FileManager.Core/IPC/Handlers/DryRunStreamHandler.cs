@@ -47,6 +47,14 @@ public sealed class DryRunStreamHandler(
     /// Test seam: shrunk so truncation is reachable without half a million files.</summary>
     internal int MaxStreamedFiles { get; init; } = DryRunEngine.MaxStreamedFiles;
 
+    /// <summary>Test seam. Production (the IPC server) serializes each frame before requesting the
+    /// next, so the converter reuses the previous frame's wire DTOs (see
+    /// <see cref="WireChunkConverter"/>). An in-proc consumer that BUFFERS responses across advances
+    /// — which several handler tests do — would observe recycled records, so those tests construct
+    /// the handler with this off. The byte-identical on/off round-trip test is the guard that keeps
+    /// the recycling path equivalent.</summary>
+    internal bool RecycleWireRecords { get; init; } = true;
+
     public string RequestType => IpcRequestTypes.DryRunStream;
 
     /// <summary>Never invoked — the server routes streaming handlers to <see cref="HandleStreamAsync"/>.</summary>
@@ -112,7 +120,7 @@ public sealed class DryRunStreamHandler(
         // One converter for the whole stream: it owns the report's directory-index space across the
         // file phase AND the sweep, so each outgoing chunk carries exactly its first-referenced
         // directory entries with globally valid indices.
-        WireChunkConverter converter = new();
+        WireChunkConverter converter = new(RecycleWireRecords);
         // Live discovery counters, incremented by the engine's scan pump (sources) and the sweep's
         // walkers (destinations); sampled on ProgressInterval below so the interleaved progress
         // frames stay throttled no matter how fast files are found.
@@ -426,9 +434,22 @@ public sealed class DryRunStreamHandler(
     /// Internal (not private) for one reason: the per-entry allocation gauge test brackets
     /// <see cref="Convert(DryRunChunk)"/> with <see cref="GC.GetAllocatedBytesForCurrentThread"/> —
     /// the CI regression gate for the converter's allocation budget.</summary>
-    internal sealed class WireChunkConverter
+    internal sealed class WireChunkConverter(bool recycleWireRecords = true)
     {
         private readonly DryRunDirectoryTableBuilder _dirs = new();
+        /// <summary>Wire-DTO pools plus the previously returned response. The production consumer
+        /// (<c>IpcServer.ServeStreamAsync</c>) serializes each frame BEFORE requesting the next, so
+        /// by the time <see cref="Convert(DryRunChunk)"/> runs again the previous response's records
+        /// are provably off the wire and can be reused — one chunk's worth of DTOs serves the whole
+        /// stream instead of one per entry. A consumer that buffers responses across chunks (some
+        /// in-proc tests) must construct with <c>recycleWireRecords: false</c>; the byte-identical
+        /// on/off round-trip test is what keeps the recycling path honest. The stream's final
+        /// response is never recycled — one chunk of garbage, not one per chunk.</summary>
+        private readonly Stack<DryRunFile> _filePool = new();
+        private readonly Stack<DryRunOperation> _opPool = new();
+        private readonly Stack<List<DryRunFile>> _fileListPool = new();
+        private readonly Stack<List<DryRunOperation>> _opListPool = new();
+        private DryRunChunkResponse? _previous;
         /// <summary>Reference-keyed (path → converted triple + root) memo, cleared per chunk. An op's
         /// <c>Path</c>/<c>Root</c> are usually the SAME string instances as its file's — every sweep
         /// pair shares them by construction, and source file/op pairs share the payload's path — so
@@ -448,22 +469,26 @@ public sealed class DryRunStreamHandler(
             IReadOnlyList<IPhysicalFileView> sourceFiles, IReadOnlyList<IPhysicalFileView> destinationFiles,
             IReadOnlyList<IFileOperationView> sourceOps, IReadOnlyList<IFileOperationView> destinationOps)
         {
+            // Reclaim the previous response's DTOs first — the caller has provably finished with it
+            // (this converter is called once per chunk, after the previous frame went out).
+            if (recycleWireRecords)
+                RecyclePrevious();
             // Files convert BEFORE ops (memo fill order), matching the wire lists' order anyway.
             _sharedPathMemo.Clear();
-            List<DryRunFile> wireSourceFiles = new(sourceFiles.Count);
+            List<DryRunFile> wireSourceFiles = RentFileList(sourceFiles.Count);
             foreach (IPhysicalFileView f in sourceFiles)
                 wireSourceFiles.Add(ConvertFile(f));
-            List<DryRunFile> wireDestinationFiles = new(destinationFiles.Count);
+            List<DryRunFile> wireDestinationFiles = RentFileList(destinationFiles.Count);
             foreach (IPhysicalFileView f in destinationFiles)
                 wireDestinationFiles.Add(ConvertFile(f));
-            List<DryRunOperation> wireSourceOps = new(sourceOps.Count);
+            List<DryRunOperation> wireSourceOps = RentOpList(sourceOps.Count);
             foreach (IFileOperationView o in sourceOps)
                 wireSourceOps.Add(ConvertOp(o));
-            List<DryRunOperation> wireDestinationOps = new(destinationOps.Count);
+            List<DryRunOperation> wireDestinationOps = RentOpList(destinationOps.Count);
             foreach (IFileOperationView o in destinationOps)
                 wireDestinationOps.Add(ConvertOp(o));
 
-            return new DryRunChunkResponse
+            DryRunChunkResponse response = new()
             {
                 Directories = _dirs.FlushNew(),
                 SourceFiles = wireSourceFiles,
@@ -471,21 +496,80 @@ public sealed class DryRunStreamHandler(
                 SourceOperations = wireSourceOps,
                 DestinationOperations = wireDestinationOps,
             };
+            _previous = response;
+            return response;
+        }
+
+        private void RecyclePrevious()
+        {
+            if (_previous is not { } previous)
+                return;
+            _previous = null;
+            // The response's lists are always this converter's own (created in Convert above), so the
+            // casts hold by construction; the directory slice stays with the GC (tiny, and its
+            // entries are shared immutable records).
+            ReturnFiles((List<DryRunFile>)previous.SourceFiles);
+            ReturnFiles((List<DryRunFile>)previous.DestinationFiles);
+            ReturnOps((List<DryRunOperation>)previous.SourceOperations);
+            ReturnOps((List<DryRunOperation>)previous.DestinationOperations);
+        }
+
+        private void ReturnFiles(List<DryRunFile> list)
+        {
+            foreach (DryRunFile f in list)
+            {
+                f.FileName = "";   // don't pin the name from a retained slot
+                _filePool.Push(f);
+            }
+            list.Clear();
+            _fileListPool.Push(list);
+        }
+
+        private void ReturnOps(List<DryRunOperation> list)
+        {
+            foreach (DryRunOperation o in list)
+            {
+                o.FileName = "";
+                o.Detail = null;
+                _opPool.Push(o);
+            }
+            list.Clear();
+            _opListPool.Push(list);
+        }
+
+        private List<DryRunFile> RentFileList(int capacity)
+        {
+            if (_fileListPool.Count == 0)
+                return new List<DryRunFile>(capacity);
+            List<DryRunFile> list = _fileListPool.Pop();
+            list.EnsureCapacity(capacity);
+            return list;
+        }
+
+        private List<DryRunOperation> RentOpList(int capacity)
+        {
+            if (_opListPool.Count == 0)
+                return new List<DryRunOperation>(capacity);
+            List<DryRunOperation> list = _opListPool.Pop();
+            list.EnsureCapacity(capacity);
+            return list;
         }
 
         private DryRunFile ConvertFile(IPhysicalFileView f)
         {
             (int dirIndex, string fileName, int rootDirIndex) = _dirs.Convert(f.Path, f.Root);
             _sharedPathMemo[f.Path] = (dirIndex, fileName, rootDirIndex, f.Root);
-            return new DryRunFile
-            {
-                DirIndex = dirIndex,
-                FileName = fileName,
-                RootDirIndex = rootDirIndex,
-                Length = f.Length,
-                LastWritten = f.LastWritten,
-                IsReparsePoint = f.IsReparsePoint,
-            };
+            DryRunFile wire = _filePool.Count > 0
+                ? _filePool.Pop()
+                : new DryRunFile { DirIndex = 0, FileName = "", RootDirIndex = 0, Length = 0, LastWritten = default };
+            // Every property is (re)assigned — a rented instance keeps its previous values.
+            wire.DirIndex = dirIndex;
+            wire.FileName = fileName;
+            wire.RootDirIndex = rootDirIndex;
+            wire.Length = f.Length;
+            wire.LastWritten = f.LastWritten;
+            wire.IsReparsePoint = f.IsReparsePoint;
+            return wire;
         }
 
         private DryRunOperation ConvertOp(IFileOperationView o)
@@ -497,17 +581,18 @@ public sealed class DryRunStreamHandler(
             {
                 (hit.DirIndex, hit.FileName, hit.RootDirIndex) = _dirs.Convert(o.Path, o.Root);
             }
-            return new DryRunOperation
-            {
-                DirIndex = hit.DirIndex,
-                FileName = hit.FileName,
-                RootDirIndex = hit.RootDirIndex,
-                Kind = o.Kind,
-                SourceIndex = o.SourceIndex,
-                SubjectIndex = o.SubjectIndex,
-                SourceDisposition = o.SourceDisposition,
-                Detail = o.Detail,
-            };
+            DryRunOperation wire = _opPool.Count > 0
+                ? _opPool.Pop()
+                : new DryRunOperation { DirIndex = 0, FileName = "", RootDirIndex = 0, Kind = default };
+            wire.DirIndex = hit.DirIndex;
+            wire.FileName = hit.FileName;
+            wire.RootDirIndex = hit.RootDirIndex;
+            wire.Kind = o.Kind;
+            wire.SourceIndex = o.SourceIndex;
+            wire.SubjectIndex = o.SubjectIndex;
+            wire.SourceDisposition = o.SourceDisposition;
+            wire.Detail = o.Detail;
+            return wire;
         }
     }
 }

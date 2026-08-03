@@ -65,43 +65,83 @@ public sealed record DryRunDirectory(string Name, int ParentIndex);
 /// <summary>The wire form of a discovered file: its directory as an index into the report's shared
 /// <see cref="DryRunReport.Directories"/> table plus the file name — never a flat absolute path.
 /// Otherwise mirrors <see cref="PhysicalFile"/>, which remains the engine's in-memory currency
-/// (evaluation and hashing need absolute paths) but no longer crosses the IPC boundary.</summary>
-public sealed record DryRunFile
+/// (evaluation and hashing need absolute paths) but no longer crosses the IPC boundary.
+///
+/// <para>A mutable class rather than a record, deliberately: the service pools these on the streamed
+/// path (a dry run over 500k files would otherwise allocate one per entry, and in-run peak commit
+/// tracks that churn), and the batched builder remaps indices in place instead of <c>with{}</c>
+/// copies. Mutability is invisible on the wire (<c>set</c> serializes exactly like <c>init</c>) and
+/// value equality is preserved by hand below — but note <c>==</c> is now reference equality; compare
+/// with <see cref="Equals(DryRunFile?)"/>. Property declaration order is the wire order
+/// (source-generated serialization emits in declaration order) — do not reorder.</para></summary>
+public sealed class DryRunFile : IEquatable<DryRunFile>
 {
     /// <summary>Index of the containing directory in <see cref="DryRunReport.Directories"/>.</summary>
-    public required int DirIndex { get; init; }
-    public required string FileName { get; init; }
+    public required int DirIndex { get; set; }
+    public required string FileName { get; set; }
     /// <summary>Index of the source/target root this file was discovered under — the group/facet key.</summary>
-    public required int RootDirIndex { get; init; }
-    public required long Length { get; init; }
-    public required DateTimeOffset LastWritten { get; init; }
-    public bool IsReparsePoint { get; init; }
+    public required int RootDirIndex { get; set; }
+    public required long Length { get; set; }
+    public required DateTimeOffset LastWritten { get; set; }
+    public bool IsReparsePoint { get; set; }
+
+    public bool Equals(DryRunFile? other) =>
+        other is not null
+        && DirIndex == other.DirIndex
+        && FileName == other.FileName
+        && RootDirIndex == other.RootDirIndex
+        && Length == other.Length
+        && LastWritten.Equals(other.LastWritten)
+        && IsReparsePoint == other.IsReparsePoint;
+
+    public override bool Equals(object? obj) => Equals(obj as DryRunFile);
+
+    public override int GetHashCode() =>
+        HashCode.Combine(DirIndex, FileName, RootDirIndex, Length, LastWritten, IsReparsePoint);
 }
 
 /// <summary>The wire form of <see cref="VirtualFileOperation"/>: the op's path as a directory-table
 /// index plus file name. Index semantics (<see cref="SourceIndex"/>/<see cref="SubjectIndex"/>) are
-/// unchanged — positions into the report's file lists.</summary>
-public sealed record DryRunOperation
+/// unchanged — positions into the report's file lists.
+/// <para>A mutable class for the same pooling/in-place-remap reasons as <see cref="DryRunFile"/> —
+/// see its doc for the equality and property-order caveats.</para></summary>
+public sealed class DryRunOperation : IEquatable<DryRunOperation>
 {
     /// <summary>Index of the resulting path's directory in <see cref="DryRunReport.Directories"/>.</summary>
-    public required int DirIndex { get; init; }
-    public required string FileName { get; init; }
+    public required int DirIndex { get; set; }
+    public required string FileName { get; set; }
     /// <summary>Index of the source/target root this op's path sits under — facet key and cross-tab
     /// relative-path alignment.</summary>
-    public required int RootDirIndex { get; init; }
-    public required OperationKind Kind { get; init; }
+    public required int RootDirIndex { get; set; }
+    public required OperationKind Kind { get; set; }
     /// <summary>Index into <see cref="DryRunReport.SourceFiles"/> for the content origin. <c>-1</c>
     /// when there is none.</summary>
-    public int SourceIndex { get; init; } = -1;
+    public int SourceIndex { get; set; } = -1;
     /// <summary>Index into <see cref="DryRunReport.DestinationFiles"/> for the pre-existing file this
     /// destination op touches. <c>-1</c> when there is none (New/Rename, and all source ops).</summary>
-    public int SubjectIndex { get; init; } = -1;
+    public int SubjectIndex { get; set; } = -1;
     /// <summary>Source ops only: what happens to the original after a successful copy. Null when the
     /// file does not process.</summary>
-    public OnSuccessAction? SourceDisposition { get; init; }
+    public OnSuccessAction? SourceDisposition { get; set; }
     /// <summary>Display string: e.g. the existing file's mtime, the suffixed rename name, the
     /// deciding filter rule, or the unchanged reason.</summary>
-    public string? Detail { get; init; }
+    public string? Detail { get; set; }
+
+    public bool Equals(DryRunOperation? other) =>
+        other is not null
+        && DirIndex == other.DirIndex
+        && FileName == other.FileName
+        && RootDirIndex == other.RootDirIndex
+        && Kind == other.Kind
+        && SourceIndex == other.SourceIndex
+        && SubjectIndex == other.SubjectIndex
+        && SourceDisposition == other.SourceDisposition
+        && Detail == other.Detail;
+
+    public override bool Equals(object? obj) => Equals(obj as DryRunOperation);
+
+    public override int GetHashCode() =>
+        HashCode.Combine(DirIndex, FileName, RootDirIndex, Kind, SourceIndex, SubjectIndex, SourceDisposition, Detail);
 }
 
 /// <summary>Read-only view of a discovered file's fields, implemented by both the immutable

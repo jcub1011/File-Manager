@@ -159,7 +159,9 @@ public sealed class DryRunFrameSizeTests
                 new SyntheticScanScheduler(sweptFiles, filesPerDirectory)),
             new FakeVolumeInfoProvider(), new EngineConfig(),
             new EngineEventBus(NullLogger<EngineEventBus>.Instance), NullMemoryTrimCoordinator.Instance)
-        { MaxStreamedFiles = 1_000_000 };
+        // Sizes are serialized inline, but CollectWithSizes also buffers the frame OBJECTS for the
+        // post-hoc swept-count check — recycling would corrupt those (the seam's documented case).
+        { MaxStreamedFiles = 1_000_000, RecycleWireRecords = false };
 
     private static async Task<List<(IpcResponse Frame, int Bytes)>> CollectWithSizes(
         DryRunStreamHandler handler, Guid profileId)

@@ -25,11 +25,12 @@ public sealed class WireChunkConverterAllocationTests(ITestOutputHelper output)
 {
     /// <summary>Steady-state ceiling per (file, op) pair, with the pair sharing one path string —
     /// the destination-sweep shape, which is the volume case. Measured at ~90-char paths: 627 B/pair
-    /// before the span-probe/memo pass (two throwaway <c>GetDirectoryName</c> strings, two
-    /// <c>GetFileName</c> strings), 254 B/pair after (two wire records, ONE file-name string, list
-    /// slots, amortized directory-table misses). The headroom above 254 is for runtime/layout
-    /// variation across machines, not for new allocations.</summary>
-    private const int MaxBytesPerEntryPair = 400;
+    /// originally (two throwaway <c>GetDirectoryName</c> strings, two <c>GetFileName</c> strings,
+    /// fresh wire records); 254 after the span-probe/memo pass removed the throwaway strings; 113
+    /// after wire-DTO recycling removed the per-entry records and chunk lists — what remains is the
+    /// one file-name string the wire genuinely carries, plus amortized odds and ends. The headroom
+    /// above 113 is for runtime/layout variation across machines, not for new allocations.</summary>
+    private const int MaxBytesPerEntryPair = 200;
 
     private const int EntriesPerChunk = 300;   // ~ one WireChunkByteBudget chunk's worth
     private const int Chunks = 60;

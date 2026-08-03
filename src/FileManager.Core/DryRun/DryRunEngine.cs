@@ -729,15 +729,18 @@ public sealed class DryRunEngine(
             int sourceIndex = SourceFiles.Count;
             int destBase = DestinationFiles.Count;
             SourceFiles.Add(sourceFile);
-            SourceOperations.Add(sourceOp with { SourceIndex = sourceIndex });
+            // The builder exclusively owns the freshly converted DTOs, so the global remap mutates
+            // them in place (these were `with{}` copies when the wire types were records).
+            sourceOp.SourceIndex = sourceIndex;
+            SourceOperations.Add(sourceOp);
             foreach (DryRunFile file in destFiles)
                 DestinationFiles.Add(file);
             foreach (DryRunOperation op in destOps)
-                DestinationOperations.Add(op with
-                {
-                    SourceIndex = op.SourceIndex == 0 ? sourceIndex : -1,
-                    SubjectIndex = op.SubjectIndex >= 0 ? destBase + op.SubjectIndex : -1,
-                });
+            {
+                op.SourceIndex = op.SourceIndex == 0 ? sourceIndex : -1;
+                op.SubjectIndex = op.SubjectIndex >= 0 ? destBase + op.SubjectIndex : -1;
+                DestinationOperations.Add(op);
+            }
             DestinationProjector.AccumulateSurvivors(Survivors, bundle.DestinationOps);
             return true;
         }
@@ -756,7 +759,8 @@ public sealed class DryRunEngine(
             }
             int subjectIndex = DestinationFiles.Count;
             DestinationFiles.Add(wireFile);
-            DestinationOperations.Add(wireOp with { SubjectIndex = subjectIndex });
+            wireOp.SubjectIndex = subjectIndex;   // freshly converted, exclusively owned — remap in place
+            DestinationOperations.Add(wireOp);
             return true;
         }
 

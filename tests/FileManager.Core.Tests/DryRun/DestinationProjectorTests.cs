@@ -412,7 +412,9 @@ public sealed class DestinationProjectorTests : IDisposable
             expected.Add(Path.GetFileName(TargetFile(Path.Combine($"d{i % 6}", $"f{i}.txt"))));
 
         DestinationProjector projector = NewProjector(Workers);
-        DryRunStreamHandler.WireChunkConverter converter = new();
+        // recycleWireRecords off: this test buffers the responses to inspect them after the stream,
+        // which is exactly the consumption shape wire-DTO recycling forbids.
+        DryRunStreamHandler.WireChunkConverter converter = new(recycleWireRecords: false);
         List<DryRunChunkResponse> frames = [];
         HashSet<NormalizedPath> survivors = [];
         await foreach (Result<DryRunChunk, string> result in projector.SweepStreamAsync(
