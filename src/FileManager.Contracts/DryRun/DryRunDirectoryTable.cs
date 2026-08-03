@@ -210,16 +210,10 @@ public static class DryRunDirectoryTable
     public static string[] Materialize(IReadOnlyList<DryRunDirectory> directories)
     {
         ArgumentNullException.ThrowIfNull(directories);
-        string[] paths = new string[directories.Count];
+        DryRunDirectoryPathBuilder builder = new(directories.Count);
         for (int i = 0; i < directories.Count; i++)
-        {
-            DryRunDirectory entry = directories[i];
-            if (entry.ParentIndex < -1 || entry.ParentIndex >= i)
-                throw new InvalidOperationException(
-                    $"malformed directory table: entry {i} ('{entry.Name}') has ParentIndex {entry.ParentIndex}");
-            paths[i] = entry.ParentIndex < 0 ? entry.Name : Path.Join(paths[entry.ParentIndex], entry.Name);
-        }
-        return paths;
+            builder.Append(directories[i]);
+        return builder.ToArray();
     }
 
     /// <summary>Returns a description of the first file/op record whose <c>DirIndex</c> or
@@ -251,5 +245,62 @@ public static class DryRunDirectoryTable
                 return $"operation '{o.FileName}' RootDirIndex {o.RootDirIndex}";
         }
         return null;
+    }
+}
+
+/// <summary>Resolves a report's directory table into absolute paths <em>incrementally</em> — entries
+/// can be appended as their chunks arrive rather than only once the whole table is in hand.
+///
+/// <para>The parents-precede-children invariant is what makes this possible: an entry's parent is
+/// always already resolved, so appending is O(1) and a streaming consumer never has to buffer the
+/// table just to resolve it. <see cref="DryRunDirectoryTable.Materialize"/> is the batch case of
+/// exactly this loop, so the two cannot drift. A violated invariant (malformed producer) throws
+/// rather than silently mis-rooting every path beneath it.</para>
+///
+/// <para>Only the resolved path strings are kept — the <see cref="DryRunDirectory"/> entries
+/// themselves are not retained, which is the point for a caller streaming at the 500k cap.</para></summary>
+public sealed class DryRunDirectoryPathBuilder
+{
+    private string[] _paths;
+
+    public DryRunDirectoryPathBuilder(int capacity = 0) =>
+        _paths = capacity > 0 ? new string[capacity] : [];
+
+    /// <summary>How many entries have been appended. This is the value a trust-boundary check
+    /// compares a record's <c>DirIndex</c>/<c>RootDirIndex</c> against.</summary>
+    public int Count { get; private set; }
+
+    /// <summary>The absolute path of an already-appended entry.</summary>
+    public string this[int index]
+    {
+        get
+        {
+            if ((uint)index >= (uint)Count)
+                throw new ArgumentOutOfRangeException(nameof(index), index, $"the directory table holds {Count} entries");
+            return _paths[index];
+        }
+    }
+
+    public void Append(DryRunDirectory entry)
+    {
+        ArgumentNullException.ThrowIfNull(entry);
+        if (entry.ParentIndex < -1 || entry.ParentIndex >= Count)
+            throw new InvalidOperationException(
+                $"malformed directory table: entry {Count} ('{entry.Name}') has ParentIndex {entry.ParentIndex}");
+        if (Count == _paths.Length)
+            Array.Resize(ref _paths, _paths.Length == 0 ? 64 : _paths.Length * 2);
+        _paths[Count] = entry.ParentIndex < 0 ? entry.Name : Path.Join(_paths[entry.ParentIndex], entry.Name);
+        Count++;
+    }
+
+    /// <summary>The resolved paths, exactly <see cref="Count"/> long. Returns the internal array
+    /// when it is already exact, so the common pre-sized path copies nothing.</summary>
+    public string[] ToArray()
+    {
+        if (Count == _paths.Length)
+            return _paths;
+        string[] exact = new string[Count];
+        Array.Copy(_paths, exact, Count);
+        return exact;
     }
 }

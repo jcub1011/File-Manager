@@ -191,17 +191,19 @@ public sealed class IpcGateway(Func<string?>? serviceExePath = null, TimeProvide
         }
     }
 
-    public async Task<Result<DryRunReport, IpcError>> DryRunAsync(
-        Guid profileId, IProgress<DryRunProgress>? progress = null, Profile? draft = null,
-        CancellationToken ct = default)
+    public async Task<Result<DryRunCompletion, IpcError>> DryRunAsync(
+        Guid profileId, IDryRunChunkSink sink, IProgress<DryRunProgress>? progress = null,
+        Profile? draft = null, CancellationToken ct = default)
     {
+        ArgumentNullException.ThrowIfNull(sink);
+
         // Own connection: cancel = dispose, leaving the shared channel clean. May start the service:
         // this path runs once per explicit user action, so it cannot become the runaway loop the
         // shared channel's 2 s poll can — that is what the cooldown in EnsureConnectedAsync guards.
         var connected = await ServiceLauncher
             .ConnectOrStartAsync(_serviceExePath?.Invoke(), allowStart: true, ct).ConfigureAwait(false);
         if (connected.IsCanceled)
-            return Result<DryRunReport, IpcError>.Canceled();
+            return Result<DryRunCompletion, IpcError>.Canceled();
         if (connected.TryGetError(out string? connectError))
         {
             Log.Warning("Dry-run could not connect to the service: {Error}", connectError);
@@ -211,23 +213,23 @@ public sealed class IpcGateway(Func<string?>? serviceExePath = null, TimeProvide
 
         await using (client)
         {
-            // Streamed: the report arrives as many small frames and is reassembled here, so it is
-            // not bounded by the single-frame size cap (no ~50k-file truncation). The GUI always
-            // simulates every source (ScopePath stays null) and focuses the result in the view;
-            // scoped enumeration remains a service/CLI capability.
+            // Streamed: the run arrives as many small frames, so it is not bounded by the single-frame
+            // size cap (no ~50k-file truncation), and each frame is handed to the sink and dropped
+            // rather than accumulated. The GUI always simulates every source (ScopePath stays null)
+            // and focuses the result in the view; scoped enumeration remains a service/CLI capability.
             var response = await client!.DryRunStreamAsync(
                 new DryRunStreamRequest { ProfileId = profileId, ScopePath = null, InlineProfile = draft },
-                progress, ct).ConfigureAwait(false);
+                sink, progress, ct).ConfigureAwait(false);
             if (response.IsCanceled)
-                return Result<DryRunReport, IpcError>.Canceled();
+                return Result<DryRunCompletion, IpcError>.Canceled();
             if (response.TryGetError(out IpcError? error))
             {
                 Log.Warning("Dry-run IPC request for profile {ProfileId} failed: {Code} {Message}",
                     profileId, error.Code, error.Message);
                 return error;
             }
-            response.TryGetValue(out DryRunReport? report);
-            return report!;
+            response.TryGetValue(out DryRunCompletion? completion);
+            return completion!;
         }
     }
 

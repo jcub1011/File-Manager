@@ -23,6 +23,66 @@
 > **116 MB / ~1.6 s**. The remaining follow-up, if the residual pause matters, is moving
 > the build off the UI thread.
 
+> **Addendum 2 (2026-08-03): the columnar pass.** The three optimizations above took the
+> retained preview from 519 MB to 219 MB by making rows cheaper. This pass removed the
+> rows. What was left after them was structural: one `DryRunFileRow` + target list +
+> `DryRunDestinationRow` + entry list per source file, and every destination operation
+> materialized **twice** (once as a target of its source row, once as an entry of its
+> destination row) — ~2.5M objects at the 500k cap. Two changes, both measured:
+>
+> 1. **`DryRunRowStore`** (`src/FileManager.UI/ViewModels/DryRunRowStore.cs`) — one column
+>    per field in segmented `ColumnBuffer<T>` blocks, with the row types reduced to
+>    `(store, index)` handles built per indexer access. Both tabs hold `int[]` of store
+>    keys; `DryRunRowList<T>` is the bound view. File names are interned across records
+>    (a copy preserves its name, so a destination operation's name is almost always its
+>    source's) and `Detail` strings are deduplicated.
+> 2. **Streaming ingest** — `IpcClient.DryRunStreamAsync` gained an `IDryRunChunkSink`
+>    overload; the assembling overload is now written on top of it. The UI's store *is*
+>    the sink, so the reassembled `DryRunReport` — which used to be live at the same time
+>    as the rows being projected out of it — never exists in the UI process.
+>
+> **Retained**, by the same probes (`DryRunViewModelMemoryTests`, 500k files):
+> shallow shape **238 MB → 66 MB**; realistic deep paths **219 MB → 72 MB (−67%)**;
+> tree toggle **48 MB → 48 MB** (unchanged in bytes, but its per-directory row buckets
+> are now 4 bytes a file instead of a row reference). Budgets tightened to 95 / 100 / 60 MB.
+>
+> **Allocation and time** (`DryRunViewModelBenchmarks`, 500k). The comparable pair is the
+> whole finished-run-to-populated-preview cost: the old `PrepareReport` (which was the
+> entire projection) at **1,139 ms / 462,663 KB**, against the new `ApplyReport` at
+> **838 ms / 149,709 KB** — **−68% allocated, −26% time**. The new split matters more than
+> the total, though: `IngestReport` is 203 ms / 77,906 KB and the app pays it *incrementally,
+> frame by frame, while the service is still scanning*; only `PrepareReport`'s 557 ms /
+> 71,783 KB (the two sorts) lands after the stream ends. `ToggleStatusFilter` — the
+> interactive filter pass — is 12.6 ms / 3,257 KB at 500k; there is no committed baseline
+> for it (the previous report carried only `PrepareReport` rows), so that is an absolute
+> figure, not a comparison.
+>
+> `DryRunTreeBenchmarks` is unaffected and was not re-run: it calls `BuildForest` with its
+> own row types, and `BuildForest` itself did not change — only its call sites, which now
+> pass row indices instead of row objects.
+>
+> Note the deep-path shape now measures *higher* than the shallow one, reversing the prior
+> relationship. That is the expected end state: with an object per row gone, what remains
+> is dominated by interned file names and the directory-path table, and the deep shape has
+> ~25k directories of ~100-char paths against the other's 64.
+>
+> **Two invariants this rests on**, both pinned by `DryRunRowStoreTests`:
+> - Handles are values, not identities — two handles for the same row are `Equals`, because
+>   a row record is a record over (store, key). ListBox selection, `IndexOf` and container
+>   recycling all depend on it. This is what makes lazy row projection safe now where
+>   Optimization 3 below rejected it: the hazard there was the row's nested list comparing
+>   by reference. **Never add a field to a row record that joins its generated equality.**
+> - `DryRunRowList<T>` implements non-generic `IList`. Avalonia's `ItemsSourceView` uses it
+>   for indexed access and otherwise copies the whole source into a list — which would
+>   materialize every handle up front and undo the change. It used to hold by accident,
+>   because the bound instance was a `List<T>`.
+>
+> **The new floor.** Retained is now dominated by the ~500k interned `FileName` strings and
+> the directory-path table, plus the transient `string[] keys` each `ComputeLoad` sort
+> builds. Going lower means storing names as a UTF-8 blob with `(offset, length)` pairs,
+> which needs span overloads on `DryRunPaths.PathContains` and `DryRunSort.RelativeKey`.
+> Not done — measure before deciding it is worth the API churn.
+
 ## Context
 
 After a dry run completes, `DryRunView` holds a large amount of memory even before

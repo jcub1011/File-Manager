@@ -23,8 +23,32 @@ public sealed class DryRunItemActionsCommandsTests
         public void OpenFolderInExplorer(string path) => OpenedFolder = path;
     }
 
-    private static DryRunFileRow FileRow(string dir, string name, IDryRunItemActions actions) =>
-        new(dir, name, null, OperationKind.Processed, null, null, Array.Empty<DryRunTargetRow>()) { Actions = actions };
+    /// <summary>A single-file row. Rows are handles into a <see cref="DryRunRowStore"/> now, so the
+    /// fixture goes through a one-file report rather than constructing the record directly.</summary>
+    private static DryRunFileRow FileRow(string dir, string name, IDryRunItemActions actions)
+    {
+        DryRunDirectoryTableBuilder dirs = new();
+        string path = Path.Join(dir, name);
+        DryRunFile file = dirs.Convert(new PhysicalFile
+        {
+            Path = path, Root = dir, Length = 0, LastWritten = DateTimeOffset.UnixEpoch,
+        });
+        DryRunOperation op = dirs.Convert(new VirtualFileOperation
+        {
+            Path = path, Root = dir, Kind = OperationKind.Processed, SourceIndex = 0,
+        });
+        DryRunRowStore store = DryRunRowStore.FromReport(new DryRunReport
+        {
+            ProfileId = Guid.Empty,
+            GeneratedAt = DateTimeOffset.UnixEpoch,
+            Directories = dirs.Entries.ToList(),
+            SourceFiles = [file],
+            DestinationFiles = [],
+            SourceOperations = [op],
+            DestinationOperations = [],
+        });
+        return new DryRunFileRow(store, 0) { Actions = actions };
+    }
 
     [Fact]
     public void Copy_commands_send_path_name_and_stem_to_the_service()

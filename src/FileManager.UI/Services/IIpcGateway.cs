@@ -23,15 +23,20 @@ public interface IIpcGateway
     Task<Result<Profile, IpcError>> GetProfileAsync(Guid profileId, CancellationToken ct = default);
     Task<Result<SaveOutcome, IpcError>> SaveProfileAsync(Profile profile, bool acknowledgeWarnings, CancellationToken ct = default);
     Task<Result<bool, IpcError>> DeleteProfileAsync(Guid profileId, CancellationToken ct = default);
-    /// <summary>Runs a streamed dry run. <paramref name="progress"/> (when supplied) receives
-    /// throttled discovery updates as the service reports them; construct the
-    /// <see cref="Progress{T}"/> on the UI thread so reports marshal there automatically.
-    /// When <paramref name="draft"/> is supplied, the service previews that in-memory profile
-    /// (unsaved edits) directly instead of resolving <paramref name="profileId"/> against the
-    /// persisted catalog.</summary>
-    Task<Result<DryRunReport, IpcError>> DryRunAsync(
-        Guid profileId, IProgress<DryRunProgress>? progress = null, Profile? draft = null,
-        CancellationToken ct = default);
+    /// <summary>Runs a streamed dry run, folding each chunk frame into <paramref name="sink"/> as it
+    /// arrives and returning only the run-level facts from the terminator.
+    /// <para>It streams rather than returning a <c>DryRunReport</c> for a memory reason, not a
+    /// stylistic one: assembling the report meant the whole run was live in the client at the same
+    /// time as the rows being projected out of it, which is most of the UI's peak at the 500k cap.
+    /// The caller's sink (<c>DryRunRowStore</c>) folds each chunk into its columns and drops it.</para>
+    /// <para><paramref name="progress"/> (when supplied) receives throttled discovery updates as the
+    /// service reports them; construct the <see cref="Progress{T}"/> on the UI thread so reports
+    /// marshal there automatically. When <paramref name="draft"/> is supplied, the service previews
+    /// that in-memory profile (unsaved edits) directly instead of resolving
+    /// <paramref name="profileId"/> against the persisted catalog.</para></summary>
+    Task<Result<DryRunCompletion, IpcError>> DryRunAsync(
+        Guid profileId, IDryRunChunkSink sink, IProgress<DryRunProgress>? progress = null,
+        Profile? draft = null, CancellationToken ct = default);
     Task<Result<GlobalSettings, IpcError>> GetSettingsAsync(CancellationToken ct = default);
     Task<Result<GlobalSettings, IpcError>> SaveSettingsAsync(GlobalSettings settings, CancellationToken ct = default);
     /// <summary>Relocates the profiles storage directory, optionally moving the existing files.

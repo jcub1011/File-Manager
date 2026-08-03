@@ -190,13 +190,38 @@ public sealed class IpcClient : IAsyncDisposable
     {
         ArgumentNullException.ThrowIfNull(request);
 
+        ReportAssemblySink sink = new();
+        Result<DryRunCompletion, IpcError> outcome =
+            await DryRunStreamAsync(request, sink, progress, ct).ConfigureAwait(false);
+
+        if (outcome.IsCanceled)
+            return Result<DryRunReport, IpcError>.Canceled();
+        if (outcome.TryGetError(out IpcError? error))
+            return error;
+        outcome.TryGetValue(out DryRunCompletion? completion);
+        return sink.ToReport(request.ProfileId, completion!);
+    }
+
+    /// <summary>The streaming core of <see cref="DryRunStreamAsync(DryRunStreamRequest, IProgress{DryRunProgress}?, CancellationToken)"/>:
+    /// pushes each validated chunk frame to <paramref name="sink"/> and returns only the run-level
+    /// facts from the terminator, so a consumer that folds chunks as they arrive never holds the
+    /// assembled report. See <see cref="IDryRunChunkSink"/> for the sink's contract; the framing,
+    /// gating, poisoning and error semantics are identical to the assembling overload — which is
+    /// implemented on top of this method, so there is one reassembly loop, not two.</summary>
+    public async Task<Result<DryRunCompletion, IpcError>> DryRunStreamAsync(
+        DryRunStreamRequest request, IDryRunChunkSink sink,
+        IProgress<DryRunProgress>? progress = null, CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        ArgumentNullException.ThrowIfNull(sink);
+
         try
         {
             await _requestGate.WaitAsync(ct).ConfigureAwait(false);
         }
         catch (OperationCanceledException)
         {
-            return Result<DryRunReport, IpcError>.Canceled();
+            return Result<DryRunCompletion, IpcError>.Canceled();
         }
         catch (Exception ex)
         {
@@ -217,23 +242,19 @@ public sealed class IpcClient : IAsyncDisposable
             _poisoned = true;   // re-armed only by a complete, in-sync stream outcome (see RequestAsync)
             Result writeResult = await IpcFrameCodec.WriteFrameAsync(_pipe, payload, ct).ConfigureAwait(false);
             if (writeResult.IsCanceled)
-                return Result<DryRunReport, IpcError>.Canceled();
+                return Result<DryRunCompletion, IpcError>.Canceled();
             if (writeResult.TryGetError(out string? writeError))
                 return new IpcError("IPC_TRANSPORT", writeError);
 
-            // Appended in receive order so the lists' indices stay global — an op's
-            // SourceIndex/SubjectIndex is a position into the fully assembled file lists, and a
-            // file/op's DirIndex/RootDirIndex is a position into the assembled directory table.
-            List<DryRunDirectory> directories = [];
-            List<DryRunFile> sourceFiles = [];
-            List<DryRunFile> destinationFiles = [];
-            List<DryRunOperation> sourceOperations = [];
-            List<DryRunOperation> destinationOperations = [];
+            // The running directory count is all the trust-boundary check needs — the entries
+            // themselves go to the sink, which is free to resolve them and drop them. Indices stay
+            // global because chunks are handed over in receive order.
+            int directoryCount = 0;
             while (true)
             {
                 Result<byte[], string> frame = await IpcFrameCodec.ReadFrameAsync(_pipe, ct).ConfigureAwait(false);
                 if (frame.IsCanceled)
-                    return Result<DryRunReport, IpcError>.Canceled();
+                    return Result<DryRunCompletion, IpcError>.Canceled();
                 if (frame.TryGetError(out string? transportError))
                     return new IpcError("IPC_TRANSPORT", transportError);
                 frame.TryGetValue(out byte[]? bytes);
@@ -250,41 +271,38 @@ public sealed class IpcClient : IAsyncDisposable
                         // must already be in the assembled table (parents precede children globally).
                         foreach (DryRunDirectory dir in chunk.Directories)
                         {
-                            if (dir.ParentIndex < -1 || dir.ParentIndex >= directories.Count)
+                            if (dir.ParentIndex < -1 || dir.ParentIndex >= directoryCount)
                                 return new IpcError("IPC_MALFORMED",
                                     $"the service sent a directory entry ('{dir.Name}') whose ParentIndex {dir.ParentIndex} does not precede it in the table");
-                            directories.Add(dir);
+                            directoryCount++;
                         }
                         // Every file/op index must resolve against the table assembled so far
                         // (directories precede the records that reference them). Reject an
                         // out-of-range index here rather than letting a consumer crash on it.
                         if (DryRunDirectoryTable.FindInvalidReference(
-                                directories.Count, chunk.SourceFiles, chunk.SourceOperations) is { } badSource)
+                                directoryCount, chunk.SourceFiles, chunk.SourceOperations) is { } badSource)
                             return new IpcError("IPC_MALFORMED",
                                 $"the service sent a record with an out-of-range directory index: {badSource}");
                         if (DryRunDirectoryTable.FindInvalidReference(
-                                directories.Count, chunk.DestinationFiles, chunk.DestinationOperations) is { } badDest)
+                                directoryCount, chunk.DestinationFiles, chunk.DestinationOperations) is { } badDest)
                             return new IpcError("IPC_MALFORMED",
                                 $"the service sent a record with an out-of-range directory index: {badDest}");
-                        sourceFiles.AddRange(chunk.SourceFiles);
-                        destinationFiles.AddRange(chunk.DestinationFiles);
-                        sourceOperations.AddRange(chunk.SourceOperations);
-                        destinationOperations.AddRange(chunk.DestinationOperations);
+                        // Only after the chunk has cleared the trust boundary. A throwing sink is a
+                        // consumer bug, not a protocol fault, so it does not un-poison the connection
+                        // (the remaining frames are still queued on the pipe either way).
+                        try
+                        {
+                            sink.OnChunk(chunk);
+                        }
+                        catch (Exception ex)
+                        {
+                            return new IpcError("IPC_SINK_FAILED",
+                                $"the dry-run chunk sink threw: {ex.GetType().Name}: {ex.Message}");
+                        }
                         break;
                     case DryRunCompleteResponse complete:
                         _poisoned = false;           // terminator consumed — connection in sync
-                        return new DryRunReport
-                        {
-                            ProfileId = request.ProfileId,
-                            GeneratedAt = complete.GeneratedAt,
-                            Directories = directories,
-                            SourceFiles = sourceFiles,
-                            DestinationFiles = destinationFiles,
-                            SourceOperations = sourceOperations,
-                            DestinationOperations = destinationOperations,
-                            Truncated = complete.Truncated,
-                            Space = complete.Space,
-                        };
+                        return new DryRunCompletion(complete.GeneratedAt, complete.Truncated, complete.Space);
                     case DryRunProgressResponse progressFrame:
                         // Informational only — reassembly state is untouched, the loop just continues.
                         progress?.Report(new DryRunProgress(
@@ -301,7 +319,7 @@ public sealed class IpcClient : IAsyncDisposable
         }
         catch (OperationCanceledException)
         {
-            return Result<DryRunReport, IpcError>.Canceled();
+            return Result<DryRunCompletion, IpcError>.Canceled();
         }
         catch (Exception ex) when (ex is System.IO.IOException or ObjectDisposedException)
         {
@@ -317,6 +335,41 @@ public sealed class IpcClient : IAsyncDisposable
         {
             ReleaseGate();
         }
+    }
+
+    /// <summary>The sink that reproduces the historical behaviour: append every record in receive
+    /// order so the lists' indices stay global, then hand back one <see cref="DryRunReport"/>.
+    /// Callers that can fold chunks incrementally should implement their own sink instead — this one
+    /// holds the whole run.</summary>
+    private sealed class ReportAssemblySink : IDryRunChunkSink
+    {
+        private readonly List<DryRunDirectory> _directories = [];
+        private readonly List<DryRunFile> _sourceFiles = [];
+        private readonly List<DryRunFile> _destinationFiles = [];
+        private readonly List<DryRunOperation> _sourceOperations = [];
+        private readonly List<DryRunOperation> _destinationOperations = [];
+
+        public void OnChunk(DryRunChunkResponse chunk)
+        {
+            _directories.AddRange(chunk.Directories);
+            _sourceFiles.AddRange(chunk.SourceFiles);
+            _destinationFiles.AddRange(chunk.DestinationFiles);
+            _sourceOperations.AddRange(chunk.SourceOperations);
+            _destinationOperations.AddRange(chunk.DestinationOperations);
+        }
+
+        public DryRunReport ToReport(Guid profileId, DryRunCompletion completion) => new()
+        {
+            ProfileId = profileId,
+            GeneratedAt = completion.GeneratedAt,
+            Directories = _directories,
+            SourceFiles = _sourceFiles,
+            DestinationFiles = _destinationFiles,
+            SourceOperations = _sourceOperations,
+            DestinationOperations = _destinationOperations,
+            Truncated = completion.Truncated,
+            Space = completion.Space,
+        };
     }
 
     /// <summary>Sends SubscribeEventsRequest; after the acknowledgment the connection is a

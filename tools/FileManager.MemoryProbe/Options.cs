@@ -4,10 +4,26 @@ using System.IO;
 
 namespace FileManager.MemoryProbe;
 
+/// <summary>How the harness consumes the streamed run — the A/B for the client-side half of the
+/// memory work.</summary>
+internal enum ClientIngest
+{
+    /// <summary>Fold each chunk as it arrives and drop it, as the UI's row store does. The run never
+    /// exists as one object graph in the client.</summary>
+    Sink,
+
+    /// <summary>Reassemble the whole run into one <c>DryRunReport</c> — what the client used to do
+    /// unconditionally, and what the sink path replaced. Kept as the comparison tier: the difference
+    /// between the two <c>client peak</c> rows IS the saving.</summary>
+    Report,
+}
+
 /// <summary>Parsed command line. Kept separate from <see cref="Program"/> so the defaults and the
 /// help text sit next to each other and cannot drift.</summary>
 internal sealed record Options
 {
+    public ClientIngest ClientIngest { get; init; } = ClientIngest.Sink;
+
     public string TreeRoot { get; init; } = "";
     public int SourceFiles { get; init; } = 33_500;
     public int DestinationFiles { get; init; } = 357_000;
@@ -57,6 +73,18 @@ internal sealed record Options
                         break;
                     case "--generate-only":
                         options = options with { GenerateOnly = true };
+                        break;
+                    case "--client-ingest":
+                        options = options with
+                        {
+                            ClientIngest = Next(arg) switch
+                            {
+                                "sink" => ClientIngest.Sink,
+                                "report" => ClientIngest.Report,
+                                string other => throw new ArgumentException($"--client-ingest must be sink or report, not '{other}'"),
+                                null => throw new ArgumentException("--client-ingest needs a value"),
+                            },
+                        };
                         break;
                     case "--service":
                         options = options with { ServiceExePath = Next(arg) };
@@ -123,6 +151,10 @@ internal sealed record Options
         "  --budget-private-mb <n>   Exit non-zero if settled private memory exceeds this. Makes it a gate.",
         "  --label <text>            Tag for the CSV rows (e.g. a stage name).",
         "  --additive                Preview as AdditiveArchive with destination scanning instead of Mirror.",
+        "  --client-ingest <mode>    How this harness consumes the stream: sink (default, folds each",
+        "                            chunk and drops it, as the UI does) or report (reassembles the",
+        "                            whole run, as the client used to). The client rows below make the",
+        "                            two comparable; the difference is the client-side peak saving.",
         "",
         "Notes:",
         "  * The trees are cached behind a .tree-manifest sentinel; a second run with the same shape",

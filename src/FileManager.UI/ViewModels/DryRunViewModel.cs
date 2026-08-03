@@ -1,4 +1,4 @@
-using Avalonia;
+﻿using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Controls.Models.TreeDataGrid;
 using CommunityToolkit.Mvvm.ComponentModel;
@@ -23,8 +23,33 @@ namespace FileManager.UI.ViewModels;
 //  Row / node models shared by the two tabs (Sources, Destinations).
 // ─────────────────────────────────────────────────────────────────────────────────────────────
 
-public sealed record DryRunTargetRow(string DirPath, string FileName, string? TargetRoot, OperationKind Kind, string? Detail)
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+//  The row types are HANDLES: each stores a reference to the shared DryRunRowStore and one integer
+//  position into it, and every property below is a column read. Two consequences worth knowing
+//  before editing them.
+//
+//  Identity. Because a handle is a record over (store, index), two handles built for the same row
+//  at different times are Equals — record equality is reference equality on the store plus an int
+//  compare. That is load-bearing: the bound lists materialize a handle per indexer access, so
+//  ListBox selection, IndexOf and container recycling all depend on it. Do NOT add a field that
+//  joins the generated equality (a cached list, a command instance) — an earlier design was
+//  rejected for exactly that (docs/dry-run-memory-optimization.md, Optimization 3).
+//
+//  Allocation. A handle is created per realization, not per file, so computed properties are the
+//  right default and cheap here — but they run on the UI thread during scrolling, so keep them
+//  O(this row's operations), never O(report).
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+
+/// <summary>One destination operation carried out on behalf of a source file, addressed by its CSR
+/// position in <see cref="DryRunRowStore"/>.</summary>
+public sealed record DryRunTargetRow(DryRunRowStore Store, int Position)
 {
+    public string DirPath => Store.OpDirPath(Position);
+    public string FileName => Store.OpFileName(Position);
+    public string? TargetRoot => Store.OpRoot(Position);
+    public OperationKind Kind => Store.OpKind(Position);
+    public string? Detail => Store.OpDetail(Position);
+
     /// <summary>The absolute resulting path, reconstructed on demand — rows share their directory
     /// string instead of each retaining a full path.</summary>
     public string Path => System.IO.Path.Join(DirPath, FileName);
@@ -38,19 +63,39 @@ public sealed record DryRunTargetRow(string DirPath, string FileName, string? Ta
 /// <summary>A source file in the Sources tab. Carries its own pills: Untouched (nothing happens to
 /// the source — filtered out or unchanged), Processed, and Deleted (a destructive source
 /// disposition). A processed-and-deleted file shows both the Processed and Deleted pills.</summary>
-public sealed partial record DryRunFileRow(
-    string DirPath,
-    string FileName,
-    string? SourceRoot,
-    OperationKind Disposition,
-    string? DecidingFilter,
-    string? SourceDisposition,
-    IReadOnlyList<DryRunTargetRow> Targets,
-    long SizeBytes = 0,
-    string? SourceCommonRoot = null) : IDryRunFileRow
+public sealed partial record DryRunFileRow(DryRunRowStore Store, int Index) : IDryRunFileRow
 {
+    public string DirPath => Store.SourceDirPath(Index);
+    public string FileName => Store.SourceFileName(Index);
+    public string? SourceRoot => Store.SourceRoot(Index);
+    public OperationKind Disposition => Store.SourceKind(Index);
+    public string? DecidingFilter => Store.SourceDetail(Index);
+    public string? SourceDisposition => Store.SourceDispositionText(Index);
+    public long SizeBytes => Store.SourceSize(Index);
+    public string? SourceCommonRoot => Store.SourceCommonRoot;
+
+    /// <summary>This file's destination operations. Materialized on demand and bound nowhere — the
+    /// row shows a single rolled-up status glyph (<see cref="PrimaryKindText"/>), not a nested list —
+    /// so it exists for tests and for callers that want the operations as objects. The row's own
+    /// pill, facet and search logic all read the store's CSR range directly instead, which is why a
+    /// 500k-file preview allocates none of these.</summary>
+    public IReadOnlyList<DryRunTargetRow> Targets
+    {
+        get
+        {
+            int start = Store.TargetStart(Index), end = Store.TargetEnd(Index);
+            if (start == end)
+                return [];
+            DryRunTargetRow[] targets = new DryRunTargetRow[end - start];
+            for (int p = start; p < end; p++)
+                targets[p - start] = new DryRunTargetRow(Store, p);
+            return targets;
+        }
+    }
+
     /// <summary>Clipboard/shell actions behind this row's right-click menu; set at build time, null
-    /// in headless tests (the commands then no-op).</summary>
+    /// in headless tests (the commands then no-op). An <c>init</c> property and NOT a positional
+    /// member, so it stays out of the record's value equality — see the identity note above.</summary>
     public IDryRunItemActions? Actions { get; init; }
 
     // File right-click commands (the Sources list rows are always real source files). Names mirror
@@ -86,14 +131,41 @@ public sealed partial record DryRunFileRow(
     public string SizeText => ByteSize.Format(SizeBytes);
 
     /// <summary>The single operation-kind pill shown in place of the (dropped) nested target list —
-    /// the most consequential of this file's target operations. Null when the file has no targets.</summary>
-    private OperationKind? PrimaryTargetKind =>
-        Targets.Count == 0 ? null
-        : Targets.Any(t => t.IsOverwrite) ? OperationKind.Overwrite
-        : Targets.Any(t => t.IsRename) ? OperationKind.Rename
-        : Targets.Any(t => t.IsWrite) ? OperationKind.New
-        : Targets.Any(t => t.IsSkip) ? OperationKind.SkipConflict
-        : OperationKind.Unknown;
+    /// the most consequential of this file's target operations. Null when the file has no targets.
+    /// One pass over the row's CSR range, tracking the best kind seen, rather than the four
+    /// <c>Any</c> scans it replaced: this runs per realized row while the user scrolls.</summary>
+    private OperationKind? PrimaryTargetKind
+    {
+        get
+        {
+            int start = Store.TargetStart(Index), end = Store.TargetEnd(Index);
+            if (start == end)
+                return null;
+            // Descending consequence: an Overwrite anywhere wins outright, so the scan can stop.
+            OperationKind best = OperationKind.Unknown;
+            int bestRank = 0;
+            for (int p = start; p < end; p++)
+            {
+                OperationKind kind = Store.OpKind(p);
+                int rank = kind switch
+                {
+                    OperationKind.Overwrite => 4,
+                    OperationKind.Rename => 3,
+                    OperationKind.New => 2,
+                    OperationKind.SkipConflict or OperationKind.SkipUnchanged => 1,
+                    _ => 0,
+                };
+                if (rank <= bestRank)
+                    continue;
+                bestRank = rank;
+                // The skip kinds both present as SkipConflict, matching the previous IsSkip fold.
+                best = rank == 1 ? OperationKind.SkipConflict : kind;
+                if (rank == 4)
+                    break;
+            }
+            return best;
+        }
+    }
 
     public bool HasTargetKind => PrimaryTargetKind is not null;
     public string PrimaryKindText => PrimaryTargetKind?.GetTitle() ?? "";
@@ -117,9 +189,10 @@ public sealed partial record DryRunFileRow(
         _ => null,
     };
 
-    /// <summary>Anything other than keeping the source is destructive from the source's view.</summary>
-    public bool IsSourceDisposalDestructive =>
-        SourceDisposition is not null && SourceDisposition != nameof(Contracts.Profiles.OnSuccessAction.KeepSource);
+    /// <summary>Anything other than keeping the source is destructive from the source's view. Reads
+    /// the stored enum rather than <see cref="SourceDisposition"/>, whose <c>ToString</c> would
+    /// allocate on a predicate the filter pass runs per row.</summary>
+    public bool IsSourceDisposalDestructive => Store.IsSourceDisposalDestructive(Index);
 
     public bool IsProcessed => Disposition == OperationKind.Processed;
     public bool IsFilterSkipped => Disposition == OperationKind.SkippedByFilter;
@@ -134,20 +207,35 @@ public sealed partial record DryRunFileRow(
     /// "filter by destination" facet keys. Allocates per call, so only the once-per-load facet
     /// count pass reads it; the per-row rebuild filter goes through the allocation-free
     /// <see cref="HasTargetUnder"/> instead.</summary>
-    public IReadOnlyList<string> TargetRoots => Targets
-        .Where(t => t.TargetRoot is not null)
-        .Select(t => t.TargetRoot!)
-        .Distinct(StringComparer.OrdinalIgnoreCase)
-        .ToList();
+    public IReadOnlyList<string> TargetRoots
+    {
+        get
+        {
+            int start = Store.TargetStart(Index), end = Store.TargetEnd(Index);
+            if (start == end)
+                return [];
+            // A file fans out to a handful of targets at most, and its roots are references into the
+            // one directory-path array — so a linear scan beats a HashSet for the distinct check.
+            List<string> roots = new(end - start);
+            for (int p = start; p < end; p++)
+            {
+                string root = Store.OpRoot(p);
+                if (!roots.Contains(root, StringComparer.OrdinalIgnoreCase))
+                    roots.Add(root);
+            }
+            return roots;
+        }
+    }
 
     /// <summary>Whether any target lands under one of the given roots — the destination-facet
     /// predicate, run per row on every rebuild (duplicates don't matter for an any-match, so this
-    /// skips <see cref="TargetRoots"/>' Distinct/ToList allocations).</summary>
+    /// skips <see cref="TargetRoots"/>' distinct/list allocations).</summary>
     public bool HasTargetUnder(IReadOnlySet<string> destinationRoots)
     {
-        foreach (DryRunTargetRow t in Targets)
+        int end = Store.TargetEnd(Index);
+        for (int p = Store.TargetStart(Index); p < end; p++)
         {
-            if (t.TargetRoot is not null && destinationRoots.Contains(t.TargetRoot))
+            if (destinationRoots.Contains(Store.OpRoot(p)))
                 return true;
         }
         return false;
@@ -157,9 +245,18 @@ public sealed partial record DryRunFileRow(
     /// targets); the pills stay fully legible, so it binds this on the content only.</summary>
     public double ContentOpacity => IsFilterSkipped ? 0.55 : 1.0;
 
-    public bool Matches(string term) =>
-        DryRunPaths.PathContains(DirPath, FileName, term)
-        || Targets.Any(t => DryRunPaths.PathContains(t.DirPath, t.FileName, term));
+    public bool Matches(string term)
+    {
+        if (DryRunPaths.PathContains(DirPath, FileName, term))
+            return true;
+        int end = Store.TargetEnd(Index);
+        for (int p = Store.TargetStart(Index); p < end; p++)
+        {
+            if (DryRunPaths.PathContains(Store.OpDirPath(p), Store.OpFileName(p), term))
+                return true;
+        }
+        return false;
+    }
 }
 
 /// <summary>How a destination-side file is affected in the Destinations tab. A display-oriented
@@ -167,19 +264,42 @@ public sealed partial record DryRunFileRow(
 /// present as <see cref="New"/>; the several skip/keep kinds collapse to <see cref="Untouched"/>).</summary>
 public enum DestinationRowKind { Untouched, New, Overwritten, Deleted, Unknown }
 
+internal static class DestinationKindMap
+{
+    /// <summary>Projects a destination <see cref="OperationKind"/> onto the display-oriented
+    /// <see cref="DestinationRowKind"/>. The server already split a conflict rename into a Rename op
+    /// (a new file at the suffixed path) plus an Untouched op (the kept original), so both are mapped
+    /// straight through.</summary>
+    public static DestinationRowKind Map(OperationKind kind) => kind switch
+    {
+        OperationKind.New => DestinationRowKind.New,
+        OperationKind.Overwrite => DestinationRowKind.Overwritten,
+        OperationKind.Rename => DestinationRowKind.New,
+        OperationKind.SkipConflict => DestinationRowKind.Untouched,
+        OperationKind.SkipUnchanged => DestinationRowKind.Untouched,
+        OperationKind.Untouched => DestinationRowKind.Untouched,
+        OperationKind.Deleted => DestinationRowKind.Deleted,
+        _ => DestinationRowKind.Unknown,
+    };
+}
+
 /// <summary>One resulting destination path within a <see cref="DryRunDestinationRow"/> — a single
 /// target a source file lands at (a grouped row can have several), or the sole entry of a row that
 /// has no originating source (a Mirror deletion, a kept-around conflict original, a pre-existing
 /// untouched file).</summary>
-public sealed record DryRunDestinationEntry(
-    string DirPath,
-    string FileName,
-    string TargetRoot,
-    DestinationRowKind Kind,
-    string? Detail,
-    string? CommonRoot,
-    long SizeBytes = 0)
+public sealed record DryRunDestinationEntry(DryRunRowStore Store, int Position)
 {
+    public string DirPath => Store.OpDirPath(Position);
+    public string FileName => Store.OpFileName(Position);
+    public string TargetRoot => Store.OpRoot(Position);
+    public DestinationRowKind Kind => DestinationKindMap.Map(Store.OpKind(Position));
+    public string? Detail => Store.OpDetail(Position);
+    public string? CommonRoot => Store.DestinationCommonRoot;
+
+    /// <summary>The resulting file's byte size: the incoming content for a write, or the existing
+    /// file for an untouched/deleted entry.</summary>
+    public long SizeBytes => Store.OpSize(Position);
+
     /// <summary>The absolute resulting path, reconstructed on demand (tooltips) — entries share
     /// their directory string instead of each retaining a full path.</summary>
     public string TargetPath => System.IO.Path.Join(DirPath, FileName);
@@ -234,15 +354,54 @@ public sealed record DryRunDestinationEntry(
 /// (replication collapses to one row with a list of destinations instead of one row per target).
 /// Rows with no originating source (<see cref="HasSource"/> false) carry a single
 /// <see cref="DryRunDestinationEntry"/> and render as a plain single-status row.</summary>
+/// <param name="Key">A source-file index when non-negative — the row is that file and its fan-out.
+/// Otherwise <c>~position</c> of a single destination operation with no originating source.</param>
+/// <param name="Slice">Null for a whole row (the store's own CSR range). Non-null when a filter kept
+/// only some of a fan-out's destinations: the Destinations tab filters at the entry level, so a row
+/// replicated to four targets can survive showing one. The slice is shared by every row of one
+/// filtered list, so it compares by reference and row identity survives re-materialization.</param>
+/// <param name="SliceStart">First index in <paramref name="Slice"/> belonging to this row.</param>
+/// <param name="SliceEnd">One past this row's last index in <paramref name="Slice"/>.</param>
 public sealed partial record DryRunDestinationRow(
-    string? SourceDirPath,
-    string? SourceFileName,
-    string? SourceRoot,
-    string? SourceCommonRoot,
-    IReadOnlyList<DryRunDestinationEntry> Destinations) : IDryRunFileRow
+    DryRunRowStore Store, int Key, int[]? Slice = null, int SliceStart = 0, int SliceEnd = 0) : IDryRunFileRow
 {
+    /// <summary>Whether this row is a source file and its fan-out, as opposed to a lone destination
+    /// operation that has no originating source.</summary>
+    public bool HasSource => Key >= 0;
+
+    public string? SourceDirPath => HasSource ? Store.SourceDirPath(Key) : null;
+    public string? SourceFileName => HasSource ? Store.SourceFileName(Key) : null;
+    public string? SourceRoot => HasSource ? Store.SourceRoot(Key) : null;
+    public string? SourceCommonRoot => Store.SourceCommonRoot;
+
+    /// <summary>How many resulting destinations this row shows.</summary>
+    public int EntryCount => Slice is null ? WholeEnd - WholeStart : SliceEnd - SliceStart;
+
+    /// <summary>The store CSR position of this row's <paramref name="n"/>th shown destination.</summary>
+    public int EntryAt(int n) => Slice is null ? WholeStart + n : Slice[SliceStart + n];
+
+    /// <summary>The store's own CSR range for this row: a source file's whole fan-out, or the single
+    /// operation of a no-source row.</summary>
+    private int WholeStart => HasSource ? Store.TargetStart(Key) : ~Key;
+    private int WholeEnd => HasSource ? Store.TargetEnd(Key) : ~Key + 1;
+
+    /// <summary>The resulting destinations. Materialized on demand — the row's own glyphs go through
+    /// <see cref="DistinctStatusEntries"/>, which reads the store's kinds directly and allocates only
+    /// the entries it actually renders.</summary>
+    public IReadOnlyList<DryRunDestinationEntry> Destinations
+    {
+        get
+        {
+            DryRunDestinationEntry[] entries = new DryRunDestinationEntry[EntryCount];
+            for (int n = 0; n < entries.Length; n++)
+                entries[n] = new DryRunDestinationEntry(Store, EntryAt(n));
+            return entries;
+        }
+    }
+
     /// <summary>Clipboard/shell actions behind this row's right-click menu; set at build time, null
-    /// in headless tests (the commands then no-op).</summary>
+    /// in headless tests (the commands then no-op). An <c>init</c> property and NOT a positional
+    /// member, so it stays out of the record's value equality.</summary>
     public IDryRunItemActions? Actions { get; init; }
 
     // File right-click commands acting on the representative destination (Primary) — a destination
@@ -277,25 +436,60 @@ public sealed partial record DryRunDestinationRow(
         SourceFileName is null ? "" :
         DryRunPaths.ParentDisplayFor(SourceDirPath!, SourceCommonRoot) + SourceFileName;
 
-    public bool HasSource => SourceFileName is not null;
-
     /// <summary>The sole entry of a no-source row (also the first entry generally); the simple
     /// template binds its status and folder off this.</summary>
-    public DryRunDestinationEntry Primary => Destinations[0];
+    public DryRunDestinationEntry Primary => new(Store, EntryAt(0));
 
     /// <summary>One entry per distinct destination status kind, in kind order — drives the row's
     /// status glyphs so a source fanning out to N targets shows one icon per kind, not N identical
-    /// icons.</summary>
-    public IReadOnlyList<DryRunDestinationEntry> DistinctStatusEntries =>
-        Destinations.DistinctBy(e => e.Kind).OrderBy(e => e.Kind).ToList();
+    /// icons. There are five kinds, so the distinct set is a bitmask over the row's CSR range: this
+    /// runs on the UI thread for every realized destination row, and the LINQ chain it replaced
+    /// (<c>DistinctBy</c> → <c>OrderBy</c> → <c>ToList</c>) allocated four objects plus one entry per
+    /// destination before discarding all but the few it rendered.</summary>
+    public IReadOnlyList<DryRunDestinationEntry> DistinctStatusEntries
+    {
+        get
+        {
+            int count = EntryCount;
+            int seen = 0;
+            // First position per kind, so the entry rendered for a kind is the same one the old
+            // DistinctBy kept (it takes the first of each group).
+            Span<int> firstOf = stackalloc int[5];
+            for (int n = 0; n < count; n++)
+            {
+                int p = EntryAt(n);
+                int kind = (int)DestinationKindMap.Map(Store.OpKind(p));
+                if ((seen & (1 << kind)) != 0)
+                    continue;
+                seen |= 1 << kind;
+                firstOf[kind] = p;
+            }
+            List<DryRunDestinationEntry> distinct = new(System.Numerics.BitOperations.PopCount((uint)seen));
+            for (int kind = 0; kind < 5; kind++)       // ascending kind == the old OrderBy(e => e.Kind)
+            {
+                if ((seen & (1 << kind)) != 0)
+                    distinct.Add(new DryRunDestinationEntry(Store, firstOf[kind]));
+            }
+            return distinct;
+        }
+    }
 
     /// <summary>The row tooltip: the originating source path, or the resulting path for rows that
     /// have no source (Mirror deletions, kept-around originals, pre-existing untouched files).</summary>
     public string HoverPath => SourcePath ?? Primary.TargetPath;
 
-    public bool Matches(string term) =>
-        (SourceFileName is not null && DryRunPaths.PathContains(SourceDirPath!, SourceFileName, term))
-        || Destinations.Any(d => d.Matches(term));
+    public bool Matches(string term)
+    {
+        if (HasSource && DryRunPaths.PathContains(Store.SourceDirPath(Key), Store.SourceFileName(Key), term))
+            return true;
+        for (int n = 0; n < EntryCount; n++)
+        {
+            int p = EntryAt(n);
+            if (DryRunPaths.PathContains(Store.OpDirPath(p), Store.OpFileName(p), term))
+                return true;
+        }
+        return false;
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────
@@ -1044,16 +1238,20 @@ internal static class DryRunRebuild
     /// large reports never block the UI thread.</summary>
     public const int SyncThreshold = 5_000;
 
-    /// <summary>Whether two row lists hold the same instances in the same order. A rebuild whose
-    /// output is unchanged republishes the SAME list instance, so the bound ItemsControl (and its
-    /// scroll position / selection) is left alone.</summary>
-    public static bool SameRows<T>(List<T> a, List<T> b) where T : class
+    /// <summary>Whether two key arrays describe the same rows in the same order. A rebuild whose
+    /// output is unchanged republishes the SAME bound list instance, so the ItemsControl (and its
+    /// scroll position / selection) is left alone. Rows are keys now, not objects, so this is an int
+    /// compare rather than the reference compare it replaced — and the common no-filter case hands
+    /// back the very same array, which <see cref="ReferenceEquals"/> settles in one step.</summary>
+    public static bool SameKeys(int[] a, int[] b)
     {
-        if (a.Count != b.Count)
+        if (ReferenceEquals(a, b))
+            return true;
+        if (a.Length != b.Length)
             return false;
-        for (int i = 0; i < a.Count; i++)
+        for (int i = 0; i < a.Length; i++)
         {
-            if (!ReferenceEquals(a[i], b[i]))
+            if (a[i] != b[i])
                 return false;
         }
         return true;
@@ -1152,8 +1350,13 @@ public sealed partial class DryRunSourcesTab : ViewModelBase
     private readonly TimeSpan _searchDebounce;
     private readonly DryRunRebuildGate _rebuildGate = new();
     private bool _applying;
-    private List<DryRunFileRow> _all = [];      // presorted by DryRunSort at load, never mutated after
-    private List<DryRunFileRow> _visible = [];
+    // Rows are source-file indices into _store, not objects: the whole retained cost of a 500k-row
+    // preview is these two int arrays (4 MB) plus the store itself. _all is presorted by DryRunSort at
+    // load and never mutated after; _visible is an order-preserving subset of it (the same array
+    // instance when no filter is active).
+    private DryRunRowStore _store = DryRunRowStore.Empty;
+    private int[] _all = [];
+    private int[] _visible = [];
 
     /// <summary>Clipboard/shell actions for the row + tree right-click menus (null in headless tests).</summary>
     private readonly IDryRunItemActions? _actions;
@@ -1162,6 +1365,18 @@ public sealed partial class DryRunSourcesTab : ViewModelBase
     {
         _searchDebounce = searchDebounce;
         _actions = actions;
+    }
+
+    /// <summary>Wraps a set of source-file indices as the bound row list. The handles are built per
+    /// indexer access, so this costs the array and nothing else.</summary>
+    private DryRunRowList<DryRunFileRow> RowsFor(int[] keys)
+    {
+        DryRunRowStore store = _store;
+        IDryRunItemActions? actions = _actions;
+        return new DryRunRowList<DryRunFileRow>(
+            keys,
+            i => new DryRunFileRow(store, keys[i]) { Actions = actions },
+            static r => r.Index);
     }
 
     /// <summary>The in-flight (or last completed) rebuild. Rebuilds over
@@ -1245,7 +1460,8 @@ public sealed partial class DryRunSourcesTab : ViewModelBase
     /// <summary>Everything <see cref="Load(LoadData)"/> assigns, precomputed by
     /// <see cref="ComputeLoad"/> — pure data, safe to build off the UI thread.</summary>
     internal sealed record LoadData(
-        List<DryRunFileRow> SortedRows,
+        DryRunRowStore Store,
+        int[] SortedKeys,
         string? CommonRoot,
         int UntouchedCount,
         int ProcessedCount,
@@ -1255,24 +1471,39 @@ public sealed partial class DryRunSourcesTab : ViewModelBase
 
     /// <summary>The pure, thread-safe half of loading: one pass for the status and facet counts,
     /// then the single sort the tab ever pays. The sort key is fixed per row (path relative to its
-    /// root), so sorting once here makes every later rebuild a linear order-preserving filter.</summary>
-    internal static LoadData ComputeLoad(
-        IReadOnlyList<DryRunFileRow> rows, string? commonRoot, CancellationToken ct = default)
+    /// root), so sorting once here makes every later rebuild a linear order-preserving filter.
+    /// Reads the store's columns directly — no row object is built for any of it.</summary>
+    internal static LoadData ComputeLoad(DryRunRowStore store, CancellationToken ct = default)
     {
+        ArgumentNullException.ThrowIfNull(store);
+        string? commonRoot = store.SourceCommonRoot;
         int untouched = 0, processed = 0, deleted = 0;
         Dictionary<string, int> sourceCounts = new(StringComparer.OrdinalIgnoreCase);
         Dictionary<string, int> destinationCounts = new(StringComparer.OrdinalIgnoreCase);
-        int i = 0;
-        foreach (DryRunFileRow r in rows)
+        List<string> rowRoots = [];   // reused per row; a file fans out to a handful of targets
+        int n = store.SourceCount;
+        for (int i = 0; i < n; i++)
         {
-            if ((++i & 0x3FFF) == 0) ct.ThrowIfCancellationRequested();
-            if (r.IsUntouched) untouched++;
-            if (r.IsProcessed) processed++;
-            if (r.IsDeleted) deleted++;
-            if (r.SourceRoot is not null)
-                sourceCounts[r.SourceRoot] = sourceCounts.GetValueOrDefault(r.SourceRoot) + 1;
-            foreach (string root in r.TargetRoots)
+            if ((i & 0x3FFF) == 0) ct.ThrowIfCancellationRequested();
+            OperationKind kind = store.SourceKind(i);
+            if (kind is OperationKind.SkippedByFilter or OperationKind.SkippedUnchanged) untouched++;
+            if (kind is OperationKind.Processed) processed++;
+            if (store.IsSourceDisposalDestructive(i)) deleted++;
+
+            string sourceRoot = store.SourceRoot(i);
+            sourceCounts[sourceRoot] = sourceCounts.GetValueOrDefault(sourceRoot) + 1;
+
+            // The facet counts rows, so a file fanning out twice to the same root counts once.
+            rowRoots.Clear();
+            int end = store.TargetEnd(i);
+            for (int p = store.TargetStart(i); p < end; p++)
+            {
+                string root = store.OpRoot(p);
+                if (rowRoots.Contains(root, StringComparer.OrdinalIgnoreCase))
+                    continue;
+                rowRoots.Add(root);
                 destinationCounts[root] = destinationCounts.GetValueOrDefault(root) + 1;
+            }
         }
         ct.ThrowIfCancellationRequested();
 
@@ -1281,17 +1512,12 @@ public sealed partial class DryRunSourcesTab : ViewModelBase
         // array is sorted — no per-comparison Path.Join, no per-row tuple, no OrderBy buffering. The
         // final original-index tiebreak keeps the sort stable (Array.Sort is not), matching the prior
         // LINQ OrderBy/ThenBy so rows equal on key+root keep report order.
-        DryRunFileRow[] rowArray = rows as DryRunFileRow[] ?? rows.ToArray();
-        int n = rowArray.Length;
         string[] keys = new string[n];
         if (n <= DryRunRebuild.SyncThreshold)
         {
             Dictionary<(string, string?), string> relDirCache = [];
             for (int j = 0; j < n; j++)
-            {
-                DryRunFileRow r = rowArray[j];
-                keys[j] = DryRunSort.RelativeKey(r.DirPath, r.FileName, r.SourceRoot, relDirCache);
-            }
+                keys[j] = DryRunSort.RelativeKey(store.SourceDirPath(j), store.SourceFileName(j), store.SourceRoot(j), relDirCache);
         }
         else
         {
@@ -1301,8 +1527,7 @@ public sealed partial class DryRunSourcesTab : ViewModelBase
                 () => new Dictionary<(string, string?), string>(),
                 (j, _, cache) =>
                 {
-                    DryRunFileRow r = rowArray[j];
-                    keys[j] = DryRunSort.RelativeKey(r.DirPath, r.FileName, r.SourceRoot, cache);
+                    keys[j] = DryRunSort.RelativeKey(store.SourceDirPath(j), store.SourceFileName(j), store.SourceRoot(j), cache);
                     return cache;
                 },
                 _ => { });
@@ -1315,20 +1540,17 @@ public sealed partial class DryRunSourcesTab : ViewModelBase
         {
             int c = string.Compare(keys[a], keys[b], StringComparison.OrdinalIgnoreCase);
             if (c != 0) return c;
-            c = string.Compare(rowArray[a].SourceRoot ?? "", rowArray[b].SourceRoot ?? "", StringComparison.OrdinalIgnoreCase);
+            c = string.Compare(store.SourceRoot(a), store.SourceRoot(b), StringComparison.OrdinalIgnoreCase);
             return c != 0 ? c : a.CompareTo(b);
         });
-        List<DryRunFileRow> sorted = new(n);
-        for (int j = 0; j < n; j++)
-            sorted.Add(rowArray[order[j]]);
         ct.ThrowIfCancellationRequested();
-        return new(sorted, commonRoot, untouched, processed, deleted, sourceCounts, destinationCounts);
+        // `order` IS the presorted row set: position → source index. The sort keys die with this frame.
+        return new(store, order, commonRoot, untouched, processed, deleted, sourceCounts, destinationCounts);
     }
 
-    /// <summary>Convenience for callers holding raw rows (tests); the app path computes off-thread
-    /// via <see cref="DryRunViewModel.PrepareReport"/> and calls <see cref="Load(LoadData)"/>.</summary>
-    public void Load(IReadOnlyList<DryRunFileRow> rows, string? commonRoot) =>
-        Load(ComputeLoad(rows, commonRoot));
+    /// <summary>Convenience for callers holding a store (tests); the app path computes off-thread via
+    /// <see cref="DryRunViewModel.PrepareReport"/> and calls <see cref="Load(LoadData)"/>.</summary>
+    public void Load(DryRunRowStore store) => Load(ComputeLoad(store));
 
     /// <summary>The UI-thread half of loading: assigns the precomputed data to the bound
     /// properties. A fresh load has no active filters and the rows arrive presorted, so the whole
@@ -1338,7 +1560,8 @@ public sealed partial class DryRunSourcesTab : ViewModelBase
         _rebuildGate.Cancel();   // a rebuild racing this load must not publish the old report's rows
         IsRebuilding = false;    // the cancelled rebuild has no successor to clear the overlay
         _applying = true;
-        _all = data.SortedRows;
+        _store = data.Store;
+        _all = data.SortedKeys;
         CommonRoot = data.CommonRoot;
         UntouchedCount = data.UntouchedCount;
         ProcessedCount = data.ProcessedCount;
@@ -1355,8 +1578,8 @@ public sealed partial class DryRunSourcesTab : ViewModelBase
         Tree = [];   // mirror Clear(): the _applying guard stops the ShowTree setter from clearing a
                      // previously-built forest, which would otherwise stay retained until the next toggle.
         _applying = false;
-        _visible = data.SortedRows;
-        VisibleRows = _visible;
+        _visible = data.SortedKeys;
+        VisibleRows = RowsFor(_visible);
     }
 
     public void Clear()
@@ -1364,6 +1587,7 @@ public sealed partial class DryRunSourcesTab : ViewModelBase
         _rebuildGate.Cancel();   // a rebuild racing this clear must not publish the old report's rows
         IsRebuilding = false;    // the cancelled rebuild has no successor to clear the overlay
         _applying = true;
+        _store = DryRunRowStore.Empty;   // drops the whole preview's columns
         _all = [];
         _visible = [];
         VisibleRows = [];
@@ -1478,13 +1702,14 @@ public sealed partial class DryRunSourcesTab : ViewModelBase
                 SelectedStatusKeys(),
                 ShowTree,
                 CommonRoot,
+                _store,
                 _all,
                 _visible,
                 ShowTree && Tree.Count > 0 ? DryRunTreeNode.CollectExpanded(Tree) : null,
                 _actions);
 
             RebuildResult result;
-            if (input.All.Count <= DryRunRebuild.SyncThreshold)
+            if (input.All.Length <= DryRunRebuild.SyncThreshold)
             {
                 result = ComputeRebuild(input, ct);
             }
@@ -1499,8 +1724,15 @@ public sealed partial class DryRunSourcesTab : ViewModelBase
             _rebuildGate.TryPublish(ct, () =>
             {
                 IsRebuilding = false;
-                _visible = result.Visible;
-                VisibleRows = result.Visible;
+                // Republish the bound list only when the visible set actually changed, so an
+                // unchanged rebuild leaves the ListBox's scroll position and selection alone. (The
+                // old code got this by republishing the same List instance; keys are value-compared
+                // now, so the decision has to be explicit.)
+                if (!DryRunRebuild.SameKeys(result.Visible, _visible))
+                {
+                    _visible = result.Visible;
+                    VisibleRows = RowsFor(_visible);
+                }
                 if (input.ShowTree && ShowTree)
                 {
                     IReadOnlyList<DryRunTreeNode> forest = result.Forest!;
@@ -1529,63 +1761,101 @@ public sealed partial class DryRunSourcesTab : ViewModelBase
         HashSet<string>? StatusKeys,
         bool ShowTree,
         string? CommonRoot,
-        List<DryRunFileRow> All,
-        List<DryRunFileRow> CurrentVisible,
+        DryRunRowStore Store,
+        int[] All,
+        int[] CurrentVisible,
         IReadOnlySet<string>? ExpandedPaths,
         IDryRunItemActions? Actions);
 
-    private sealed record RebuildResult(List<DryRunFileRow> Visible, IReadOnlyList<DryRunTreeNode>? Forest);
+    private sealed record RebuildResult(int[] Visible, IReadOnlyList<DryRunTreeNode>? Forest);
 
     /// <summary>Pure: filters the presorted rows (order-preserving — the sort was paid once at
     /// load) and, in tree mode, builds the forest. Runs on the thread pool for large reports, so it
-    /// touches nothing but its snapshot.</summary>
+    /// touches nothing but its snapshot. Every predicate reads the store's columns directly, so a
+    /// filter pass over 500k rows allocates one int array and no row objects at all.</summary>
     private static RebuildResult ComputeRebuild(RebuildInput input, CancellationToken ct)
     {
-        List<DryRunFileRow> visible;
+        DryRunRowStore store = input.Store;
+        int[] visible;
         if (input.Term is null && input.SourceRoots is null && input.DestinationRoots is null && input.StatusKeys is null)
         {
             visible = input.All;   // no filter active — the presorted whole set IS the view
         }
         else
         {
-            visible = [];
-            int i = 0;
-            foreach (DryRunFileRow r in input.All)
+            int[] kept = new int[input.All.Length];
+            int count = 0;
+            for (int i = 0; i < input.All.Length; i++)
             {
-                if ((++i & 0x3FFF) == 0) ct.ThrowIfCancellationRequested();
-                if (input.SourceRoots is not null && (r.SourceRoot is null || !input.SourceRoots.Contains(r.SourceRoot)))
+                if ((i & 0x3FFF) == 0) ct.ThrowIfCancellationRequested();
+                int key = input.All[i];
+                if (input.SourceRoots is not null && !input.SourceRoots.Contains(store.SourceRoot(key)))
                     continue;
-                if (input.DestinationRoots is not null && !r.HasTargetUnder(input.DestinationRoots))
+                if (input.DestinationRoots is HashSet<string> destinations && !HasTargetUnder(store, key, destinations))
                     continue;
-                if (input.StatusKeys is HashSet<string> statuses
-                    && !((statuses.Contains("untouched") && r.IsUntouched) ||
-                         (statuses.Contains("processed") && r.IsProcessed) ||
-                         (statuses.Contains("deleted") && r.IsDeleted)))
+                if (input.StatusKeys is HashSet<string> statuses && !MatchesStatus(store, key, statuses))
                     continue;
-                if (input.Term is not null && !r.Matches(input.Term))
+                if (input.Term is string term && !Matches(store, key, term))
                     continue;
-                visible.Add(r);
+                kept[count++] = key;
             }
-            if (DryRunRebuild.SameRows(visible, input.CurrentVisible))
+            visible = count == kept.Length ? kept : kept[..count];
+            if (DryRunRebuild.SameKeys(visible, input.CurrentVisible))
                 visible = input.CurrentVisible;
         }
         ct.ThrowIfCancellationRequested();
-        return new(visible, input.ShowTree ? BuildTree(visible, input.CommonRoot, input.ExpandedPaths, input.Actions) : null);
+        return new(visible, input.ShowTree ? BuildTree(store, visible, input.CommonRoot, input.ExpandedPaths, input.Actions) : null);
+
+        static bool HasTargetUnder(DryRunRowStore store, int key, IReadOnlySet<string> roots)
+        {
+            int end = store.TargetEnd(key);
+            for (int p = store.TargetStart(key); p < end; p++)
+            {
+                if (roots.Contains(store.OpRoot(p)))
+                    return true;
+            }
+            return false;
+        }
+
+        static bool MatchesStatus(DryRunRowStore store, int key, HashSet<string> statuses)
+        {
+            OperationKind kind = store.SourceKind(key);
+            return (statuses.Contains("untouched") && kind is OperationKind.SkippedByFilter or OperationKind.SkippedUnchanged)
+                || (statuses.Contains("processed") && kind is OperationKind.Processed)
+                || (statuses.Contains("deleted") && store.IsSourceDisposalDestructive(key));
+        }
+
+        static bool Matches(DryRunRowStore store, int key, string term)
+        {
+            if (DryRunPaths.PathContains(store.SourceDirPath(key), store.SourceFileName(key), term))
+                return true;
+            int end = store.TargetEnd(key);
+            for (int p = store.TargetStart(key); p < end; p++)
+            {
+                if (DryRunPaths.PathContains(store.OpDirPath(p), store.OpFileName(p), term))
+                    return true;
+            }
+            return false;
+        }
     }
 
+    /// <summary>Builds the forest over source-file <em>indices</em> rather than row objects: the
+    /// per-directory buckets <c>BuildForest</c> retains for its lazy leaf factories then cost 4 bytes
+    /// a file instead of a row reference plus the row.</summary>
     private static IReadOnlyList<DryRunTreeNode> BuildTree(
-        IReadOnlyList<DryRunFileRow> rows, string? commonRoot, IReadOnlySet<string>? expandedPaths,
+        DryRunRowStore store, int[] keys, string? commonRoot, IReadOnlySet<string>? expandedPaths,
         IDryRunItemActions? actions) =>
-        DryRunTreeNode.BuildForest(rows, static r => r.DirPath, static r => r.FileName, static r =>
+        DryRunTreeNode.BuildForest(keys, store.SourceDirPath, store.SourceFileName, i =>
         {
             List<(string, int)> cats = [];
-            if (r.IsUntouched) cats.Add(("untouched", 1));
-            if (r.IsProcessed) cats.Add(("processed", 1));
-            if (r.IsDeleted) cats.Add(("deleted", 1));
+            OperationKind kind = store.SourceKind(i);
+            if (kind is OperationKind.SkippedByFilter or OperationKind.SkippedUnchanged) cats.Add(("untouched", 1));
+            if (kind is OperationKind.Processed) cats.Add(("processed", 1));
+            if (store.IsSourceDisposalDestructive(i)) cats.Add(("deleted", 1));
             return cats;
             // A prior forest (expandedPaths non-null) → restore its expansion; the very first build
             // → null so BuildForest's top-level auto-expand heuristic applies.
-        }, TreeSpecs, commonRoot, expandedPaths, static r => r.SizeBytes, actions);
+        }, TreeSpecs, commonRoot, expandedPaths, store.SourceSize, actions);
 }
 
 /// <summary>The Destinations tab: the resulting destination structure — files a run would add
@@ -1607,8 +1877,34 @@ public sealed partial class DryRunDestinationsTab : ViewModelBase
     private readonly TimeSpan _searchDebounce;
     private readonly DryRunRebuildGate _rebuildGate = new();
     private bool _applying;
-    private List<DryRunDestinationRow> _all = [];      // presorted by DryRunSort at load, never mutated after
-    private List<DryRunDestinationRow> _visible = [];
+    // Rows are store keys: a source-file index for a grouped row, ~position for a destination
+    // operation with no originating source. _all is presorted by DryRunSort at load and never mutated
+    // after; _visible is an order-preserving subset, which unlike the Sources tab can also carry a
+    // per-row slice of surviving destinations (this tab filters at the entry level).
+    private DryRunRowStore _store = DryRunRowStore.Empty;
+    private int[] _all = [];
+    private VisibleRowSet _visible = VisibleRowSet.Empty;
+
+    /// <summary>The rows a rebuild published: their keys, plus — when an entry-level filter kept only
+    /// part of some fan-out — a CSR of the destination positions that survived.</summary>
+    private sealed record VisibleRowSet(int[] Keys, int[]? SliceStarts, int[]? SlicePositions)
+    {
+        public static readonly VisibleRowSet Empty = new([], null, null);
+
+        /// <summary>Whether this set shows exactly what <paramref name="other"/> shows. Slices are
+        /// built fresh per rebuild, so they are compared elementwise rather than by reference.</summary>
+        public bool Same(VisibleRowSet other)
+        {
+            if (ReferenceEquals(this, other))
+                return true;
+            if (!DryRunRebuild.SameKeys(Keys, other.Keys))
+                return false;
+            if (SlicePositions is null || other.SlicePositions is null)
+                return SlicePositions is null && other.SlicePositions is null;
+            return DryRunRebuild.SameKeys(SliceStarts!, other.SliceStarts!)
+                && DryRunRebuild.SameKeys(SlicePositions, other.SlicePositions);
+        }
+    }
 
     /// <summary>Clipboard/shell actions for the row + tree right-click menus (null in headless tests).</summary>
     private readonly IDryRunItemActions? _actions;
@@ -1617,6 +1913,22 @@ public sealed partial class DryRunDestinationsTab : ViewModelBase
     {
         _searchDebounce = searchDebounce;
         _actions = actions;
+    }
+
+    /// <summary>Wraps a visible set as the bound row list — handles built per indexer access.</summary>
+    private DryRunRowList<DryRunDestinationRow> RowsFor(VisibleRowSet rows)
+    {
+        DryRunRowStore store = _store;
+        IDryRunItemActions? actions = _actions;
+        int[] keys = rows.Keys;
+        int[]? starts = rows.SliceStarts;
+        int[]? positions = rows.SlicePositions;
+        return new DryRunRowList<DryRunDestinationRow>(
+            keys,
+            positions is null
+                ? i => new DryRunDestinationRow(store, keys[i]) { Actions = actions }
+                : i => new DryRunDestinationRow(store, keys[i], positions, starts![i], starts[i + 1]) { Actions = actions },
+            static r => r.Key);
     }
 
     /// <summary>The in-flight (or last completed) rebuild. Rebuilds over
@@ -1699,7 +2011,8 @@ public sealed partial class DryRunDestinationsTab : ViewModelBase
     /// <summary>Everything <see cref="Load(LoadData)"/> assigns, precomputed by
     /// <see cref="ComputeLoad"/> — pure data, safe to build off the UI thread.</summary>
     internal sealed record LoadData(
-        List<DryRunDestinationRow> SortedRows,
+        DryRunRowStore Store,
+        int[] SortedKeys,
         string? CommonRoot,
         int UntouchedCount,
         int NewCount,
@@ -1712,33 +2025,53 @@ public sealed partial class DryRunDestinationsTab : ViewModelBase
     /// then the single sort the tab ever pays. The sort key is fixed per row (the source's — or for
     /// no-source rows the sole entry's — path relative to its root; entry filtering can't change
     /// it), so sorting once here makes every later rebuild a linear order-preserving filter.</summary>
-    internal static LoadData ComputeLoad(
-        IReadOnlyList<DryRunDestinationRow> rows, string? commonRoot, CancellationToken ct = default)
+    internal static LoadData ComputeLoad(DryRunRowStore store, CancellationToken ct = default)
     {
+        ArgumentNullException.ThrowIfNull(store);
+        string? commonRoot = store.DestinationCommonRoot;
+
+        // The row set: one row per source file that produced destination operations, then one per
+        // operation with no originating source (a Mirror orphan, a kept-around conflict original, a
+        // pre-existing untouched file). The store's CSR already has both groups contiguous.
+        List<int> keyList = new(store.SourceCount);
+        for (int i = 0; i < store.SourceCount; i++)
+        {
+            if (store.TargetStart(i) != store.TargetEnd(i))
+                keyList.Add(i);
+        }
+        for (int p = store.NoSourceStart; p < store.OperationCount; p++)
+            keyList.Add(~p);
+        int[] rowKeys = [.. keyList];
+
         int untouched = 0, added = 0, overwritten = 0, deleted = 0;
         Dictionary<string, int> sourceCounts = new(StringComparer.OrdinalIgnoreCase);
         Dictionary<string, int> destinationCounts = new(StringComparer.OrdinalIgnoreCase);
-        HashSet<string> rowRoots = new(StringComparer.OrdinalIgnoreCase);   // reused per row
-        int i = 0;
-        foreach (DryRunDestinationRow row in rows)
+        List<string> rowRoots = [];   // reused per row
+        for (int i = 0; i < rowKeys.Length; i++)
         {
-            if ((++i & 0x3FFF) == 0) ct.ThrowIfCancellationRequested();
-            string sourceKey = row.SourceRoot ?? NoSourceKey;
+            if ((i & 0x3FFF) == 0) ct.ThrowIfCancellationRequested();
+            int key = rowKeys[i];
+            string sourceKey = key >= 0 ? store.SourceRoot(key) : NoSourceKey;
             sourceCounts[sourceKey] = sourceCounts.GetValueOrDefault(sourceKey) + 1;
             rowRoots.Clear();
-            foreach (DryRunDestinationEntry e in row.Destinations)
+            (int start, int end) = EntryRange(store, key);
+            for (int p = start; p < end; p++)
             {
                 // Counts are over the individual destination entries (one per resulting path), not
                 // the grouped rows, so replicating one file to N targets still counts as N.
-                switch (e.Kind)
+                switch (DestinationKindMap.Map(store.OpKind(p)))
                 {
                     case DestinationRowKind.Untouched: untouched++; break;
                     case DestinationRowKind.New: added++; break;
                     case DestinationRowKind.Overwritten: overwritten++; break;
                     case DestinationRowKind.Deleted: deleted++; break;
+                    default: break;
                 }
-                if (rowRoots.Add(e.TargetRoot))   // the facet counts rows, so dedupe roots per row
-                    destinationCounts[e.TargetRoot] = destinationCounts.GetValueOrDefault(e.TargetRoot) + 1;
+                string root = store.OpRoot(p);
+                if (rowRoots.Contains(root, StringComparer.OrdinalIgnoreCase))
+                    continue;   // the facet counts rows, so dedupe roots per row
+                rowRoots.Add(root);
+                destinationCounts[root] = destinationCounts.GetValueOrDefault(root) + 1;
             }
         }
         ct.ThrowIfCancellationRequested();
@@ -1747,19 +2080,13 @@ public sealed partial class DryRunDestinationsTab : ViewModelBase
         // rows) so the preview stays comparable to the Sources tab. Keys are computed once per row up
         // front, then an index array is sorted (key → root → original position); the final index
         // tiebreak keeps Array.Sort stable, matching the prior LINQ OrderBy/ThenBy.
-        DryRunDestinationRow[] rowArray = rows as DryRunDestinationRow[] ?? rows.ToArray();
-        int n = rowArray.Length;
+        int n = rowKeys.Length;
         string[] keys = new string[n];
         if (n <= DryRunRebuild.SyncThreshold)
         {
             Dictionary<(string, string?), string> relDirCache = [];
             for (int j = 0; j < n; j++)
-            {
-                DryRunDestinationRow r = rowArray[j];
-                keys[j] = r.HasSource
-                    ? DryRunSort.RelativeKey(r.SourceDirPath!, r.SourceFileName!, r.SourceRoot, relDirCache)
-                    : DryRunSort.RelativeKey(r.Primary.DirPath, r.Primary.FileName, r.Primary.TargetRoot, relDirCache);
-            }
+                keys[j] = SortKey(store, rowKeys[j], relDirCache);
         }
         else
         {
@@ -1769,10 +2096,7 @@ public sealed partial class DryRunDestinationsTab : ViewModelBase
                 () => new Dictionary<(string, string?), string>(),
                 (j, _, cache) =>
                 {
-                    DryRunDestinationRow r = rowArray[j];
-                    keys[j] = r.HasSource
-                        ? DryRunSort.RelativeKey(r.SourceDirPath!, r.SourceFileName!, r.SourceRoot, cache)
-                        : DryRunSort.RelativeKey(r.Primary.DirPath, r.Primary.FileName, r.Primary.TargetRoot, cache);
+                    keys[j] = SortKey(store, rowKeys[j], cache);
                     return cache;
                 },
                 _ => { });
@@ -1785,23 +2109,32 @@ public sealed partial class DryRunDestinationsTab : ViewModelBase
         {
             int c = string.Compare(keys[a], keys[b], StringComparison.OrdinalIgnoreCase);
             if (c != 0) return c;
-            c = string.Compare(
-                rowArray[a].SourceRoot ?? rowArray[a].Primary.TargetRoot,
-                rowArray[b].SourceRoot ?? rowArray[b].Primary.TargetRoot,
-                StringComparison.OrdinalIgnoreCase);
+            c = string.Compare(RootOf(store, rowKeys[a]), RootOf(store, rowKeys[b]), StringComparison.OrdinalIgnoreCase);
             return c != 0 ? c : a.CompareTo(b);
         });
-        List<DryRunDestinationRow> sorted = new(n);
+        int[] sorted = new int[n];
         for (int j = 0; j < n; j++)
-            sorted.Add(rowArray[order[j]]);
+            sorted[j] = rowKeys[order[j]];
         ct.ThrowIfCancellationRequested();
-        return new(sorted, commonRoot, untouched, added, overwritten, deleted, sourceCounts, destinationCounts);
+        return new(store, sorted, commonRoot, untouched, added, overwritten, deleted, sourceCounts, destinationCounts);
+
+        static string SortKey(DryRunRowStore store, int key, Dictionary<(string, string?), string> cache) =>
+            key >= 0
+                ? DryRunSort.RelativeKey(store.SourceDirPath(key), store.SourceFileName(key), store.SourceRoot(key), cache)
+                : DryRunSort.RelativeKey(store.OpDirPath(~key), store.OpFileName(~key), store.OpRoot(~key), cache);
+
+        static string RootOf(DryRunRowStore store, int key) =>
+            key >= 0 ? store.SourceRoot(key) : store.OpRoot(~key);
     }
 
-    /// <summary>Convenience for callers holding raw rows (tests); the app path computes off-thread
-    /// via <see cref="DryRunViewModel.PrepareReport"/> and calls <see cref="Load(LoadData)"/>.</summary>
-    public void Load(IReadOnlyList<DryRunDestinationRow> rows, string? commonRoot) =>
-        Load(ComputeLoad(rows, commonRoot));
+    /// <summary>The store CSR range of a row's destination operations — a source file's fan-out, or
+    /// the single operation of a no-source row.</summary>
+    private static (int Start, int End) EntryRange(DryRunRowStore store, int key) =>
+        key >= 0 ? (store.TargetStart(key), store.TargetEnd(key)) : (~key, ~key + 1);
+
+    /// <summary>Convenience for callers holding a store (tests); the app path computes off-thread via
+    /// <see cref="DryRunViewModel.PrepareReport"/> and calls <see cref="Load(LoadData)"/>.</summary>
+    public void Load(DryRunRowStore store) => Load(ComputeLoad(store));
 
     /// <summary>The UI-thread half of loading: assigns the precomputed data to the bound
     /// properties. A fresh load has no active filters and the rows arrive presorted, so the whole
@@ -1811,7 +2144,8 @@ public sealed partial class DryRunDestinationsTab : ViewModelBase
         _rebuildGate.Cancel();   // a rebuild racing this load must not publish the old report's rows
         IsRebuilding = false;    // the cancelled rebuild has no successor to clear the overlay
         _applying = true;
-        _all = data.SortedRows;
+        _store = data.Store;
+        _all = data.SortedKeys;
         CommonRoot = data.CommonRoot;
         UntouchedCount = data.UntouchedCount;
         NewCount = data.NewCount;
@@ -1829,8 +2163,8 @@ public sealed partial class DryRunDestinationsTab : ViewModelBase
         Tree = [];   // mirror Clear(): the _applying guard stops the ShowTree setter from clearing a
                      // previously-built forest, which would otherwise stay retained until the next toggle.
         _applying = false;
-        _visible = data.SortedRows;
-        VisibleRows = _visible;
+        _visible = new VisibleRowSet(data.SortedKeys, null, null);
+        VisibleRows = RowsFor(_visible);
     }
 
     public void Clear()
@@ -1838,8 +2172,9 @@ public sealed partial class DryRunDestinationsTab : ViewModelBase
         _rebuildGate.Cancel();   // a rebuild racing this clear must not publish the old report's rows
         IsRebuilding = false;    // the cancelled rebuild has no successor to clear the overlay
         _applying = true;
+        _store = DryRunRowStore.Empty;   // drops the whole preview's columns
         _all = [];
-        _visible = [];
+        _visible = VisibleRowSet.Empty;
         VisibleRows = [];
         Tree = [];
         CommonRoot = null;
@@ -1964,13 +2299,14 @@ public sealed partial class DryRunDestinationsTab : ViewModelBase
                 SelectedStatusKeys(),
                 ShowTree,
                 CommonRoot,
+                _store,
                 _all,
                 _visible,
                 ShowTree && Tree.Count > 0 ? DryRunTreeNode.CollectExpanded(Tree) : null,
                 _actions);
 
             RebuildResult result;
-            if (input.All.Count <= DryRunRebuild.SyncThreshold)
+            if (input.All.Length <= DryRunRebuild.SyncThreshold)
             {
                 result = ComputeRebuild(input, ct);
             }
@@ -1985,8 +2321,15 @@ public sealed partial class DryRunDestinationsTab : ViewModelBase
             _rebuildGate.TryPublish(ct, () =>
             {
                 IsRebuilding = false;
-                _visible = result.Visible;
-                VisibleRows = result.Visible;
+                // Republish the bound list only when the visible set actually changed, so an
+                // unchanged rebuild leaves the ListBox's scroll position and selection alone. Entry
+                // slices count as part of "changed": the same rows showing different destinations is
+                // a different view.
+                if (!result.Visible.Same(_visible))
+                {
+                    _visible = result.Visible;
+                    VisibleRows = RowsFor(_visible);
+                }
                 if (input.ShowTree && ShowTree)
                 {
                     IReadOnlyList<DryRunTreeNode> forest = result.Forest!;
@@ -2015,64 +2358,89 @@ public sealed partial class DryRunDestinationsTab : ViewModelBase
         HashSet<string>? StatusKeys,
         bool ShowTree,
         string? CommonRoot,
-        List<DryRunDestinationRow> All,
-        List<DryRunDestinationRow> CurrentVisible,
+        DryRunRowStore Store,
+        int[] All,
+        VisibleRowSet CurrentVisible,
         IReadOnlySet<string>? ExpandedPaths,
         IDryRunItemActions? Actions);
 
-    private sealed record RebuildResult(List<DryRunDestinationRow> Visible, IReadOnlyList<DryRunTreeNode>? Forest);
+    private sealed record RebuildResult(VisibleRowSet Visible, IReadOnlyList<DryRunTreeNode>? Forest);
 
     /// <summary>Pure: filters the presorted rows (order-preserving — the sort was paid once at
     /// load) and, in tree mode, builds the forest. Runs on the thread pool for large reports, so it
     /// touches nothing but its snapshot.</summary>
     private static RebuildResult ComputeRebuild(RebuildInput input, CancellationToken ct)
     {
-        List<DryRunDestinationRow> visible;
+        DryRunRowStore store = input.Store;
+        VisibleRowSet visible;
         if (input.Term is null && input.SourceRoots is null && input.DestinationRoots is null && input.StatusKeys is null)
         {
-            visible = input.All;   // no filter active — the presorted whole set IS the view
+            visible = new VisibleRowSet(input.All, null, null);   // no filter — the presorted whole set IS the view
         }
         else
         {
             // Filter at the destination-entry level and drop rows left with nothing, so a grouped row
             // shows only the destinations that survived the destination-facet / status / search filters.
             // The source facet applies to the whole row; a search hit on the source path keeps all entries.
-            visible = [];
-            int i = 0;
-            foreach (DryRunDestinationRow row in input.All)
+            // The survivors are collected as a CSR of store positions rather than as rebuilt rows — the
+            // shape that lets a filtered view cost two int arrays instead of a row object per hit.
+            List<int> keptKeys = [];
+            List<int> starts = [0];
+            List<int> positions = [];
+            bool anySliced = false;
+            for (int i = 0; i < input.All.Length; i++)
             {
-                if ((++i & 0x3FFF) == 0) ct.ThrowIfCancellationRequested();
-                if (input.SourceRoots is not null && !input.SourceRoots.Contains(row.SourceRoot ?? NoSourceKey))
+                if ((i & 0x3FFF) == 0) ct.ThrowIfCancellationRequested();
+                int key = input.All[i];
+                if (input.SourceRoots is not null
+                    && !input.SourceRoots.Contains(key >= 0 ? store.SourceRoot(key) : NoSourceKey))
                     continue;
 
-                IEnumerable<DryRunDestinationEntry> entries = row.Destinations;
-                if (input.DestinationRoots is HashSet<string> destinations)
-                    entries = entries.Where(e => destinations.Contains(e.TargetRoot));
-                if (input.StatusKeys is HashSet<string> statuses)
-                    entries = entries.Where(e => statuses.Contains(StatusKey(e.Kind)));
-                if (input.Term is string term
-                    && !(row.SourceFileName is not null && DryRunPaths.PathContains(row.SourceDirPath!, row.SourceFileName, term)))
-                    entries = entries.Where(e => e.Matches(term));
+                // A search hit on the source path keeps every destination; otherwise each entry is
+                // tested individually.
+                bool sourceMatches = input.Term is null
+                    || (key >= 0 && DryRunPaths.PathContains(store.SourceDirPath(key), store.SourceFileName(key), input.Term));
 
-                List<DryRunDestinationEntry> kept = entries.ToList();
-                if (kept.Count == 0)
-                    continue;
-                visible.Add(kept.Count == row.Destinations.Count ? row : row with { Destinations = kept });
+                (int start, int end) = EntryRange(store, key);
+                int before = positions.Count;
+                for (int p = start; p < end; p++)
+                {
+                    if (input.DestinationRoots is HashSet<string> destinations && !destinations.Contains(store.OpRoot(p)))
+                        continue;
+                    if (input.StatusKeys is HashSet<string> statuses
+                        && !statuses.Contains(StatusKey(DestinationKindMap.Map(store.OpKind(p)))))
+                        continue;
+                    if (!sourceMatches && !DryRunPaths.PathContains(store.OpDirPath(p), store.OpFileName(p), input.Term!))
+                        continue;
+                    positions.Add(p);
+                }
+                int kept = positions.Count - before;
+                if (kept == 0)
+                    continue;   // every destination filtered out — the row disappears with them
+                anySliced |= kept != end - start;
+                keptKeys.Add(key);
+                starts.Add(positions.Count);
             }
-            if (DryRunRebuild.SameRows(visible, input.CurrentVisible))
+            // Whole rows only → drop the slice entirely, so the common case stores just the keys and
+            // rows read their range straight off the store.
+            visible = anySliced
+                ? new VisibleRowSet([.. keptKeys], [.. starts], [.. positions])
+                : new VisibleRowSet([.. keptKeys], null, null);
+            if (visible.Same(input.CurrentVisible))
                 visible = input.CurrentVisible;
         }
         ct.ThrowIfCancellationRequested();
-        return new(visible, input.ShowTree ? BuildTree(visible, input.CommonRoot, input.ExpandedPaths, input.Actions) : null);
+        return new(visible, input.ShowTree ? BuildTree(store, visible, input.CommonRoot, input.ExpandedPaths, input.Actions) : null);
     }
 
+    /// <summary>Builds the forest over destination CSR <em>positions</em> rather than entry objects —
+    /// one leaf per resulting path, the tree is per-file and unchanged.</summary>
     private static IReadOnlyList<DryRunTreeNode> BuildTree(
-        IReadOnlyList<DryRunDestinationRow> rows, string? commonRoot, IReadOnlySet<string>? expandedPaths,
+        DryRunRowStore store, VisibleRowSet rows, string? commonRoot, IReadOnlySet<string>? expandedPaths,
         IDryRunItemActions? actions) =>
-        // Flatten grouped rows back to one leaf per resulting path — the tree is per-file, unchanged.
-        DryRunTreeNode.BuildForest(rows.SelectMany(static r => r.Destinations), static e => e.DirPath, static e => e.FileName, static e =>
+        DryRunTreeNode.BuildForest(EntryPositions(store, rows), store.OpDirPath, store.OpFileName, p =>
         {
-            string kind = e.Kind switch
+            string kind = DestinationKindMap.Map(store.OpKind(p)) switch
             {
                 DestinationRowKind.Untouched => "untouched",
                 DestinationRowKind.New => "new",
@@ -2081,8 +2449,25 @@ public sealed partial class DryRunDestinationsTab : ViewModelBase
                 _ => "unknown",
             };
             return new[] { (kind, 1) };
-        }, TreeSpecs, commonRoot, expandedPaths,
-           static e => e.SizeBytes, actions);
+        }, TreeSpecs, commonRoot, expandedPaths, store.OpSize, actions);
+
+    /// <summary>Every destination position the visible rows show, flattened.</summary>
+    private static IEnumerable<int> EntryPositions(DryRunRowStore store, VisibleRowSet rows)
+    {
+        if (rows.SlicePositions is { } positions)
+            return positions;
+        return Flatten();
+
+        IEnumerable<int> Flatten()
+        {
+            foreach (int key in rows.Keys)
+            {
+                (int start, int end) = EntryRange(store, key);
+                for (int p = start; p < end; p++)
+                    yield return p;
+            }
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────
@@ -2374,7 +2759,11 @@ public sealed partial class DryRunViewModel : ViewModelBase
 
         try
         {
-            var run = await _gateway.DryRunAsync(profileId, progress, draft, ct);
+            // The run streams straight into its store: chunks fold into columns as they arrive and
+            // are dropped, so the assembled report — which used to be live alongside the rows being
+            // projected out of it — never exists here at all.
+            DryRunRowStore store = DryRunRowStore.CreateForIngest();
+            var run = await _gateway.DryRunAsync(profileId, store, progress, draft, ct);
             if (run.IsCanceled)
             {
                 Log.Debug("Dry run for profile {ProfileId} cancelled by the user", profileId);
@@ -2388,16 +2777,20 @@ public sealed partial class DryRunViewModel : ViewModelBase
                     : $"Dry run failed: {error.Message}";
                 return;
             }
-            run.TryGetValue(out DryRunReport? report);
+            run.TryGetValue(out DryRunCompletion? completion);
             // Set unconditionally (not only via a progress frame): a fast run may finish before any
-            // frame arrives, and the projection below is real seconds of work worth labelling.
+            // frame arrives, and the preparation below is real seconds of work worth labelling.
             RunStatusText = "Building the lists…";
-            // Projecting a full report is seconds of CPU at the streamed cap, so it runs on the
-            // thread pool. No ConfigureAwait(false): the continuation must resume on the UI
-            // context so ApplyPrepared raises its property changes on the UI thread.
+            // Completing the store and sorting both tabs is seconds of CPU at the streamed cap, so it
+            // runs on the thread pool. No ConfigureAwait(false): the continuation must resume on the
+            // UI context so ApplyPrepared raises its property changes on the UI thread.
             // RunCommand.IsRunning spans the preparation, so the view's progress bar keeps
             // animating instead of the window freezing.
-            PreparedReport prepared = await Task.Run(() => PrepareReport(report!, ct, _actions), ct);
+            PreparedReport prepared = await Task.Run(() =>
+            {
+                store.Complete();
+                return PrepareReport(store, completion!, ct);
+            }, ct);
             if (_reportEpoch != epoch)
                 return;   // the preview was cleared while running — a stale report must not apply
             ApplyPrepared(prepared);
@@ -2447,220 +2840,48 @@ public sealed partial class DryRunViewModel : ViewModelBase
         string TruncationNotice,
         DryRunSpaceViewModel? Space);
 
-    /// <summary>Synchronous prepare-and-apply, kept for the benchmarks and memory tests that gauge
-    /// the whole projection; the app path runs <see cref="PrepareReport"/> on the thread pool.</summary>
-    internal void ApplyReport(DryRunReport report) => ApplyPrepared(PrepareReport(report, actions: _actions));
-
-    /// <summary>The pure, thread-safe half of applying a report: projects the wire report into both
-    /// tabs' presorted rows, counts, and facets, plus the banner numbers. O(n) over up to the
-    /// ~500k-file streamed cap — always run this off the UI thread for real reports.</summary>
-    internal static PreparedReport PrepareReport(DryRunReport report, CancellationToken ct = default,
-        IDryRunItemActions? actions = null)
+    /// <summary>Synchronous prepare-and-apply from an assembled report, kept for the benchmarks and
+    /// memory tests that gauge the whole projection; the app path streams straight into a store and
+    /// runs <see cref="PrepareReport(DryRunRowStore, DryRunCompletion, CancellationToken)"/> on the
+    /// thread pool.</summary>
+    internal void ApplyReport(DryRunReport report)
     {
-        // The one per-directory string allocation: every row references entries of this array, so
-        // sibling files share their directory chain instead of each retaining a full path string.
-        string[] dirPaths = DryRunDirectoryTable.Materialize(report.Directories);
+        ArgumentNullException.ThrowIfNull(report);
+        DryRunRowStore store = DryRunRowStore.FromReport(report);
+        ApplyPrepared(PrepareReport(store, new DryRunCompletion(report.GeneratedAt, report.Truncated, report.Space)));
+    }
 
-        int sourceCount = report.SourceFiles.Count;
+    /// <summary>The pure, thread-safe half of applying a run: turns the completed store into both
+    /// tabs' presorted key arrays, counts and facets, plus the banner numbers. O(n log n) over up to
+    /// the ~500k-file streamed cap — always run this off the UI thread for real reports.
+    ///
+    /// <para>Almost all of what this used to do now happens during ingest or in
+    /// <see cref="DryRunRowStore.Complete"/>: the directory table is resolved as it arrives, the
+    /// destination operations are grouped by their source there, and the blast-radius counts fall out
+    /// of the same pass. What is left is the two sorts, which are genuinely per-tab.</para></summary>
+    internal static PreparedReport PrepareReport(
+        DryRunRowStore store, DryRunCompletion completion, CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(store);
+        ArgumentNullException.ThrowIfNull(completion);
 
-        // One source op per source file, addressable by the file's index — a dense array rather than a
-        // GroupBy/ToDictionary (SourceIndex is dense over [0, sourceCount)). Keep the FIRST op for a
-        // duplicate SourceIndex (a service-side bug) and harmlessly ignore out-of-range/-1 indices —
-        // degrade gracefully rather than throwing and wiping the entire preview.
-        DryRunOperation?[] sourceOpByIndex = new DryRunOperation?[sourceCount];
-        foreach (DryRunOperation op in report.SourceOperations)
-        {
-            int idx = op.SourceIndex;
-            if (idx >= 0 && idx < sourceCount && sourceOpByIndex[idx] is null)
-                sourceOpByIndex[idx] = op;
-        }
-
-        // Destination ops grouped by the source file they carry content from (SourceIndex), as a
-        // compressed-sparse-row layout instead of a ToLookup: `ordered[offsets[i]..offsets[i+1]]` holds
-        // source i's op indices in their original DestinationOperations order (matching ToLookup's
-        // within-group insertion order). Ops with SourceIndex == -1 (the rename-around Untouched, swept
-        // orphans) attach to no source and collect into `noSource` for their own single-entry rows;
-        // an out-of-range-high SourceIndex is dropped, exactly as the prior ToLookup key was never read.
-        IReadOnlyList<DryRunOperation> destOps = report.DestinationOperations;
-        int[] offsets = new int[sourceCount + 1];
-        List<int> noSource = [];
-        for (int k = 0; k < destOps.Count; k++)
-        {
-            int idx = destOps[k].SourceIndex;
-            if (idx >= 0 && idx < sourceCount)
-                offsets[idx + 1]++;
-            else if (idx < 0)
-                noSource.Add(k);
-        }
-        for (int i = 0; i < sourceCount; i++)
-            offsets[i + 1] += offsets[i];   // prefix-sum: offsets[i] is bucket i's start, offsets[i+1] its end
-        int[] ordered = new int[offsets[sourceCount]];
-        int[] cursor = new int[sourceCount];   // per-bucket fill position — preserves within-bucket order
-        for (int k = 0; k < destOps.Count; k++)
-        {
-            int idx = destOps[k].SourceIndex;
-            if (idx >= 0 && idx < sourceCount)
-                ordered[offsets[idx] + cursor[idx]++] = k;
-        }
-
-        // The folder every displayed path is shown relative to, per panel: the single source/target
-        // dir, else the common parent, else null (spanning drives → full paths). Distinct first so a
-        // huge scan doesn't re-walk identical roots.
-        string? sourceCommonRoot = DryRunPaths.CommonRoot(
-            report.SourceFiles.Select(f => f.RootDirIndex).Distinct().Select(i => dirPaths[i]));
-        string? destCommonRoot = DryRunPaths.CommonRoot(
-            report.DestinationOperations.Select(o => o.RootDirIndex).Distinct().Select(i => dirPaths[i]));
-
-        // Build the source rows into a preallocated array — in parallel above the sync threshold. Each
-        // slot [i] is written once from a disjoint iteration reading only immutable inputs (dirPaths,
-        // the CSR arrays, sourceOpByIndex, EmptyTargets, sourceCommonRoot; rows are immutable records),
-        // so no locking is needed; disposalCount, the sole shared accumulator, sums partition-locals.
-        DryRunFileRow[] fileRowArr = new DryRunFileRow[sourceCount];
-        int disposalCount = 0;
-
-        DryRunFileRow BuildFileRow(int i)
-        {
-            DryRunFile file = report.SourceFiles[i];
-            DryRunOperation? op = sourceOpByIndex[i];
-            int start = offsets[i], end = offsets[i + 1];
-            List<DryRunTargetRow> targets = new(end - start);
-            for (int j = start; j < end; j++)
-            {
-                DryRunOperation t = destOps[ordered[j]];
-                targets.Add(new DryRunTargetRow(dirPaths[t.DirIndex], t.FileName, dirPaths[t.RootDirIndex], t.Kind, t.Detail));
-            }
-            return new DryRunFileRow(
-                dirPaths[file.DirIndex],
-                file.FileName,
-                dirPaths[file.RootDirIndex],
-                op?.Kind ?? OperationKind.Processed,
-                op?.Detail,
-                op?.SourceDisposition?.ToString(),
-                targets.Count == 0 ? EmptyTargets : targets,
-                file.Length,
-                sourceCommonRoot)
-            { Actions = actions };
-        }
-
-        if (sourceCount <= DryRunRebuild.SyncThreshold)
-        {
-            for (int i = 0; i < sourceCount; i++)
-            {
-                if ((i & 0x3FFF) == 0) ct.ThrowIfCancellationRequested();
-                DryRunFileRow row = BuildFileRow(i);
-                if (row.IsSourceDisposalDestructive) disposalCount++;
-                fileRowArr[i] = row;
-            }
-        }
-        else
-        {
-            // ParallelOptions.CancellationToken makes Parallel.For poll ct between iterations and throw
-            // a clean OperationCanceledException — no explicit body check (which would risk being
-            // wrapped in an AggregateException) is needed.
-            Parallel.For(0, sourceCount, new ParallelOptions { CancellationToken = ct },
-                () => 0,
-                (i, _, localDisposal) =>
-                {
-                    DryRunFileRow row = BuildFileRow(i);
-                    if (row.IsSourceDisposalDestructive) localDisposal++;
-                    fileRowArr[i] = row;
-                    return localDisposal;
-                },
-                localDisposal => Interlocked.Add(ref disposalCount, localDisposal));
-        }
-
-        // The byte size behind a destination op: the incoming content (its source file) for a write,
-        // else the pre-existing file it touches (untouched / deleted / kept original), else nothing.
-        long OpSize(DryRunOperation o) =>
-            o.SourceIndex >= 0 && o.SourceIndex < report.SourceFiles.Count ? report.SourceFiles[o.SourceIndex].Length
-            : o.SubjectIndex >= 0 && o.SubjectIndex < report.DestinationFiles.Count ? report.DestinationFiles[o.SubjectIndex].Length
-            : 0;
-
-        // The destination "after" view groups the server's destination operations by the source file
-        // they carry content from: a file replicated to N targets is one row listing N destinations
-        // (each keeping its own status), instead of N near-identical rows. Ops with SourceIndex == -1
-        // (a pre-existing untouched file, a kept-around conflict original, a Mirror orphan) have no
-        // originating source and become their own single-entry rows.
-        DryRunDestinationEntry Entry(DryRunOperation o, long sizeBytes) =>
-            new(dirPaths[o.DirIndex], o.FileName, dirPaths[o.RootDirIndex], MapDestinationKind(o.Kind), o.Detail, destCommonRoot, sizeBytes);
-
-        // Build the grouped destination rows into a preallocated array (null = a source with no dest
-        // op), in parallel above the sync threshold — same disjoint-slot, immutable-input safety as the
-        // source loop. Then compact in 0..N-1 order (deterministic, matching the old sequential append)
-        // and append the no-source rows single-threaded.
-        DryRunDestinationRow?[] destRowArr = new DryRunDestinationRow?[sourceCount];
-
-        DryRunDestinationRow? BuildDestRow(int i)
-        {
-            int start = offsets[i], end = offsets[i + 1];
-            if (end == start)
-                return null;   // a filtered/unchanged source that produced no destination op
-            List<DryRunDestinationEntry> entries = new(end - start);
-            for (int j = start; j < end; j++)
-            {
-                DryRunOperation o = destOps[ordered[j]];
-                entries.Add(Entry(o, OpSize(o)));
-            }
-            DryRunFile file = report.SourceFiles[i];
-            return new DryRunDestinationRow(
-                dirPaths[file.DirIndex], file.FileName, dirPaths[file.RootDirIndex], sourceCommonRoot, entries)
-            { Actions = actions };
-        }
-
-        if (sourceCount <= DryRunRebuild.SyncThreshold)
-        {
-            for (int i = 0; i < sourceCount; i++)
-            {
-                if ((i & 0x3FFF) == 0) ct.ThrowIfCancellationRequested();
-                destRowArr[i] = BuildDestRow(i);
-            }
-        }
-        else
-        {
-            Parallel.For(0, sourceCount, new ParallelOptions { CancellationToken = ct },
-                i => destRowArr[i] = BuildDestRow(i));
-        }
-
-        List<DryRunDestinationRow> destRows = new(sourceCount);
-        for (int i = 0; i < sourceCount; i++)
-        {
-            if (destRowArr[i] is { } row)
-                destRows.Add(row);
-        }
-        foreach (int k in noSource)
-        {
-            DryRunOperation o = destOps[k];
-            destRows.Add(new DryRunDestinationRow(null, null, null, null, [Entry(o, OpSize(o))]) { Actions = actions });
-        }
-
-        // One pass over the destination ops for the blast-radius banner numbers (previously three
-        // full Count/Any scans).
-        int overwriteCount = 0, renameCount = 0;
-        bool anyDestinationDeleted = false;
-        foreach (DryRunOperation o in report.DestinationOperations)
-        {
-            if (o.Kind == OperationKind.Overwrite) overwriteCount++;
-            else if (o.Kind == OperationKind.Rename) renameCount++;
-            else if (o.Kind == OperationKind.Deleted) anyDestinationDeleted = true;
-        }
-
-        // The two tabs' loads share no mutable state, so run their independent O(n log n) sorts
-        // concurrently above the sync threshold — overlapping the two single-threaded sorts. Below it
-        // they run inline (no Task/Parallel overhead) so small reports and tests stay deterministic.
+        // The two tabs' loads share no mutable state (the store is immutable once completed), so run
+        // their independent O(n log n) sorts concurrently above the sync threshold. Below it they run
+        // inline (no Task/Parallel overhead) so small reports and tests stay deterministic.
         DryRunSourcesTab.LoadData sourcesLoad;
         DryRunDestinationsTab.LoadData destinationsLoad;
-        if (sourceCount <= DryRunRebuild.SyncThreshold)
+        if (store.SourceCount <= DryRunRebuild.SyncThreshold)
         {
-            sourcesLoad = DryRunSourcesTab.ComputeLoad(fileRowArr, sourceCommonRoot, ct);
-            destinationsLoad = DryRunDestinationsTab.ComputeLoad(destRows, destCommonRoot, ct);
+            sourcesLoad = DryRunSourcesTab.ComputeLoad(store, ct);
+            destinationsLoad = DryRunDestinationsTab.ComputeLoad(store, ct);
         }
         else
         {
             DryRunSourcesTab.LoadData? s = null;
             DryRunDestinationsTab.LoadData? d = null;
             Parallel.Invoke(new ParallelOptions { CancellationToken = ct },
-                () => s = DryRunSourcesTab.ComputeLoad(fileRowArr, sourceCommonRoot, ct),
-                () => d = DryRunDestinationsTab.ComputeLoad(destRows, destCommonRoot, ct));
+                () => s = DryRunSourcesTab.ComputeLoad(store, ct),
+                () => d = DryRunDestinationsTab.ComputeLoad(store, ct));
             sourcesLoad = s!;
             destinationsLoad = d!;
         }
@@ -2668,20 +2889,22 @@ public sealed partial class DryRunViewModel : ViewModelBase
         return new PreparedReport(
             sourcesLoad,
             destinationsLoad,
-            TotalFiles: report.SourceFiles.Count,
-            OverwriteCount: overwriteCount,
-            RenameCount: renameCount,
-            DisposalCount: disposalCount,
-            HasDestructiveActions: overwriteCount > 0 || disposalCount > 0 || anyDestinationDeleted,
-            GeneratedAtText: $"Generated {report.GeneratedAt.ToLocalTime():yyyy-MM-dd HH:mm:ss}",
-            WasTruncated: report.Truncated,
-            TruncationNotice: report.Truncated
-                ? $"Report truncated: showing the first {report.SourceFiles.Count:N0} files — the scan found more. Destination deletions are not shown for a truncated report. Use the filters to narrow the view."
+            TotalFiles: store.SourceCount,
+            OverwriteCount: store.OverwriteCount,
+            RenameCount: store.RenameCount,
+            DisposalCount: store.DisposalCount,
+            HasDestructiveActions:
+                store.OverwriteCount > 0 || store.DisposalCount > 0 || store.AnyDestinationDeleted,
+            GeneratedAtText: $"Generated {completion.GeneratedAt.ToLocalTime():yyyy-MM-dd HH:mm:ss}",
+            WasTruncated: completion.Truncated,
+            TruncationNotice: completion.Truncated
+                ? $"Report truncated: showing the first {store.SourceCount:N0} files — the scan found more. Destination deletions are not shown for a truncated report. Use the filters to narrow the view."
                 : "",
-            Space: report.Space is { Volumes.Count: > 0 } projection
+            Space: completion.Space is { Volumes.Count: > 0 } projection
                 ? new DryRunSpaceViewModel(projection)
                 : null);
     }
+
 
     /// <summary>The UI-thread half of applying a report: assigns the precomputed data to the bound
     /// properties and hands each tab its load.</summary>
@@ -2700,22 +2923,6 @@ public sealed partial class DryRunViewModel : ViewModelBase
         Destinations.Load(prepared.Destinations);
         HasReport = true;
     }
-
-    /// <summary>Projects a destination <see cref="OperationKind"/> onto the display-oriented
-    /// <see cref="DestinationRowKind"/>. The server already split a conflict rename into a Rename op
-    /// (a new file at the suffixed path) plus an Untouched op (the kept original), so both are mapped
-    /// straight through.</summary>
-    private static DestinationRowKind MapDestinationKind(OperationKind kind) => kind switch
-    {
-        OperationKind.New => DestinationRowKind.New,
-        OperationKind.Overwrite => DestinationRowKind.Overwritten,
-        OperationKind.Rename => DestinationRowKind.New,
-        OperationKind.SkipConflict => DestinationRowKind.Untouched,
-        OperationKind.SkipUnchanged => DestinationRowKind.Untouched,
-        OperationKind.Untouched => DestinationRowKind.Untouched,
-        OperationKind.Deleted => DestinationRowKind.Deleted,
-        _ => DestinationRowKind.Unknown,
-    };
 
     private void ClearReport()
     {

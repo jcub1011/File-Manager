@@ -8,7 +8,6 @@ using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Runtime.CompilerServices;
-using System.Threading;
 using System.Threading.Tasks;
 
 namespace FileManager.MemoryProbe;
@@ -122,6 +121,10 @@ internal static class Program
         try
         {
             using MemorySampler sampler = new(service);
+            // The client half of the picture. The service's footprint was the whole story until the
+            // client stopped reassembling every run into one report; now the consumer side is worth a
+            // number of its own, and it is measured the same way — sampled private commit, high-water.
+            using MemorySampler clientSampler = new(Process.GetCurrentProcess());
             List<PhaseReading> readings = [];
 
             // Let startup settle before calling anything an idle baseline: the host is still creating
@@ -146,6 +149,7 @@ internal static class Program
             await using (client)
             {
                 MemorySample idle = sampler.Sample();
+                MemorySample clientIdle = clientSampler.Sample();
 
                 Stopwatch watch = Stopwatch.StartNew();
                 DryRunOutcome outcome = await RunDryRunAsync(client!, options);
@@ -164,7 +168,8 @@ internal static class Program
                 Console.WriteLine();
                 Console.WriteLine(
                     $"dry run: {outcome.SourceFiles:N0} source files, {outcome.DestinationFiles:N0} destination " +
-                    $"files, truncated={outcome.Truncated}, {watch.ElapsedMilliseconds:N0}ms");
+                    $"files, truncated={outcome.Truncated}, {watch.ElapsedMilliseconds:N0}ms, " +
+                    $"client ingest={options.ClientIngest.ToString().ToLowerInvariant()}");
                 Console.WriteLine($"phase transitions: {string.Join(" -> ", outcome.Phases)}");
 
                 // The trim coordinator debounces on a 25s quiet period, so a t+0 reading shows none of
@@ -177,6 +182,7 @@ internal static class Program
                 // before the settle samples could report a "peak" lower than a later row — which reads
                 // as a broken measurement rather than what it is (a stale snapshot).
                 (long peakPrivate, long peakWorkingSet) = sampler.Peak;
+                (long clientPeakPrivate, long clientPeakWorkingSet) = clientSampler.Peak;
                 string settleLabel = $"settle t+{options.SettleSeconds}s";
 
                 Console.WriteLine();
@@ -184,6 +190,10 @@ internal static class Program
                 readings.Add(new PhaseReading("peak", peakPrivate, peakWorkingSet));
                 readings.Add(new PhaseReading("settle t+0s", settledNow.PrivateBytes, settledNow.WorkingSetBytes));
                 readings.Add(new PhaseReading(settleLabel, settledLater.PrivateBytes, settledLater.WorkingSetBytes));
+                // This process, not the child. Only the peak matters here: the harness holds nothing
+                // after the run either way, so a settled client reading would say nothing.
+                readings.Add(new PhaseReading("client idle", clientIdle.PrivateBytes, clientIdle.WorkingSetBytes));
+                readings.Add(new PhaseReading("client peak", clientPeakPrivate, clientPeakWorkingSet));
                 foreach (PhaseReading reading in readings)
                     Report(reading);
 
@@ -198,12 +208,16 @@ internal static class Program
         }
     }
 
-    /// <summary>Runs the dry run and DROPS the report before returning.
+    /// <summary>Runs the dry run and DROPS whatever it accumulated before returning.
     ///
-    /// <para>The harness receives the client-side reassembled report — at 357k entries that is
-    /// hundreds of MB in THIS process. Building and releasing it inside a non-inlined frame keeps the
-    /// harness from OOMing, and keeps anyone reading the output from confusing the two processes'
-    /// numbers: every figure this tool prints is the SERVICE's.</para></summary>
+    /// <para>Under <see cref="ClientIngest.Report"/> the harness receives the client-side reassembled
+    /// report — at 357k entries that is hundreds of MB in THIS process. Building and releasing it
+    /// inside a non-inlined frame keeps the harness from OOMing and keeps the two processes' numbers
+    /// apart: the <c>service</c> rows are the child's, the <c>client</c> rows are this process's.</para>
+    ///
+    /// <para>Under <see cref="ClientIngest.Sink"/> (the default, and what the UI does) chunks are
+    /// counted and dropped, so nothing accumulates at all. That is the whole point of the comparison:
+    /// run both and the difference in the client peak is what streaming into a sink saved.</para></summary>
     [MethodImpl(MethodImplOptions.NoInlining)]
     private static async Task<DryRunOutcome> RunDryRunAsync(IpcClient client, Options options)
     {
@@ -219,19 +233,44 @@ internal static class Program
         });
 
         Profile profile = BuildProfile(options);
-        Result<DryRunReport, IpcError> result = await client.DryRunStreamAsync(
-            new DryRunStreamRequest { ProfileId = profile.Id, InlineProfile = profile }, progress);
+        DryRunStreamRequest request = new() { ProfileId = profile.Id, InlineProfile = profile };
 
-        if (result.TryGetError(out IpcError? error))
+        if (options.ClientIngest == ClientIngest.Report)
+        {
+            Result<DryRunReport, IpcError> assembled =
+                await client.DryRunStreamAsync(request, progress);
+            if (assembled.TryGetError(out IpcError? assembleError))
+                return new DryRunOutcome(0, 0, false, phases, $"{assembleError.Code}: {assembleError.Message}");
+            assembled.TryGetValue(out DryRunReport? report);
+            // report goes out of scope with this frame (deliberately not inlined into the caller's).
+            return new DryRunOutcome(
+                report!.SourceFiles.Count, report.DestinationFiles.Count, report.Truncated, phases, null);
+        }
+
+        CountingSink sink = new();
+        Result<DryRunCompletion, IpcError> streamed =
+            await client.DryRunStreamAsync(request, sink, progress);
+        if (streamed.TryGetError(out IpcError? error))
             return new DryRunOutcome(0, 0, false, phases, $"{error.Code}: {error.Message}");
-        result.TryGetValue(out DryRunReport? report);
+        streamed.TryGetValue(out DryRunCompletion? completion);
+        return new DryRunOutcome(sink.SourceFiles, sink.DestinationFiles, completion!.Truncated, phases, null);
+    }
 
-        DryRunOutcome outcome = new(
-            report!.SourceFiles.Count, report.DestinationFiles.Count, report.Truncated, phases, null);
-        // report goes out of scope here (this frame is deliberately not inlined into the caller's),
-        // so the harness's own footprint never enters the readings — every figure this tool prints is
-        // sampled from the SERVICE process, not this one.
-        return outcome;
+    /// <summary>Counts what went past and keeps nothing — the minimum a sink can do, so the client
+    /// rows measure the transport and deserialization floor rather than any particular consumer's
+    /// data structure. (The UI's real sink builds its columnar store on top of this floor; what that
+    /// store retains is measured by <c>DryRunViewModelMemoryTests</c>, in-process, where retention is
+    /// the thing being asked about.)</summary>
+    private sealed class CountingSink : IDryRunChunkSink
+    {
+        public int SourceFiles { get; private set; }
+        public int DestinationFiles { get; private set; }
+
+        public void OnChunk(DryRunChunkResponse chunk)
+        {
+            SourceFiles += chunk.SourceFiles.Count;
+            DestinationFiles += chunk.DestinationFiles.Count;
+        }
     }
 
     private sealed record DryRunOutcome(

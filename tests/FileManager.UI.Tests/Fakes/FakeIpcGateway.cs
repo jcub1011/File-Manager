@@ -85,9 +85,13 @@ internal sealed class FakeIpcGateway : IIpcGateway
         return Task.FromResult(DeleteResult);
     }
 
-    public async Task<Result<DryRunReport, IpcError>> DryRunAsync(
-        Guid profileId, IProgress<DryRunProgress>? progress = null, Profile? draft = null,
-        CancellationToken ct = default)
+    /// <summary>Replays <see cref="DryRunResult"/> to the caller's sink as a single chunk — the same
+    /// shape the real gateway delivers, just in one frame instead of many — and returns its run-level
+    /// facts. Tests keep scripting a whole <c>DryRunReport</c>, which stays the convenient way to
+    /// describe an expected run; only the delivery mechanism changed.</summary>
+    public async Task<Result<DryRunCompletion, IpcError>> DryRunAsync(
+        Guid profileId, IDryRunChunkSink sink, IProgress<DryRunProgress>? progress = null,
+        Profile? draft = null, CancellationToken ct = default)
     {
         DryRunCalls.Add(profileId);
         DryRunDrafts.Add(draft);
@@ -105,10 +109,24 @@ internal sealed class FakeIpcGateway : IIpcGateway
             catch (OperationCanceledException)
             {
                 // Mirror the real gateway: cancellation is a Canceled result, never a throw.
-                return Result<DryRunReport, IpcError>.Canceled();
+                return Result<DryRunCompletion, IpcError>.Canceled();
             }
         }
-        return DryRunResult;
+
+        if (DryRunResult.IsCanceled)
+            return Result<DryRunCompletion, IpcError>.Canceled();
+        if (DryRunResult.TryGetError(out IpcError? error))
+            return error;
+        DryRunResult.TryGetValue(out DryRunReport? report);
+        sink.OnChunk(new DryRunChunkResponse
+        {
+            Directories = report!.Directories,
+            SourceFiles = report.SourceFiles,
+            DestinationFiles = report.DestinationFiles,
+            SourceOperations = report.SourceOperations,
+            DestinationOperations = report.DestinationOperations,
+        });
+        return new DryRunCompletion(report.GeneratedAt, report.Truncated, report.Space);
     }
 
     public Task<Result<GlobalSettings, IpcError>> GetSettingsAsync(CancellationToken ct = default) =>

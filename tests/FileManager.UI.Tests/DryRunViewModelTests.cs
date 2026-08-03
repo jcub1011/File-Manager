@@ -103,6 +103,38 @@ public sealed class DryRunViewModelTests
             Truncated = truncated,
         };
 
+    /// <summary>A store holding source files only (no destination operations) — the shape the
+    /// tab-level filter/search/rebuild tests need. Rows are no longer objects a test can construct
+    /// directly: they are handles into a <see cref="DryRunRowStore"/>, so a test that used to build a
+    /// <c>List&lt;DryRunFileRow&gt;</c> builds one of these instead.</summary>
+    private DryRunRowStore SourceStore(params (string Name, OperationKind Kind, OnSuccessAction? Disposition)[] files)
+    {
+        List<DryRunFile> sourceFiles = [];
+        List<DryRunOperation> sourceOps = [];
+        for (int i = 0; i < files.Length; i++)
+        {
+            (string name, OperationKind kind, OnSuccessAction? disposition) = files[i];
+            sourceFiles.Add(Pf($@"C:\s\{name}", @"C:\s"));
+            sourceOps.Add(SrcOp(i, $@"C:\s\{name}", @"C:\s", kind, disposition));
+        }
+        return DryRunRowStore.FromReport(Report(Guid.NewGuid(), sourceFiles, sourceOps, [], []));
+    }
+
+    /// <summary>Enough rows to cross <c>DryRunRebuild.SyncThreshold</c>, so rebuilds hop to the thread
+    /// pool exactly as they do for a real large report. Even indices are processed, odd are
+    /// filter-skipped.</summary>
+    private DryRunRowStore ManyRows(int count)
+    {
+        var files = new (string, OperationKind, OnSuccessAction?)[count];
+        for (int i = 0; i < count; i++)
+        {
+            files[i] = i % 2 == 0
+                ? ($"file-{i:D6}.txt", OperationKind.Processed, OnSuccessAction.KeepSource)
+                : ($"file-{i:D6}.txt", OperationKind.SkippedByFilter, (OnSuccessAction?)null);
+        }
+        return SourceStore(files);
+    }
+
     // fresh.txt: new write (KeepSource). clobber.txt: overwrites one target + renames around another
     // (the kept original is a destination-only Untouched op), and its source is trashed (processed AND
     // deleted). junk.tmp: filtered out. same.txt: unchanged.
@@ -1464,13 +1496,10 @@ public sealed class DryRunViewModelTests
     public async Task Nonzero_debounce_coalesces_rapid_search_changes_to_the_final_term()
     {
         var tab = new DryRunSourcesTab(TimeSpan.FromMilliseconds(60));
-        List<DryRunFileRow> rows =
-        [
-            new(@"C:\s", "alpha.txt", @"C:\s", OperationKind.Processed, null, "KeepSource", []),
-            new(@"C:\s", "beta.txt", @"C:\s", OperationKind.Processed, null, "KeepSource", []),
-            new(@"C:\s", "gamma.txt", @"C:\s", OperationKind.Processed, null, "KeepSource", []),
-        ];
-        tab.Load(rows, @"C:\s");
+        tab.Load(SourceStore(
+            ("alpha.txt", OperationKind.Processed, OnSuccessAction.KeepSource),
+            ("beta.txt", OperationKind.Processed, OnSuccessAction.KeepSource),
+            ("gamma.txt", OperationKind.Processed, OnSuccessAction.KeepSource)));
         Assert.Equal(3, tab.VisibleRows.Count);
 
         tab.SearchText = "alpha";
@@ -1488,28 +1517,11 @@ public sealed class DryRunViewModelTests
         Assert.EndsWith("gamma.txt", only.SourcePath);
     }
 
-    // Enough rows to cross DryRunRebuild.SyncThreshold, so rebuilds hop to the thread pool exactly
-    // as they do for a real large report. Even indices are processed, odd are filter-skipped.
-    private static List<DryRunFileRow> ManyRows(int count)
-    {
-        List<DryRunFileRow> rows = new(count);
-        for (int i = 0; i < count; i++)
-        {
-            rows.Add(new DryRunFileRow(
-                @"C:\s", $"file-{i:D6}.txt", @"C:\s",
-                i % 2 == 0 ? OperationKind.Processed : OperationKind.SkippedByFilter,
-                null,
-                i % 2 == 0 ? "KeepSource" : null,
-                []));
-        }
-        return rows;
-    }
-
     [Fact]
     public async Task Rapid_filter_toggles_on_a_large_report_coalesce_to_the_latest_state()
     {
         var tab = new DryRunSourcesTab(TimeSpan.Zero);
-        tab.Load(ManyRows(6_000), @"C:\s");
+        tab.Load(ManyRows(6_000));
         Assert.Equal(6_000, tab.VisibleRows.Count);
 
         // Click chips in quick succession; each toggle supersedes the rebuild before it, so only
@@ -1527,17 +1539,13 @@ public sealed class DryRunViewModelTests
     public async Task Loading_a_new_report_supersedes_an_in_flight_rebuild()
     {
         var tab = new DryRunSourcesTab(TimeSpan.Zero);
-        tab.Load(ManyRows(100_000), @"C:\s");   // large enough that the rebuild is still computing below
+        tab.Load(ManyRows(100_000));   // large enough that the rebuild is still computing below
 
         // Kick off a background rebuild, then load a replacement report while it is in flight —
         // the load cancels it, and the superseded rebuild must never publish the old rows.
         tab.StatusFilters.Single(f => f.Key == "processed").IsSelected = true;
         Task superseded = tab.PendingRebuild;
-        List<DryRunFileRow> replacement =
-        [
-            new(@"C:\s", "alpha.txt", @"C:\s", OperationKind.Processed, null, "KeepSource", []),
-        ];
-        tab.Load(replacement, @"C:\s");
+        tab.Load(SourceStore(("alpha.txt", OperationKind.Processed, OnSuccessAction.KeepSource)));
         await superseded;
 
         DryRunFileRow only = Assert.Single(tab.VisibleRows);
@@ -1548,7 +1556,7 @@ public sealed class DryRunViewModelTests
     public async Task Large_rebuilds_flag_IsRebuilding_until_they_publish()
     {
         var tab = new DryRunSourcesTab(TimeSpan.Zero);
-        tab.Load(ManyRows(6_000), @"C:\s");
+        tab.Load(ManyRows(6_000));
         Assert.False(tab.IsRebuilding);
 
         // The flag is set synchronously before the rebuild hops to the thread pool, and cleared by
@@ -1576,9 +1584,10 @@ public sealed class DryRunViewModelTests
     [Fact]
     public void Prepare_report_honours_cancellation()
     {
-        DryRunReport report = SampleReport(Guid.NewGuid());
+        DryRunRowStore store = DryRunRowStore.FromReport(SampleReport(Guid.NewGuid()));
+        DryRunCompletion completion = new(DateTimeOffset.UnixEpoch, Truncated: false, Space: null);
         Assert.Throws<OperationCanceledException>(
-            () => DryRunViewModel.PrepareReport(report, new CancellationToken(canceled: true)));
+            () => DryRunViewModel.PrepareReport(store, completion, new CancellationToken(canceled: true)));
     }
 
     private static async Task WaitUntilAsync(Func<bool> condition, int timeoutMs = 2000)

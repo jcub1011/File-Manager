@@ -1,5 +1,6 @@
 using BenchmarkDotNet.Attributes;
 using FileManager.Contracts.DryRun;
+using FileManager.Contracts.IPC;
 using FileManager.Contracts.Profiles;
 using FileManager.UI.ViewModels;
 
@@ -19,6 +20,8 @@ public class DryRunViewModelBenchmarks
     private DryRunViewModel _viewModel = null!;
     private DryRunViewModel _populated = null!;
     private DryRunReport _report = null!;
+    private DryRunRowStore _store = null!;
+    private DryRunCompletion _completion = null!;
 
     /// <summary>Source files to aggregate; 500k is the engine's <c>MaxStreamedFiles</c> cap — the
     /// bound on the streamed path the UI actually uses (<c>MaxReportedFiles</c> only guards the
@@ -31,18 +34,30 @@ public class DryRunViewModelBenchmarks
     {
         _viewModel = new DryRunViewModel(gateway: null!);
         _report = BuildReport(FileCount);
+        _completion = new DryRunCompletion(_report.GeneratedAt, _report.Truncated, _report.Space);
+        _store = DryRunRowStore.FromReport(_report);
         _populated = new DryRunViewModel(gateway: null!);
         _populated.ApplyReport(_report);
     }
 
+    /// <summary>The whole cost of turning a finished run into a populated preview: fold the records
+    /// into the columnar store, then sort and count both tabs. Directly comparable to the figure this
+    /// replaced (500k: 1,139 ms / 462 MB allocated), when the same call projected the report into two
+    /// full sets of row objects instead.</summary>
     [Benchmark]
     public void ApplyReport() => _viewModel.ApplyReport(_report);
 
-    /// <summary>The pure projection alone — the part <c>RunAsync</c> now runs on the thread pool.
-    /// The delta between this and <see cref="ApplyReport"/> is what still lands on the UI thread
-    /// when a scan completes.</summary>
+    /// <summary>Ingest alone — what the app pays incrementally, one chunk at a time, while the run is
+    /// still streaming. Splitting it out from <see cref="PrepareReport"/> is what shows whether a
+    /// regression landed in the fold or in the sorts.</summary>
     [Benchmark]
-    public object PrepareReport() => DryRunViewModel.PrepareReport(_report);   // object: the record is internal, benchmark methods must be public
+    public object IngestReport() => DryRunRowStore.FromReport(_report);
+
+    /// <summary>The post-ingest preparation alone — the sorts, counts and facets. This is what
+    /// <c>RunAsync</c> still runs on the thread pool once the stream ends; everything before it has
+    /// already happened frame by frame.</summary>
+    [Benchmark]
+    public object PrepareReport() => DryRunViewModel.PrepareReport(_store, _completion);   // object: the record is internal, benchmark methods must be public
 
     /// <summary>A status-chip select and its deselect on a populated preview — the coalesced
     /// rebuilds that used to freeze the UI. Both passes run per invocation so every invocation does

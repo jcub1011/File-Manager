@@ -37,10 +37,12 @@ public sealed class DryRunViewModelMemoryTests(ITestOutputHelper output)
 
         // Budget guard. History at this shape/count: 372 MB before any optimization; 250 MB after
         // lazy display strings + root interning; 238 MB after the directory-table report (this
-        // shallow shape's ~28-char paths understate that step — see the deep-path probe below).
-        // The margin catches regressions back toward eager per-row strings without flaking on GC noise.
-        Assert.True(retained < 280L * 1024 * 1024,
-            $"ApplyReport retained {retained / (1024.0 * 1024.0):F1} MB — over the 280 MB budget");
+        // shallow shape's ~28-char paths understate that step — see the deep-path probe below);
+        // 66 MB once rows became (store, index) handles over the columnar DryRunRowStore, which
+        // removed the object per file AND the second materialization of every destination operation.
+        // The margin catches a regression back toward an object per row without flaking on GC noise.
+        Assert.True(retained < 95L * 1024 * 1024,
+            $"ApplyReport retained {retained / (1024.0 * 1024.0):F1} MB — over the 95 MB budget");
 
         GC.KeepAlive(vm);   // rows must outlive the second measurement
     }
@@ -51,7 +53,11 @@ public sealed class DryRunViewModelMemoryTests(ITestOutputHelper output)
     /// paths — where per-row path bytes dominated the old flat-string model. History at this shape:
     /// 519 MB before any optimization, 307 MB after lazy display strings + interned roots, 219 MB
     /// with the directory-table report — whose property this budget pins: retained heap no longer
-    /// scales with path depth.</summary>
+    /// scales with path depth — and 72 MB once rows became handles over the columnar store.
+    /// <para>Note this shape now measures HIGHER than the shallow one (72 vs 66 MB), the reverse of
+    /// before. That is the expected end state: with an object per row gone, what is left is dominated
+    /// by the interned file names and the directory-path table, and this shape has ~25k directories
+    /// with ~100-char paths against the other's 64.</para></summary>
     [Fact]
     [Trait("Category", "Memory")]
     public void ApplyReport_retained_heap_at_streamed_cap_with_realistic_deep_paths()
@@ -65,8 +71,8 @@ public sealed class DryRunViewModelMemoryTests(ITestOutputHelper output)
         long retained = after - before;
         output.WriteLine($"Retained after ApplyReport({FileCount:N0} deep-path files): {retained:N0} bytes ({retained / (1024.0 * 1024.0):F1} MB)");
 
-        Assert.True(retained < 260L * 1024 * 1024,
-            $"ApplyReport retained {retained / (1024.0 * 1024.0):F1} MB — over the 260 MB budget");
+        Assert.True(retained < 100L * 1024 * 1024,
+            $"ApplyReport retained {retained / (1024.0 * 1024.0):F1} MB — over the 100 MB budget");
 
         GC.KeepAlive(vm);
     }
@@ -106,10 +112,11 @@ public sealed class DryRunViewModelMemoryTests(ITestOutputHelper output)
         // dictionary, and pill strings); 116 MB / ~1.6 s building from the shared directory
         // structure (leaves reference their rows' strings; pills memoized); 48 MB / ~0.6 s once file
         // leaves became lazy — only directory nodes + per-directory row buckets are built up front,
-        // so the collapsed forest no longer carries a node per file. Time is reported but not asserted
-        // — wall clock flakes across machines.
-        Assert.True(retained < 90L * 1024 * 1024,
-            $"Tree toggle retained {retained / (1024.0 * 1024.0):F1} MB — over the 90 MB budget");
+        // so the collapsed forest no longer carries a node per file; 48 MB once the forest was built
+        // over row INDICES, making each per-directory bucket 4 bytes a file instead of a row
+        // reference. Time is reported but not asserted — wall clock flakes across machines.
+        Assert.True(retained < 60L * 1024 * 1024,
+            $"Tree toggle retained {retained / (1024.0 * 1024.0):F1} MB — over the 60 MB budget");
 
         GC.KeepAlive(vm);
     }
