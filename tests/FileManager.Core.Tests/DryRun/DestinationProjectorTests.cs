@@ -1,8 +1,10 @@
 using FileManager.Contracts.DryRun;
+using FileManager.Contracts.IPC;
 using FileManager.Contracts.Primitives;
 using FileManager.Contracts.Profiles;
 using FileManager.Contracts.Settings;
 using FileManager.Core.DryRun;
+using FileManager.Core.IPC.Handlers;
 using FileManager.Core.Jobs;
 using FileManager.Core.Files;
 using FileManager.Core.Scanning;
@@ -305,10 +307,29 @@ public sealed class DestinationProjectorTests : IDisposable
             Assert.Equal(chunk.DestinationFiles.Count, chunk.DestinationOperations.Count);
             if (chunk.DestinationFiles.Count > 0)
                 chunkSizes.Add(chunk.DestinationFiles.Count);
+            // COPY, never buffer the views: a chunk's entries are pooled carriers, valid only until
+            // the next advance (SweepStreamAsync's ownership contract). Buffering the views across
+            // chunks would read recycled carriers.
             foreach (IPhysicalFileView f in chunk.DestinationFiles)
-                files.Add((PhysicalFile)f);
+                files.Add(new PhysicalFile
+                {
+                    Path = f.Path,
+                    Root = f.Root,
+                    Length = f.Length,
+                    LastWritten = f.LastWritten,
+                    IsReparsePoint = f.IsReparsePoint,
+                });
             foreach (IFileOperationView o in chunk.DestinationOperations)
-                ops.Add((VirtualFileOperation)o);
+                ops.Add(new VirtualFileOperation
+                {
+                    Path = o.Path,
+                    Root = o.Root,
+                    Kind = o.Kind,
+                    SourceIndex = o.SourceIndex,
+                    SubjectIndex = o.SubjectIndex,
+                    SourceDisposition = o.SourceDisposition,
+                    Detail = o.Detail,
+                });
         }
         return new StreamedSweep(files, ops, capped, chunkSizes);
     }
@@ -355,6 +376,61 @@ public sealed class DestinationProjectorTests : IDisposable
             Assert.Equal(streamed.Files[i].Path, streamed.Ops[i].Path);
             Assert.Equal(-1, streamed.Ops[i].SourceIndex);
         }
+    }
+
+    [Fact]
+    public async Task Streamed_sweep_returns_every_rented_carrier_to_the_pool()
+    {
+        for (int i = 0; i < 40; i++)
+            TargetFile(Path.Combine($"d{i % 6}", $"f{i}.txt"));
+
+        DestinationProjector projector = NewProjector(Workers);
+        // A tiny budget forces many chunks, so the rent → yield → recycle cycle runs repeatedly
+        // instead of once.
+        StreamedSweep streamed = await SweepStream(projector, Mirror(), chunkByteBudget: 800);
+
+        Assert.Equal(40, streamed.Files.Count);
+        SweepCarrierPool pool = projector.LastSweepStreamPool!;
+        Assert.Equal(40, pool.RentedPairs);
+        // Borrow == return: a fully consumed stream recycles every carrier it rented (the last chunk
+        // included — the consumer's final advance is what returns it). An unreturned carrier means a
+        // chunk escaped the ownership contract.
+        Assert.Equal(pool.RentedPairs, pool.ReturnedPairs);
+        // And the pool retains a bounded working set, never one carrier per swept entry.
+        Assert.True(pool.RetainedCount <= 4_200, $"pool retained {pool.RetainedCount} objects");
+    }
+
+    [Fact]
+    public async Task Streamed_sweep_chunks_convert_to_wire_form_correctly_while_carriers_recycle()
+    {
+        // The production shape end to end: each chunk is converted to its wire frame BEFORE the next
+        // advance (which recycles the chunk's carriers). If recycling were visible to a consumed
+        // chunk — or the converter's reference-keyed memo misbehaved with carrier-shared strings —
+        // the assembled wire output would lose or corrupt entries.
+        HashSet<string> expected = [];
+        for (int i = 0; i < 40; i++)
+            expected.Add(Path.GetFileName(TargetFile(Path.Combine($"d{i % 6}", $"f{i}.txt"))));
+
+        DestinationProjector projector = NewProjector(Workers);
+        DryRunStreamHandler.WireChunkConverter converter = new();
+        List<DryRunChunkResponse> frames = [];
+        HashSet<NormalizedPath> survivors = [];
+        await foreach (Result<DryRunChunk, string> result in projector.SweepStreamAsync(
+            Mirror(), survivors, truncated: false, int.MaxValue, 0, 800, progress: null, CancellationToken.None))
+        {
+            result.TryGetValue(out DryRunChunk? chunk);
+            frames.Add(converter.Convert(chunk!));
+        }
+
+        Assert.True(frames.Count > 1, "expected the small budget to split the sweep into several frames");
+        // Wire records are immutable snapshots, so recycled carriers must not have leaked into them:
+        // exactly the expected file names, each exactly once, and every op resolving to its file.
+        List<DryRunDirectory> directories = [.. frames.SelectMany(f => f.Directories)];
+        string[] dirPaths = DryRunDirectoryTable.Materialize(directories);
+        List<DryRunFile> files = [.. frames.SelectMany(f => f.DestinationFiles)];
+        Assert.Equal(expected, files.Select(f => f.FileName).ToHashSet());
+        Assert.All(files, f => Assert.StartsWith(_target, dirPaths[f.DirIndex]));
+        Assert.All(frames.SelectMany(f => f.DestinationOperations), o => Assert.Equal(OperationKind.Deleted, o.Kind));
     }
 
     [Fact]

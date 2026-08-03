@@ -57,6 +57,11 @@ public sealed class DestinationProjector(
     /// bounds it.</summary>
     private const int StreamChunkBufferCapacity = 2;
 
+    /// <summary>Test seam: the carrier pool of the most recent <see cref="SweepStreamAsync"/> call,
+    /// so tests can assert the borrow==return and bounded-retention properties. Written per call;
+    /// meaningful only in single-stream (test) scenarios.</summary>
+    internal SweepCarrierPool? LastSweepStreamPool { get; private set; }
+
     /// <summary>Adds every resulting destination path a batch of destination operations accounts for
     /// to <paramref name="survivors"/> — so the sweep never re-reports a path a source already writes
     /// to (or the pre-existing file a rename was routed around, which the engine emits as an explicit
@@ -140,7 +145,13 @@ public sealed class DestinationProjector(
     /// <para>A capped sweep is reported by a trailing empty chunk with
     /// <see cref="DryRunChunk.SweepCapped"/> set — the cap is only known once the walk ends, and a
     /// marker frame is cheaper than buffering a chunk to back-fill the flag. <c>ScanTruncated</c>
-    /// cannot carry this: the caller ORs that in before the sweep even starts.</para></summary>
+    /// cannot carry this: the caller ORs that in before the sweep even starts.</para>
+    ///
+    /// <para><b>Ownership contract:</b> a yielded chunk's file/op entries are pooled carriers
+    /// (<see cref="SweepCarrierPool"/>), valid only until the consumer requests the NEXT chunk —
+    /// advancing the enumerator is the signal that recycles them. Consume a chunk fully (convert it,
+    /// fold it, copy what must outlive it) before advancing; never buffer the views themselves across
+    /// chunks. The handler's frame loop already has exactly this shape.</para></summary>
     /// <param name="chunkByteBudget">Wire-shape byte budget per chunk (see
     /// <c>DryRunEngine.WireChunkByteBudget</c>) — the same currency and constant the file phase uses,
     /// so both phases put frames of the same size on the wire.</param>
@@ -177,9 +188,14 @@ public sealed class DestinationProjector(
         // The walk runs on a pool thread because IScanSession.Consume() blocks the calling thread by
         // contract. It writes whole chunks, so the async side never touches a blocking enumerable and
         // the bounded channel is what stops a fast walk outrunning a slow pipe.
+        // Per-run carrier pool: the producer rents, the reader loop below recycles once the consumer
+        // has moved past a chunk. Dropped with the run, so the residual footprint is untouched.
+        SweepCarrierPool pool = new();
+        LastSweepStreamPool = pool;
+
         Task producer = Task.Run(
             () => ProduceChunksAsync(
-                plan, channel.Writer, budget, maxEntries, destinationIndexBase, chunkByteBudget, progress,
+                plan, channel.Writer, pool, budget, maxEntries, destinationIndexBase, chunkByteBudget, progress,
                 producerStop.Token),
             CancellationToken.None);
 
@@ -216,6 +232,11 @@ public sealed class DestinationProjector(
                 if (chunk is null)
                     break;      // channel completed normally
                 yield return Result<DryRunChunk, string>.Success(chunk);
+                // Resuming here means the consumer asked for the NEXT chunk, so it is done with this
+                // one — the yielded chunk's ownership contract (see the method doc). Recycling is an
+                // optimization, not bookkeeping the pool depends on: an abandoned enumerator simply
+                // never recycles and the per-run pool is dropped whole.
+                pool.Recycle(chunk);
             }
         }
         finally
@@ -242,14 +263,14 @@ public sealed class DestinationProjector(
     /// <summary>The streamed path's producer: walks, classifies, packs entries into byte-budgeted
     /// chunks with global indices, and completes the channel (with the fault, if it threw).</summary>
     private async Task ProduceChunksAsync(
-        WalkPlan plan, ChannelWriter<DryRunChunk> writer, SweepBudget budget,
+        WalkPlan plan, ChannelWriter<DryRunChunk> writer, SweepCarrierPool pool, SweepBudget budget,
         int maxEntries, int destinationIndexBase, int chunkByteBudget,
         DryRunProgressCounters? progress, CancellationToken ct)
     {
         try
         {
-            List<PhysicalFile> files = [];
-            List<VirtualFileOperation> ops = [];
+            List<IPhysicalFileView> files = pool.RentFileList();
+            List<IFileOperationView> ops = pool.RentOpList();
             long bytes = 0;
             int emitted = 0;
             // The walk's SweepBudget is a best-effort early exit shared by its workers; this serial
@@ -265,25 +286,33 @@ public sealed class DestinationProjector(
                     break;   // more survived than the budget allows
                 }
 
-                VirtualFileOperation op = new()
-                {
-                    Path = candidate.File.Path,
-                    Root = candidate.File.Root,
-                    Kind = candidate.Kind,
-                    SourceIndex = -1,
-                    SubjectIndex = destinationIndexBase + emitted,
-                    Detail = candidate.Detail,
-                };
-                files.Add(candidate.File);
+                // Rented carriers, not fresh records — every field is (re)assigned because a rented
+                // carrier keeps its previous non-string fields.
+                (PooledPhysicalFile file, PooledFileOperation op) = pool.RentPair();
+                file.Path = candidate.Path.Value;
+                file.Root = candidate.Root;
+                file.Length = candidate.Length;
+                file.LastWritten = candidate.Modified;
+                file.IsReparsePoint = candidate.IsReparsePoint;
+                // The op shares the file's string INSTANCES — the wire converter's reference-keyed
+                // memo depends on it (and it is what every sweep pair did before pooling too).
+                op.Path = file.Path;
+                op.Root = file.Root;
+                op.Kind = candidate.Kind;
+                op.SourceIndex = -1;
+                op.SubjectIndex = destinationIndexBase + emitted;
+                op.SourceDisposition = null;
+                op.Detail = candidate.Detail;
+                files.Add(file);
                 ops.Add(op);
                 emitted++;
-                bytes += DryRunEngine.WireUpperBoundBytes(candidate.File) + DryRunEngine.WireUpperBoundBytes(op);
+                bytes += DryRunEngine.WireUpperBoundBytes(file) + DryRunEngine.WireUpperBoundBytes(op);
                 if (bytes < chunkByteBudget)
                     continue;
 
                 await writer.WriteAsync(new DryRunChunk([], files, [], ops), ct).ConfigureAwait(false);
-                files = [];
-                ops = [];
+                files = pool.RentFileList();
+                ops = pool.RentOpList();
                 bytes = 0;
             }
 
@@ -427,14 +456,10 @@ public sealed class DestinationProjector(
                     : OperationKind.Untouched;       // pre-existing, left in place
             yield return new Candidate(
                 NormalizedPath.FromCanonical(fsEntry.FullPath),
-                new PhysicalFile
-                {
-                    Path = fsEntry.FullPath,
-                    Root = rootTag.Value,
-                    Length = fsEntry.Size,
-                    LastWritten = fsEntry.Modified,
-                    IsReparsePoint = isReparse,
-                },
+                rootTag.Value,
+                fsEntry.Size,
+                fsEntry.Modified,
+                isReparse,
                 kind,
                 isReparse ? "reparse point (symlink/junction)" : null);
         }
@@ -463,11 +488,18 @@ public sealed class DestinationProjector(
             }
 
             int subjectIndex = files.Count;
-            files.Add(candidate.File);
+            files.Add(new PhysicalFile
+            {
+                Path = candidate.Path.Value,
+                Root = candidate.Root,
+                Length = candidate.Length,
+                LastWritten = candidate.Modified,
+                IsReparsePoint = candidate.IsReparsePoint,
+            });
             ops.Add(new VirtualFileOperation
             {
-                Path = candidate.File.Path,
-                Root = candidate.File.Root,
+                Path = candidate.Path.Value,
+                Root = candidate.Root,
                 Kind = candidate.Kind,
                 SourceIndex = -1,
                 SubjectIndex = subjectIndex,
@@ -505,7 +537,13 @@ public sealed class DestinationProjector(
     /// <see cref="VirtualFileOperation.SubjectIndex"/> is assigned only at emission time (it depends on
     /// position, which differs between the sorted batched merge and the streamed discovery order), so
     /// it is absent here.</summary>
-    private readonly record struct Candidate(NormalizedPath Path, PhysicalFile File, OperationKind Kind, string? Detail);
+    /// <summary>One classified survivor, as raw fields rather than a materialized record — the two
+    /// entry points want different output currencies (the batched merge builds immutable
+    /// <see cref="PhysicalFile"/> records, the streamed producer fills pooled carriers), so the shared
+    /// walk hands over facts and lets each output pipeline pay only its own allocation.</summary>
+    private readonly record struct Candidate(
+        NormalizedPath Path, string Root, long Length, DateTimeOffset Modified, bool IsReparsePoint,
+        OperationKind Kind, string? Detail);
 
     /// <summary>The best-effort emission budget shared by the walk's workers: reserves a slot per
     /// candidate, latching Capped once the reservations exceed the cap. An unbounded budget always
