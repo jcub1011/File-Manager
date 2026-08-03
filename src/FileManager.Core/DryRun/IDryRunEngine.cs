@@ -47,13 +47,22 @@ public interface IDryRunEngine
 /// marker chunk when <c>DestinationProjector.SweepStreamAsync</c> hit its entry bound. It needs its own
 /// flag because <paramref name="ScanTruncated"/> is ORed in by the handler BEFORE the sweep runs (it is
 /// what suppresses the sweep entirely), so it cannot carry a signal the sweep discovers afterwards.</para>
+/// <para><paramref name="SweepFaulted"/> is set on the same trailing marker chunk when the walk itself
+/// hit a Warning-severity <c>EnumerationFault</c> (the engine's depth-ceiling backstop —
+/// <c>ScanScheduler.ReportDepthCeiling</c> — an unreadable subdirectory, or a worker crash) rather than
+/// its own entry budget. Kept distinct from <paramref name="SweepCapped"/> because the two have
+/// different causes and the handler logs each with its own accurate message; both still fold into the
+/// same overall <c>truncated</c> flag. <paramref name="SweepFaultDetail"/> carries the first such
+/// fault's message (which already names the actual path) for the streamed path's user-facing notice.</para>
 public sealed record DryRunChunk(
     IReadOnlyList<IPhysicalFileView> SourceFiles,
     IReadOnlyList<IPhysicalFileView> DestinationFiles,
     IReadOnlyList<IFileOperationView> SourceOperations,
     IReadOnlyList<IFileOperationView> DestinationOperations,
     bool ScanTruncated = false,
-    bool SweepCapped = false);
+    bool SweepCapped = false,
+    bool SweepFaulted = false,
+    string? SweepFaultDetail = null);
 
 /// <summary>The BATCHED destination sweep's output (<c>DestinationProjector.Sweep</c>/<c>Project</c>).
 /// No longer the streamed path's currency — <c>SweepStreamAsync</c> emits <see cref="DryRunChunk"/>s

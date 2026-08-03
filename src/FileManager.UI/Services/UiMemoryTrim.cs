@@ -33,6 +33,13 @@ namespace FileManager.UI.Services;
 /// discrete trigger per preview.</para></summary>
 internal static class UiMemoryTrim
 {
+    /// <summary>Indirection point callers use instead of <see cref="AfterPreviewClosed"/> directly, so a
+    /// test can substitute a cheap probe and observe whether/how often the real trim would fire without
+    /// paying for or triggering the actual two-pass blocking collect. Defaults to the real
+    /// implementation; a test that reassigns this must restore the original in a finally, since this is
+    /// static, process-wide, cross-test state.</summary>
+    internal static Action AfterPreviewClosedHook = AfterPreviewClosed;
+
     /// <summary>Collects and decommits after a preview was released. Logs the before/after so the
     /// effect is visible rather than assumed — and so the first question this answers is diagnostic:
     /// whether the post-clear heap was <em>garbage</em> (committed drops) or still <em>live</em> (it

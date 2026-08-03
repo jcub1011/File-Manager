@@ -252,6 +252,7 @@ public sealed class DryRunStreamHandler(
         int sweepBudget = Math.Max(0, MaxStreamedFiles - destinationCount);
         Stopwatch sweepWatch = Stopwatch.StartNew();
         int sweptCount = 0;
+        string? sweepFaultDetail = null;
         // AdditiveArchive can skip the sweep when the profile opts out (ScanDestination = false);
         // Mirror always sweeps because the sweep is its only source of Deleted-orphan previews.
         // SweepStreamAsync yields nothing when truncated, but short-circuit here too so the (non-trivial)
@@ -321,6 +322,15 @@ public sealed class DryRunStreamHandler(
                             "Dry-run (stream) destination sweep for profile {ProfileId} hit the {Cap:N0}-entry bound; report truncated",
                             typed.ProfileId, MaxStreamedFiles);
                         truncated = true;
+                    }
+                    if (sweepSlice.SweepFaulted)
+                    {
+                        logger.LogWarning(
+                            "Dry-run (stream) destination sweep for profile {ProfileId} could not fully walk " +
+                            "one or more target root(s): {Detail}; report truncated",
+                            typed.ProfileId, sweepSlice.SweepFaultDetail);
+                        truncated = true;
+                        sweepFaultDetail ??= sweepSlice.SweepFaultDetail;
                     }
                     sweptCount += sweepSlice.DestinationFiles.Count;
                     // The capped marker is an empty chunk; don't put an empty frame on the wire for it.
@@ -404,6 +414,20 @@ public sealed class DryRunStreamHandler(
             {
                 AtUtc = time.GetUtcNow(),
                 Message = $"{progressCounters.Skipped} item(s) under the scanned source(s) could not be read and are missing from this preview (see the service log for details).",
+            });
+        // The destination-sweep counterpart of the notice above: a Warning-severity fault (the scan
+        // depth ceiling, or an unreadable subdirectory) means real files below that point were never
+        // classified, so Mirror never previews/deletes them as orphans — this is the only place a user
+        // would otherwise have no way to know the sweep was incomplete.
+        if (sweepFaultDetail is not null)
+            eventBus.Publish(new EngineWarningEvent
+            {
+                AtUtc = time.GetUtcNow(),
+                Message = $"The destination scan could not fully verify one or more target folders "
+                    + $"({sweepFaultDetail}). Files below that point are not previewed as Mirror deletions "
+                    + "or shown as untouched. Increase Max Scan Depth in Settings if this is a "
+                    + "legitimately deep tree, or check the path for a network-share symlink loop (see the "
+                    + "service log for details).",
             });
         yield return new DryRunCompleteResponse { GeneratedAt = time.GetUtcNow(), Truncated = truncated, Space = space };
     }

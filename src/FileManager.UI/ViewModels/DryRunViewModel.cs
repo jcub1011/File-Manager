@@ -2701,7 +2701,7 @@ public sealed partial class DryRunViewModel : ViewModelBase
         ProfileId = profileId;
         ProfileName = profileName;
         HasEditableProfile = true;
-        ClearReport();
+        ReportClosed();
         // CanRun re-raises via [NotifyPropertyChangedFor] on HasEditableProfile — no manual notify.
     }
 
@@ -2711,7 +2711,7 @@ public sealed partial class DryRunViewModel : ViewModelBase
         ProfileId = null;
         ProfileName = "";
         HasEditableProfile = false;
-        ClearReport();
+        ReportClosed();
     }
 
     /// <summary>Bumped by <see cref="ClearReport"/>. A run captures it before its awaits and must
@@ -2749,7 +2749,9 @@ public sealed partial class DryRunViewModel : ViewModelBase
         // TreeSource. Without it the old report stays alive while PrepareReport builds the next one, so
         // consecutive runs peak at ~2x the row footprint (the Gen2-GC pressure that makes a re-run feel
         // worse). The epoch bump also supersedes any run still in flight; the guard below drops this
-        // run's result if a later clear/run supersedes it in turn.
+        // run's result if a later clear/run supersedes it in turn. This calls the state-only
+        // ClearReport(), not ReportClosed() — a run is never a safe moment for UiMemoryTrim's blocking
+        // collect.
         ClearReport();
         int epoch = _reportEpoch;
         // Baseline for the churn figure on the two samples below — taken after the clear so it measures
@@ -2955,11 +2957,14 @@ public sealed partial class DryRunViewModel : ViewModelBase
         HasReport = true;
     }
 
+    /// <summary>Clears the report's bound state — rows, counts, error, space projection, epoch bump —
+    /// unconditionally. Safe to call from all three transitions that need a blank report: profile
+    /// selection/deselection and the start of every run. Carries no side effect beyond state: it must
+    /// never trigger the blocking memory trim (see <see cref="ReportClosed"/> for that), because
+    /// <see cref="RunAsync"/> calls this immediately before scanning and a run is never a safe moment
+    /// for a blocking two-pass GC.Collect on the UI thread.</summary>
     private void ClearReport()
     {
-        // Only instrument a clear that actually released a preview — ClearReport also runs on profile
-        // selection/deselection and at the start of every run, where there is nothing to report.
-        bool hadReport = HasReport;
         _reportEpoch++;   // invalidates any report still being prepared or awaited
         Sources.Clear();
         Destinations.Clear();
@@ -2971,6 +2976,22 @@ public sealed partial class DryRunViewModel : ViewModelBase
         GeneratedAtText = "";
         WasTruncated = false;
         TruncationNotice = "";
+    }
+
+    /// <summary>Call when the user is genuinely done with the current preview and not about to
+    /// immediately start a new run — profile selection and deselection in the editor. Clears the
+    /// report's state via <see cref="ClearReport"/> and, only if a report was actually showing,
+    /// additionally returns the memory it was holding via <see cref="UiMemoryTrim"/>. Deliberately NOT
+    /// called from <see cref="RunAsync"/>: a run's own <c>ClearReport()</c> call must stay state-only, or
+    /// every re-run pays a blocking two-pass GC.Collect on the UI thread before the scan even starts —
+    /// the freeze this split exists to prevent (see <see cref="UiMemoryTrim"/> for why the trim is only
+    /// safe at a transition with no run in flight).</summary>
+    private void ReportClosed()
+    {
+        // Only instrument a clear that actually released a preview — this also runs on profile
+        // selection/deselection where there is nothing to report.
+        bool hadReport = HasReport;
+        ClearReport();
         if (!hadReport)
             return;
         // The rows are unrooted but not yet collected, so this reads barely changed from
@@ -2981,8 +3002,8 @@ public sealed partial class DryRunViewModel : ViewModelBase
         // process still held 214 MB against a 108 MB idle, with no gen2 having run — an idle UI
         // allocates nothing, so nothing is ever collected until the next run's burst, which is why
         // consecutive runs climbed. See UiMemoryTrim for why a collect is acceptable at this one moment
-        // and nowhere else.
-        UiMemoryTrim.AfterPreviewClosed();
+        // (profile switch/deselect) and nowhere else — in particular, never from RunAsync.
+        UiMemoryTrim.AfterPreviewClosedHook();
         // Ten seconds on, with the app idle: confirms the trim's effect persists rather than the
         // allocator immediately re-committing what it just released.
         Avalonia.Threading.DispatcherTimer.RunOnce(

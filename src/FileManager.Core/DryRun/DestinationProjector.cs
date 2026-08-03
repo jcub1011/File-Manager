@@ -130,7 +130,19 @@ public sealed class DestinationProjector(
         DestinationSweepResult merged = Merge(collected, budget.Capped, maxEntries);
         mergeWatch.Stop();
 
-        return merged with { WalkMs = walkWatch.ElapsedMilliseconds, MergeMs = mergeWatch.ElapsedMilliseconds };
+        if (plan.FaultTracker.WarningCount > 0)
+            logger.LogWarning(
+                "Destination sweep for a target root did not fully cover its tree: {Count} location(s) " +
+                "could not be walked (e.g. the scan depth ceiling, or an unreadable subdirectory) — " +
+                "first: {Message}; report truncated",
+                plan.FaultTracker.WarningCount, plan.FaultTracker.FirstMessage);
+
+        return merged with
+        {
+            Truncated = merged.Truncated || plan.FaultTracker.WarningCount > 0,
+            WalkMs = walkWatch.ElapsedMilliseconds,
+            MergeMs = mergeWatch.ElapsedMilliseconds,
+        };
     }
 
     /// <summary>Streamed sweep: emits <see cref="DryRunChunk"/>s as the walk produces them, so the
@@ -333,8 +345,17 @@ public sealed class DestinationProjector(
 
             if (files.Count > 0)
                 await writer.WriteAsync(new DryRunChunk([], files, [], ops), ct).ConfigureAwait(false);
-            if (capped || budget.Capped)
-                await writer.WriteAsync(new DryRunChunk([], [], [], [], SweepCapped: true), ct).ConfigureAwait(false);
+
+            bool sweepCapped = capped || budget.Capped;
+            bool sweepFaulted = plan.FaultTracker.WarningCount > 0;
+            if (sweepCapped || sweepFaulted)
+                await writer.WriteAsync(
+                    new DryRunChunk(
+                        [], [], [], [],
+                        SweepCapped: sweepCapped,
+                        SweepFaulted: sweepFaulted,
+                        SweepFaultDetail: sweepFaulted ? plan.FaultTracker.FirstMessage : null),
+                    ct).ConfigureAwait(false);
             writer.Complete();
         }
         catch (Exception ex)
@@ -347,7 +368,28 @@ public sealed class DestinationProjector(
 
     /// <summary>Everything the walk needs, resolved once: the session policy, the roots to submit, and
     /// the shared budget. Null when there is nothing to sweep (no resolvable target root).</summary>
-    private sealed record WalkPlan(ScanSessionOptions Options, List<TargetRoot> TargetRoots, bool Mirror);
+    private sealed record WalkPlan(
+        ScanSessionOptions Options, List<TargetRoot> TargetRoots, bool Mirror, SweepFaultTracker FaultTracker);
+
+    /// <summary>Thread-safe accumulator for Warning-severity faults the walk's <c>OnFault</c> callback
+    /// sees (the engine's depth-ceiling backstop — <c>ScanScheduler.ReportDepthCeiling</c> — an
+    /// unreadable subdirectory, or a worker crash). Unlike <see cref="SweepBudget"/> this never stops
+    /// anything — it only makes an already-conservative walk's incompleteness visible to the caller, the
+    /// same way <c>DryRunEngine.ScanAndEvaluateAsync</c> already does for the source-side scan pump.</summary>
+    private sealed class SweepFaultTracker
+    {
+        private int _warningCount;
+        private string? _firstMessage;
+
+        public void RecordWarning(string message)
+        {
+            Interlocked.Increment(ref _warningCount);
+            Interlocked.CompareExchange(ref _firstMessage, message, null);
+        }
+
+        public int WarningCount => Volatile.Read(ref _warningCount);
+        public string? FirstMessage => Volatile.Read(ref _firstMessage);
+    }
 
     /// <summary>A target root as configured (what the walk enumerates and what every file reports as its
     /// <c>Root</c>) alongside the physical location it resolves to (what root-overlap pruning compares).
@@ -377,6 +419,8 @@ public sealed class DestinationProjector(
         if (targetRoots.Count == 0)
             return null;
 
+        SweepFaultTracker faultTracker = new();
+
         ScanSessionOptions options = new()
         {
             // Deliberate asymmetries vs. the source scan: (1) NO MaxDepth pruning — a true mirror
@@ -402,17 +446,35 @@ public sealed class DestinationProjector(
                 // Best-effort budget: once crossed, stop emitting (the caller applies the exact cap).
                 return budget.TryReserve();
             },
-            // The sweep never surfaces faults as results (a missing/unopenable target root is simply
-            // "nothing (more) to report there"); the scheduler still treats a Fatal as terminal for
-            // its directory.
+            // This callback never surfaces a fault as a ScanResult (EnumerateCandidates only ever turns
+            // a result.Entry into a Candidate, never a fault) — its job is what THIS class remembers
+            // about what the walk saw, not what the scheduler emits.
+            // - Fatal (a missing/unopenable ROOT — FileSystemService's setup faults are always Fatal):
+            //   genuinely benign, as before — nothing exists there to miss. NOTE: a Fatal fault for a
+            //   subdirectory that exists but became unreadable mid-walk is indistinguishable from this
+            //   today (no root/non-root tag the way SourceScanner has) — a known, separate gap, not
+            //   addressed here.
+            // - Warning (the depth-ceiling backstop, an unreadable subdirectory, or a worker crash — see
+            //   ScanScheduler.ReportDepthCeiling/TryEmitWorkerFault): real, PRESENT files may sit
+            //   below/behind the fault and were never classified. In Mirror mode that means an orphan is
+            //   silently never previewed or deleted, so this is recorded and folded into
+            //   Truncated/SweepFaulted instead of only logged at Debug.
             OnFault = (fault, _) =>
             {
-                logger.LogDebug("Destination sweep skipped/stopped an entry: {Message}", fault.Message);
+                if (fault.Severity == EnumerationSeverity.Warning)
+                {
+                    faultTracker.RecordWarning(fault.Message);
+                    logger.LogWarning("Destination sweep incomplete: {Message}", fault.Message);
+                }
+                else
+                {
+                    logger.LogDebug("Destination sweep skipped/stopped an entry: {Message}", fault.Message);
+                }
                 return null;
             },
         };
 
-        return new WalkPlan(options, targetRoots, mirror);
+        return new WalkPlan(options, targetRoots, mirror, faultTracker);
     }
 
     /// <summary>The physical location a configured target root resolves to, following a symlink or

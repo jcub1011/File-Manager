@@ -34,17 +34,17 @@ public sealed class DestinationProjectorTests : IDisposable
 
     // A projector wired to a scan scheduler over the real file system. maxThreads pins the global and
     // per-drive scan budgets (1 = serial); null lets them auto-scale. Local temp dirs → not network.
-    private static DestinationProjector NewProjector(int? maxThreads = null)
+    // maxScanDepth overrides the engine-wide depth ceiling (default 512) to exercise the ceiling without
+    // building a tree hundreds of levels deep.
+    private static DestinationProjector NewProjector(int? maxThreads = null, int? maxScanDepth = null)
     {
         FileSystemService fs = new(NullLogger<FileSystemService>.Instance);
-        GlobalSettings settings = maxThreads is int n
+        ThreadBudget budget = maxThreads is int n ? ThreadBudget.Explicit(n) : ThreadBudget.Auto;
+        GlobalSettings settings = maxThreads is int || maxScanDepth is int
             ? new GlobalSettings
             {
-                ScanThreading = new ScanThreadingSettings
-                {
-                    MaxScanThreads = ThreadBudget.Explicit(n),
-                    PerDriveDefault = ThreadBudget.Explicit(n),
-                },
+                MaxScanDepth = maxScanDepth ?? GlobalSettings.DefaultMaxScanDepth,
+                ScanThreading = new ScanThreadingSettings { MaxScanThreads = budget, PerDriveDefault = budget },
             }
             : GlobalSettings.Default;
         ScanScheduler scheduler = new(NullLogger<ScanScheduler>.Instance, fs, new FakeSettingsProvider(settings));
@@ -157,6 +157,30 @@ public sealed class DestinationProjectorTests : IDisposable
         VirtualFileOperation op = Assert.Single(Project(profile).Ops);
         Assert.Equal(deep, op.Path);
         Assert.Equal(OperationKind.Deleted, op.Kind);
+    }
+
+    [Fact]
+    public void Depth_ceiling_prunes_are_surfaced_as_truncation_not_silently_dropped()
+    {
+        // MinScanDepth (ScanThreadResolver) is 8 — the lowest legal ceiling — so a 9-level-deep orphan
+        // sits past it regardless of the machine's real MaxScanDepth default (512).
+        string shallow = TargetFile("shallow-orphan.txt");
+        string deepChain = "d1";
+        for (int i = 2; i <= 10; i++)
+            deepChain = Path.Combine(deepChain, $"d{i}");
+        string deep = TargetFile(Path.Combine(deepChain, "deep-orphan.txt"));
+
+        DestinationSweepResult result = NewProjector(Workers, maxScanDepth: 8)
+            .Sweep(Mirror(), new SurvivorSet(), truncated: false, CancellationToken.None);
+
+        // Already-found entries above the ceiling stay in the report — only the ceiling's own subtree
+        // is missing, so this precedent matches DestinationSweepResult.Truncated's contract elsewhere.
+        Assert.Contains(result.Ops, o => string.Equals(o.Path, shallow, StringComparison.OrdinalIgnoreCase));
+        // The deep orphan sits past the ceiling and is correctly never walked — the ceiling's own job.
+        Assert.DoesNotContain(result.Ops, o => string.Equals(o.Path, deep, StringComparison.OrdinalIgnoreCase));
+        // The bug: this used to be false, silently — a Mirror run would never preview/delete
+        // "deep-orphan.txt" and never say so.
+        Assert.True(result.Truncated);
     }
 
     [Fact]
@@ -340,7 +364,7 @@ public sealed class DestinationProjectorTests : IDisposable
     // pairing and the reported Root are.
 
     private sealed record StreamedSweep(
-        List<PhysicalFile> Files, List<VirtualFileOperation> Ops, bool Capped, List<int> ChunkSizes);
+        List<PhysicalFile> Files, List<VirtualFileOperation> Ops, bool Capped, bool Faulted, List<int> ChunkSizes);
 
     private static async Task<StreamedSweep> SweepStream(
         DestinationProjector projector, Profile profile, int maxEntries = int.MaxValue,
@@ -350,6 +374,7 @@ public sealed class DestinationProjectorTests : IDisposable
         List<VirtualFileOperation> ops = [];
         List<int> chunkSizes = [];
         bool capped = false;
+        bool faulted = false;
         SurvivorSet survivors = new();
         await foreach (Result<DryRunChunk, string> result in projector.SweepStreamAsync(
             profile, survivors, truncated, maxEntries, indexBase, chunkByteBudget,
@@ -358,6 +383,7 @@ public sealed class DestinationProjectorTests : IDisposable
             Assert.False(result.TryGetError(out string? error), error);
             result.TryGetValue(out DryRunChunk? chunk);
             capped |= chunk!.SweepCapped;
+            faulted |= chunk.SweepFaulted;
             // Chunks carry destination entries only — there is no source half in a sweep.
             Assert.Empty(chunk.SourceFiles);
             Assert.Empty(chunk.SourceOperations);
@@ -388,7 +414,7 @@ public sealed class DestinationProjectorTests : IDisposable
                     Detail = o.Detail,
                 });
         }
-        return new StreamedSweep(files, ops, capped, chunkSizes);
+        return new StreamedSweep(files, ops, capped, faulted, chunkSizes);
     }
 
     [Fact]
@@ -511,6 +537,22 @@ public sealed class DestinationProjectorTests : IDisposable
             streamed.Files.Count <= budget,
             $"emitted {streamed.Files.Count} entries against a budget of {budget}");
         Assert.Equal(streamed.Files.Count, streamed.Ops.Count);   // still whole (file, op) pairs
+    }
+
+    [Fact]
+    public async Task Streamed_sweep_marks_faulted_when_the_depth_ceiling_prunes_a_subtree()
+    {
+        string shallow = TargetFile("shallow-orphan.txt");
+        string deepChain = "d1";
+        for (int i = 2; i <= 10; i++)
+            deepChain = Path.Combine(deepChain, $"d{i}");
+        string deep = TargetFile(Path.Combine(deepChain, "deep-orphan.txt"));
+
+        StreamedSweep streamed = await SweepStream(NewProjector(Workers, maxScanDepth: 8), Mirror());
+
+        Assert.Contains(streamed.Ops, o => string.Equals(o.Path, shallow, StringComparison.OrdinalIgnoreCase));
+        Assert.DoesNotContain(streamed.Ops, o => string.Equals(o.Path, deep, StringComparison.OrdinalIgnoreCase));
+        Assert.True(streamed.Faulted);
     }
 
     [Fact]

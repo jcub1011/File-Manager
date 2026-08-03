@@ -1169,6 +1169,35 @@ public sealed class DryRunViewModelTests
     }
 
     [Fact]
+    public async Task RunAsync_does_not_trigger_the_memory_trim_when_a_report_is_already_loaded()
+    {
+        // Regression for the UI-thread freeze: ClearReport() ran inside RunAsync used to inherit
+        // UiMemoryTrim's blocking two-pass GC.Collect whenever a report was already showing, so every
+        // re-run froze the window before the scan even started. RunAsync must never invoke it — only
+        // ReportClosed() (profile select/deselect) may.
+        var (viewModel, gateway) = NewViewModel();
+        gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value);
+        await viewModel.RunAsync(CancellationToken.None);
+        Assert.True(viewModel.HasReport);
+
+        Action original = UiMemoryTrim.AfterPreviewClosedHook;
+        int callCount = 0;
+        UiMemoryTrim.AfterPreviewClosedHook = () => callCount++;
+        try
+        {
+            gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value);
+            await viewModel.RunAsync(CancellationToken.None);
+        }
+        finally
+        {
+            UiMemoryTrim.AfterPreviewClosedHook = original;
+        }
+
+        Assert.Equal(0, callCount);
+        Assert.True(viewModel.HasReport);   // the re-run still applied normally
+    }
+
+    [Fact]
     public async Task Re_running_after_a_tree_toggle_replaces_the_grid_source()
     {
         // Regression for the tree-view memory leak: OnTreeChanged now disposes the previous
