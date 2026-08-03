@@ -33,7 +33,10 @@ internal sealed class PooledPhysicalFile : IPhysicalFileView
     /// one incidental read (a log line, a future estimator field) silently push every later entry
     /// back onto the joining path — byte-identical output, no failing test, the saving gone. It also
     /// makes the lazy join a benign race (both racers store the same string) rather than a mutation
-    /// the producer and consumer can disagree about.</para></summary>
+    /// the producer and consumer can disagree about.</para>
+    /// <para><b>Never assign null.</b> The getter reads the backing string's length, so a null stored
+    /// here faults on the very next read — do not use null as an "unset" sentinel (the snapshot reader
+    /// uses the empty string; see <see cref="DryRunSnapshotFormat"/>).</para></summary>
     public string Path
     {
         get

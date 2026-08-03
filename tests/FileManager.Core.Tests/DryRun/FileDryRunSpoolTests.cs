@@ -40,6 +40,39 @@ public sealed class FileDryRunSpoolTests : IDisposable
         return new FileEvaluation(source, sourceOp, [dest], [destOp]);
     }
 
+    /// <summary>An entry whose destination op targets a PRE-EXISTING destination file
+    /// (<c>SubjectIndex >= 0</c>, as Overwrite / SkipUnchanged / SkipConflict / Untouched do). The
+    /// snapshot format omits such an op's Path on disk and reconstructs it from the subject file on
+    /// read-back, so this is the only shape that exercises that branch — <see cref="Entry"/>'s New op
+    /// (SubjectIndex -1) carries its Path and never reaches it.</summary>
+    private static FileEvaluation SubjectTargetingEntry(int i)
+    {
+        PhysicalFile source = new()
+        {
+            Path = $@"C:\src\file{i}.txt",
+            Root = @"C:\src",
+            Length = i,
+            LastWritten = DateTimeOffset.UnixEpoch.AddSeconds(i),
+        };
+        VirtualFileOperation sourceOp = new()
+        {
+            Path = source.Path,
+            Root = source.Root,
+            Kind = OperationKind.SkippedUnchanged,
+        };
+        PhysicalFile dest = new() { Path = $@"C:\dst\file{i}.txt", Root = @"C:\dst", Length = i, LastWritten = source.LastWritten };
+        VirtualFileOperation destOp = new()
+        {
+            Path = dest.Path,        // omitted on the wire — must come back as this exact path
+            Root = dest.Root,
+            Kind = OperationKind.SkipUnchanged,
+            SourceIndex = 0,
+            SubjectIndex = 0,        // the bundle-local position of `dest`
+            Detail = $"identical content ({i})",
+        };
+        return new FileEvaluation(source, sourceOp, [dest], [destOp]);
+    }
+
     // ReadAllAsync yields IEvaluationView: original records on the in-memory/non-spilled path, pooled
     // carriers on the spilled path. Comparing field-by-field via the view covers both uniformly.
     private static void AssertEntryEqual(FileEvaluation expected, IEvaluationView actual)
@@ -127,6 +160,26 @@ public sealed class FileDryRunSpoolTests : IDisposable
 
         await spool.DisposeAsync();
         Assert.Empty(Directory.EnumerateFiles(_scratch, "*.snapshot"));   // deleted on dispose
+    }
+
+    [Fact]
+    public async Task Spilled_ops_that_target_an_existing_destination_file_round_trip_their_omitted_path()
+    {
+        // The snapshot format drops a destination op's Path when the op targets a subject file and
+        // rebuilds it from that file on read-back. Regression guard: the reader used to mark the omitted
+        // Path with null, which the pooled carrier's lazy-join Path getter dereferences — every spilled
+        // run with a pre-existing destination file (the common overwrite/skip preview) died with a
+        // NullReferenceException the engine reported as an opaque "dry-run spool failed".
+        List<FileEvaluation> entries = [.. Enumerable.Range(0, 50).Select(SubjectTargetingEntry)];
+        await using FileDryRunSpool spool = new(_scratch, spillThresholdBytes: 8, new EvaluationCarrierPool(), NullLogger.Instance);
+
+        List<IEvaluationView> read = await WriteReadAsync(spool, entries);
+
+        Assert.True(Directory.EnumerateFiles(_scratch, "*.snapshot").Any(),
+            "this test only proves anything if the run spilled");
+        Assert.Equal(entries.Count, read.Count);
+        for (int i = 0; i < entries.Count; i++)
+            AssertEntryEqual(entries[i], read[i]);
     }
 
     [Fact]

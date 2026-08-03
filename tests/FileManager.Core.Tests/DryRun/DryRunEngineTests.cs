@@ -106,6 +106,16 @@ public sealed class DryRunEngineTests : IDisposable
         };
     }
 
+    /// <summary>The assertion message for a stream item that must be a chunk, carrying the error arm's
+    /// text when it is not. A bare "failure chunk" message hides the actual fault (the engine reports
+    /// spool/scan faults as an error string and logs the detail through a NullLogger in tests), which is
+    /// exactly how a NullReferenceException in the snapshot reader once masqueraded as an unexplained
+    /// baseline failure.</summary>
+    private static string FailureMessage(Result<DryRunChunk, string> item) =>
+        item.TryGetError(out string? error)
+            ? $"stream yielded a failure chunk: {error}"
+            : "stream yielded a failure chunk";
+
     /// <summary>Concatenates a stream's source files with their source operations (paired by the
     /// global index — the position in the concatenated list, matching each op's SourceIndex).</summary>
     private static async Task<List<(string SourcePath, OperationKind Kind)>> CollectStream(
@@ -115,7 +125,7 @@ public sealed class DryRunEngineTests : IDisposable
         Dictionary<int, IFileOperationView> ops = [];
         await foreach (Result<DryRunChunk, string> chunk in engine.SimulateStreamAsync(profile, scope, ct: ct))
         {
-            Assert.True(chunk.TryGetValue(out DryRunChunk? c), "stream yielded a failure chunk");
+            Assert.True(chunk.TryGetValue(out DryRunChunk? c), FailureMessage(chunk));
             files.AddRange(c!.SourceFiles);
             foreach (IFileOperationView op in c.SourceOperations)
                 ops[op.SourceIndex] = op;
@@ -955,7 +965,7 @@ public sealed class DryRunEngineTests : IDisposable
         List<(int, int, string, OperationKind, string?)> destOps = [];
         await foreach (Result<DryRunChunk, string> item in engine.SimulateStreamAsync(profile, null))
         {
-            Assert.True(item.TryGetValue(out DryRunChunk? c), "stream yielded a failure chunk");
+            Assert.True(item.TryGetValue(out DryRunChunk? c), FailureMessage(item));
             foreach (IPhysicalFileView f in c!.SourceFiles) sourceFiles.Add((f.Path, f.Root, f.Length));
             foreach (IPhysicalFileView f in c.DestinationFiles) destFiles.Add((f.Path, f.Root, f.Length));
             foreach (IFileOperationView o in c.SourceOperations) sourceOps[o.SourceIndex] = (o.Path, o.Kind, o.SourceDisposition);

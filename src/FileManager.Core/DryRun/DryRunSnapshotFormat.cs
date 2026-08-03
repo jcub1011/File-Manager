@@ -118,6 +118,26 @@ internal static class DryRunSnapshotFormat
     public static PooledEvaluation Read(ReadOnlySpan<byte> json, EvaluationCarrierPool pool)
     {
         PooledEvaluation e = pool.RentEvaluation();
+        try
+        {
+            Fill(json, e, pool);
+        }
+        catch
+        {
+            // A faulted record must not leak the carriers it already holds. The replay turns the throw
+            // into a single failure item and abandons the run, but the pool's borrowed == returned
+            // invariant should hold on that path too — the carrier count is what the tests read to prove
+            // recycling works, and a leak here would make a fault look like a recycling bug.
+            pool.Return(e);
+            throw;
+        }
+        return e;
+    }
+
+    /// <summary>The parse itself, split out so <see cref="Read"/> is just the rent + the return-on-fault
+    /// guard and the parse body stays unindented.</summary>
+    private static void Fill(ReadOnlySpan<byte> json, PooledEvaluation e, EvaluationCarrierPool pool)
+    {
         RootInterner roots = pool.Roots;
         Utf8JsonReader reader = new(json);
 
@@ -170,7 +190,7 @@ internal static class DryRunSnapshotFormat
         e.SourceOp.Root = e.SourceFile.Root;
         foreach (PooledFileOperation o in e.DestinationOps)
         {
-            if (o.Path is null)
+            if (o.Path.Length == 0)
             {
                 // Bounds-checked: a corrupted record with an omitted Path and a bad SubjectIndex
                 // must fail as the descriptive IOException the replay converts to a failure item,
@@ -181,8 +201,6 @@ internal static class DryRunSnapshotFormat
                 o.Path = e.DestinationFiles[o.SubjectIndex].Path;
             }
         }
-
-        return e;
     }
 
     // Each reader is positioned on the value's StartObject on entry and left on the matching EndObject,
@@ -209,8 +227,10 @@ internal static class DryRunSnapshotFormat
 
     private static void ReadOp(ref Utf8JsonReader reader, PooledFileOperation o, RootInterner roots)
     {
-        // Null Path is the sentinel for "omitted — reconstruct after the record is read".
-        o.Path = null!;
+        // An EMPTY Path is the sentinel for "omitted — reconstruct after the record is read" (a written
+        // path is never empty). Not null: the carrier's Path getter dereferences its backing field, so a
+        // null would fault on the very next read (see PooledFileOperation.Path).
+        o.Path = "";
         o.Root = null!;
         o.SourceIndex = -1;
         o.SubjectIndex = -1;

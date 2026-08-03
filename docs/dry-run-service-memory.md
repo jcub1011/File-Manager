@@ -1192,3 +1192,35 @@ are fixed; the measured table above is unaffected except where noted.
    `DryRunDirectoryTableBuilder.Convert` reference-memoizes its directory, as `GetOrAddRoot` already
    did; and `HandleStreamAsync` documents the valid-until-you-advance contract that recycling imposes
    on its public enumerable.
+
+### 13.2 The `Path` getter change in 13.1 item 5 broke the snapshot reader (fixed)
+
+Item 5's getter guard — `if (_path.Length == 0 && _directory is { } directory)`, so an incidental read
+keeps `DirectoryHint` — was listed as behaviorally harmless. It was not. The getter now **dereferences**
+`_path` before anything else, and `DryRunSnapshotFormat.ReadOp` was using `null` as its "this op's `Path`
+was omitted on disk, reconstruct it from the subject file" sentinel. The reconstruction's `if (o.Path is
+null)` therefore threw `NullReferenceException`, which `FileDryRunSpool.ReadAllAsync` propagated into
+`SimulateStreamAsync`'s replay catch-all — so **every spilled run containing a pre-existing destination
+file** (i.e. any Overwrite/SkipUnchanged/SkipConflict/Untouched op, the common overwrite preview) ended
+with the single failure item `"dry-run spool failed: Object reference not set to an instance of an
+object."` instead of a report.
+
+The fix and the three things that let it hide:
+
+- The sentinel is now the **empty string** (a written path is never empty), so no carrier field is ever
+  null. Both carriers' `Path` docs now state that null must never be stored, because the getter reads
+  the backing string's length.
+- `FileDryRunSpoolTests.Entry` hard-coded `SubjectIndex = -1`, so the omitted-Path branch of the format
+  had **no unit coverage at all** — every spool round-trip test wrote its op's path.
+  `Spilled_ops_that_target_an_existing_destination_file_round_trip_their_omitted_path` now pins it.
+  `DryRunEngineTests.Spilled_stream_returns_every_rented_carrier_to_the_pool` is source-only for the
+  same reason, which is why exactly two of the three spill tests failed.
+- `DryRunEngineTests`' stream helpers asserted the bare literal `"stream yielded a failure chunk"` and
+  discarded the `Result` error arm, so the NRE never appeared in any test output and the two failures
+  read as an unexplained branch baseline. They now include the error text.
+- `DryRunSnapshotFormat.Read` also returns the rented carrier to the pool when the parse throws, so a
+  faulted record no longer unbalances borrowed == returned.
+
+Standing lesson: the replay's `catch (Exception)` at the `MoveNextAsync` boundary is deliberate (a fault
+must be one failure item, never a torn stream), but it converts *bugs* into user-facing spool errors just
+as readily as disk faults. A test that swallows that string swallows the bug.
