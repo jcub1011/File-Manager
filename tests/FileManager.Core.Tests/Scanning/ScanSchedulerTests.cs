@@ -176,7 +176,7 @@ public sealed class ScanSchedulerTests
     });
 
     private static FileSystemEntry FileEntry(string path) =>
-        new(System.IO.Path.GetFileName(path), path, IsDirectory: false, Size: 1, Modified: DateTimeOffset.UnixEpoch);
+        new(System.IO.Path.GetFileName(path), path, isDirectory: false, size: 1, modified: DateTimeOffset.UnixEpoch);
 
     /// <summary>An in-memory file system whose <see cref="EnumerateEntries"/> blocks on a shared gate
     /// (so workers pile up on a volume) and tracks the peak concurrent-enumeration count.</summary>

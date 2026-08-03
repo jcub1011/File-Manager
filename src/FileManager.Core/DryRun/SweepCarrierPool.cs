@@ -94,9 +94,9 @@ internal sealed class SweepCarrierPool
                     continue;
                 ReturnedPairs++;
                 // Clear the strings BEFORE the cap check, same rationale as EvaluationCarrierPool:
-                // a retained carrier must not pin its (unique) path for the rest of the run, and a
-                // dropped one must actually release it.
-                file.Path = "";
+                // a retained carrier must not pin its (unique) location strings for the rest of the
+                // run, and a dropped one must actually release them.
+                file.ResetLocation();
                 file.Root = "";
                 if (_files.Count < MaxRetainedPerKind)
                     _files.Push(file);
@@ -105,7 +105,7 @@ internal sealed class SweepCarrierPool
             {
                 if (o is not PooledFileOperation op)
                     continue;
-                op.Path = "";
+                op.ResetLocation();
                 op.Root = "";
                 op.Detail = null;
                 if (_ops.Count < MaxRetainedPerKind)

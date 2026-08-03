@@ -66,7 +66,7 @@ public sealed class DestinationProjector(
     /// to <paramref name="survivors"/> — so the sweep never re-reports a path a source already writes
     /// to (or the pre-existing file a rename was routed around, which the engine emits as an explicit
     /// Untouched op). Safe to call repeatedly across streamed chunks.</summary>
-    public static void AccumulateSurvivors(ISet<NormalizedPath> survivors, IReadOnlyList<IFileOperationView> destinationOperations)
+    public static void AccumulateSurvivors(SurvivorSet survivors, IReadOnlyList<IFileOperationView> destinationOperations)
     {
         ArgumentNullException.ThrowIfNull(survivors);
         ArgumentNullException.ThrowIfNull(destinationOperations);
@@ -79,7 +79,7 @@ public sealed class DestinationProjector(
     public DestinationSweepResult Project(
         Profile profile, IReadOnlyList<VirtualFileOperation> destinationOperations, bool truncated, CancellationToken ct)
     {
-        HashSet<NormalizedPath> survivors = [];
+        SurvivorSet survivors = new();
         AccumulateSurvivors(survivors, destinationOperations);
         return Sweep(profile, survivors, truncated, ct);
     }
@@ -101,7 +101,7 @@ public sealed class DestinationProjector(
     /// <param name="progress">When supplied, its destination counter is incremented per classified
     /// file so a caller can sample it for live progress.</param>
     public DestinationSweepResult Sweep(
-        Profile profile, ISet<NormalizedPath> survivors, bool truncated, CancellationToken ct,
+        Profile profile, SurvivorSet survivors, bool truncated, CancellationToken ct,
         int maxEntries = int.MaxValue, DryRunProgressCounters? progress = null)
     {
         ArgumentNullException.ThrowIfNull(profile);
@@ -156,7 +156,7 @@ public sealed class DestinationProjector(
     /// <c>DryRunEngine.WireChunkByteBudget</c>) — the same currency and constant the file phase uses,
     /// so both phases put frames of the same size on the wire.</param>
     public async IAsyncEnumerable<Result<DryRunChunk, string>> SweepStreamAsync(
-        Profile profile, ISet<NormalizedPath> survivors, bool truncated,
+        Profile profile, SurvivorSet survivors, bool truncated,
         int maxEntries, int destinationIndexBase, int chunkByteBudget,
         DryRunProgressCounters? progress, [EnumeratorCancellation] CancellationToken ct)
     {
@@ -287,16 +287,17 @@ public sealed class DestinationProjector(
                 }
 
                 // Rented carriers, not fresh records — every field is (re)assigned because a rented
-                // carrier keeps its previous non-string fields.
+                // carrier keeps its previous non-string fields. The location is the (directory,
+                // name) PAIR: nothing downstream on the streamed path reads a joined Path (the wire
+                // converter and the estimator both work from the pair), so no per-entry path string
+                // exists anywhere in the sweep.
                 (PooledPhysicalFile file, PooledFileOperation op) = pool.RentPair();
-                file.Path = candidate.Path.Value;
+                file.SetLocation(candidate.Directory, candidate.FileName);
                 file.Root = candidate.Root;
                 file.Length = candidate.Length;
                 file.LastWritten = candidate.Modified;
                 file.IsReparsePoint = candidate.IsReparsePoint;
-                // The op shares the file's string INSTANCES — the wire converter's reference-keyed
-                // memo depends on it (and it is what every sweep pair did before pooling too).
-                op.Path = file.Path;
+                op.SetLocation(candidate.Directory, candidate.FileName);
                 op.Root = file.Root;
                 op.Kind = candidate.Kind;
                 op.SourceIndex = -1;
@@ -306,7 +307,8 @@ public sealed class DestinationProjector(
                 files.Add(file);
                 ops.Add(op);
                 emitted++;
-                bytes += DryRunEngine.WireUpperBoundBytes(file) + DryRunEngine.WireUpperBoundBytes(op);
+                bytes += DryRunEngine.WireFileUpperBoundBytes(candidate.FileName)
+                    + DryRunEngine.WireOpUpperBoundBytes(candidate.FileName, candidate.Detail);
                 if (bytes < chunkByteBudget)
                     continue;
 
@@ -334,7 +336,7 @@ public sealed class DestinationProjector(
     /// the shared budget. Null when there is nothing to sweep (no resolvable target root).</summary>
     private sealed record WalkPlan(ScanSessionOptions Options, List<NormalizedPath> TargetRoots, bool Mirror);
 
-    private WalkPlan? PlanWalk(Profile profile, ISet<NormalizedPath> survivors, SweepBudget budget)
+    private WalkPlan? PlanWalk(Profile profile, SurvivorSet survivors, SweepBudget budget)
     {
         // Normalize source roots once, for the target-under-source exclusion: a target root may
         // legally contain the source files (the validator only warns on overlap), and those source
@@ -375,12 +377,10 @@ public sealed class DestinationProjector(
                 if (InfrastructurePaths.IsTempFileName(entry.FileName))
                     return false;
                 // The enumerated path descends from a GetFullPath-canonicalized target root, so it is
-                // itself canonical — wrap it WITHOUT paying Create's per-file re-canonicalization.
-                NormalizedPath filePath = NormalizedPath.FromCanonical(entry.FullPath);
-                if (survivors.Contains(filePath))
-                    return false;   // a source writes here — already an operation from the file phase
-                if (IsUnderAnySource(filePath, sourceRoots))
-                    return false;   // a source file that happens to live under a target root
+                // itself canonical — and it is probed as a SPAN composed into a stack buffer, so the
+                // per-file exclusion check allocates nothing at all (no path string, no wrapper).
+                if (IsExcludedPath(entry, survivors, sourceRoots))
+                    return false;
                 // Best-effort budget: once crossed, stop emitting (the caller applies the exact cap).
                 return budget.TryReserve();
             },
@@ -454,8 +454,14 @@ public sealed class DestinationProjector(
                 : plan.Mirror
                     ? OperationKind.Deleted          // orphan a mirror would remove
                     : OperationKind.Untouched;       // pre-existing, left in place
+            // Real enumeration always carries a directory hint; the split fallback serves synthetic
+            // test schedulers that construct entries from full paths (allocation there is test-only).
+            string directory = fsEntry.DirectoryHint
+                ?? Path.GetDirectoryName(fsEntry.FullPath)
+                ?? throw new InvalidOperationException($"swept entry '{fsEntry.FullPath}' has no containing directory");
             yield return new Candidate(
-                NormalizedPath.FromCanonical(fsEntry.FullPath),
+                directory,
+                fsEntry.FileName,
                 rootTag.Value,
                 fsEntry.Size,
                 fsEntry.Modified,
@@ -473,13 +479,19 @@ public sealed class DestinationProjector(
     /// (<see cref="PruneNestedRoots"/>), so no path can be enumerated twice.</para></summary>
     private static DestinationSweepResult Merge(List<Candidate> collected, bool cappedDuringWalk, int maxEntries)
     {
-        collected.Sort(static (a, b) =>
-            string.Compare(a.Path.Value, b.Path.Value, StringComparison.OrdinalIgnoreCase));
+        // The batched path's output is full-path records, so compose each candidate's path ONCE here
+        // (bounded — this path collects under its walk budget), then sort on the composed strings.
+        // The comparison is unchanged: full absolute path, OrdinalIgnoreCase.
+        var paired = new (string Path, Candidate Candidate)[collected.Count];
+        for (int i = 0; i < collected.Count; i++)
+            paired[i] = (Path.Join(collected[i].Directory, collected[i].FileName), collected[i]);
+        Array.Sort(paired, static (a, b) =>
+            string.Compare(a.Path, b.Path, StringComparison.OrdinalIgnoreCase));
 
-        List<PhysicalFile> files = new(collected.Count);
-        List<VirtualFileOperation> ops = new(collected.Count);
+        List<PhysicalFile> files = new(paired.Length);
+        List<VirtualFileOperation> ops = new(paired.Length);
         bool capped = cappedDuringWalk;
-        foreach (Candidate candidate in collected)
+        foreach ((string path, Candidate candidate) in paired)
         {
             if (files.Count >= maxEntries)
             {
@@ -490,7 +502,7 @@ public sealed class DestinationProjector(
             int subjectIndex = files.Count;
             files.Add(new PhysicalFile
             {
-                Path = candidate.Path.Value,
+                Path = path,
                 Root = candidate.Root,
                 Length = candidate.Length,
                 LastWritten = candidate.Modified,
@@ -498,7 +510,7 @@ public sealed class DestinationProjector(
             });
             ops.Add(new VirtualFileOperation
             {
-                Path = candidate.Path.Value,
+                Path = path,
                 Root = candidate.Root,
                 Kind = candidate.Kind,
                 SourceIndex = -1,
@@ -517,17 +529,55 @@ public sealed class DestinationProjector(
         return (key, volumes.GetDriveClass(path));
     }
 
-    private static void AddNormalized(ISet<NormalizedPath> set, string path)
+    /// <summary>The sweep's per-file exclusion check ("a source writes here" / "this IS a source
+    /// file"), against the entry's canonical full path composed into a stack buffer — the hot path
+    /// pays no allocation. Falls back to the materialized path for full-path-constructed entries
+    /// (synthetic scan schedulers in tests; real enumeration always carries a directory hint).
+    /// Correctness guard: <c>Span_probe_agrees_with_NormalizedPath_probing</c> pins this against the
+    /// NormalizedPath-based answer over adversarial paths.</summary>
+    private static bool IsExcludedPath(FileSystemEntry entry, SurvivorSet survivors, List<NormalizedPath> sourceRoots)
     {
+        if (entry.DirectoryHint is not { } directory)
+        {
+            ReadOnlySpan<char> full = Path.TrimEndingDirectorySeparator(entry.FullPath.AsSpan());
+            return survivors.Contains(full) || IsUnderAnySource(full, sourceRoots);
+        }
+
+        // Join with Path.Join's separator rule: add one only when the directory doesn't end in one
+        // (volume roots like "C:\" do). File names never carry a trailing separator, so the result
+        // needs no trimming.
+        bool needsSeparator = directory.Length > 0 && !Path.EndsInDirectorySeparator(directory);
+        int length = directory.Length + (needsSeparator ? 1 : 0) + entry.FileName.Length;
+        char[]? rented = null;
+        Span<char> buffer = length <= 512 ? stackalloc char[512] : (rented = System.Buffers.ArrayPool<char>.Shared.Rent(length));
+        directory.CopyTo(buffer);
+        int written = directory.Length;
+        if (needsSeparator)
+            buffer[written++] = Path.DirectorySeparatorChar;
+        entry.FileName.CopyTo(buffer[written..]);
+        written += entry.FileName.Length;
+
+        ReadOnlySpan<char> composed = buffer[..written];
+        bool excluded = survivors.Contains(composed) || IsUnderAnySource(composed, sourceRoots);
+        if (rented is not null)
+            System.Buffers.ArrayPool<char>.Shared.Return(rented);
+        return excluded;
+    }
+
+    private static void AddNormalized(SurvivorSet set, string path)
+    {
+        // Create, never FromCanonical: destination op paths are built from the RAW profile string
+        // (see docs/dry-run-service-memory.md §11) — GetFullPath here is what makes a target written
+        // as "d:/out" or "D:\out\.\" match the sweep's canonical probes.
         if (NormalizedPath.Create(path).TryGetValue(out NormalizedPath normalized))
             set.Add(normalized);
     }
 
-    private static bool IsUnderAnySource(NormalizedPath path, List<NormalizedPath> sourceRoots)
+    private static bool IsUnderAnySource(ReadOnlySpan<char> canonicalPath, List<NormalizedPath> sourceRoots)
     {
         foreach (NormalizedPath root in sourceRoots)
         {
-            if (path.Equals(root) || path.IsUnder(root))
+            if (NormalizedPath.IsEqualToOrUnder(canonicalPath, root))
                 return true;
         }
         return false;
@@ -540,10 +590,12 @@ public sealed class DestinationProjector(
     /// <summary>One classified survivor, as raw fields rather than a materialized record — the two
     /// entry points want different output currencies (the batched merge builds immutable
     /// <see cref="PhysicalFile"/> records, the streamed producer fills pooled carriers), so the shared
-    /// walk hands over facts and lets each output pipeline pay only its own allocation.</summary>
+    /// walk hands over facts and lets each output pipeline pay only its own allocation. The location
+    /// is the (directory, name) pair, never a joined path: the directory string is shared by every
+    /// sibling, and only the batched merge (bounded) ever composes full paths.</summary>
     private readonly record struct Candidate(
-        NormalizedPath Path, string Root, long Length, DateTimeOffset Modified, bool IsReparsePoint,
-        OperationKind Kind, string? Detail);
+        string Directory, string FileName, string Root, long Length, DateTimeOffset Modified,
+        bool IsReparsePoint, OperationKind Kind, string? Detail);
 
     /// <summary>The best-effort emission budget shared by the walk's workers: reserves a slot per
     /// candidate, latching Capped once the reservations exceed the cap. An unbounded budget always

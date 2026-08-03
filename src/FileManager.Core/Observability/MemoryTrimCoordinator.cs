@@ -35,8 +35,10 @@ public interface IMemoryTrimCoordinator
 /// <item>enough work has accumulated since the last trim — a ten-file preview never triggers one;</item>
 /// <item>nothing has run for the quiet period — this is the debounce, so back-to-back dry runs pay
 /// once at the end instead of once each;</item>
-/// <item>committed-but-not-live is actually large — the symptom itself, and a better gate than any
-/// file count because it self-scales to what the run really cost;</item>
+/// <item>there is something to reclaim — either committed-but-not-live is large (the classic
+/// symptom: collected-but-not-decommitted heap), or total committed sits far above the idle floor
+/// with the garbage simply not collected yet (the post-allocation-avoidance shape, where the run
+/// triggers almost no collections). Both self-scale to what the run really cost;</item>
 /// <item>no operation is in flight — mid-sweep, LOH compaction would be O(live LOH) with up to
 /// hundreds of scan workers suspended behind it.</item>
 /// </list></remarks>
@@ -49,6 +51,16 @@ public sealed class MemoryTrimCoordinator : IMemoryTrimCoordinator, IDisposable
     /// <summary>Committed-but-not-live bytes below which there is nothing worth reclaiming. This is
     /// the condition that actually describes the reported symptom.</summary>
     private const long CommittedSlackBytes = 32L * 1024 * 1024;
+
+    /// <summary>Total committed bytes above which a trim is worth it even with LITTLE slack. Slack
+    /// (committed − heap) only measures memory the GC has already collected but not decommitted; a
+    /// low-allocation burst (post allocation-avoidance work, the dry run barely triggers collections)
+    /// ends with the heap FULL of uncollected garbage instead — committed ≈ heap, near-zero slack,
+    /// and yet one aggressive collect returns almost all of it. Discovered the hard way: after the
+    /// sweep stopped allocating per-entry, a 500k-file dry run settled at ~200 MB because the slack
+    /// gate alone read "nothing to reclaim". Well above the ~8 MB idle floor and comfortably above
+    /// anything a small preview commits, so trivial runs still never pay.</summary>
+    private const long CommittedFloorBytes = 96L * 1024 * 1024;
 
     /// <summary>How long the process must stay idle before a trim fires. Long enough that a user
     /// re-running a dry run, or tweaking a profile and previewing again, never pays for it.</summary>
@@ -138,7 +150,10 @@ public sealed class MemoryTrimCoordinator : IMemoryTrimCoordinator, IDisposable
 
             (long committed, long heap) = ReadMemory();
             long slack = committed - heap;
-            if (slack < CommittedSlackBytes)
+            // Two shapes of "worth reclaiming": committed-but-free heap the GC kept (slack), or a
+            // heap still full of uncollected garbage after a low-allocation burst (high committed,
+            // near-zero slack — see CommittedFloorBytes).
+            if (slack < CommittedSlackBytes && committed < CommittedFloorBytes)
                 return;
 
             Interlocked.Add(ref _pendingUnits, -units);

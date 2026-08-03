@@ -38,6 +38,12 @@ public readonly record struct NormalizedPath : IComparable<NormalizedPath>
     private static readonly StringComparison Comparison =
         OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
 
+    /// <summary>The <see cref="StringComparer"/> matching <see cref="Comparison"/>, for containers
+    /// keyed on <see cref="Value"/> strings (e.g. the sweep's survivor set) that must agree exactly
+    /// with this type's equality.</summary>
+    internal static StringComparer ValueComparer =>
+        OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;
+
     private NormalizedPath(string value) => Value = value;
 
     public string Value { get; }
@@ -108,6 +114,28 @@ public readonly record struct NormalizedPath : IComparable<NormalizedPath>
             return false;
         // Ancestor may itself end in a separator only when it is a volume root ("C:\").
         char boundary = Value[ancestor.Value.Length];
+        return ancestor.Value[^1] == System.IO.Path.DirectorySeparatorChar
+            || ancestor.Value[^1] == System.IO.Path.AltDirectorySeparatorChar
+            || boundary == System.IO.Path.DirectorySeparatorChar
+            || boundary == System.IO.Path.AltDirectorySeparatorChar;
+    }
+
+    /// <summary>Span twin of "<c>path.Equals(root) || path.IsUnder(root)</c>" for probe paths that
+    /// were never materialized as strings (the destination sweep's per-file exclusion check).
+    /// <paramref name="canonicalPath"/> must be canonical with no trailing separator — the same
+    /// contract <see cref="FromCanonical"/> documents. Kept next to <see cref="IsUnder"/> so the
+    /// boundary logic cannot drift between the two.</summary>
+    internal static bool IsEqualToOrUnder(ReadOnlySpan<char> canonicalPath, NormalizedPath ancestor)
+    {
+        if (ancestor.Value is null)
+            return false;
+        if (canonicalPath.Equals(ancestor.Value, Comparison))
+            return true;
+        if (canonicalPath.Length <= ancestor.Value.Length)
+            return false;
+        if (!canonicalPath.StartsWith(ancestor.Value, Comparison))
+            return false;
+        char boundary = canonicalPath[ancestor.Value.Length];
         return ancestor.Value[^1] == System.IO.Path.DirectorySeparatorChar
             || ancestor.Value[^1] == System.IO.Path.AltDirectorySeparatorChar
             || boundary == System.IO.Path.DirectorySeparatorChar

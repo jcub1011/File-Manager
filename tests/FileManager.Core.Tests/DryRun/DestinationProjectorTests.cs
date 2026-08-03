@@ -293,7 +293,7 @@ public sealed class DestinationProjectorTests : IDisposable
         List<VirtualFileOperation> ops = [];
         List<int> chunkSizes = [];
         bool capped = false;
-        HashSet<NormalizedPath> survivors = [];
+        SurvivorSet survivors = new();
         await foreach (Result<DryRunChunk, string> result in projector.SweepStreamAsync(
             profile, survivors, truncated, maxEntries, indexBase, chunkByteBudget,
             progress: null, CancellationToken.None))
@@ -416,7 +416,7 @@ public sealed class DestinationProjectorTests : IDisposable
         // which is exactly the consumption shape wire-DTO recycling forbids.
         DryRunStreamHandler.WireChunkConverter converter = new(recycleWireRecords: false);
         List<DryRunChunkResponse> frames = [];
-        HashSet<NormalizedPath> survivors = [];
+        SurvivorSet survivors = new();
         await foreach (Result<DryRunChunk, string> result in projector.SweepStreamAsync(
             Mirror(), survivors, truncated: false, int.MaxValue, 0, 800, progress: null, CancellationToken.None))
         {
@@ -505,7 +505,7 @@ public sealed class DestinationProjectorTests : IDisposable
         // chunks to write and is parked on the (capacity 2) channel — the abandoned state under test.
         IAsyncEnumerator<Result<DryRunChunk, string>> stream = NewProjector(Workers)
             .SweepStreamAsync(
-                Mirror(), new HashSet<NormalizedPath>(), truncated: false,
+                Mirror(), new SurvivorSet(), truncated: false,
                 maxEntries: int.MaxValue, destinationIndexBase: 0, chunkByteBudget: 800,
                 progress: null, CancellationToken.None)
             .GetAsyncEnumerator(CancellationToken.None);
@@ -532,7 +532,7 @@ public sealed class DestinationProjectorTests : IDisposable
     }
 
     private DestinationSweepResult Sweep(Profile profile, int maxEntries) =>
-        NewProjector(8).Sweep(profile, new HashSet<NormalizedPath>(), truncated: false, CancellationToken.None, maxEntries);
+        NewProjector(8).Sweep(profile, new SurvivorSet(), truncated: false, CancellationToken.None, maxEntries);
 
     // The sweep's per-file hot path wraps each enumerated path with NormalizedPath.FromCanonical
     // (skipping Create's Path.GetFullPath) on the guarantee that a path enumerated beneath an

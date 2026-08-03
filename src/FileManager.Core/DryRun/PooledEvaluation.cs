@@ -19,7 +19,55 @@ namespace FileManager.Core.DryRun;
 /// the global remap. Plain classes (no reflection, no unmanaged state) — AOT-safe.</para></summary>
 internal sealed class PooledPhysicalFile : IPhysicalFileView
 {
-    public string Path { get; set; } = "";
+    private string _path = "";
+    private string? _directory;
+
+    /// <summary>Two location shapes. The source phase's spool replay sets <see cref="Path"/>
+    /// directly (the snapshot stores full paths). The destination sweep sets
+    /// <see cref="SetLocation"/> — the (directory, name) pair, directory shared per sibling — and
+    /// <see cref="Path"/> joins lazily, so a swept carrier whose consumers all use the pair (the
+    /// wire converter's fast path, the estimator) never materializes a path string at all.</summary>
+    public string Path
+    {
+        get
+        {
+            if (_directory is { } directory)
+            {
+                _path = System.IO.Path.Join(directory, FileName);
+                _directory = null;
+            }
+            return _path;
+        }
+        set
+        {
+            _path = value;
+            _directory = null;
+        }
+    }
+
+    /// <summary>The containing directory when the location is a (directory, name) pair and
+    /// <see cref="Path"/> has not been materialized; null otherwise.</summary>
+    public string? DirectoryHint => _directory;
+
+    /// <summary>Meaningful only alongside <see cref="DirectoryHint"/> (the sweep shape); empty on
+    /// the source phase's full-path shape.</summary>
+    public string FileName { get; private set; } = "";
+
+    public void SetLocation(string directory, string fileName)
+    {
+        _directory = directory;
+        FileName = fileName;
+        _path = "";
+    }
+
+    /// <summary>Drops every location string so a pooled (or dropped) carrier pins nothing.</summary>
+    public void ResetLocation()
+    {
+        _path = "";
+        _directory = null;
+        FileName = "";
+    }
+
     public string Root { get; set; } = "";
     public long Length { get; set; }
     public DateTimeOffset LastWritten { get; set; }
@@ -33,7 +81,49 @@ internal sealed class PooledPhysicalFile : IPhysicalFileView
 /// copies.</summary>
 internal sealed class PooledFileOperation : IFileOperationView
 {
-    public string Path { get; set; } = "";
+    private string _path = "";
+    private string? _directory;
+
+    /// <inheritdoc cref="PooledPhysicalFile.Path"/>
+    public string Path
+    {
+        get
+        {
+            if (_directory is { } directory)
+            {
+                _path = System.IO.Path.Join(directory, FileName);
+                _directory = null;
+            }
+            return _path;
+        }
+        set
+        {
+            _path = value;
+            _directory = null;
+        }
+    }
+
+    /// <inheritdoc cref="PooledPhysicalFile.DirectoryHint"/>
+    public string? DirectoryHint => _directory;
+
+    /// <inheritdoc cref="PooledPhysicalFile.FileName"/>
+    public string FileName { get; private set; } = "";
+
+    public void SetLocation(string directory, string fileName)
+    {
+        _directory = directory;
+        FileName = fileName;
+        _path = "";
+    }
+
+    /// <inheritdoc cref="PooledPhysicalFile.ResetLocation"/>
+    public void ResetLocation()
+    {
+        _path = "";
+        _directory = null;
+        FileName = "";
+    }
+
     public string Root { get; set; } = "";
     public OperationKind Kind { get; set; }
     public int SourceIndex { get; set; } = -1;

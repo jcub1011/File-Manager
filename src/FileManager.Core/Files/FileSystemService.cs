@@ -31,7 +31,11 @@ public sealed class FileSystemService(ILogger<FileSystemService> logger) : IFile
             if (!dir.Exists)
                 setupFault = new EnumerationFault("Directory does not exist.", EnumerationSeverity.Fatal);
             else
-                enumerator = new Enumerator(path, logger);
+                // FullName, not the raw path: entries are built as (directory, name) pairs sharing
+                // the ctor string, so it must be the same canonical form FileSystemEnumerator's own
+                // normalization would have produced for ToFullPath (a relative or ..-laden path
+                // would otherwise leak into every entry's lazily joined FullPath).
+                enumerator = new Enumerator(dir.FullName, logger);
         }
         catch (Exception ex)
         {
@@ -137,10 +141,15 @@ public sealed class FileSystemService(ILogger<FileSystemService> logger) : IFile
                 // offset, Created is UTC. Directories carry Modified AND Attributes — the
                 // OnSubdirectory reparse-point guards (junction cycles / root escape) are dead code
                 // without the attribute flags; only Created stays unenriched for them.
+                //
+                // InDirectory, not ToFullPath(): this is a single-level walk, so every entry's
+                // containing directory IS the ctor path — one shared string per directory instead
+                // of a joined path string per entry. FullPath joins lazily for the consumers that
+                // read it; the destination sweep never does.
                 return entry.IsDirectory
-                    ? new FileSystemEntry(entry.FileName.ToString(), entry.ToFullPath(), true, 0,
+                    ? FileSystemEntry.InDirectory(path, entry.FileName.ToString(), true, 0,
                         entry.LastWriteTimeUtc.ToLocalTime(), default, entry.Attributes)
-                    : new FileSystemEntry(entry.FileName.ToString(), entry.ToFullPath(), false, entry.Length,
+                    : FileSystemEntry.InDirectory(path, entry.FileName.ToString(), false, entry.Length,
                         entry.LastWriteTimeUtc.ToLocalTime(), entry.CreationTimeUtc, entry.Attributes);
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)

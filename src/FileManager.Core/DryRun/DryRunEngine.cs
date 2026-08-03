@@ -689,7 +689,7 @@ public sealed class DryRunEngine(
         /// <summary>Destination paths a kept source writes to, accumulated from the stringy bundles —
         /// the batched path's input to the destination sweep (mirrors the streaming handler's
         /// running survivor set).</summary>
-        public HashSet<NormalizedPath> Survivors { get; } = [];
+        public SurvivorSet Survivors { get; } = new();
 
         /// <summary>True once a unit was rejected because keeping it would cross the budget.</summary>
         public bool Truncated { get; private set; }
@@ -905,6 +905,16 @@ public sealed class DryRunEngine(
     /// <inheritdoc cref="WireUpperBoundBytes(IPhysicalFileView)"/>
     internal static long WireUpperBoundBytes(IFileOperationView op) =>
         OperationStructuralBytes + StringUpperBound(Path.GetFileName(op.Path.AsSpan())) + StringUpperBound(op.Detail);
+
+    /// <inheritdoc cref="WireUpperBoundBytes(IPhysicalFileView)"/>
+    /// <remarks>For callers that already hold the file name (the streamed sweep's producer, whose
+    /// carriers deliberately never materialize a full path to take the name from).</remarks>
+    internal static long WireFileUpperBoundBytes(string fileName) =>
+        PhysicalFileStructuralBytes + StringUpperBound(fileName);
+
+    /// <inheritdoc cref="WireFileUpperBoundBytes(string)"/>
+    internal static long WireOpUpperBoundBytes(string fileName, string? detail) =>
+        OperationStructuralBytes + StringUpperBound(fileName) + StringUpperBound(detail);
 
     private static long UpperBoundBytes(DryRunFile file) =>
         PhysicalFileStructuralBytes + StringUpperBound(file.FileName);

@@ -118,11 +118,11 @@ public sealed class DryRunFrameSizeTests
                     {
                         ct.ThrowIfCancellationRequested();
                         FileSystemEntry entry = new(
-                            FileName: SyntheticName(i),
-                            FullPath: SyntheticPath(root.Directory, i, filesPerDirectory),
-                            IsDirectory: false,
-                            Size: 0,
-                            Modified: DateTimeOffset.UnixEpoch);
+                            fileName: SyntheticName(i),
+                            fullPath: SyntheticPath(root.Directory, i, filesPerDirectory),
+                            isDirectory: false,
+                            size: 0,
+                            modified: DateTimeOffset.UnixEpoch);
                         if (!options.OnFile(entry, root.Tag))
                             continue;
                         yield return new ScanResult(entry, null, root.Tag);

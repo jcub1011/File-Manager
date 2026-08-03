@@ -115,8 +115,10 @@ public sealed class DryRunStreamHandler(
         Stopwatch estimatorWatch = new();
         // Accumulate only the (small) set of destination paths a source writes to (every destination
         // operation's resulting path) as chunks stream by — NOT the file objects — so the destination
-        // sweep below can identify orphans without retaining the whole report in memory.
-        HashSet<NormalizedPath> survivors = [];
+        // sweep below can identify orphans without retaining the whole report in memory. SurvivorSet
+        // rather than a HashSet<NormalizedPath> so the sweep can probe it by span, without a per-file
+        // path string.
+        SurvivorSet survivors = new();
         // One converter for the whole stream: it owns the report's directory-index space across the
         // file phase AND the sweep, so each outgoing chunk carries exactly its first-referenced
         // directory entries with globally valid indices.
@@ -557,8 +559,22 @@ public sealed class DryRunStreamHandler(
 
         private DryRunFile ConvertFile(IPhysicalFileView f)
         {
-            (int dirIndex, string fileName, int rootDirIndex) = _dirs.Convert(f.Path, f.Root);
-            _sharedPathMemo[f.Path] = (dirIndex, fileName, rootDirIndex, f.Root);
+            int dirIndex;
+            string fileName;
+            int rootDirIndex;
+            // Fast path for the sweep's carriers: they hold (directory, name) and never materialize
+            // a joined path, so convert from the pair — the wire even reuses the enumeration's name
+            // string. The memo is pointless there (the pair conversion is already allocation-free)
+            // and touching Path at all would defeat the carrier's laziness.
+            if (f is PooledPhysicalFile { DirectoryHint: { } fileDir } pooledFile)
+            {
+                (dirIndex, fileName, rootDirIndex) = _dirs.Convert(fileDir, pooledFile.FileName, f.Root);
+            }
+            else
+            {
+                (dirIndex, fileName, rootDirIndex) = _dirs.Convert(f.Path, f.Root);
+                _sharedPathMemo[f.Path] = (dirIndex, fileName, rootDirIndex, f.Root);
+            }
             DryRunFile wire = _filePool.Count > 0
                 ? _filePool.Pop()
                 : new DryRunFile { DirIndex = 0, FileName = "", RootDirIndex = 0, Length = 0, LastWritten = default };
@@ -574,10 +590,16 @@ public sealed class DryRunStreamHandler(
 
         private DryRunOperation ConvertOp(IFileOperationView o)
         {
+            (int DirIndex, string FileName, int RootDirIndex, string Root) hit;
+            // Same fast path as ConvertFile — sweep ops carry the identical (directory, name) pair
+            // as their file, so the directory-table probe hits the entry the file just ensured.
+            if (o is PooledFileOperation { DirectoryHint: { } opDir } pooledOp)
+            {
+                (hit.DirIndex, hit.FileName, hit.RootDirIndex) = _dirs.Convert(opDir, pooledOp.FileName, o.Root);
+            }
             // Both Path AND Root must be the file's instances — a same-path op under a different
             // root (nothing produces one today) would need its own root resolution, so it misses.
-            if (!_sharedPathMemo.TryGetValue(o.Path, out (int DirIndex, string FileName, int RootDirIndex, string Root) hit)
-                || !ReferenceEquals(hit.Root, o.Root))
+            else if (!_sharedPathMemo.TryGetValue(o.Path, out hit) || !ReferenceEquals(hit.Root, o.Root))
             {
                 (hit.DirIndex, hit.FileName, hit.RootDirIndex) = _dirs.Convert(o.Path, o.Root);
             }

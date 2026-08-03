@@ -165,6 +165,25 @@ public sealed class MemoryTrimCoordinatorTests
     }
 
     [Fact]
+    public void Trims_when_committed_is_high_even_with_near_zero_slack()
+    {
+        // The post-allocation-avoidance shape: a big run that triggered almost no collections ends
+        // with the heap FULL of uncollected garbage — committed ≈ heap, near-zero slack — yet one
+        // aggressive collect returns almost all of it. The slack gate alone read this as "nothing to
+        // reclaim" and left a 500k-file dry run settled at ~200 MB; the committed floor is what
+        // catches it. 200 MB committed, 4 MB slack.
+        FakeTimeProvider time = new();
+        (MemoryTrimCoordinator coordinator, List<long> trims) = NewCoordinator(
+            time, memory: () => (200L * 1024 * 1024, 196L * 1024 * 1024));
+        using MemoryTrimCoordinator _ = coordinator;
+
+        RunOperation(coordinator, BigRun);
+        time.Advance(PastQuietPeriod);
+
+        Assert.Equal([BigRun], trims);
+    }
+
+    [Fact]
     public void Does_not_trim_when_the_setting_is_off()
     {
         FakeTimeProvider time = new();

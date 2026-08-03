@@ -98,6 +98,16 @@ public sealed class DryRunDirectoryTableBuilder
         return (GetOrAdd(dir), Path.GetFileName(absolutePath), GetOrAddRoot(root));
     }
 
+    /// <summary>The wire triple for a location already split as (directory, name) — the fast path
+    /// for producers whose entries carry the pair and never materialize a joined path. The file name
+    /// string is passed through to the wire as-is, so a caller reusing the enumeration's name string
+    /// makes this overload allocation-free on a directory-table hit.</summary>
+    public (int DirIndex, string FileName, int RootDirIndex) Convert(string directory, string fileName, string root)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(directory);
+        return (GetOrAdd(directory), fileName, GetOrAddRoot(root));
+    }
+
     private int GetOrAddRoot(string root)
     {
         if (ReferenceEquals(root, _memoRoot1))

@@ -557,11 +557,11 @@ public sealed class DryRunStreamHandlerTests
                     {
                         ct.ThrowIfCancellationRequested();
                         FileSystemEntry entry = new(
-                            FileName: $"f{i:D8}.dat",
-                            FullPath: Path.Combine(root.Directory, $"f{i:D8}.dat"),
-                            IsDirectory: false,
-                            Size: 0,
-                            Modified: DateTimeOffset.UnixEpoch);
+                            fileName: $"f{i:D8}.dat",
+                            fullPath: Path.Combine(root.Directory, $"f{i:D8}.dat"),
+                            isDirectory: false,
+                            size: 0,
+                            modified: DateTimeOffset.UnixEpoch);
                         if (!options.OnFile(entry, root.Tag))
                             continue;
                         yield return new ScanResult(entry, null, root.Tag);
