@@ -35,6 +35,14 @@ public sealed class DryRunDirectoryTableBuilder
     private int _memoRootIndex1;
     private string? _memoRoot2;
     private int _memoRootIndex2;
+    // Same trick, same reason, for the pair overload's directory: the sweep hands every sibling the
+    // SAME directory string instance (FileSystemEntry.InDirectory shares one per enumerated
+    // directory), so at ~200 files per directory this skips the trim + full Ordinal hash of a ~60-char
+    // path for 199 of every 200 entries — on the exact hot path the pair overload exists to cheapen.
+    // One slot suffices: a chunk converts its files and then its ops, each walking the same directory
+    // sequence, so only a genuine directory change misses. Invalidated by RollbackTo.
+    private string? _memoDirectory;
+    private int _memoDirectoryIndex;
 
     public DryRunDirectoryTableBuilder() =>
         _indexBySpan = _indexByPath.GetAlternateLookup<ReadOnlySpan<char>>();
@@ -105,7 +113,18 @@ public sealed class DryRunDirectoryTableBuilder
     public (int DirIndex, string FileName, int RootDirIndex) Convert(string directory, string fileName, string root)
     {
         ArgumentException.ThrowIfNullOrEmpty(directory);
-        return (GetOrAdd(directory), fileName, GetOrAddRoot(root));
+        return (GetOrAddDirectory(directory), fileName, GetOrAddRoot(root));
+    }
+
+    /// <summary>Reference-memoized <see cref="GetOrAdd(string)"/> — see <see cref="_memoDirectory"/>.
+    /// Keyed by instance, so the trimming and dedup semantics are exactly the uncached call's.</summary>
+    private int GetOrAddDirectory(string directory)
+    {
+        if (ReferenceEquals(directory, _memoDirectory))
+            return _memoDirectoryIndex;
+        int index = GetOrAdd(directory);
+        (_memoDirectory, _memoDirectoryIndex) = (directory, index);
+        return index;
     }
 
     private int GetOrAddRoot(string root)
@@ -174,9 +193,11 @@ public sealed class DryRunDirectoryTableBuilder
             _indexByPath.Remove(_paths[i]);
         _entries.RemoveRange(mark, _entries.Count - mark);
         _paths.RemoveRange(mark, _paths.Count - mark);
-        // A memoized root may be among the removed entries; a stale slot would resurrect its index.
+        // A memoized root or directory may be among the removed entries; a stale slot would resurrect
+        // its index.
         _memoRoot1 = null;
         _memoRoot2 = null;
+        _memoDirectory = null;
     }
 }
 

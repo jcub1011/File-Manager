@@ -62,6 +62,16 @@ public sealed class DryRunStreamHandler(
         throw new NotSupportedException(
             $"{nameof(DryRunStreamHandler)} is a streaming handler; the server must call {nameof(HandleStreamAsync)}");
 
+    /// <summary><b>Ownership contract:</b> a yielded <see cref="DryRunChunkResponse"/>'s wire records
+    /// are valid only until the consumer requests the NEXT response — advancing the enumerator is
+    /// what hands them back to be refilled (see <see cref="WireChunkConverter"/>, and the identical
+    /// contract <c>DestinationProjector.SweepStreamAsync</c> puts on the carriers underneath). Serialize,
+    /// copy, or otherwise finish with each frame before advancing; never buffer the records themselves
+    /// across advances. <c>IpcServer.ServeStreamAsync</c> — the production consumer —
+    /// writes each frame to the pipe before its next <c>MoveNextAsync</c>, which is what makes this
+    /// safe; a consumer that cannot honor it constructs the handler with
+    /// <see cref="RecycleWireRecords"/> off (buffering a recycled frame is silent, not an exception:
+    /// every file name reads back empty and every Detail null).</summary>
     public async IAsyncEnumerable<IpcResponse> HandleStreamAsync(
         IpcRequest request, [EnumeratorCancellation] CancellationToken ct = default)
     {

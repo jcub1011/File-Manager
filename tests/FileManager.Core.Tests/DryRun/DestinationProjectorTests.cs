@@ -385,17 +385,22 @@ public sealed class DestinationProjectorTests : IDisposable
             TargetFile(Path.Combine($"d{i % 6}", $"f{i}.txt"));
 
         DestinationProjector projector = NewProjector(Workers);
+        // The test holds the pool, not the projector: the observer hands it over as the stream starts
+        // (see SweepStreamPoolObserver) so nothing on the long-lived projector keeps it alive.
+        SweepCarrierPool? observed = null;
+        projector.SweepStreamPoolObserver = p => observed = p;
         // A tiny budget forces many chunks, so the rent → yield → recycle cycle runs repeatedly
         // instead of once.
         StreamedSweep streamed = await SweepStream(projector, Mirror(), chunkByteBudget: 800);
 
         Assert.Equal(40, streamed.Files.Count);
-        SweepCarrierPool pool = projector.LastSweepStreamPool!;
-        Assert.Equal(40, pool.RentedPairs);
-        // Borrow == return: a fully consumed stream recycles every carrier it rented (the last chunk
-        // included — the consumer's final advance is what returns it). An unreturned carrier means a
-        // chunk escaped the ownership contract.
-        Assert.Equal(pool.RentedPairs, pool.ReturnedPairs);
+        SweepCarrierPool pool = Assert.IsType<SweepCarrierPool>(observed);
+        Assert.Equal(40, pool.RentedFiles);
+        // Borrow == return, counted per kind: a fully consumed stream recycles every carrier it
+        // rented (the last chunk included — the consumer's final advance is what returns it). An
+        // unreturned carrier means a chunk escaped the ownership contract.
+        Assert.Equal(pool.RentedFiles, pool.ReturnedFiles);
+        Assert.Equal(pool.RentedOps, pool.ReturnedOps);
         // And the pool retains a bounded working set, never one carrier per swept entry.
         Assert.True(pool.RetainedCount <= 4_200, $"pool retained {pool.RetainedCount} objects");
     }

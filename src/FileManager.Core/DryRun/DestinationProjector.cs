@@ -57,10 +57,13 @@ public sealed class DestinationProjector(
     /// bounds it.</summary>
     private const int StreamChunkBufferCapacity = 2;
 
-    /// <summary>Test seam: the carrier pool of the most recent <see cref="SweepStreamAsync"/> call,
-    /// so tests can assert the borrow==return and bounded-retention properties. Written per call;
-    /// meaningful only in single-stream (test) scenarios.</summary>
-    internal SweepCarrierPool? LastSweepStreamPool { get; private set; }
+    /// <summary>Test seam: handed each <see cref="SweepStreamAsync"/> call's carrier pool as the
+    /// stream starts, so a test can hold the pool and assert the borrow==return and bounded-retention
+    /// properties after consuming the stream. A <em>property</em> holding the last pool would root it
+    /// on this object, which the service registers as a singleton
+    /// (<c>EngineComposition</c>) — a run's carriers would then outlive the run, which is precisely
+    /// the residual footprint the pooling exists to avoid. Null in production.</summary>
+    internal Action<SweepCarrierPool>? SweepStreamPoolObserver { get; set; }
 
     /// <summary>Adds every resulting destination path a batch of destination operations accounts for
     /// to <paramref name="survivors"/> — so the sweep never re-reports a path a source already writes
@@ -191,7 +194,7 @@ public sealed class DestinationProjector(
         // Per-run carrier pool: the producer rents, the reader loop below recycles once the consumer
         // has moved past a chunk. Dropped with the run, so the residual footprint is untouched.
         SweepCarrierPool pool = new();
-        LastSweepStreamPool = pool;
+        SweepStreamPoolObserver?.Invoke(pool);
 
         Task producer = Task.Run(
             () => ProduceChunksAsync(
@@ -292,12 +295,22 @@ public sealed class DestinationProjector(
                 // converter and the estimator both work from the pair), so no per-entry path string
                 // exists anywhere in the sweep.
                 (PooledPhysicalFile file, PooledFileOperation op) = pool.RentPair();
-                file.SetLocation(candidate.Directory, candidate.FileName);
+                if (candidate.Directory is { } directory)
+                {
+                    file.SetLocation(directory, candidate.Location);
+                    op.SetLocation(directory, candidate.Location);
+                }
+                else
+                {
+                    // Full-path shape (see Candidate): the path is authoritative, so hand it over
+                    // verbatim and let the wire converter derive the name from it. Off the hot path.
+                    file.Path = candidate.Location;
+                    op.Path = candidate.Location;
+                }
                 file.Root = candidate.Root;
                 file.Length = candidate.Length;
                 file.LastWritten = candidate.Modified;
                 file.IsReparsePoint = candidate.IsReparsePoint;
-                op.SetLocation(candidate.Directory, candidate.FileName);
                 op.Root = file.Root;
                 op.Kind = candidate.Kind;
                 op.SourceIndex = -1;
@@ -307,8 +320,8 @@ public sealed class DestinationProjector(
                 files.Add(file);
                 ops.Add(op);
                 emitted++;
-                bytes += DryRunEngine.WireFileUpperBoundBytes(candidate.FileName)
-                    + DryRunEngine.WireOpUpperBoundBytes(candidate.FileName, candidate.Detail);
+                bytes += DryRunEngine.WireFileUpperBoundBytes(candidate.Location)
+                    + DryRunEngine.WireOpUpperBoundBytes(candidate.Location, candidate.Detail);
                 if (bytes < chunkByteBudget)
                     continue;
 
@@ -454,14 +467,20 @@ public sealed class DestinationProjector(
                 : plan.Mirror
                     ? OperationKind.Deleted          // orphan a mirror would remove
                     : OperationKind.Untouched;       // pre-existing, left in place
-            // Real enumeration always carries a directory hint; the split fallback serves synthetic
-            // test schedulers that construct entries from full paths (allocation there is test-only).
-            string directory = fsEntry.DirectoryHint
-                ?? Path.GetDirectoryName(fsEntry.FullPath)
-                ?? throw new InvalidOperationException($"swept entry '{fsEntry.FullPath}' has no containing directory");
+            // Two location shapes, mirroring FileSystemEntry itself. Real enumeration carries a
+            // directory hint and the (directory, name) PAIR is the location — no per-entry path
+            // string anywhere in the sweep. A full-path-constructed entry (synthetic test schedulers,
+            // FileSystemService's "Home") has a FileName that is a display name, NOT necessarily the
+            // last segment (see FileSystemEntry.FileName), so its FullPath is authoritative and is
+            // never re-derived: splitting and rejoining it would report the entry at a path other
+            // than the one IsExcludedPath probed, which in Mirror mode is a Deleted op for a path
+            // that does not exist.
+            (string? directory, string location) = fsEntry.DirectoryHint is { } hint
+                ? (hint, fsEntry.FileName)
+                : ((string?)null, fsEntry.FullPath);
             yield return new Candidate(
                 directory,
-                fsEntry.FileName,
+                location,
                 rootTag.Value,
                 fsEntry.Size,
                 fsEntry.Modified,
@@ -484,7 +503,11 @@ public sealed class DestinationProjector(
         // The comparison is unchanged: full absolute path, OrdinalIgnoreCase.
         var paired = new (string Path, Candidate Candidate)[collected.Count];
         for (int i = 0; i < collected.Count; i++)
-            paired[i] = (Path.Join(collected[i].Directory, collected[i].FileName), collected[i]);
+            paired[i] = (
+                collected[i].Directory is { } directory
+                    ? Path.Join(directory, collected[i].Location)
+                    : collected[i].Location,          // full-path shape: authoritative, see Candidate
+                collected[i]);
         Array.Sort(paired, static (a, b) =>
             string.Compare(a.Path, b.Path, StringComparison.OrdinalIgnoreCase));
 
@@ -550,18 +573,26 @@ public sealed class DestinationProjector(
         int length = directory.Length + (needsSeparator ? 1 : 0) + entry.FileName.Length;
         char[]? rented = null;
         Span<char> buffer = length <= 512 ? stackalloc char[512] : (rented = System.Buffers.ArrayPool<char>.Shared.Rent(length));
-        directory.CopyTo(buffer);
-        int written = directory.Length;
-        if (needsSeparator)
-            buffer[written++] = Path.DirectorySeparatorChar;
-        entry.FileName.CopyTo(buffer[written..]);
-        written += entry.FileName.Length;
+        try
+        {
+            directory.CopyTo(buffer);
+            int written = directory.Length;
+            if (needsSeparator)
+                buffer[written++] = Path.DirectorySeparatorChar;
+            entry.FileName.CopyTo(buffer[written..]);
+            written += entry.FileName.Length;
 
-        ReadOnlySpan<char> composed = buffer[..written];
-        bool excluded = survivors.Contains(composed) || IsUnderAnySource(composed, sourceRoots);
-        if (rented is not null)
-            System.Buffers.ArrayPool<char>.Shared.Return(rented);
-        return excluded;
+            ReadOnlySpan<char> composed = buffer[..written];
+            return survivors.Contains(composed) || IsUnderAnySource(composed, sourceRoots);
+        }
+        finally
+        {
+            // try/finally, not a straight-line return: this runs per enumerated file on every scan
+            // worker, so a throw from the probes above would leak one buffer PER FILE out of the
+            // shared pool and degrade every other char[] renter in the process.
+            if (rented is not null)
+                System.Buffers.ArrayPool<char>.Shared.Return(rented);
+        }
     }
 
     private static void AddNormalized(SurvivorSet set, string path)
@@ -590,11 +621,15 @@ public sealed class DestinationProjector(
     /// <summary>One classified survivor, as raw fields rather than a materialized record — the two
     /// entry points want different output currencies (the batched merge builds immutable
     /// <see cref="PhysicalFile"/> records, the streamed producer fills pooled carriers), so the shared
-    /// walk hands over facts and lets each output pipeline pay only its own allocation. The location
-    /// is the (directory, name) pair, never a joined path: the directory string is shared by every
-    /// sibling, and only the batched merge (bounded) ever composes full paths.</summary>
+    /// walk hands over facts and lets each output pipeline pay only its own allocation.</summary>
+    /// <param name="Directory">The containing directory when the location is the enumeration's
+    /// (directory, name) pair — shared by every sibling, which is what keeps the sweep free of
+    /// per-entry path strings. Null when the entry was constructed from a full path, in which case
+    /// <paramref name="Location"/> IS that path and is used verbatim.</param>
+    /// <param name="Location">The file name under <paramref name="Directory"/>, or — when that is
+    /// null — the entry's authoritative absolute path.</param>
     private readonly record struct Candidate(
-        string Directory, string FileName, string Root, long Length, DateTimeOffset Modified,
+        string? Directory, string Location, string Root, long Length, DateTimeOffset Modified,
         bool IsReparsePoint, OperationKind Kind, string? Detail);
 
     /// <summary>The best-effort emission budget shared by the walk's workers: reserves a slot per

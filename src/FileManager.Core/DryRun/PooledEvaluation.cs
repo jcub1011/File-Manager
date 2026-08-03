@@ -26,16 +26,20 @@ internal sealed class PooledPhysicalFile : IPhysicalFileView
     /// directly (the snapshot stores full paths). The destination sweep sets
     /// <see cref="SetLocation"/> — the (directory, name) pair, directory shared per sibling — and
     /// <see cref="Path"/> joins lazily, so a swept carrier whose consumers all use the pair (the
-    /// wire converter's fast path, the estimator) never materializes a path string at all.</summary>
+    /// wire converter's fast path, the estimator) never materializes a path string at all.
+    ///
+    /// <para>Reading this CACHES the join without clearing <see cref="DirectoryHint"/>: the hint is
+    /// what selects the converter's allocation-free fast path, so a getter that dropped it would let
+    /// one incidental read (a log line, a future estimator field) silently push every later entry
+    /// back onto the joining path — byte-identical output, no failing test, the saving gone. It also
+    /// makes the lazy join a benign race (both racers store the same string) rather than a mutation
+    /// the producer and consumer can disagree about.</para></summary>
     public string Path
     {
         get
         {
-            if (_directory is { } directory)
-            {
+            if (_path.Length == 0 && _directory is { } directory)
                 _path = System.IO.Path.Join(directory, FileName);
-                _directory = null;
-            }
             return _path;
         }
         set
@@ -45,8 +49,10 @@ internal sealed class PooledPhysicalFile : IPhysicalFileView
         }
     }
 
-    /// <summary>The containing directory when the location is a (directory, name) pair and
-    /// <see cref="Path"/> has not been materialized; null otherwise.</summary>
+    /// <summary>The containing directory when the location is a (directory, name) pair; null on the
+    /// full-path shape. This is the signal consumers pattern-match to take the pair-based fast path
+    /// (<c>DryRunStreamHandler.WireChunkConverter</c>), so it survives a <see cref="Path"/> read and
+    /// is cleared only by <see cref="Path"/>'s setter and <see cref="ResetLocation"/>.</summary>
     public string? DirectoryHint => _directory;
 
     /// <summary>Meaningful only alongside <see cref="DirectoryHint"/> (the sweep shape); empty on
@@ -89,11 +95,8 @@ internal sealed class PooledFileOperation : IFileOperationView
     {
         get
         {
-            if (_directory is { } directory)
-            {
+            if (_path.Length == 0 && _directory is { } directory)
                 _path = System.IO.Path.Join(directory, FileName);
-                _directory = null;
-            }
             return _path;
         }
         set

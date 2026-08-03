@@ -1107,7 +1107,8 @@ Two findings worth keeping:
 2. **The trim's slack gate misreads a low-allocation burst (fixed with Stage 4).** `committed − heap`
    only measures collected-but-not-decommitted memory; a run that barely allocates barely collects,
    ends with committed ≈ heap (all garbage), and the trim skipped — the 500k run settled at 203 MB.
-   A 96 MB committed floor now catches that shape (`Trims_when_committed_is_high_even_with_near_zero_slack`).
+   A 96 MB committed floor now catches that shape (`Trims_when_committed_is_high_even_with_near_zero_slack`),
+   with the self-limiting latch from §13.1 so the floor cannot fire forever on a live heap.
 
 **What remains at 500k, and why it stays:** the ~200 MB in-run commit is now dominated by the scan
 layer's per-entry `FileSystemEntry` + name-string churn and queue transients (§11's rejected
@@ -1122,3 +1123,43 @@ Stage 4's `(dirIndex, name)` shape extended into `DryRunSnapshotFormat`.
 
 **Still owed:** §12's human end-to-end check, now doubly mandatory — the peak pass changed how the
 survivor probe runs, and a wrong probe answer omits a file from a Mirror deletion preview.
+
+### 13.1 Review fixes on top of the five stages
+
+A code review of the pass turned up two defects in the stages themselves and three latent risks. All
+are fixed; the measured table above is unaffected except where noted.
+
+1. **The `LastSweepStreamPool` test seam undid Stage 2's residual claim.** `DestinationProjector` is
+   a DI singleton, so a property holding "the last sweep's pool" kept a run's carriers (up to 2,048
+   of each kind, plus the retained chunk lists) alive for the process lifetime — exactly the
+   retention Stage 2 exists to bound. Replaced with `SweepStreamPoolObserver`, an `Action` the test
+   sets to capture the pool as the stream starts; production holds nothing. The settle numbers in the
+   table were taken with MemoryProbe, which never set the seam, so they stand.
+2. **Stage 3's byte-identity guard never ran the sweep.** It drove `TestProfiles.Valid()`, whose
+   target is the non-existent `C:\fm-test\target`, so the sweep emitted zero chunks and only the fake
+   engine's full-path file phase was compared — the `DirectoryHint` fast path and `RecyclePrevious`,
+   i.e. all of the code Stage 3 and Stage 4 added, were uncovered, and every other handler test had
+   opted out with `RecycleWireRecords = false`. It now walks a real 200-orphan temp tree, pinned to
+   one scan worker so two runs are byte-comparable, spanning several chunks. A second test
+   (`Recycled_wire_records_report_every_swept_orphan_at_its_real_path`) reassembles the wire triples
+   the way the client does and checks them against the file system, which is strictly stronger: a
+   deliberately dropped `DirIndex` reassignment fails it while byte-identity still passes.
+3. **The committed floor could fire forever on a live heap.** The floor proves committed is high, not
+   that any of it is collectable; a process whose steady state sits above 96 MB would pay two
+   blocking LOH-compacting collections after every qualifying run and reclaim nothing. The floor now
+   gets one attempt and is suppressed until slack — which does prove reclaimable memory — triggers a
+   trim (`FloorTrimMinRecoveredBytes`, `_floorTrimUnproductive`).
+4. **Stage 4 re-derived swept paths from `(GetDirectoryName(FullPath), FileName)`.** For a
+   full-path-constructed entry `FileName` is a display name, not necessarily the last segment
+   (`FileSystemEntry`'s own doc), so the emitted path could differ from the one `IsExcludedPath`
+   probed — a Mirror `Deleted` op for a path that does not exist. The sweep's `Candidate` now carries
+   either the (directory, name) pair (real enumeration, still no per-entry string) or the
+   authoritative `FullPath`, never a re-split of one. This also removed a `?? throw` guard that missed
+   `GetDirectoryName`'s empty-string return.
+5. **Smaller:** the pooled carriers' `Path` getter no longer clears `DirectoryHint` (one incidental
+   read would have silently pushed every later entry off Stage 4's fast path, byte-identically);
+   `IsExcludedPath`'s `ArrayPool` rent is in a `try/finally`; the sweep pool counts borrows and
+   returns per kind rather than as "pairs" counted off the file loop alone; the pair overload of
+   `DryRunDirectoryTableBuilder.Convert` reference-memoizes its directory, as `GetOrAddRoot` already
+   did; and `HandleStreamAsync` documents the valid-until-you-advance contract that recycling imposes
+   on its public enumerable.

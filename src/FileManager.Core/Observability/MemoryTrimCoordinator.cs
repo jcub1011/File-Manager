@@ -62,6 +62,11 @@ public sealed class MemoryTrimCoordinator : IMemoryTrimCoordinator, IDisposable
     /// anything a small preview commits, so trivial runs still never pay.</summary>
     private const long CommittedFloorBytes = 96L * 1024 * 1024;
 
+    /// <summary>Bytes a floor-triggered trim must decommit to have been worth its pause. Below this
+    /// the committed bytes were live, not garbage, and repeating the trim would only repeat the
+    /// pause — see <see cref="_floorTrimUnproductive"/>.</summary>
+    private const long FloorTrimMinRecoveredBytes = 8L * 1024 * 1024;
+
     /// <summary>How long the process must stay idle before a trim fires. Long enough that a user
     /// re-running a dry run, or tweaking a profile and previewing again, never pays for it.</summary>
     private static readonly TimeSpan QuietPeriod = TimeSpan.FromSeconds(25);
@@ -73,6 +78,13 @@ public sealed class MemoryTrimCoordinator : IMemoryTrimCoordinator, IDisposable
     private long _pendingUnits;
     private int _inFlight;
     private volatile bool _disposed;
+
+    /// <summary>Set when the last floor-only trim decommitted less than
+    /// <see cref="FloorTrimMinRecoveredBytes"/> — evidence that this process's committed bytes are
+    /// live rather than collectable. While set, <see cref="CommittedFloorBytes"/> alone no longer
+    /// triggers; only slack (which does prove reclaimable memory) does, and a slack-triggered trim
+    /// clears it. Touched only from the timer callback, which never overlaps itself.</summary>
+    private bool _floorTrimUnproductive;
 
     /// <summary>Test seam: production compacts and collects. Tests substitute a recorder so the
     /// DECISION logic can be asserted without actually pausing the test host — and so a passing test
@@ -153,7 +165,16 @@ public sealed class MemoryTrimCoordinator : IMemoryTrimCoordinator, IDisposable
             // Two shapes of "worth reclaiming": committed-but-free heap the GC kept (slack), or a
             // heap still full of uncollected garbage after a low-allocation burst (high committed,
             // near-zero slack — see CommittedFloorBytes).
-            if (slack < CommittedSlackBytes && committed < CommittedFloorBytes)
+            bool slackWorthIt = slack >= CommittedSlackBytes;
+            bool floorWorthIt = committed >= CommittedFloorBytes;
+            if (!slackWorthIt && !floorWorthIt)
+                return;
+            // Slack PROVES memory is reclaimable; the floor only says committed is high, which is
+            // equally true of a process whose heap is genuinely live. Such a process would otherwise
+            // pay two blocking, LOH-compacting collections after every qualifying run — a multi-second
+            // all-threads pause that frees nothing — for the rest of its life. So the floor gets one
+            // attempt and must prove itself (see _floorTrimUnproductive).
+            if (!slackWorthIt && _floorTrimUnproductive)
                 return;
 
             Interlocked.Add(ref _pendingUnits, -units);
@@ -161,6 +182,11 @@ public sealed class MemoryTrimCoordinator : IMemoryTrimCoordinator, IDisposable
                 substitute(units);
             else
                 Trim(units, slack, committed, heap);
+
+            // Latch only on the floor-only trigger: a slack-triggered trim means the heap has since
+            // changed shape, so the floor is worth trying again.
+            _floorTrimUnproductive =
+                !slackWorthIt && committed - ReadMemory().Committed < FloorTrimMinRecoveredBytes;
         }
         catch (Exception ex)
         {

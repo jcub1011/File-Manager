@@ -41,11 +41,24 @@ internal sealed class SweepCarrierPool
     private readonly Stack<List<IPhysicalFileView>> _fileLists = new();
     private readonly Stack<List<IFileOperationView>> _opLists = new();
 
-    /// <summary>(file, op) pairs handed out / recycled over the pool's life. Equal after a fully
+    /// <summary>Carriers handed out / recycled over the pool's life, counted PER KIND. Rents come in
+    /// pairs, but returns do not have to: a chunk whose op list is replaced (or only partially
+    /// recycled) returns files without ops, and a single "pairs" counter driven off the file loop
+    /// alone cannot see that. Each kind's rented count equals its returned count after a fully
     /// consumed stream — the borrow==return property the tests assert (mirroring
-    /// <c>Spilled_stream_returns_every_rented_carrier_to_the_pool</c>).</summary>
-    public long RentedPairs { get; private set; }
-    public long ReturnedPairs { get; private set; }
+    /// <c>Spilled_stream_returns_every_rented_carrier_to_the_pool</c>).
+    /// <para>Read under the same lock that guards the writes: the producer rents on a pool thread
+    /// while the consumer recycles, so an unsynchronized read of a <c>long</c> field can observe a
+    /// stale value even on x64.</para></summary>
+    public long RentedFiles { get { lock (_gate) return _rentedFiles; } }
+    public long RentedOps { get { lock (_gate) return _rentedOps; } }
+    public long ReturnedFiles { get { lock (_gate) return _returnedFiles; } }
+    public long ReturnedOps { get { lock (_gate) return _returnedOps; } }
+
+    private long _rentedFiles;
+    private long _rentedOps;
+    private long _returnedFiles;
+    private long _returnedOps;
 
     /// <summary>Carriers/lists currently held for reuse — bounded, never proportional to the swept
     /// entry count.</summary>
@@ -62,7 +75,8 @@ internal sealed class SweepCarrierPool
     {
         lock (_gate)
         {
-            RentedPairs++;
+            _rentedFiles++;
+            _rentedOps++;
             return (
                 _files.Count > 0 ? _files.Pop() : new PooledPhysicalFile(),
                 _ops.Count > 0 ? _ops.Pop() : new PooledFileOperation());
@@ -92,7 +106,7 @@ internal sealed class SweepCarrierPool
             {
                 if (f is not PooledPhysicalFile file)
                     continue;
-                ReturnedPairs++;
+                _returnedFiles++;
                 // Clear the strings BEFORE the cap check, same rationale as EvaluationCarrierPool:
                 // a retained carrier must not pin its (unique) location strings for the rest of the
                 // run, and a dropped one must actually release them.
@@ -105,6 +119,7 @@ internal sealed class SweepCarrierPool
             {
                 if (o is not PooledFileOperation op)
                     continue;
+                _returnedOps++;
                 op.ResetLocation();
                 op.Root = "";
                 op.Detail = null;

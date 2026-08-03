@@ -184,6 +184,76 @@ public sealed class MemoryTrimCoordinatorTests
     }
 
     [Fact]
+    public void A_floor_trim_that_reclaims_nothing_does_not_repeat_on_the_next_run()
+    {
+        // The floor says "committed is high", which is equally true of a process whose heap is
+        // genuinely LIVE (a big profile catalog, a retained snapshot, a steady state above 96 MB).
+        // There the collect frees nothing, and repeating it after every qualifying run would be a
+        // multi-second all-threads LOH-compacting pause forever, in exchange for no memory at all.
+        // One attempt, then it has to prove itself.
+        FakeTimeProvider time = new();
+        (MemoryTrimCoordinator coordinator, List<long> trims) = NewCoordinator(
+            time, memory: () => (200L * 1024 * 1024, 196L * 1024 * 1024));   // fixed: nothing given back
+        using MemoryTrimCoordinator _ = coordinator;
+
+        RunOperation(coordinator, BigRun);
+        time.Advance(PastQuietPeriod);
+        Assert.Equal([BigRun], trims);      // the one attempt
+
+        RunOperation(coordinator, BigRun);
+        time.Advance(PastQuietPeriod);
+
+        Assert.Equal([BigRun], trims);      // and no second one
+    }
+
+    [Fact]
+    public void A_floor_trim_that_reclaims_memory_stays_armed_for_the_next_run()
+    {
+        // The shape the floor exists for: high committed, near-zero slack, and the aggressive collect
+        // really does return it. Proving itself is what keeps it firing.
+        FakeTimeProvider time = new();
+        List<long> trims = [];
+        long committed = 200L * 1024 * 1024;
+        GlobalSettings settings = new() { ReleaseMemoryAfterLargeOperations = true };
+        using MemoryTrimCoordinator coordinator = new(
+            NullLogger<MemoryTrimCoordinator>.Instance, new FakeSettingsProvider(settings), time)
+        {
+            // The substituted trim stands in for the collection, so the probe models its effect:
+            // 64 MB decommitted per trim.
+            TrimOverride = units => { trims.Add(units); committed -= 64L * 1024 * 1024; },
+            MemoryProbeOverride = () => (committed, committed - (4L * 1024 * 1024)),
+        };
+
+        RunOperation(coordinator, BigRun);
+        time.Advance(PastQuietPeriod);
+        RunOperation(coordinator, BigRun);
+        time.Advance(PastQuietPeriod);
+
+        Assert.Equal([BigRun, BigRun], trims);
+    }
+
+    [Fact]
+    public void Slack_still_triggers_a_trim_after_the_floor_has_proved_unproductive()
+    {
+        // Suppressing the floor must not suppress the slack condition: slack is direct evidence that
+        // committed memory IS reclaimable, which is exactly what the floor's failed attempt lacked.
+        FakeTimeProvider time = new();
+        (long Committed, long Heap) memory = (200L * 1024 * 1024, 196L * 1024 * 1024);
+        (MemoryTrimCoordinator coordinator, List<long> trims) = NewCoordinator(time, memory: () => memory);
+        using MemoryTrimCoordinator _ = coordinator;
+
+        RunOperation(coordinator, BigRun);
+        time.Advance(PastQuietPeriod);
+        Assert.Single(trims);              // the floor's one attempt, which recovers nothing
+
+        memory = (512L * 1024 * 1024, 64L * 1024 * 1024);   // committed-but-free memory appears
+        RunOperation(coordinator, BigRun);
+        time.Advance(PastQuietPeriod);
+
+        Assert.Equal(2, trims.Count);
+    }
+
+    [Fact]
     public void Does_not_trim_when_the_setting_is_off()
     {
         FakeTimeProvider time = new();

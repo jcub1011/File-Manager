@@ -2,6 +2,7 @@ using FileManager.Contracts.DryRun;
 using FileManager.Contracts.IPC;
 using FileManager.Contracts.Primitives;
 using FileManager.Contracts.Profiles;
+using FileManager.Contracts.Settings;
 using FileManager.Core;
 using FileManager.Core.DryRun;
 using FileManager.Core.Files;
@@ -103,29 +104,86 @@ public sealed class DryRunStreamHandlerTests
         { MaxStreamedFiles = maxStreamedFiles, RecycleWireRecords = false };
     }
 
+    /// <summary>A real source/target pair on disk, so the destination sweep actually walks something.
+    /// Enough orphans to split the sweep across several chunks at the fixed 48 KiB wire budget —
+    /// a single chunk would never invoke <c>RecyclePrevious</c> at all.</summary>
+    private sealed class TempTargetTree : IDisposable
+    {
+        private readonly string _root;
+
+        public TempTargetTree(int orphans)
+        {
+            _root = Path.Combine(Path.GetTempPath(), "fm-drsh-" + Guid.NewGuid().ToString("N"));
+            Source = Path.Combine(_root, "source");
+            Target = Path.Combine(_root, "target");
+            Directory.CreateDirectory(Source);
+            Directory.CreateDirectory(Target);
+            for (int i = 0; i < orphans; i++)
+            {
+                string full = Path.Combine(Target, $"d{i % 8}", $"orphan{i}.txt");
+                Directory.CreateDirectory(Path.GetDirectoryName(full)!);
+                File.WriteAllText(full, "x");
+                Orphans.Add(full);
+            }
+        }
+
+        public string Source { get; }
+        public string Target { get; }
+        public List<string> Orphans { get; } = [];
+
+        /// <summary>Mirror, so every orphan is previewed as a Deleted op and the sweep always runs.</summary>
+        public Profile MirrorProfile() => TestProfiles.Valid(Source, Target) with { SyncMode = SyncMode.Mirror };
+
+        public void Dispose() => Directory.Delete(_root, recursive: true);
+    }
+
+    /// <summary>A handler over the real scan scheduler, pinned to ONE scan worker. The sweep's row
+    /// order is explicitly non-deterministic across workers (see <see cref="DestinationProjector"/>),
+    /// so a pinned budget is what lets two runs of the same tree be compared byte for byte.</summary>
+    private static DryRunStreamHandler NewSweepingHandler(Profile profile, bool recycle)
+    {
+        GlobalSettings settings = new()
+        {
+            ScanThreading = new ScanThreadingSettings
+            {
+                MaxScanThreads = ThreadBudget.Explicit(1),
+                PerDriveDefault = ThreadBudget.Explicit(1),
+            },
+        };
+        FileSystemService fileSystem = new(NullLogger<FileSystemService>.Instance);
+        ScanScheduler scheduler = new(
+            NullLogger<ScanScheduler>.Instance, fileSystem, new FakeSettingsProvider(settings));
+        return new(
+            NullLogger<DryRunStreamHandler>.Instance, new FakeStreamEngine(totalFiles: 100, chunkSize: 7),
+            new FakeCatalog(profile), TimeProvider.System,
+            new DestinationProjector(NullLogger<DestinationProjector>.Instance, new FakeVolumeInfoProvider(), scheduler),
+            new FakeVolumeInfoProvider(), new EngineConfig(),
+            new EngineEventBus(NullLogger<EngineEventBus>.Instance), NullMemoryTrimCoordinator.Instance)
+        { MaxStreamedFiles = 1_000, RecycleWireRecords = recycle };
+    }
+
     /// <summary>The load-bearing guard for wire-DTO recycling: with recycling ON (production — the
     /// server serializes each frame before advancing) every serialized chunk frame must be
     /// byte-identical to the run with recycling OFF. A recycled record leaking a previous chunk's
     /// value, a missed field reassignment, or a stale list would all show up here as a byte
     /// difference. Only chunk frames are compared — progress frames are timer-interleaved and the
-    /// completion frame carries a wall-clock timestamp.</summary>
+    /// completion frame carries a wall-clock timestamp.
+    ///
+    /// <para>The run MUST include a real destination sweep. The sweep is the half that hands the
+    /// converter pooled carriers with a <c>DirectoryHint</c>, and that fast path — where a recycled
+    /// DTO could keep the previous chunk's DirIndex, RootDirIndex or FileName — is precisely the code
+    /// recycling introduced. Against a non-existent target root the sweep yields nothing and this
+    /// compares only the fake engine's full-path file phase, i.e. the branch recycling did not
+    /// change.</para></summary>
     [Fact]
     public async Task Wire_frames_are_byte_identical_with_and_without_dto_recycling()
     {
-        Profile profile = TestProfiles.Valid();
+        using TempTargetTree tree = new(orphans: 200);
+        Profile profile = tree.MirrorProfile();
 
         async Task<List<byte[]>> SerializedChunkFrames(bool recycle)
         {
-            FileSystemService fileSystem = new(NullLogger<FileSystemService>.Instance);
-            ScanScheduler scheduler = new(NullLogger<ScanScheduler>.Instance, fileSystem, new FakeSettingsProvider());
-            DryRunStreamHandler handler = new(
-                NullLogger<DryRunStreamHandler>.Instance, new FakeStreamEngine(totalFiles: 100, chunkSize: 7),
-                new FakeCatalog(profile), TimeProvider.System,
-                new DestinationProjector(NullLogger<DestinationProjector>.Instance, new FakeVolumeInfoProvider(), scheduler),
-                new FakeVolumeInfoProvider(), new EngineConfig(),
-                new EngineEventBus(NullLogger<EngineEventBus>.Instance), NullMemoryTrimCoordinator.Instance)
-            { MaxStreamedFiles = 1_000, RecycleWireRecords = recycle };
-
+            DryRunStreamHandler handler = NewSweepingHandler(profile, recycle);
             // Serialize IMMEDIATELY, per frame — the production consumption shape. Nothing may hold
             // a frame object across an advance when recycling is on.
             List<byte[]> serialized = [];
@@ -143,6 +201,42 @@ public sealed class DryRunStreamHandlerTests
         for (int i = 0; i < withRecycling.Count; i++)
             Assert.True(withoutRecycling[i].AsSpan().SequenceEqual(withRecycling[i]),
                 $"chunk frame {i} differs between recycling on and off");
+    }
+
+    /// <summary>The same recycling path checked against the FILE SYSTEM rather than against a second
+    /// run: every swept orphan must be reported at its real absolute path, reassembled the way the
+    /// client does it (append each frame's directory slice, then resolve DirIndex + FileName). A
+    /// recycled <c>DryRunFile</c> carrying the previous chunk's name or directory index shows up here
+    /// as a wrong path, even if both recycling modes agreed on it.</summary>
+    [Fact]
+    public async Task Recycled_wire_records_report_every_swept_orphan_at_its_real_path()
+    {
+        using TempTargetTree tree = new(orphans: 200);
+        Profile profile = tree.MirrorProfile();
+        DryRunStreamHandler handler = NewSweepingHandler(profile, recycle: true);
+
+        // Copy out of each frame BEFORE advancing — the ownership contract. Directories accumulate in
+        // global index order; the (DirIndex, FileName) pairs are resolved after the stream ends.
+        List<DryRunDirectory> directories = [];
+        List<(int DirIndex, string FileName)> swept = [];
+        int chunkFrames = 0;
+        await foreach (IpcResponse frame in handler.HandleStreamAsync(new DryRunStreamRequest { ProfileId = profile.Id }))
+        {
+            if (frame is not DryRunChunkResponse chunk)
+                continue;
+            directories.AddRange(chunk.Directories);
+            if (chunk.DestinationFiles.Count > 0)
+                chunkFrames++;
+            foreach (DryRunFile file in chunk.DestinationFiles)
+                swept.Add((file.DirIndex, file.FileName));
+        }
+
+        // More than one sweep frame, or RecyclePrevious never ran and this proves nothing.
+        Assert.True(chunkFrames > 1, $"expected the sweep to span several chunks, got {chunkFrames}");
+        string[] paths = DryRunDirectoryTable.Materialize(directories);
+        Assert.Equal(
+            tree.Orphans.ToHashSet(StringComparer.OrdinalIgnoreCase),
+            swept.Select(e => Path.Join(paths[e.DirIndex], e.FileName)).ToHashSet(StringComparer.OrdinalIgnoreCase));
     }
 
     [Fact]
