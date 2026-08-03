@@ -67,4 +67,16 @@ public sealed class ScanThreadResolverTests
 
         Assert.Equal(4, ScanThreadResolver.ResolvePerDriveCap(settings, "c:", DriveClass.Fixed));
     }
+
+    [Theory]
+    [InlineData(512, 512)]        // the shipped default passes through
+    [InlineData(64, 64)]          // an in-range pin is honored
+    [InlineData(0, 8)]            // a hand-edited 0 would otherwise stop every scan at its root
+    [InlineData(-5, 8)]
+    [InlineData(3, 8)]            // below the floor: a real nested tree must not be pruned
+    [InlineData(int.MaxValue, 10_000)]   // past the ceiling it stops being a backstop at all
+    public void The_scan_depth_ceiling_is_clamped_to_a_range_that_stays_a_backstop(int configured, int expected)
+    {
+        Assert.Equal(expected, ScanThreadResolver.ResolveMaxScanDepth(configured));
+    }
 }

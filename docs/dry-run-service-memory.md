@@ -827,6 +827,27 @@ membership, `IsUnderAnySource`, mirror→`Deleted` / additive→`Untouched` / re
 (`:79-80`). The existing `ScanSessionOptions` callback seam already enforces that separation — keep it.
 Only the *output* pipeline is shared.
 
+**One bound is the engine's, not the adapter's: `MaxScanDepth`.** `ScanScheduler.Process` refuses to
+descend past a configured depth ceiling (default 512, `GlobalSettings.MaxScanDepth`, clamped by
+`ScanThreadResolver.ResolveMaxScanDepth`) and no session can opt out. Do not read the two bullets above
+as "the sweep is unbounded" — it is bounded by exactly this and nothing else, because
+`MaxDepth` is deliberately not applied here and `SweepBudget` gates *emission*, not descent (once the
+entry cap latches, `OnFile` returns false but the walk keeps going).
+
+It is a **cycle backstop, not a feature knob.** Never-descend-a-reparse-point covers every loop a local
+NTFS volume can produce, since symlinks, junctions, and mount points all carry
+`FileAttributes.ReparsePoint` in the directory record. What it cannot cover is a loop with no reparse
+attribute to see: a server-side symlink on an SMB/Samba share (`follow symlinks` + `wide links`), an NFS
+symlink, or a looping DFS link all arrive at the client as ordinary directories. Without the ceiling the
+sweep walks those forever, re-expanding the full subtree breadth at every level. The reachable failure
+mode with it is *under*-reporting orphans — an under-delete, never an over-delete — and the sweep's
+`OnFault`-swallowing policy means the prune is logged, not surfaced as a report item.
+`ScanSchedulerTests.A_directory_tree_that_loops_back_on_itself_terminates_at_the_depth_ceiling` is the
+regression test, and it needs no privileges: it fakes the loop in `IFileSystemService`.
+
+Root identity is also resolved before pruning (§8.4) — two target roots aliasing one tree through a
+junction are not textually nested, and would otherwise each be swept in full.
+
 ### 8.3 Handler collapse
 
 `DryRunStreamHandler.cs:175-249` becomes the same loop body as the file phase (`:113-172`) — extract that
@@ -847,6 +868,14 @@ Streaming cannot afford `Merge`'s `HashSet<NormalizedPath> reported` sized to th
 (`NormalizedPath.IsUnder`, `Jobs/Job.cs:101`). The parent's walk already covers the child's subtree, so
 the same file set is reported and the duplicate enumeration I/O disappears. This also replaces the
 `targetRoots.Count > 1` heuristic (`:185`, `:195-197`) with an exact predicate.
+
+**Compare PHYSICAL locations, not configured paths.** `PlanWalk` resolves each root through
+`Directory.ResolveLinkTarget(returnFinalTarget: true)` (`ResolvePhysicalRoot`) and prunes on that, keeping
+the configured path for the walk and the reported `Root`. Two roots aliasing one tree through a junction
+(`D:\backup` and `C:\link-to-backup`) are not textually nested, so a path-only comparison sweeps every
+file under them twice — and in Mirror mode emits **two `Deleted` ops for one physical file**. Known limit:
+this resolves a link at the root itself, not one in an ancestor segment (`C:\link\sub`); closing that
+needs `GetFinalPathNameByHandle` behind `IPathCanonicalizer`.
 
 **The latent bug it fixes:** `Merge` dedups by keeping whichever duplicate the sort left first, but
 `List<T>.Sort` is an unstable introsort and the comparison is on `Path` only (`:200-201`) — so **today the

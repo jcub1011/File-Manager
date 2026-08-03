@@ -249,6 +249,63 @@ public sealed class DestinationProjectorTests : IDisposable
     }
 
     [Fact]
+    public void A_directory_junction_under_a_target_root_is_never_descended()
+    {
+        // The sweep's half of the guard, previously untested while the source scan's was covered. It
+        // matters more here: in Mirror mode a file reached through a junction is reported Deleted, so
+        // following one turns "delete this destination's orphans" into "delete files somewhere else".
+        string orphan = TargetFile("orphan.txt");
+        string outside = Path.Combine(Path.GetTempPath(), "fm-destproj-out-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(outside);
+        try
+        {
+            File.WriteAllText(Path.Combine(outside, "not-mine.txt"), "x");
+            using ReparseFixture.Junction? junction = ReparseFixture.CreateJunction(
+                Path.Combine(_target, "jump"), outside);
+            if (junction is null)
+                return;   // skip explicitly requested — see ReparseFixture.SkipEnvVar
+
+            DestinationSweepResult result = Project(Mirror());
+
+            VirtualFileOperation op = Assert.Single(result.Ops);
+            Assert.Equal(orphan, op.Path);   // not-mine.txt was never reached
+        }
+        finally
+        {
+            Directory.Delete(outside, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void Two_target_roots_aliasing_one_tree_through_a_junction_report_each_file_once()
+    {
+        // PruneNestedRoots compares the roots' PHYSICAL locations, not their configured paths. These two
+        // roots are not textually nested, so on a path-only comparison every file is enumerated twice —
+        // and in Mirror mode gets two Deleted ops for one physical file.
+        string real = Path.Combine(_root, "real-target");
+        Directory.CreateDirectory(real);
+        for (int i = 0; i < 10; i++)
+            File.WriteAllText(Path.Combine(real, $"f{i}.txt"), "x");
+
+        using ReparseFixture.Junction? junction = ReparseFixture.CreateJunction(
+            Path.Combine(_root, "aliased-target"), real);
+        if (junction is null)
+            return;
+
+        Profile profile = Mirror() with
+        {
+            Targets = [new TargetConfig { Path = real }, new TargetConfig { Path = junction.Path }],
+        };
+
+        DestinationSweepResult result = Project(profile);
+
+        Assert.Equal(10, result.Files.Count);
+        Assert.Equal(10, result.Ops.Count);
+        Assert.Equal(10, result.Ops.Select(o => o.Path).ToHashSet(StringComparer.OrdinalIgnoreCase).Count);
+        Assert.All(result.Ops, o => Assert.Equal(real, o.Root));   // the first-declared root survives
+    }
+
+    [Fact]
     public void Nested_target_roots_report_the_outermost_root_deterministically()
     {
         // Before nested-root pruning this was a latent bug: the file was enumerated under BOTH roots

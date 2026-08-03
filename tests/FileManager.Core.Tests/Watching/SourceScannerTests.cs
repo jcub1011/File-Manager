@@ -126,46 +126,75 @@ public sealed class SourceScannerTests : IDisposable
     [Fact]
     public void A_directory_junction_is_never_descended()
     {
-        // A junction inside the source can cycle back into an ancestor (unbounded re-walk) or reach
-        // files OUTSIDE the source root, which would become disposition candidates far beyond the
-        // tree the profile configured. The scan must not follow it.
+        // A junction inside the source reaches files OUTSIDE the source root, which would become
+        // disposition candidates far beyond the tree the profile configured. The scan must not follow it.
         Touch("keep.txt");
         string outside = Path.Combine(Path.GetTempPath(), "fm-scanner-out-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(outside);
         try
         {
             File.WriteAllText(Path.Combine(outside, "escape.txt"), "x");
-            string junction = Path.Combine(_root, "jump");
-            // mklink /J needs no elevation; if the environment still refuses, skip rather than fail.
-            var mklink = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
-            {
-                FileName = "cmd.exe",
-                Arguments = $"/c mklink /J \"{junction}\" \"{outside}\"",
-                CreateNoWindow = true,
-                UseShellExecute = false,
-            })!;
-            mklink.WaitForExit();
-            if (mklink.ExitCode != 0 || !Directory.Exists(junction))
-                return;   // junction creation unavailable here — nothing to assert
+            using ReparseFixture.Junction? junction = ReparseFixture.CreateJunction(Path.Combine(_root, "jump"), outside);
+            if (junction is null)
+                return;   // skip explicitly requested — see ReparseFixture.SkipEnvVar
 
-            try
-            {
-                var (payloads, faults) = Collect(NewScanner().Scan(ProfileOver(_root), TriggerKind.Cli));
+            var (payloads, faults) = Collect(NewScanner().Scan(ProfileOver(_root), TriggerKind.Cli));
 
-                Assert.Empty(faults);
-                Assert.Single(payloads);
-                Assert.EndsWith("keep.txt", payloads[0].SourcePath);   // escape.txt never reached
-            }
-            finally
-            {
-                // Remove the junction itself before the fixture's recursive delete of _root — a
-                // (soon-dangling) junction in the tree breaks Directory.Delete(recursive).
-                Directory.Delete(junction, recursive: false);
-            }
+            Assert.Empty(faults);
+            Assert.Single(payloads);
+            Assert.EndsWith("keep.txt", payloads[0].SourcePath);   // escape.txt never reached
         }
         finally
         {
             Directory.Delete(outside, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void A_junction_that_loops_back_into_its_own_ancestor_is_never_descended()
+    {
+        // The cycle shape the outside-target test above does NOT cover: the junction points at an
+        // ancestor of itself, so following it once re-walks the whole subtree, and following it again
+        // re-walks it again — unbounded. The scan must terminate with the tree's real contents.
+        Touch("deep", "keep.txt");
+        using ReparseFixture.Junction? junction = ReparseFixture.CreateJunction(
+            Path.Combine(_root, "deep", "back"), _root);
+        if (junction is null)
+            return;
+
+        var (payloads, faults) = Collect(NewScanner().Scan(ProfileOver(_root), TriggerKind.Cli));
+
+        Assert.Empty(faults);
+        Assert.Single(payloads);
+        Assert.EndsWith("keep.txt", payloads[0].SourcePath);
+    }
+
+    [Fact]
+    public void A_source_root_that_is_itself_a_junction_IS_scanned()
+    {
+        // Intended behavior, pinned so it is not "fixed" by mistake. The reparse guard exists to stop a
+        // walk escaping the configured tree — but a root junction IS the configured tree: the user
+        // pointed at that path deliberately, and refusing it would silently scan nothing. It cannot
+        // loop either, since any reparse point reached inside the target is still pruned.
+        string real = Path.Combine(Path.GetTempPath(), "fm-scanner-real-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(real);
+        try
+        {
+            File.WriteAllText(Path.Combine(real, "inside.txt"), "x");
+            using ReparseFixture.Junction? junction = ReparseFixture.CreateJunction(
+                Path.Combine(_root, "aliased-root"), real);
+            if (junction is null)
+                return;
+
+            var (payloads, faults) = Collect(NewScanner().Scan(ProfileOver(junction.Path), TriggerKind.Cli));
+
+            Assert.Empty(faults);
+            Assert.Single(payloads);
+            Assert.EndsWith("inside.txt", payloads[0].SourcePath);
+        }
+        finally
+        {
+            Directory.Delete(real, recursive: true);
         }
     }
 

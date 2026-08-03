@@ -23,6 +23,10 @@ namespace FileManager.Core.Scanning;
 /// session's volumes (fair-share, bounded wait → no starvation). A directory runs only while its
 /// worker holds both a global thread and a slot in its volume's cap.
 ///
+/// Descent policy is entirely the adapter's (<see cref="ScanSessionOptions.OnSubdirectory"/>) with one
+/// exception the engine keeps for itself: a hard depth ceiling (<c>MaxScanDepth</c>) that no session can
+/// opt out of. It is a cycle backstop, not a feature — see the check in <see cref="Process"/>.
+///
 /// Backpressure is per-session and never blocks a shared worker: a worker that fills a session's
 /// bounded output parks the current directory (its remaining entries and any un-written result),
 /// releases its volume slot, and moves to other work; the consumer draining the buffer re-arms the
@@ -53,8 +57,10 @@ public sealed class ScanScheduler : IScanScheduler, IDisposable
     public IScanSession OpenSession(ScanSessionOptions options, CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(options);
-        ScanThreadingSettings threading = _settings.Current.ScanThreading;
-        ScanSession session = new(this, options, threading, ct);
+        GlobalSettings current = _settings.Current;
+        ScanThreadingSettings threading = current.ScanThreading;
+        ScanSession session = new(
+            this, options, threading, ScanThreadResolver.ResolveMaxScanDepth(current.MaxScanDepth), ct);
         lock (_lock)
         {
             ObjectDisposedException.ThrowIf(_shutdown, this);
@@ -234,8 +240,23 @@ public sealed class ScanScheduler : IScanScheduler, IDisposable
                 {
                     queue.Dequeue();
                     ChildDecision decision = opts.OnSubdirectory(entry, work.Tag);
-                    if (decision.Descend)
-                        session.Submit(new ScanWorkItem(entry.FullPath, work.VolumeKey, work.DriveClass, decision.ChildTag));
+                    if (!decision.Descend)
+                        continue;
+                    int childDepth = work.Depth + 1;
+                    if (childDepth > session.MaxScanDepth)
+                    {
+                        // The cycle backstop, and the only bound that applies to EVERY session. The
+                        // adapters already refuse to descend reparse points, which covers every loop a
+                        // local volume can produce — but a server-side symlink on an SMB/NFS share or a
+                        // looping DFS link arrives as an ordinary directory with no reparse attribute,
+                        // and the destination sweep has no depth policy of its own. Without this the
+                        // walk would re-expand the whole subtree at every level, forever.
+                        if (!ReportDepthCeiling(session, work, entry))
+                            return;   // parked with the fault pending; it is flushed on resume
+                        continue;
+                    }
+                    session.SubmitChild(
+                        new ScanWorkItem(entry.FullPath, work.VolumeKey, work.DriveClass, decision.ChildTag), childDepth);
                 }
                 else
                 {
@@ -265,6 +286,44 @@ public sealed class ScanScheduler : IScanScheduler, IDisposable
             TryEmitWorkerFault(session, work, ex);
             session.Complete(work);
         }
+    }
+
+    /// <summary>Surfaces the depth-ceiling prune: one Warning fault per session (see
+    /// <see cref="ScanSession.TryLatchDepthCeilingReport"/>), every later prune at Debug only. Returns
+    /// false when the fault could not be written and the directory was parked with it pending — the
+    /// caller must return so the worker does not keep draining a parked work item.</summary>
+    private bool ReportDepthCeiling(ScanSession session, ScanWorkState work, FileSystemEntry child)
+    {
+        if (!session.TryLatchDepthCeilingReport())
+        {
+            _logger.LogDebug(
+                "Scan depth ceiling {Ceiling} reached again at {Directory}; not descending",
+                session.MaxScanDepth, child.FullPath);
+            return true;
+        }
+
+        _logger.LogWarning(
+            "Scan stopped descending at {Directory}: the depth ceiling of {Ceiling} levels was reached. "
+            + "The tree below this point is not scanned. A directory tree that loops back on itself "
+            + "(typically a symlink on a network share) looks exactly like this — check the path before "
+            + "raising MaxScanDepth",
+            child.FullPath, session.MaxScanDepth);
+
+        var fault = new EnumerationFault(
+            $"stopped descending at \"{child.FullPath}\": scan depth ceiling of {session.MaxScanDepth} "
+            + "levels reached; deeper entries are not included",
+            EnumerationSeverity.Warning);
+        EnumerationFault? mapped = session.Options.OnFault is null ? fault : session.Options.OnFault(fault, work.Tag);
+        if (mapped is not EnumerationFault emit)
+            return true;
+
+        ScanResult result = new(null, emit, work.Tag);
+        if (session.TryWrite(result))
+            return true;
+
+        work.Pending = result;
+        Repark(session, work);
+        return false;
     }
 
     /// <summary>Best-effort: maps a worker fault through the adapter's OnFault (which may itself be
@@ -306,12 +365,16 @@ public sealed class ScanScheduler : IScanScheduler, IDisposable
 
     /// <summary>Mutable per-directory work: the volume it belongs to, the adapter's tag, the
     /// materialized remaining entries, and a single result awaiting buffer space after a park.</summary>
-    private sealed class ScanWorkState(string directory, string volumeKey, DriveClass driveClass, object? tag)
+    private sealed class ScanWorkState(string directory, string volumeKey, DriveClass driveClass, object? tag, int depth)
     {
         public string Directory { get; } = directory;
         public string VolumeKey { get; } = volumeKey;
         public DriveClass DriveClass { get; } = driveClass;
         public object? Tag { get; } = tag;
+
+        /// <summary>Levels below the scan root: 0 for a submitted root, parent + 1 for a descended
+        /// child. Compared against the session's depth ceiling — the cycle backstop.</summary>
+        public int Depth { get; } = depth;
         public Queue<Result<FileSystemEntry, EnumerationFault>>? Remaining { get; set; }
         public ScanResult? Pending { get; set; }
         public bool Materialized { get; set; }
@@ -337,15 +400,23 @@ public sealed class ScanScheduler : IScanScheduler, IDisposable
         private int _active;         // workers currently in this session (bounded by MaxConcurrency)
         private bool _submissionsDone;   // no further ROOT submissions; guarded by _sched._lock
         private volatile bool _cancelled;
+        private int _depthCeilingReported;   // latch: the ceiling yields ONE result, however often it is hit
 
         public ScanSessionOptions Options { get; }
         public bool IsCancelled => _cancelled;
 
-        public ScanSession(ScanScheduler sched, ScanSessionOptions options, ScanThreadingSettings threading, CancellationToken ct)
+        /// <summary>This session's snapshot of the resolved depth ceiling. Settings are read once per
+        /// session (like the thread budgets) so a walk in flight cannot change ceiling mid-tree.</summary>
+        public int MaxScanDepth { get; }
+
+        public ScanSession(
+            ScanScheduler sched, ScanSessionOptions options, ScanThreadingSettings threading, int maxScanDepth,
+            CancellationToken ct)
         {
             _sched = sched;
             Options = options;
             _threading = threading;
+            MaxScanDepth = maxScanDepth;
             _capacity = Math.Max(1, options.OutputCapacity);
             _channel = Channel.CreateBounded<ScanResult>(new BoundedChannelOptions(_capacity)
             {
@@ -356,7 +427,16 @@ public sealed class ScanScheduler : IScanScheduler, IDisposable
             _ctReg = ct.CanBeCanceled ? ct.Register(static s => ((ScanSession)s!).Cancel(), this) : default;
         }
 
-        public void Submit(ScanWorkItem item)
+        /// <summary>Queues a ROOT directory — depth 0. The interface entry point; adapters only ever
+        /// submit roots, so they cannot get the depth accounting wrong.</summary>
+        public void Submit(ScanWorkItem item) => SubmitAt(item, depth: 0);
+
+        /// <summary>Queues a directory discovered while enumerating its parent, at the parent's depth
+        /// plus one. Internal to the scheduler: only <see cref="ScanScheduler.Process"/> descends, and it
+        /// holds the concrete session, so the depth chain stays entirely inside the engine.</summary>
+        public void SubmitChild(ScanWorkItem item, int depth) => SubmitAt(item, depth);
+
+        private void SubmitAt(ScanWorkItem item, int depth)
         {
             string key = ScanThreadResolver.NormalizeKey(item.VolumeKey);
             lock (_sched._lock)
@@ -377,7 +457,7 @@ public sealed class ScanScheduler : IScanScheduler, IDisposable
                     _pending[key] = stack;
                     _volumeOrder.Add(key);
                 }
-                stack.Push(new ScanWorkState(item.Directory, key, item.DriveClass, item.Tag));
+                stack.Push(new ScanWorkState(item.Directory, key, item.DriveClass, item.Tag, depth));
                 _outstanding++;
                 Monitor.PulseAll(_sched._lock);
                 _sched.MaybeSpawnWorkerLocked();
@@ -410,6 +490,11 @@ public sealed class ScanScheduler : IScanScheduler, IDisposable
         }
 
         public bool TryWrite(ScanResult result) => _channel.Writer.TryWrite(result);
+
+        /// <summary>True for the FIRST caller only. A looping tree hits the depth ceiling once per
+        /// directory at the boundary — thousands of times for a wide loop — and one truncated-walk
+        /// warning is the whole message; the rest would bury the report and the log.</summary>
+        public bool TryLatchDepthCeilingReport() => Interlocked.Exchange(ref _depthCeilingReported, 1) == 0;
 
         // A worker finished (or abandoned) a directory: release its slots and, if this was the last
         // outstanding work, complete the output. Caller is a worker (not holding _lock).

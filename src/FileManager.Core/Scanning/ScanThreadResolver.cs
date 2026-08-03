@@ -63,6 +63,24 @@ internal static class ScanThreadResolver
         return Math.Min(perDrive, ResolveMaxScanThreads(s));
     }
 
+    /// <summary>Lower bound on the resolved depth ceiling: below this a legitimately nested tree would
+    /// be pruned, which turns a safety stop into silent data loss in the sweep (an orphan below the
+    /// ceiling is never reported, so a Mirror never deletes it).</summary>
+    private const int MinScanDepth = 8;
+
+    /// <summary>Upper bound: past this the ceiling stops being a backstop at all. A loop re-expands the
+    /// full subtree breadth at every level, so 10,000 levels is already far beyond "caught quickly" —
+    /// and Windows' 32,767-char path limit binds somewhere near here anyway.</summary>
+    private const int MaxScanDepthCeiling = 10_000;
+
+    /// <summary>The effective directory-depth ceiling for a scan, clamped so neither a hand-edited
+    /// settings.json nor a stale UI value can defeat the cycle backstop or prune a real tree.
+    /// <para>This is the ONLY bound that applies to every session. The source scan additionally prunes
+    /// on the profile's MaxDepth, but that is optional; the destination sweep deliberately has no depth
+    /// policy at all, so without this a looping share would walk it forever.</para></summary>
+    public static int ResolveMaxScanDepth(int configured) =>
+        Math.Clamp(configured, MinScanDepth, MaxScanDepthCeiling);
+
     /// <summary>Canonical form of a specific-drive override key so it matches
     /// <see cref="Platform.IVolumeInfoProvider.GetVolumeKey"/> output ("c:", "\\server\share").
     /// Delegates to <see cref="VolumeKeys.Normalize"/> — the rule lives in Contracts so the settings UI

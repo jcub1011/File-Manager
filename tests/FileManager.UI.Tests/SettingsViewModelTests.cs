@@ -58,6 +58,58 @@ public sealed class SettingsViewModelTests
     }
 
     [Fact]
+    public async Task Load_reflects_an_explicit_backend_scan_depth()
+    {
+        FakeIpcGateway gateway = new() { GetSettingsResult = new GlobalSettings { MaxScanDepth = 64 } };
+        SettingsViewModel vm = new(gateway, new FakeFolderPicker(), clientSettingsPath: TempFiles.ClientSettings());
+
+        await vm.LoadAsync();
+
+        Assert.False(vm.MaxScanDepth.Auto);
+        Assert.Equal(64, vm.MaxScanDepth.Value);
+    }
+
+    [Fact]
+    public async Task Load_reads_the_shipped_scan_depth_ceiling_back_as_auto()
+    {
+        // Auto here means "the shipped ceiling", so the stored default must not present as a user pin —
+        // otherwise every load would look like an explicit choice the user never made.
+        FakeIpcGateway gateway = new() { GetSettingsResult = GlobalSettings.Default };
+        SettingsViewModel vm = new(gateway, new FakeFolderPicker(), clientSettingsPath: TempFiles.ClientSettings());
+
+        await vm.LoadAsync();
+
+        Assert.True(vm.MaxScanDepth.Auto);
+        Assert.Equal(GlobalSettings.DefaultMaxScanDepth, vm.MaxScanDepth.Value);
+    }
+
+    [Fact]
+    public async Task Save_sends_an_explicit_scan_depth()
+    {
+        FakeIpcGateway gateway = new();
+        SettingsViewModel vm = new(gateway, new FakeFolderPicker(), clientSettingsPath: TempFiles.ClientSettings());
+        vm.MaxScanDepth.Auto = false;
+        vm.MaxScanDepth.Value = 1024;
+
+        await vm.SaveCommand.ExecuteAsync(null);
+
+        Assert.Equal(1024, Assert.Single(gateway.SaveSettingsCalls).MaxScanDepth);
+    }
+
+    [Fact]
+    public async Task Save_sends_the_default_scan_depth_when_auto_is_checked()
+    {
+        FakeIpcGateway gateway = new();
+        SettingsViewModel vm = new(gateway, new FakeFolderPicker(), clientSettingsPath: TempFiles.ClientSettings());
+        vm.MaxScanDepth.Auto = true;
+        vm.MaxScanDepth.Value = 1024;   // the shadow value must be ignored while Auto is on
+
+        await vm.SaveCommand.ExecuteAsync(null);
+
+        Assert.Equal(GlobalSettings.DefaultMaxScanDepth, Assert.Single(gateway.SaveSettingsCalls).MaxScanDepth);
+    }
+
+    [Fact]
     public async Task Save_rejects_duplicate_drive_type_overrides()
     {
         FakeIpcGateway gateway = new();

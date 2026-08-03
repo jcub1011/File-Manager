@@ -347,7 +347,12 @@ public sealed class DestinationProjector(
 
     /// <summary>Everything the walk needs, resolved once: the session policy, the roots to submit, and
     /// the shared budget. Null when there is nothing to sweep (no resolvable target root).</summary>
-    private sealed record WalkPlan(ScanSessionOptions Options, List<NormalizedPath> TargetRoots, bool Mirror);
+    private sealed record WalkPlan(ScanSessionOptions Options, List<TargetRoot> TargetRoots, bool Mirror);
+
+    /// <summary>A target root as configured (what the walk enumerates and what every file reports as its
+    /// <c>Root</c>) alongside the physical location it resolves to (what root-overlap pruning compares).
+    /// The two differ when the configured path is a symlink or junction.</summary>
+    private readonly record struct TargetRoot(NormalizedPath Configured, NormalizedPath Physical);
 
     private WalkPlan? PlanWalk(Profile profile, SurvivorSet survivors, SweepBudget budget)
     {
@@ -363,10 +368,10 @@ public sealed class DestinationProjector(
 
         // Collect target roots (paired with themselves so every file records its root), then drop any
         // root nested under another — see PruneNestedRoots.
-        List<NormalizedPath> targetRoots = [];
+        List<TargetRoot> targetRoots = [];
         foreach (TargetConfig target in profile.Targets)
             if (NormalizedPath.Create(target.Path).TryGetValue(out NormalizedPath targetRoot))
-                targetRoots.Add(targetRoot);
+                targetRoots.Add(new TargetRoot(targetRoot, ResolvePhysicalRoot(targetRoot)));
         PruneNestedRoots(targetRoots);
 
         if (targetRoots.Count == 0)
@@ -410,16 +415,54 @@ public sealed class DestinationProjector(
         return new WalkPlan(options, targetRoots, mirror);
     }
 
+    /// <summary>The physical location a configured target root resolves to, following a symlink or
+    /// junction chain to its final target; the root itself when it is an ordinary directory. Used only
+    /// for overlap pruning — the configured path is what gets walked and reported.
+    ///
+    /// <para>Best-effort by contract, and one stat per ROOT (not per file), so the cost is irrelevant.
+    /// A missing target root is a normal case for the sweep ("nothing to report there"), and a broken
+    /// or cyclic link throws — none of which may fail a dry run, so every failure degrades to the
+    /// configured path, which is exactly the pre-existing behavior.</para>
+    ///
+    /// <para><b>Known limit:</b> this resolves a link at the root itself, not one in an ancestor
+    /// segment — <c>C:\link\sub</c> where <c>C:\link</c> is the junction still reads as its own physical
+    /// path. Closing that needs <c>GetFinalPathNameByHandle</c> behind
+    /// <see cref="IPathCanonicalizer"/>; the case handled here (a root that IS an alias) is the one a
+    /// user actually configures.</para></summary>
+    private NormalizedPath ResolvePhysicalRoot(NormalizedPath root)
+    {
+        try
+        {
+            if (Directory.ResolveLinkTarget(root.Value, returnFinalTarget: true) is not { } final)
+                return root;   // an ordinary directory — already its own physical location
+            return NormalizedPath.Create(final.FullName).TryGetValue(out NormalizedPath resolved) ? resolved : root;
+        }
+        catch (Exception ex)
+        {
+            // Deliberately unfiltered: this is an identity hint, and the set of exceptions a link
+            // resolution can raise (missing path, broken chain, cycle, denied, unsupported filesystem)
+            // is neither stable nor worth enumerating when every one of them means the same thing.
+            logger.LogDebug(ex, "Could not resolve the physical location of target root {Root}", root.Value);
+            return root;
+        }
+    }
+
     /// <summary>Drops any target root equal to or nested under another. The outer root's walk already
     /// covers the inner one's subtree, so the same file set is reported either way — but the duplicate
     /// enumeration I/O disappears, and so does the need for a per-path dedup set (which at 357k paths
     /// would be ~80 MB, defeating the point of streaming).
     ///
+    /// <para>Comparison is on the PHYSICAL location, not the configured path. Two roots that alias one
+    /// tree through a junction ("D:\backup" and "C:\link-to-backup") are not textually nested, so
+    /// without this every file under them is swept twice — and in Mirror mode gets two <c>Deleted</c>
+    /// ops for one file. The survivor keeps its configured path, so the walk and the reported
+    /// <c>Root</c> are unchanged.</para>
+    ///
     /// <para>It also fixes a latent non-determinism. The old merge deduped by keeping whichever copy
     /// the sort left first, but <c>List&lt;T&gt;.Sort</c> is an unstable introsort and the comparison
     /// was on <c>Path</c> alone — so the <c>Root</c> reported for a file under two overlapping target
     /// roots was arbitrary. After pruning it is always the outermost root.</para></summary>
-    private static void PruneNestedRoots(List<NormalizedPath> roots)
+    private static void PruneNestedRoots(List<TargetRoot> roots)
     {
         if (roots.Count < 2)
             return;
@@ -430,7 +473,8 @@ public sealed class DestinationProjector(
                 if (i == j)
                     continue;
                 // Equal roots: keep the earlier one so the survivor is stable (drop the later index).
-                bool nested = roots[i].IsUnder(roots[j]) || (roots[i].Equals(roots[j]) && j < i);
+                bool nested = roots[i].Physical.IsUnder(roots[j].Physical)
+                    || (roots[i].Physical.Equals(roots[j].Physical) && j < i);
                 if (!nested)
                     continue;
                 roots.RemoveAt(i);
@@ -446,10 +490,11 @@ public sealed class DestinationProjector(
     private IEnumerable<Candidate> EnumerateCandidates(WalkPlan plan, CancellationToken ct)
     {
         using IScanSession session = scheduler.OpenSession(plan.Options, ct);
-        foreach (NormalizedPath targetRoot in plan.TargetRoots)
+        foreach (TargetRoot targetRoot in plan.TargetRoots)
         {
-            (string key, DriveClass driveClass) = ResolveVolume(targetRoot.Value);
-            session.Submit(new ScanWorkItem(targetRoot.Value, key, driveClass, targetRoot));
+            NormalizedPath configured = targetRoot.Configured;
+            (string key, DriveClass driveClass) = ResolveVolume(configured.Value);
+            session.Submit(new ScanWorkItem(configured.Value, key, driveClass, configured));
         }
         // Roots are all in: without this the session would finalize the instant outstanding
         // touches zero — e.g. an empty first target root finishing while ResolveVolume blocks

@@ -56,6 +56,44 @@ public sealed class SettingsServiceTests : IDisposable
     }
 
     [Fact]
+    public void An_absent_scan_depth_reads_back_as_the_shipped_ceiling()
+    {
+        // The nullable-backing contract: the source generator does not run property initializers for
+        // absent members, so a settings.json predating this field must not read back as 0 — which would
+        // stop every scan at its root.
+        File.WriteAllText(_paths.SettingsFilePath, """{"SchemaVersion":6}""");
+
+        Assert.Equal(GlobalSettings.DefaultMaxScanDepth, NewService().Current.MaxScanDepth);
+    }
+
+    [Fact]
+    public void An_explicit_scan_depth_round_trips()
+    {
+        SettingsService service = NewService();
+        Assert.True(service.Update(new GlobalSettings { MaxScanDepth = 64 }).TryGetValue(out GlobalSettings? saved));
+
+        Assert.Equal(64, saved!.MaxScanDepth);
+        Assert.Equal(64, NewService().Current.MaxScanDepth);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-1)]
+    [InlineData(2)]
+    [InlineData(int.MaxValue)]
+    public void Update_clamps_a_scan_depth_the_scheduler_would_not_honor(int configured)
+    {
+        // What the UI reads back has to be what the walk will actually use, so the clamp happens here
+        // as well as in the resolver — otherwise a hand-edited file shows one number and behaves as
+        // another.
+        SettingsService service = NewService();
+        service.Update(new GlobalSettings { MaxScanDepth = configured });
+
+        Assert.InRange(service.Current.MaxScanDepth, 8, 10_000);
+        Assert.NotEqual(configured, service.Current.MaxScanDepth);
+    }
+
+    [Fact]
     public void Update_clamps_an_explicit_value_below_one()
     {
         SettingsService service = NewService();

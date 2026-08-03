@@ -160,14 +160,97 @@ public sealed class ScanSchedulerTests
             session.Submit(new ScanWorkItem("b:\\late", "b:", DriveClass.Fixed, null)));
     }
 
+    [Fact]
+    public void A_directory_tree_that_loops_back_on_itself_terminates_at_the_depth_ceiling()
+    {
+        // THE cycle test. Neither adapter's never-descend-a-reparse-point rule can see this loop: the
+        // repeating child is an ordinary directory with NO reparse attribute, which is exactly how a
+        // server-side symlink on an SMB/NFS share and a looping DFS link reach the client. Nothing else
+        // bounds the walk — the destination sweep has no depth policy at all and its entry budget gates
+        // emission, not descent — so without the engine ceiling this call never returns.
+        LoopingFileSystem fs = new(branches: 1);
+        using ScanScheduler scheduler = new(
+            NullLogger<ScanScheduler>.Instance, fs, Settings(maxScan: 4, perDrive: 4, maxDepth: 8));
+
+        using IScanSession session = scheduler.OpenSession(DescendEverything(), CancellationToken.None);
+        session.Submit(new ScanWorkItem("v:\\root", "v:", DriveClass.Fixed, null));
+        session.CompleteSubmissions();
+
+        List<ScanResult> results = Drain(session);
+
+        // Depth 0 (the root) through depth 8 inclusive = 9 directories, one file each.
+        Assert.Equal(9, results.Count(r => r.Entry is not null));
+        Assert.Equal(9, fs.EnumeratedPaths.Count);
+        // ...and the truncation is reported rather than silent, so a looping share is diagnosable.
+        ScanResult result = Assert.Single(results, r => r.Fault is not null);
+        EnumerationFault fault = result.Fault!.Value;
+        Assert.Equal(EnumerationSeverity.Warning, fault.Severity);
+        Assert.Contains("depth ceiling", fault.Message);
+    }
+
+    [Fact]
+    public void The_configured_depth_ceiling_is_what_bounds_the_walk()
+    {
+        // Pins the setting to the behavior: the ceiling comes from GlobalSettings, not a constant.
+        LoopingFileSystem fs = new(branches: 1);
+        using ScanScheduler scheduler = new(
+            NullLogger<ScanScheduler>.Instance, fs, Settings(maxScan: 4, perDrive: 4, maxDepth: 20));
+
+        using IScanSession session = scheduler.OpenSession(DescendEverything(), CancellationToken.None);
+        session.Submit(new ScanWorkItem("v:\\root", "v:", DriveClass.Fixed, null));
+        session.CompleteSubmissions();
+
+        Assert.Equal(21, Drain(session).Count(r => r.Entry is not null));   // depths 0..20
+    }
+
+    [Fact]
+    public void A_branching_loop_reports_the_depth_ceiling_once_not_per_pruned_directory()
+    {
+        // A loop re-expands the full subtree breadth at every level, so the ceiling is hit once per
+        // directory ON the boundary — 512 times here. One warning is the whole message; 512 would bury
+        // both the report and the log.
+        LoopingFileSystem fs = new(branches: 2);
+        using ScanScheduler scheduler = new(
+            NullLogger<ScanScheduler>.Instance, fs, Settings(maxScan: 4, perDrive: 4, maxDepth: 8));
+
+        using IScanSession session = scheduler.OpenSession(DescendEverything(), CancellationToken.None);
+        session.Submit(new ScanWorkItem("v:\\root", "v:", DriveClass.Fixed, null));
+        session.CompleteSubmissions();
+
+        List<ScanResult> results = Drain(session);
+
+        Assert.Equal(511, results.Count(r => r.Entry is not null));   // 2^0 + ... + 2^8 directories
+        Assert.Single(results, r => r.Fault is not null);
+    }
+
+    /// <summary>Drains a session on a worker thread with a hard timeout, so a walk that fails to
+    /// terminate fails the test instead of hanging the run — the whole point of these cases.</summary>
+    private static List<ScanResult> Drain(IScanSession session)
+    {
+        List<ScanResult> results = [];
+        Task consumer = Task.Run(() => results.AddRange(session.Consume()));
+        Assert.True(consumer.Wait(TimeSpan.FromSeconds(30)), "the scan did not terminate — the depth ceiling did not bound it");
+        return results;
+    }
+
     private static ScanSessionOptions EmitEverything() => new()
     {
         OnSubdirectory = static (_, _) => new ChildDecision(false, null),
         OnFile = static (_, _) => true,
     };
 
-    private static FakeSettingsProvider Settings(int maxScan, int perDrive) => new(new GlobalSettings
+    /// <summary>The unguarded adapter: descends every subdirectory with no reparse, depth, or name
+    /// policy of its own, leaving the scheduler's ceiling as the only bound.</summary>
+    private static ScanSessionOptions DescendEverything() => new()
     {
+        MaxConcurrency = 1,   // serial: the assertions are on exact counts
+        OnSubdirectory = static (_, tag) => new ChildDecision(true, tag),
+        OnFile = static (_, _) => true,
+    };
+
+    private static FakeSettingsProvider Settings(int maxScan, int perDrive, int? maxDepth = null) => new(new GlobalSettings
+    {
+        MaxScanDepth = maxDepth ?? GlobalSettings.DefaultMaxScanDepth,
         ScanThreading = new ScanThreadingSettings
         {
             MaxScanThreads = ThreadBudget.Explicit(maxScan),
@@ -177,6 +260,32 @@ public sealed class ScanSchedulerTests
 
     private static FileSystemEntry FileEntry(string path) =>
         new(System.IO.Path.GetFileName(path), path, isDirectory: false, size: 1, modified: DateTimeOffset.UnixEpoch);
+
+    /// <summary>A file system with no bottom: every directory enumerates as one file plus
+    /// <paramref name="branches"/> subdirectories that enumerate the same way, forever. The
+    /// subdirectory entries carry NO attributes — in particular not
+    /// <see cref="System.IO.FileAttributes.ReparsePoint"/> — which is the case the adapters' guards
+    /// cannot catch and the engine's depth ceiling exists for.</summary>
+    private sealed class LoopingFileSystem(int branches) : IFileSystemService
+    {
+        public System.Collections.Concurrent.ConcurrentBag<string> EnumeratedPaths { get; } = [];
+
+        public IEnumerable<Result<FileSystemEntry, EnumerationFault>> EnumerateEntries(string path)
+        {
+            EnumeratedPaths.Add(path);
+            yield return FileEntry($"{path}\\f.txt");
+            for (int i = 0; i < branches; i++)
+            {
+                string child = $"{path}\\loop{i}";
+                yield return new FileSystemEntry(
+                    $"loop{i}", child, isDirectory: true, size: 0, modified: DateTimeOffset.UnixEpoch);
+            }
+        }
+
+        public IEnumerable<Result<FileSystemEntry, EnumerationFault>> EnumerateRoots() => throw new NotSupportedException();
+        public Result<string, string> GetHomeDirectory() => throw new NotSupportedException();
+        public Result<string?, string> GetParent(string path) => throw new NotSupportedException();
+    }
 
     /// <summary>An in-memory file system whose <see cref="EnumerateEntries"/> blocks on a shared gate
     /// (so workers pile up on a volume) and tracks the peak concurrent-enumeration count.</summary>

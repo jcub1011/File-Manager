@@ -198,14 +198,25 @@ public sealed class SettingsService : ISettingsProvider
     // volume-key form the scheduler resolves, and blank keys are dropped. Directory settings must be
     // absolute: an empty or relative value (a hand-edited file, or a plain update-settings that
     // bypassed the relocate handler's validation) would silently empty the profile catalog, so it
-    // falls back to the default instead of persisting.
+    // falls back to the default instead of persisting. The scan-depth backstop is clamped to the range
+    // the scheduler will honor anyway, so what the UI reads back is what the walk will actually use.
     private GlobalSettings Normalize(GlobalSettings settings) =>
         settings with
         {
             ScanThreading = NormalizeThreading(settings.ScanThreading),
+            MaxScanDepth = NormalizeScanDepth(settings.MaxScanDepth),
             ScratchDirectory = NormalizeDirectory(settings.ScratchDirectory, GlobalSettings.DefaultScratchDirectory, "ScratchDirectory"),
             ProfilesDirectory = NormalizeDirectory(settings.ProfilesDirectory, GlobalSettings.DefaultProfilesDirectory, "ProfilesDirectory"),
         };
+
+    private int NormalizeScanDepth(int value)
+    {
+        int clamped = ScanThreadResolver.ResolveMaxScanDepth(value);
+        if (clamped != value)
+            _logger.LogWarning(
+                "Settings MaxScanDepth value {Value} is outside the supported range; using {Clamped}", value, clamped);
+        return clamped;
+    }
 
     private string NormalizeDirectory(string value, string fallback, string name)
     {

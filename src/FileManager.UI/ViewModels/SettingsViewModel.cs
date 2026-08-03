@@ -97,6 +97,15 @@ public sealed partial class SettingsViewModel : ViewModelBase
             $"Caps parallel file hashing during a dry run. Auto uses cores − 1 ({HashAutoDefault} on this machine).",
             ["performance", "concurrency", "parallel", "cpu", "workers", "hash", "checksum", "verify", "threads"]);
 
+        MaxScanDepth = Setting.AutoNumber(
+            "performance.maxScanDepth", "Max scan depth",
+            "A safety stop for directory trees that loop back on themselves — most often a symlink on a "
+            + $"network share, which Windows cannot flag as a link. Auto uses {GlobalSettings.DefaultMaxScanDepth} "
+            + "levels below each scan root; nothing below the limit is scanned. Raise it only for a "
+            + "genuinely deeper tree, and use a profile's own depth filter to limit a scan on purpose.",
+            ["performance", "depth", "recursion", "levels", "nested", "loop", "cycle", "symlink",
+             "junction", "reparse", "network", "share", "safety", "limit"]);
+
         DriveOverrides = new DriveOverridesSettingViewModel(
             "performance.driveOverrides", "Per-drive overrides",
             "Override the per-drive budget for a whole drive type, or for a specific volume key (highest precedence). Precedence: specific drive → drive type → per-drive default.",
@@ -137,6 +146,7 @@ public sealed partial class SettingsViewModel : ViewModelBase
         MaxScanThreads.Value = ScanAutoDefault;
         PerDriveDefault.Value = PerDriveAutoDefault;
         MaxHashThreads.Value = HashAutoDefault;
+        MaxScanDepth.Value = GlobalSettings.DefaultMaxScanDepth;
 
         BuildCatalog();
         BuildNavigation();
@@ -167,6 +177,7 @@ public sealed partial class SettingsViewModel : ViewModelBase
     public AutoNumberSettingViewModel MaxScanThreads { get; }
     public AutoNumberSettingViewModel PerDriveDefault { get; }
     public AutoNumberSettingViewModel MaxHashThreads { get; }
+    public AutoNumberSettingViewModel MaxScanDepth { get; }
     public DriveOverridesSettingViewModel DriveOverrides { get; }
     public BoolSettingViewModel ReleaseMemoryAfterLargeOperations { get; }
     public TextSettingViewModel ScratchDirectory { get; }
@@ -190,7 +201,7 @@ public sealed partial class SettingsViewModel : ViewModelBase
     private void BuildCatalog()
     {
         SettingsCategoryViewModel performance = new(
-            "performance", "Scan performance", "Thread budgets shared across all profiles.")
+            "performance", "Scan performance", "Thread budgets and scan limits shared across all profiles.")
         { RequiresService = true };
 
         Categories.Add(new SettingsCategoryViewModel(
@@ -199,7 +210,7 @@ public sealed partial class SettingsViewModel : ViewModelBase
         Categories.Add(new SettingsCategoryViewModel("startup", "Service startup") { RequiresService = true }
             .With(StartupMode));
         Categories.Add(performance.With(
-            MaxScanThreads, PerDriveDefault, MaxHashThreads, ReleaseMemoryAfterLargeOperations));
+            MaxScanThreads, PerDriveDefault, MaxHashThreads, MaxScanDepth, ReleaseMemoryAfterLargeOperations));
         Categories.Add(new SettingsCategoryViewModel("performance.advanced", "Per-drive overrides", parent: performance)
             { RequiresService = true }
             .With(DriveOverrides));
@@ -556,6 +567,11 @@ public sealed partial class SettingsViewModel : ViewModelBase
             ReleaseMemoryAfterLargeOperations.Value = settings.ReleaseMemoryAfterLargeOperations;
             ProfilesDirectory.Value = settings.ProfilesDirectory;
 
+            // Auto here means "the shipped ceiling", so a stored value equal to it reads back as Auto —
+            // the same absent-means-default round-trip GlobalSettings.MaxScanDepth itself performs.
+            (MaxScanDepth.Auto, MaxScanDepth.Value) =
+                (settings.MaxScanDepth == GlobalSettings.DefaultMaxScanDepth, settings.MaxScanDepth);
+
             ScanThreadingSettings st = settings.ScanThreading;
             ApplyBudget(MaxScanThreads, st.MaxScanThreads, ScanAutoDefault);
             ApplyBudget(MaxHashThreads, st.MaxHashThreads, HashAutoDefault);
@@ -687,6 +703,7 @@ public sealed partial class SettingsViewModel : ViewModelBase
                 // The profiles directory is changed transactionally via ChangeProfilesDirectory; carry
                 // the current value through so a generic Save never resets it to the default.
                 ProfilesDirectory = ProfilesDirectory.Value,
+                MaxScanDepth = MaxScanDepth.Auto ? GlobalSettings.DefaultMaxScanDepth : MaxScanDepth.Value,
                 ScanThreading = new ScanThreadingSettings
                 {
                     MaxScanThreads = ToBudget(MaxScanThreads.Auto, MaxScanThreads.Value),

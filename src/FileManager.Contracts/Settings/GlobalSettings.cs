@@ -17,8 +17,8 @@ public sealed record GlobalSettings
     /// <see cref="ScratchDirectory"/>. v4 added <see cref="ProfilesDirectory"/>. v5 removed ThemeMode,
     /// which moved to the UI's client-settings.json (the engine never read it); a v4 file's orphaned
     /// member is ignored here and migrated by the UI on first run. v6 added
-    /// <see cref="ReleaseMemoryAfterLargeOperations"/>.</summary>
-    public int SchemaVersion { get; init; } = 6;
+    /// <see cref="ReleaseMemoryAfterLargeOperations"/>. v7 added <see cref="MaxScanDepth"/>.</summary>
+    public int SchemaVersion { get; init; } = 7;
 
     /// <summary>When the worker service is started and stopped relative to the UI. Defaults to
     /// <see cref="Settings.ServiceStartupMode.StartAndStopWithProgram"/> so the service does not
@@ -143,6 +143,43 @@ public sealed record GlobalSettings
         get => _releaseMemoryAfterLargeOperations;
         init => _releaseMemoryAfterLargeOperations = value is true ? null : value;
     }
+
+    private readonly int? _maxScanDepth;
+
+    /// <summary>Hard ceiling on how many directory levels below a scan root the enumeration will
+    /// descend. This is a cycle backstop, not a feature knob: a directory tree that loops back on
+    /// itself would otherwise be walked forever. Directory reparse points (symlinks, junctions, mount
+    /// points) are already never descended, which covers every loop a local NTFS volume can produce —
+    /// but a server-side symlink on an SMB/NFS share, or a looping DFS link, reaches the client as an
+    /// ordinary directory with no reparse attribute, and nothing else bounds that walk. Raise it only
+    /// for a genuinely deeper-than-512 tree; the profile's own MaxDepth filter is the knob for
+    /// deliberately limiting scan depth.
+    ///
+    /// <para>Nullable backing field for the same reason as the members above: a settings.json predating
+    /// this field deserializes with no value, and the source generator does not run property
+    /// initializers for absent members — so a plain <c>int</c> would read back as 0 and stop every scan
+    /// at the root. The setter collapses the default back to the absent representation so an omitted
+    /// field and an explicit 512 compare equal under the record's value-equality.</para></summary>
+    [JsonIgnore]
+    public int MaxScanDepth
+    {
+        get => _maxScanDepth ?? DefaultMaxScanDepth;
+        init => _maxScanDepth = value == DefaultMaxScanDepth ? null : value;
+    }
+
+    /// <summary>Serialization surface for <see cref="MaxScanDepth"/>: carries the nullable backing
+    /// representation so the default stays ABSENT in settings.json and on the wire.</summary>
+    [JsonInclude, JsonPropertyName("MaxScanDepth")]
+    public int? MaxScanDepthSerialized
+    {
+        get => _maxScanDepth;
+        init => _maxScanDepth = value == DefaultMaxScanDepth ? null : value;
+    }
+
+    /// <summary>Deep enough that no real tree reaches it (Windows' own path limit binds first for most
+    /// shapes), shallow enough that a looping share is caught in seconds rather than after thousands of
+    /// levels of re-expanding breadth.</summary>
+    public const int DefaultMaxScanDepth = 512;
 
     public static GlobalSettings Default { get; } = new();
 }
