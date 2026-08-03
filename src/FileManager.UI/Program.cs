@@ -26,6 +26,10 @@ namespace FileManager.UI
                     retainedFileCountLimit: 14)
                 .CreateLogger();
 
+            // Once, before anything allocates: the UI sets no GC properties, and this line is how that
+            // is confirmed rather than assumed (see UiMemoryLog).
+            UiMemoryLog.LogGcConfiguration();
+
             AppDomain.CurrentDomain.UnhandledException += (_, e) =>
                 Log.Fatal(e.ExceptionObject as Exception, "Unhandled exception");
             TaskScheduler.UnobservedTaskException += (_, e) =>

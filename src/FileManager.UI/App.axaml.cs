@@ -109,6 +109,12 @@ namespace FileManager.UI
                         // resolves its profile name through the shell's loaded profile list — starting
                         // the pump before that list existed left every row of the first seed nameless.
                         _ = pump.RunAsync(_shutdown.Token);
+                        // The idle baseline every later sample is read against: posted at Background
+                        // priority so it runs once the first paint, the font atlases and the profile
+                        // list are done, rather than mid-startup.
+                        Avalonia.Threading.Dispatcher.UIThread.Post(
+                            static () => UiMemoryLog.Sample("idle"),
+                            Avalonia.Threading.DispatcherPriority.Background);
                     }
                 };
                 _ = viewModel.StatusBar.RunPollLoopAsync(_shutdown.Token);

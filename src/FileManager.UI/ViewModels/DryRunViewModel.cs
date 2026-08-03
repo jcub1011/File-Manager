@@ -2752,6 +2752,9 @@ public sealed partial class DryRunViewModel : ViewModelBase
         // run's result if a later clear/run supersedes it in turn.
         ClearReport();
         int epoch = _reportEpoch;
+        // Baseline for the churn figure on the two samples below — taken after the clear so it measures
+        // this run only, not the previous preview's teardown.
+        long allocatedBefore = UiMemoryLog.AllocatedSnapshot();
         RunStatusText = "Scanning sources…";
         // Constructed on the UI thread, so Progress<T> captures the UI SynchronizationContext and
         // every report marshals there — the service's throttling (~10 frames/sec) bounds the load.
@@ -2791,9 +2794,18 @@ public sealed partial class DryRunViewModel : ViewModelBase
                 store.Complete();
                 return PrepareReport(store, completion!, ct);
             }, ct);
+            // NOTE THE SAMPLE POINT: the store, both tabs' prepared loads AND the transient sort-key
+            // arrays PrepareReport just dropped are all accounted here without a collection having been
+            // forced, so this is the closest thing to the run's PEAK that can be read without
+            // perturbing it. It is the only visibility we have into the transient burst — the retained
+            // heap probes in DryRunViewModelMemoryTests measure after a forced full collection and
+            // cannot see it at all.
+            UiMemoryLog.Sample("preview-prepared (near peak)", allocatedBefore);
             if (_reportEpoch != epoch)
                 return;   // the preview was cleared while running — a stale report must not apply
             ApplyPrepared(prepared);
+            // What the app now sits at with a preview on screen — the number a user reports.
+            UiMemoryLog.Sample("preview-applied", allocatedBefore);
         }
         catch (OperationCanceledException)
         {
@@ -2926,6 +2938,9 @@ public sealed partial class DryRunViewModel : ViewModelBase
 
     private void ClearReport()
     {
+        // Only instrument a clear that actually released a preview — ClearReport also runs on profile
+        // selection/deselection and at the start of every run, where there is nothing to report.
+        bool hadReport = HasReport;
         _reportEpoch++;   // invalidates any report still being prepared or awaited
         Sources.Clear();
         Destinations.Clear();
@@ -2937,5 +2952,18 @@ public sealed partial class DryRunViewModel : ViewModelBase
         GeneratedAtText = "";
         WasTruncated = false;
         TruncationNotice = "";
+        if (!hadReport)
+            return;
+        // Two samples, and the pair is the point. The immediate one reads with the rows unrooted but
+        // NOT yet collected — nothing is forced here (a blocking gen2 on the UI thread is exactly the
+        // jank this app must not have), so it will look barely changed and that is correct, not a bug.
+        // The deferred one, several seconds later, is the settled figure: compare it against the "idle"
+        // line to answer whether the preview's pages actually came back. If they never do, that is a
+        // worse problem than the retained byte count and a different fix (GC configuration / trim),
+        // which is precisely what this instrumentation exists to distinguish.
+        UiMemoryLog.Sample("preview-cleared (not yet collected)");
+        Avalonia.Threading.DispatcherTimer.RunOnce(
+            static () => UiMemoryLog.Sample("preview-cleared (settled)"),
+            TimeSpan.FromSeconds(10));
     }
 }

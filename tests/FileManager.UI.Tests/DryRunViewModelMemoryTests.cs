@@ -1,6 +1,7 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using FileManager.Contracts.DryRun;
+using FileManager.Contracts.IPC;
 using FileManager.Contracts.Profiles;
 using FileManager.UI.ViewModels;
 using Xunit.Abstractions;
@@ -121,6 +122,124 @@ public sealed class DryRunViewModelMemoryTests(ITestOutputHelper output)
         GC.KeepAlive(vm);
     }
 
+    /// <summary>How much of the retained store is <em>file names</em>, measured rather than derived.
+    /// Builds the deep store twice — once normally, once with every file name replaced by one shared
+    /// constant so the store's interner collapses them to a single instance — and diffs the retained
+    /// heap. Everything else (row count, directory table, detail strings, every fixed-width column) is
+    /// byte-identical between the two, so the delta is the all-in name cost: the distinct
+    /// <see cref="string"/> objects plus the two reference columns that point at them.
+    ///
+    /// <para>This exists because <c>docs/dry-run-ui-memory-next-steps.md</c> §"Question 2" is
+    /// arithmetic, not measurement, and it is the number that decides whether a UTF-8 name blob is
+    /// worth the API churn. Its estimate was ~38 MB (names only); attributing the <c>_srcName</c> and
+    /// <c>_opName</c> reference columns to names as well predicts ~46.7 MB of the deep shape's
+    /// ~72 MB. Reported, not asserted — this is a gauge for a decision, not an invariant.</para></summary>
+    [Fact]
+    [Trait("Category", "Memory")]
+    public void File_names_share_of_retained_store_at_streamed_cap_with_realistic_deep_paths()
+    {
+        long withDistinctNames = MeasureDeepStore(fixedName: null);
+        long withOneSharedName = MeasureDeepStore(fixedName: "render-output-0000000.png");
+        long nameCost = withDistinctNames - withOneSharedName;
+
+        output.WriteLine(
+            $"Deep store retained ({FileCount:N0} files): {withDistinctNames / (1024.0 * 1024.0):F1} MB with distinct names, " +
+            $"{withOneSharedName / (1024.0 * 1024.0):F1} MB with one shared name — " +
+            $"file names cost {nameCost / (1024.0 * 1024.0):F1} MB " +
+            $"({100.0 * nameCost / withDistinctNames:F0}% of the store)");
+
+        // The only thing worth failing on: the two builds must actually differ in name storage, or the
+        // probe is measuring nothing (e.g. a future change that stops interning, or a builder edit that
+        // ignores the override).
+        Assert.True(nameCost > 0,
+            $"the shared-name build retained no less than the distinct-name build ({nameCost:N0} bytes) — the probe is not measuring name cost");
+    }
+
+    /// <summary>The <em>transient</em> cost of turning a completed store into both tabs' loads — the
+    /// gauge this suite was missing. The three probes above all measure retained heap after a forced
+    /// full collection, so by construction none of them can see the allocation burst
+    /// <see cref="DryRunViewModel.PrepareReport"/> pays: each tab's <c>ComputeLoad</c> materializes a
+    /// <c>string[] keys</c> holding one relative-path string per row, sorts an index array against it,
+    /// and drops it — and the two tabs run in parallel, so both arrays are live at once.
+    ///
+    /// <para>On this deep shape a key is ~71 chars (~168 B), which predicts ~84 MB for Sources plus
+    /// ~56 MB for Destinations — roughly double the entire retained heap, and the number a user is most
+    /// likely to actually notice, because it lands while they are watching the progress bar. The
+    /// committed <c>DryRunViewModelBenchmarks</c> figure (557 ms / 71,783 KB) is the <em>shallow</em>
+    /// shape, where keys are ~21 chars, so it understates this by more than half.</para>
+    ///
+    /// <para>Allocated bytes are exact and deterministic; the peak managed figure is polled from a
+    /// background thread and depends on GC timing, so it is reported and not asserted. The budget is
+    /// deliberately loose — it exists to catch an order-of-magnitude regression, not to pin a
+    /// number.</para></summary>
+    [Fact]
+    [Trait("Category", "Memory")]
+    public void PrepareReport_transient_allocation_at_streamed_cap_with_realistic_deep_paths()
+    {
+        (DryRunRowStore store, WeakReference report) = BuildDeepStore(fixedName: null);
+        // Settle first, THEN assert: the ingest report is unreachable but not yet collected, and this
+        // probe's whole subject is the transient delta above the settled baseline — so the baseline has
+        // to exclude the report's bytes or the peak below is measured against the wrong floor.
+        long settled = GC.GetTotalMemory(forceFullCollection: true);
+        Assert.False(report.IsAlive);
+        long peakManaged = settled;
+        using CancellationTokenSource pollStop = new();
+        Thread poll = new(() =>
+        {
+            while (!pollStop.IsCancellationRequested)
+            {
+                long sample = GC.GetTotalMemory(false);
+                if (sample > peakManaged)
+                    Interlocked.Exchange(ref peakManaged, sample);
+                Thread.Sleep(1);
+            }
+        }) { IsBackground = true };
+        poll.Start();
+
+        long allocatedBefore = GC.GetTotalAllocatedBytes();
+        Stopwatch watch = Stopwatch.StartNew();
+        DryRunViewModel.PreparedReport prepared = DryRunViewModel.PrepareReport(
+            store, new DryRunCompletion(DateTimeOffset.UnixEpoch, Truncated: false, Space: null));
+        watch.Stop();
+        long allocated = GC.GetTotalAllocatedBytes() - allocatedBefore;
+        pollStop.Cancel();
+        poll.Join();
+
+        output.WriteLine(
+            $"PrepareReport({FileCount:N0} deep-path files): allocated {allocated:N0} bytes " +
+            $"({allocated / (1024.0 * 1024.0):F1} MB) in {watch.ElapsedMilliseconds:N0} ms; " +
+            $"managed heap {settled / (1024.0 * 1024.0):F1} MB before → peak {peakManaged / (1024.0 * 1024.0):F1} MB " +
+            $"(+{(peakManaged - settled) / (1024.0 * 1024.0):F1} MB transient)");
+
+        Assert.True(allocated < 400L * 1024 * 1024,
+            $"PrepareReport allocated {allocated / (1024.0 * 1024.0):F1} MB — over the 400 MB budget");
+
+        GC.KeepAlive(prepared);
+        GC.KeepAlive(store);
+    }
+
+    /// <summary>Retained heap of a completed store alone (no view model, no tabs), so a name-storage
+    /// change can be attributed without the tabs' key arrays in the way. NoInlining, and the store dies
+    /// with this frame so the next call's forced collection starts from a clean baseline.</summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static long MeasureDeepStore(string? fixedName)
+    {
+        long before = GC.GetTotalMemory(forceFullCollection: true);
+        (DryRunRowStore store, WeakReference report) = BuildDeepStore(fixedName);
+        long after = GC.GetTotalMemory(forceFullCollection: true);
+        Assert.False(report.IsAlive);
+        GC.KeepAlive(store);
+        return after - before;
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static (DryRunRowStore Store, WeakReference Report) BuildDeepStore(string? fixedName)
+    {
+        DryRunReport report = BuildDeepReport(FileCount, fixedName);
+        DryRunRowStore store = DryRunRowStore.FromReport(report);
+        return (store, new WeakReference(report));
+    }
+
     /// <summary>NoInlining so the report reference provably dies with this frame — nulling a local
     /// in the caller would not guarantee the JIT treats it as unreachable.</summary>
     [MethodImpl(MethodImplOptions.NoInlining)]
@@ -144,7 +263,14 @@ public sealed class DryRunViewModelMemoryTests(ITestOutputHelper output)
     /// <summary>A realistic 500k-file tree: 20 files per leaf directory, leaves nested four levels
     /// under the root (project/assets/renders/batch), absolute paths ~100 chars. Ops mirror the
     /// benchmark shape's disposition mix (processed with two targets / filtered / unchanged).</summary>
-    private static DryRunReport BuildDeepReport(int fileCount)
+    /// <param name="fixedName">When set, every file uses this name instead of a distinct one. Rows,
+    /// directories, operations and detail strings are unchanged — only the store's name interner
+    /// collapses, from one instance per file to one overall. Diffing the retained heap against a
+    /// <c>null</c> build therefore isolates the all-in cost of file names; see
+    /// <see cref="File_names_share_of_retained_store_at_streamed_cap_with_realistic_deep_paths"/>.
+    /// The default distinct name is 26 chars, so pass a 26-char constant to keep the one surviving
+    /// string the same size and the delta purely a count difference.</param>
+    private static DryRunReport BuildDeepReport(int fileCount, string? fixedName = null)
     {
         DryRunDirectoryTableBuilder dirs = new();
         var sourceFiles = new List<DryRunFile>(fileCount);
@@ -156,7 +282,8 @@ public sealed class DryRunViewModelMemoryTests(ITestOutputHelper output)
         {
             int leaf = i / 20;                    // 20 files per directory → 25k leaf dirs at 500k
             string sourceDir = $@"C:\media-archive\projects\project-{leaf % 500:D3}\assets\renders\batch-{leaf / 500:D4}";
-            string source = $@"{sourceDir}\render-output-{i:D7}.png";
+            string name = fixedName ?? $"render-output-{i:D7}.png";
+            string source = $@"{sourceDir}\{name}";
             sourceFiles.Add(dirs.Convert(new PhysicalFile
             {
                 Path = source,
@@ -176,7 +303,7 @@ public sealed class DryRunViewModelMemoryTests(ITestOutputHelper output)
                         SourceIndex = i,
                         SourceDisposition = i % 6 == 0 ? OnSuccessAction.MoveToTrash : OnSuccessAction.KeepSource,
                     }));
-                    string target = $@"D:\backup\media-archive\projects\project-{leaf % 500:D3}\assets\renders\batch-{leaf / 500:D4}\render-output-{i:D7}.png";
+                    string target = $@"D:\backup\media-archive\projects\project-{leaf % 500:D3}\assets\renders\batch-{leaf / 500:D4}\{name}";
                     destinationOps.Add(dirs.Convert(new VirtualFileOperation
                     {
                         Path = target, Root = @"D:\backup\media-archive\projects", Kind = OperationKind.New, SourceIndex = i,
@@ -202,7 +329,7 @@ public sealed class DryRunViewModelMemoryTests(ITestOutputHelper output)
                         Kind = OperationKind.SkippedUnchanged,
                         SourceIndex = i,
                     }));
-                    string unchanged = $@"D:\backup\media-archive\projects\project-{leaf % 500:D3}\assets\renders\batch-{leaf / 500:D4}\render-output-{i:D7}.png";
+                    string unchanged = $@"D:\backup\media-archive\projects\project-{leaf % 500:D3}\assets\renders\batch-{leaf / 500:D4}\{name}";
                     int unchangedSubject = destinationFiles.Count;
                     destinationFiles.Add(dirs.Convert(new PhysicalFile { Path = unchanged, Root = @"D:\backup\media-archive\projects", Length = i, LastWritten = DateTimeOffset.UnixEpoch }));
                     destinationOps.Add(dirs.Convert(new VirtualFileOperation { Path = unchanged, Root = @"D:\backup\media-archive\projects", Kind = OperationKind.SkipUnchanged, SourceIndex = i, SubjectIndex = unchangedSubject, Detail = "identical content (SHA-256)" }));
