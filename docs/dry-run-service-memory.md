@@ -17,9 +17,15 @@
 > committed memory, which is what the complaint was about; a managed-heap proxy would need its own
 > doc comment warning it is not that.
 >
-> **Still open — peak.** Peak fell only 10% (363 → 325 MB) and is now dominated by GC burst policy
-> rather than by live bytes (§5.5 explains why, including the ~90 MB of peak deliberately traded for
-> the residual fix). That is the remaining lever if peak matters.
+> **Peak: addressed by a second pass (2026-08-03) — see §13.** An allocation-avoidance pass
+> (commits tagged Stage 0–4 after `197ece8`) cut in-run peak **378 → 207 MB (−45%)** and wall time
+> **5,565 → 3,666 ms (−34%)** at a destination-heavy 2k source / 500k destination workload, residual
+> still ~9 MB. The user-directed constraint was no mid-run GC control — the garbage is not generated
+> in the first place (span dictionary probes, carrier pooling, wire-DTO recycling, a sweep that never
+> materializes per-file path strings). §13 records the measurements and the one mechanism worth
+> remembering: under this GC configuration nothing collects mid-burst, so **peak tracks total
+> uncollected churn, and it only starts falling once total churn drops below the collection budget**
+> — the first ~60% of churn removal moved peak barely at all.
 >
 > **Not done — the human end-to-end check in §12**, in particular re-running a Mirror profile and
 > confirming the `Deleted` orphan set is identical to a pre-change run. Stage 3 changed how orphans are
@@ -1044,5 +1050,75 @@ Run the Downloads → Documents dry run and confirm the preview is unchanged —
 counts, same kinds/pills, same space projection — and that search, facet filtering, header sort and both
 `TreeDataGrid` tabs behave identically. Then re-run with a **Mirror** profile and confirm the `Deleted`
 orphan set is identical to a pre-change run. **That is the assertion that matters most**, because Stage 3
-changes how orphans are enumerated and deduped, and a wrong answer there is a destructive-plan bug rather
-than a cosmetic one.
+changed how orphans are enumerated and deduped — and §13's pass changed how the survivor probe runs — so
+a wrong answer there is a destructive-plan bug rather than a cosmetic one.
+
+---
+
+## 13. The peak pass (2026-08-03) — allocation avoidance, measured
+
+Direction set by the user after reviewing a GC-checkpoint proposal: *"Attempting to manually control
+gc mid-run seems like a code smell. I want to avoid generating the garbage in the first place via
+pooling and other memory management strategies."* No mid-run `GC.Collect` exists; the post-run trim
+is unchanged apart from the gate fix in finding 2 below.
+
+Per-entry allocation inventory at the start (destination sweep, ~90-char paths): ~1,050–1,150 B —
+two `Path.GetDirectoryName` strings allocated purely to probe the directory-table dictionary (~360),
+the full path from `entry.ToFullPath()` (~208), duplicate `GetFileName` strings (~96), the
+`FileSystemEntry`/`PhysicalFile`/`VirtualFileOperation` records, and the wire DTOs + lists.
+
+**Stages** (one commit each, after `197ece8`):
+
+0. Instrumentation: `allocated {N}MB` (`GC.GetTotalAllocatedBytes` delta) on the per-run log line;
+   `WireChunkConverterAllocationTests` pins converter bytes/pair (627 measured at baseline).
+1. Converter strings: span `AlternateLookup` probe on `DryRunDirectoryTableBuilder` (directory string
+   materialized only on a table miss), reference-keyed root memo, reference-keyed per-chunk
+   file/op conversion memo. Gauge 627 → 254 B/pair.
+2. Sweep record pooling: `SweepCarrierPool` (thread-safe, per-run) rents the existing pooled
+   carriers; `SweepStreamAsync` recycles a chunk when the consumer advances past it (ownership
+   contract on the method doc). Borrow==return pinned by test.
+3. Wire-DTO recycling: `DryRunFile`/`DryRunOperation` became mutable classes (hand-written value
+   equality, same property order — wire-invisible); the converter reuses the previous frame's
+   records once the server has serialized it, behind the `RecycleWireRecords` test seam. Guard:
+   byte-identical frames with recycling on vs off. Gauge 254 → 113 B/pair.
+4. No per-file path strings in the sweep: lazy `FileSystemEntry.FullPath` (enumeration passes the
+   shared directory string), `SurvivorSet` with a span probe (`stackalloc` compose;
+   `NormalizedPath.IsEqualToOrUnder` span twin; agreement with NormalizedPath probing pinned over
+   adversarial paths), `(Directory, FileName)` candidates/carriers, converter fast path reusing the
+   enumeration's name string. Batched path unchanged (composes bounded paths at merge, same sort).
+
+**Measured** (MemoryProbe, published AOT, 2,000 source / 500,000 destination, 200 files/dir,
+`--settle-seconds 35`; run-to-run noise ±20 MB):
+
+| Build | peak | settle t+0s | t+35s | wall |
+|---|---|---|---|---|
+| `197ece8` baseline | 378 MB | 358 MB | 11 MB | 5,565 ms |
+| + Stage 1 | 359 / 342 MB | 354 / 342 MB | 11 MB | — |
+| + Stage 2 | 363 MB | 291 MB | 9 MB | 4,370 ms |
+| + Stage 3 | 344 MB | 311 MB | 10 MB | 5,470 ms |
+| + Stage 4 | **207 MB** | 206 MB | **9 MB** | **3,666 ms** |
+
+Two findings worth keeping:
+
+1. **Peak is quantized by the GC's collection budget, not proportional to churn.** Stages 1–3
+   removed ~60% of allocation and peak moved ~10%; Stage 4 pushed total churn below the budget and
+   peak fell 40% in one step. Anyone extending this: measure churn (the `allocated` log line), and
+   expect no peak movement until the total crosses the cliff.
+2. **The trim's slack gate misreads a low-allocation burst (fixed with Stage 4).** `committed − heap`
+   only measures collected-but-not-decommitted memory; a run that barely allocates barely collects,
+   ends with committed ≈ heap (all garbage), and the trim skipped — the 500k run settled at 203 MB.
+   A 96 MB committed floor now catches that shape (`Trims_when_committed_is_high_even_with_near_zero_slack`).
+
+**What remains at 500k, and why it stays:** the ~200 MB in-run commit is now dominated by the scan
+layer's per-entry `FileSystemEntry` + name-string churn and queue transients (§11's rejected
+`FileSystemEntry` split territory — public contract, <10% of the original problem). Pushing peak
+lower from here is passive-GC-configuration territory (§10), not more allocation work.
+
+**Follow-up for a 500k-SOURCE profile** (not this workload): the survivor set is exact strings and
+grows with source count (~120 MB at 500k sources). The sanctioned shape if it ever matters: keep
+`SurvivorSet` (exact, span-probed) and spill it sorted to disk, probing after the walk — hashed
+survivors and `FromCanonical` accumulation stay rejected (§11). The file phase would also want
+Stage 4's `(dirIndex, name)` shape extended into `DryRunSnapshotFormat`.
+
+**Still owed:** §12's human end-to-end check, now doubly mandatory — the peak pass changed how the
+survivor probe runs, and a wrong probe answer omits a file from a Mirror deletion preview.
