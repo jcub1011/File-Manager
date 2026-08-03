@@ -1,4 +1,4 @@
-using FileManager.Contracts.DryRun;
+﻿using FileManager.Contracts.DryRun;
 using FileManager.Contracts.IPC;
 using FileManager.Contracts.Primitives;
 using FileManager.Contracts.Profiles;
@@ -118,14 +118,9 @@ internal sealed class FakeIpcGateway : IIpcGateway
         if (DryRunResult.TryGetError(out IpcError? error))
             return error;
         DryRunResult.TryGetValue(out DryRunReport? report);
-        sink.OnChunk(new DryRunChunkResponse
-        {
-            Directories = report!.Directories,
-            SourceFiles = report.SourceFiles,
-            DestinationFiles = report.DestinationFiles,
-            SourceOperations = report.SourceOperations,
-            DestinationOperations = report.DestinationOperations,
-        });
+        sink.OnChunk(DryRunColumns.ToChunk(
+            report!.Directories, report.SourceFiles, report.DestinationFiles,
+            report.SourceOperations, report.DestinationOperations));
         return new DryRunCompletion(report.GeneratedAt, report.Truncated, report.Space);
     }
 

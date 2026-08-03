@@ -1,6 +1,7 @@
 using FileManager.Contracts.DryRun;
 using FileManager.Contracts.Primitives;
 using System;
+using System.Buffers;
 using System.Collections.Generic;
 using System.IO.Pipes;
 using System.Runtime.CompilerServices;
@@ -250,16 +251,22 @@ public sealed class IpcClient : IAsyncDisposable
             // themselves go to the sink, which is free to resolve them and drop them. Indices stay
             // global because chunks are handed over in receive order.
             int directoryCount = 0;
+            // One buffer for the whole stream, cleared per frame and grown at most a few times. A
+            // streamed run's chunk frames are megabytes each (measured: 7.4 MB for a 20,000-file chunk),
+            // so the exact-size-array overload would put every frame on the Large Object Heap — ~133
+            // bytes per wire record of pure LOH churn, which is the kind that becomes lasting committed
+            // memory rather than a transient read.
+            ArrayBufferWriter<byte> frameBuffer = new();
             while (true)
             {
-                Result<byte[], string> frame = await IpcFrameCodec.ReadFrameAsync(_pipe, ct).ConfigureAwait(false);
+                frameBuffer.Clear();   // keeps the capacity, drops the previous frame's contents
+                Result<int, string> frame = await IpcFrameCodec.ReadFrameAsync(_pipe, frameBuffer, ct).ConfigureAwait(false);
                 if (frame.IsCanceled)
                     return Result<DryRunCompletion, IpcError>.Canceled();
                 if (frame.TryGetError(out string? transportError))
                     return new IpcError("IPC_TRANSPORT", transportError);
-                frame.TryGetValue(out byte[]? bytes);
 
-                Result<IpcResponse, string> parsed = IpcSerializer.DeserializeResponse(bytes!);
+                Result<IpcResponse, string> parsed = IpcSerializer.DeserializeResponse(frameBuffer.WrittenSpan);
                 if (parsed.TryGetError(out string? parseError))
                     return new IpcError("IPC_MALFORMED", $"the service sent a response that could not be parsed: {parseError}");
                 parsed.TryGetValue(out IpcResponse? response);
@@ -267,23 +274,32 @@ public sealed class IpcClient : IAsyncDisposable
                 switch (response!)
                 {
                     case DryRunChunkResponse chunk:
+                        // Raggedness FIRST — before anything reads two columns at the same index. A
+                        // record-wise chunk could not express a half-built row; a columnar one can, and
+                        // zipping mismatched columns would pair one file's name with another's
+                        // directory. Every check below indexes columns positionally, so this one gates
+                        // them.
+                        if (DryRunColumns.FindRaggedColumn(chunk) is { } ragged)
+                            return new IpcError("IPC_MALFORMED",
+                                $"the service sent a chunk whose columns disagree in length: {ragged}");
                         // Fail loud on a malformed table rather than mis-rooting paths: every parent
                         // must already be in the assembled table (parents precede children globally).
-                        foreach (DryRunDirectory dir in chunk.Directories)
+                        for (int d = 0; d < chunk.DirectoryName.Count; d++)
                         {
-                            if (dir.ParentIndex < -1 || dir.ParentIndex >= directoryCount)
+                            int parentIndex = chunk.DirectoryParentIndex[d];
+                            if (parentIndex < -1 || parentIndex >= directoryCount)
                                 return new IpcError("IPC_MALFORMED",
-                                    $"the service sent a directory entry ('{dir.Name}') whose ParentIndex {dir.ParentIndex} does not precede it in the table");
+                                    $"the service sent a directory entry ('{chunk.DirectoryName[d]}') whose ParentIndex {parentIndex} does not precede it in the table");
                             directoryCount++;
                         }
                         // Every file/op index must resolve against the table assembled so far
                         // (directories precede the records that reference them). Reject an
                         // out-of-range index here rather than letting a consumer crash on it.
-                        if (DryRunDirectoryTable.FindInvalidReference(
+                        if (DryRunColumns.FindInvalidReference(
                                 directoryCount, chunk.SourceFiles, chunk.SourceOperations) is { } badSource)
                             return new IpcError("IPC_MALFORMED",
                                 $"the service sent a record with an out-of-range directory index: {badSource}");
-                        if (DryRunDirectoryTable.FindInvalidReference(
+                        if (DryRunColumns.FindInvalidReference(
                                 directoryCount, chunk.DestinationFiles, chunk.DestinationOperations) is { } badDest)
                             return new IpcError("IPC_MALFORMED",
                                 $"the service sent a record with an out-of-range directory index: {badDest}");
@@ -349,13 +365,18 @@ public sealed class IpcClient : IAsyncDisposable
         private readonly List<DryRunOperation> _sourceOperations = [];
         private readonly List<DryRunOperation> _destinationOperations = [];
 
+        /// <summary>Rehydrates the chunk's columns into the report's per-record types. This is the one
+        /// place that pays for the wire being columnar while <see cref="DryRunReport"/> stays record-wise
+        /// — a deliberate trade: the assembling overload has no production consumer left (the UI folds
+        /// chunks straight into its own columnar store), so the per-record cost lands only where the
+        /// caller has already opted into holding the whole run.</summary>
         public void OnChunk(DryRunChunkResponse chunk)
         {
-            _directories.AddRange(chunk.Directories);
-            _sourceFiles.AddRange(chunk.SourceFiles);
-            _destinationFiles.AddRange(chunk.DestinationFiles);
-            _sourceOperations.AddRange(chunk.SourceOperations);
-            _destinationOperations.AddRange(chunk.DestinationOperations);
+            _directories.AddRange(DryRunColumns.ToDirectoryRecords(chunk));
+            _sourceFiles.AddRange(DryRunColumns.ToRecords(chunk.SourceFiles));
+            _destinationFiles.AddRange(DryRunColumns.ToRecords(chunk.DestinationFiles));
+            _sourceOperations.AddRange(DryRunColumns.ToRecords(chunk.SourceOperations));
+            _destinationOperations.AddRange(DryRunColumns.ToRecords(chunk.DestinationOperations));
         }
 
         public DryRunReport ToReport(Guid profileId, DryRunCompletion completion) => new()

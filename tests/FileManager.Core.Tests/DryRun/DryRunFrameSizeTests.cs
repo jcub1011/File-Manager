@@ -1,4 +1,4 @@
-using FileManager.Contracts.DryRun;
+﻿using FileManager.Contracts.DryRun;
 using FileManager.Contracts.IPC;
 using FileManager.Contracts.Primitives;
 using FileManager.Contracts.Profiles;
@@ -196,8 +196,8 @@ public sealed class DryRunFrameSizeTests
 
         // Sanity: the sweep really did emit, so a silently-empty sweep can't make this test vacuous.
         int swept = frames.Select(f => f.Frame).OfType<DryRunChunkResponse>()
-            .SelectMany(c => c.DestinationOperations)
-            .Count(o => o.Kind == OperationKind.Deleted);
+            .SelectMany(c => c.DestinationOperations.Kind)
+            .Count(k => k == OperationKind.Deleted);
         Assert.Equal(20_000, swept);
 
         (IpcResponse Frame, int Bytes)[] oversized =

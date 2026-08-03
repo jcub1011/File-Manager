@@ -1,4 +1,4 @@
-using FileManager.Contracts.DryRun;
+﻿using FileManager.Contracts.DryRun;
 using FileManager.Contracts.IPC;
 using FileManager.Contracts.Primitives;
 using FileManager.Contracts.Profiles;
@@ -449,18 +449,19 @@ public sealed class DryRunStreamHandler(
     internal sealed class WireChunkConverter(bool recycleWireRecords = true)
     {
         private readonly DryRunDirectoryTableBuilder _dirs = new();
-        /// <summary>Wire-DTO pools plus the previously returned response. The production consumer
-        /// (<c>IpcServer.ServeStreamAsync</c>) serializes each frame BEFORE requesting the next, so
-        /// by the time <see cref="Convert(DryRunChunk)"/> runs again the previous response's records
-        /// are provably off the wire and can be reused — one chunk's worth of DTOs serves the whole
-        /// stream instead of one per entry. A consumer that buffers responses across chunks (some
-        /// in-proc tests) must construct with <c>recycleWireRecords: false</c>; the byte-identical
-        /// on/off round-trip test is what keeps the recycling path honest. The stream's final
-        /// response is never recycled — one chunk of garbage, not one per chunk.</summary>
-        private readonly Stack<DryRunFile> _filePool = new();
-        private readonly Stack<DryRunOperation> _opPool = new();
-        private readonly Stack<List<DryRunFile>> _fileListPool = new();
-        private readonly Stack<List<DryRunOperation>> _opListPool = new();
+        /// <summary>The previously returned response, reused wholesale. The production consumer
+        /// (<c>IpcServer.ServeStreamAsync</c>) serializes each frame BEFORE requesting the next, so by
+        /// the time <see cref="Convert(DryRunChunk)"/> runs again the previous response is provably off
+        /// the wire and its column buffers can be cleared and refilled — one chunk's worth of buffers
+        /// serves the whole stream. A consumer that buffers responses across chunks (some in-proc tests)
+        /// must construct with <c>recycleWireRecords: false</c>; the byte-identical on/off round-trip
+        /// test is what keeps the recycling path honest.
+        ///
+        /// <para>This used to be four <see cref="Stack{T}"/> pools of <c>DryRunFile</c>/
+        /// <c>DryRunOperation</c> DTOs and their lists, with hand-written return paths that also had to
+        /// null out <c>FileName</c> so a parked instance did not pin a string. Columns removed all of
+        /// it: there is no per-record DTO to pool, so recycling is <see cref="DryRunFileColumns.Clear"/>
+        /// on buffers that keep their capacity.</para></summary>
         private DryRunChunkResponse? _previous;
         /// <summary>Reference-keyed (path → converted triple + root) memo, cleared per chunk. An op's
         /// <c>Path</c>/<c>Root</c> are usually the SAME string instances as its file's — every sweep
@@ -481,93 +482,50 @@ public sealed class DryRunStreamHandler(
             IReadOnlyList<IPhysicalFileView> sourceFiles, IReadOnlyList<IPhysicalFileView> destinationFiles,
             IReadOnlyList<IFileOperationView> sourceOps, IReadOnlyList<IFileOperationView> destinationOps)
         {
-            // Reclaim the previous response's DTOs first — the caller has provably finished with it
-            // (this converter is called once per chunk, after the previous frame went out).
-            if (recycleWireRecords)
-                RecyclePrevious();
-            // Files convert BEFORE ops (memo fill order), matching the wire lists' order anyway.
+            // Reuse the previous response's column buffers first — the caller has provably finished
+            // with it (this converter is called once per chunk, after the previous frame went out).
+            DryRunChunkResponse response = recycleWireRecords && _previous is { } reusable
+                ? Recycled(reusable)
+                : new DryRunChunkResponse();
+            // Files convert BEFORE ops (memo fill order), matching the wire columns' order anyway.
             _sharedPathMemo.Clear();
-            List<DryRunFile> wireSourceFiles = RentFileList(sourceFiles.Count);
             foreach (IPhysicalFileView f in sourceFiles)
-                wireSourceFiles.Add(ConvertFile(f));
-            List<DryRunFile> wireDestinationFiles = RentFileList(destinationFiles.Count);
+                ConvertFile(f, response.SourceFiles);
             foreach (IPhysicalFileView f in destinationFiles)
-                wireDestinationFiles.Add(ConvertFile(f));
-            List<DryRunOperation> wireSourceOps = RentOpList(sourceOps.Count);
+                ConvertFile(f, response.DestinationFiles);
             foreach (IFileOperationView o in sourceOps)
-                wireSourceOps.Add(ConvertOp(o));
-            List<DryRunOperation> wireDestinationOps = RentOpList(destinationOps.Count);
+                ConvertOp(o, response.SourceOperations);
             foreach (IFileOperationView o in destinationOps)
-                wireDestinationOps.Add(ConvertOp(o));
+                ConvertOp(o, response.DestinationOperations);
 
-            DryRunChunkResponse response = new()
+            // The directory slice is a fresh list per chunk either way: FlushNew hands over ownership
+            // of the entries first referenced here, and they are few (one per new directory, not one
+            // per file).
+            IReadOnlyList<DryRunDirectory> newDirectories = _dirs.FlushNew();
+            response.DirectoryName.Clear();
+            response.DirectoryParentIndex.Clear();
+            foreach (DryRunDirectory dir in newDirectories)
             {
-                Directories = _dirs.FlushNew(),
-                SourceFiles = wireSourceFiles,
-                DestinationFiles = wireDestinationFiles,
-                SourceOperations = wireSourceOps,
-                DestinationOperations = wireDestinationOps,
-            };
+                response.DirectoryName.Add(dir.Name);
+                response.DirectoryParentIndex.Add(dir.ParentIndex);
+            }
             _previous = response;
             return response;
         }
 
-        private void RecyclePrevious()
+        /// <summary>Empties the previous response's columns while keeping their capacity, so the whole
+        /// stream runs on one set of buffers. Nothing to un-pin per record the way the old DTO pools had
+        /// to — <c>Clear</c> drops every string reference the columns held.</summary>
+        private static DryRunChunkResponse Recycled(DryRunChunkResponse previous)
         {
-            if (_previous is not { } previous)
-                return;
-            _previous = null;
-            // The response's lists are always this converter's own (created in Convert above), so the
-            // casts hold by construction; the directory slice stays with the GC (tiny, and its
-            // entries are shared immutable records).
-            ReturnFiles((List<DryRunFile>)previous.SourceFiles);
-            ReturnFiles((List<DryRunFile>)previous.DestinationFiles);
-            ReturnOps((List<DryRunOperation>)previous.SourceOperations);
-            ReturnOps((List<DryRunOperation>)previous.DestinationOperations);
+            previous.SourceFiles.Clear();
+            previous.DestinationFiles.Clear();
+            previous.SourceOperations.Clear();
+            previous.DestinationOperations.Clear();
+            return previous;
         }
 
-        private void ReturnFiles(List<DryRunFile> list)
-        {
-            foreach (DryRunFile f in list)
-            {
-                f.FileName = "";   // don't pin the name from a retained slot
-                _filePool.Push(f);
-            }
-            list.Clear();
-            _fileListPool.Push(list);
-        }
-
-        private void ReturnOps(List<DryRunOperation> list)
-        {
-            foreach (DryRunOperation o in list)
-            {
-                o.FileName = "";
-                o.Detail = null;
-                _opPool.Push(o);
-            }
-            list.Clear();
-            _opListPool.Push(list);
-        }
-
-        private List<DryRunFile> RentFileList(int capacity)
-        {
-            if (_fileListPool.Count == 0)
-                return new List<DryRunFile>(capacity);
-            List<DryRunFile> list = _fileListPool.Pop();
-            list.EnsureCapacity(capacity);
-            return list;
-        }
-
-        private List<DryRunOperation> RentOpList(int capacity)
-        {
-            if (_opListPool.Count == 0)
-                return new List<DryRunOperation>(capacity);
-            List<DryRunOperation> list = _opListPool.Pop();
-            list.EnsureCapacity(capacity);
-            return list;
-        }
-
-        private DryRunFile ConvertFile(IPhysicalFileView f)
+        private void ConvertFile(IPhysicalFileView f, DryRunFileColumns columns)
         {
             int dirIndex;
             string fileName;
@@ -585,20 +543,10 @@ public sealed class DryRunStreamHandler(
                 (dirIndex, fileName, rootDirIndex) = _dirs.Convert(f.Path, f.Root);
                 _sharedPathMemo[f.Path] = (dirIndex, fileName, rootDirIndex, f.Root);
             }
-            DryRunFile wire = _filePool.Count > 0
-                ? _filePool.Pop()
-                : new DryRunFile { DirIndex = 0, FileName = "", RootDirIndex = 0, Length = 0, LastWritten = default };
-            // Every property is (re)assigned — a rented instance keeps its previous values.
-            wire.DirIndex = dirIndex;
-            wire.FileName = fileName;
-            wire.RootDirIndex = rootDirIndex;
-            wire.Length = f.Length;
-            wire.LastWritten = f.LastWritten;
-            wire.IsReparsePoint = f.IsReparsePoint;
-            return wire;
+            columns.Add(dirIndex, fileName, rootDirIndex, f.Length, f.LastWritten, f.IsReparsePoint);
         }
 
-        private DryRunOperation ConvertOp(IFileOperationView o)
+        private void ConvertOp(IFileOperationView o, DryRunOperationColumns columns)
         {
             (int DirIndex, string FileName, int RootDirIndex, string Root) hit;
             // Same fast path as ConvertFile — sweep ops carry the identical (directory, name) pair
@@ -613,18 +561,9 @@ public sealed class DryRunStreamHandler(
             {
                 (hit.DirIndex, hit.FileName, hit.RootDirIndex) = _dirs.Convert(o.Path, o.Root);
             }
-            DryRunOperation wire = _opPool.Count > 0
-                ? _opPool.Pop()
-                : new DryRunOperation { DirIndex = 0, FileName = "", RootDirIndex = 0, Kind = default };
-            wire.DirIndex = hit.DirIndex;
-            wire.FileName = hit.FileName;
-            wire.RootDirIndex = hit.RootDirIndex;
-            wire.Kind = o.Kind;
-            wire.SourceIndex = o.SourceIndex;
-            wire.SubjectIndex = o.SubjectIndex;
-            wire.SourceDisposition = o.SourceDisposition;
-            wire.Detail = o.Detail;
-            return wire;
+            columns.Add(
+                hit.DirIndex, hit.FileName, hit.RootDirIndex, o.Kind,
+                o.SourceIndex, o.SubjectIndex, o.SourceDisposition, o.Detail);
         }
     }
 }

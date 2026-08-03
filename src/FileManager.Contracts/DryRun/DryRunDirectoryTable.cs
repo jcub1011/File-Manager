@@ -284,12 +284,22 @@ public sealed class DryRunDirectoryPathBuilder
     public void Append(DryRunDirectory entry)
     {
         ArgumentNullException.ThrowIfNull(entry);
-        if (entry.ParentIndex < -1 || entry.ParentIndex >= Count)
+        Append(entry.Name, entry.ParentIndex);
+    }
+
+    /// <summary>Appends from a (name, parent) pair rather than a <see cref="DryRunDirectory"/> instance.
+    /// The streamed path takes this overload: the wire carries the directory table as two columns, so
+    /// there is no entry object to pass and constructing one per directory purely to satisfy a signature
+    /// would reintroduce exactly the per-record allocation the columnar shape removes.</summary>
+    public void Append(string name, int parentIndex)
+    {
+        ArgumentNullException.ThrowIfNull(name);
+        if (parentIndex < -1 || parentIndex >= Count)
             throw new InvalidOperationException(
-                $"malformed directory table: entry {Count} ('{entry.Name}') has ParentIndex {entry.ParentIndex}");
+                $"malformed directory table: entry {Count} ('{name}') has ParentIndex {parentIndex}");
         if (Count == _paths.Length)
             Array.Resize(ref _paths, _paths.Length == 0 ? 64 : _paths.Length * 2);
-        _paths[Count] = entry.ParentIndex < 0 ? entry.Name : Path.Join(_paths[entry.ParentIndex], entry.Name);
+        _paths[Count] = parentIndex < 0 ? name : Path.Join(_paths[parentIndex], name);
         Count++;
     }
 

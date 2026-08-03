@@ -61,6 +61,35 @@ public static class IpcSerializer
         }
     }
 
+    /// <summary>Deserializes from a borrowed region instead of an exact-size <c>byte[]</c> — the read-side
+    /// counterpart to <see cref="SerializeResponse(IpcResponse, IBufferWriter{byte})"/>, and for the same
+    /// reason: a streamed dry run's chunk frames are megabytes each, so an exact-size array per frame is
+    /// a Large Object Heap allocation per frame. This overload lets the client read into one reused
+    /// buffer and parse the written span in place.
+    ///
+    /// <para>Identical semantics to the array overload, including going through the BASE-type
+    /// <c>JsonTypeInfo</c> so the <c>"type"</c> discriminator is honoured.</para></summary>
+    public static Result<IpcResponse, string> DeserializeResponse(ReadOnlySpan<byte> payload)
+    {
+        try
+        {
+            IpcResponse? parsed = JsonSerializer.Deserialize(payload, FileManagerJsonContext.Default.IpcResponse);
+            if (parsed is null)
+                return "the response payload deserialized to null";
+            return parsed;
+        }
+        catch (JsonException ex)
+        {
+            return $"malformed response: {ex.Message}";
+        }
+        catch (Exception ex)
+        {
+            // Last resort: an unexpected exception becomes a traceable failure value (callers
+            // log every failure).
+            return $"response deserialization failed unexpectedly: {ex.GetType().Name}: {ex.Message}";
+        }
+    }
+
     /// <summary>Failure on malformed JSON or an unknown discriminator, carrying the parse detail
     /// so callers can log why the frame was rejected (never throws for bad input from the wire).</summary>
     public static Result<IpcResponse, string> DeserializeResponse(byte[] payload)

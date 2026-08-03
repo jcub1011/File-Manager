@@ -142,6 +142,125 @@
 > Two things tried and reverted rather than shipped as neutral diffs: resetting `PendingRebuild` in
 > `Clear()` (the completed Task does release its state machine) and a `GC.WaitForPendingFinalizers()`
 > between the trim's two passes (nothing is blocked on finalization).
+>
+> **11. Item (2): the 605 MB decomposed, and the frame-buffer half fixed.** The "rest" is no longer a
+> subtraction. `DryRunStreamAllocationTests` measures one realistic deep-shape chunk (20,000 files →
+> 58,340 wire records, a **7.4 MB** frame):
+>
+> | Phase | Cost | Per wire record |
+> |---|---:|---:|
+> | Frame buffer (`ReadFrameAsync`) | 7.4 MB | **133 B** |
+> | JSON deserialize (`DeserializeResponse`) | 19.7 MB | **355 B** |
+> | Fold into the store (`OnChunk`) | 3.9 MB | **71 B** |
+>
+> **Decode is 6.9× the fold.** The store's columnar folding — the thing three passes of work went into —
+> is already the cheap part; the wire decode above it costs seven times as much. Scaled to the measured
+> run (~730k wire records) that is ~97 MB of frame buffers and ~260 MB of deserialization against ~52 MB
+> of folding, which accounts for the bulk of the 605 MB.
+>
+> Note the frame size: at 7.4 MB **every chunk frame was a Large Object Heap allocation**, and the LOH is
+> uncompacted by default and only collected on a gen2 — the churn that becomes lasting committed memory
+> rather than a transient read, which is the same finding Stage 1 recorded service-side.
+>
+> **Fixed:** `IpcFrameCodec.ReadFrameAsync(Stream, ArrayBufferWriter<byte>, ct)` plus
+> `IpcSerializer.DeserializeResponse(ReadOnlySpan<byte>)`, and the client's streamed loop now clears and
+> reuses one buffer for the whole run instead of allocating an exact-size array per frame. Both are
+> *additive* — the array overloads are untouched, so no existing caller moves. This is the read-side
+> mirror of the server's existing `SerializeResponse(IpcResponse, IBufferWriter<byte>)`, which exists for
+> exactly this reason. §11's rejection of pooling this path was scoped to the service ("for no
+> *service*-side benefit"); the client is the consumer that benefits.
+> `Reading_frames_into_a_reused_buffer_costs_one_buffer_not_one_per_frame` gates it, and asserts both
+> paths decode byte-identical payloads — deliberately using *descending* frame sizes, because a stale tail
+> from a longer previous frame is the failure mode a reused buffer invites.
+>
+> **Still open — the biggest single number left: JSON deserialization at ~360 B/record (~260 MB/run).**
+> Every chunk materializes a `DryRunFile`/`DryRunOperation` per row, the `List<>`s holding them, and a
+> string per `FileName`, all of which the store folds and drops immediately.
+>
+> **12. What the deserialization cost is actually made of — two corrections.**
+>
+> **(a) The wire types are not records, and converting them to value types is a bad trade.** They were
+> described above as records; `DryRunFile` and `DryRunOperation` are `sealed class` with mutable `set`
+> properties and hand-written `IEquatable`, deliberately, because `DryRunStreamHandler` pools them
+> (`_filePool`, `_fileListPool`, `DryRunStreamHandler.cs:460-588`) and the batched builder remaps indices
+> in place rather than via `with{}`. Only `DryRunDirectory` is a record. On the merits:
+> - *Polymorphism is unaffected.* `[JsonPolymorphic]` + the 16 `[JsonDerivedType]` entries sit on
+>   **`IpcResponse`** (`IpcResponse.cs:10-26`); the payload types inside `DryRunChunkResponse` carry no
+>   discriminator and have no derived types. (This would be a hard blocker if the *discriminated* types
+>   were structs — STJ cannot do polymorphic serialization of value types at all — but they can't be.)
+> - *The saving is ~24 B of ~360 B/record ≈ 7%*, not the "perhaps a third" claimed above: a `DryRunFile`'s
+>   fields are ~48 B, so a struct saves the 16 B header plus the 8 B array slot and nothing else. The
+>   `FileName` string is untouched.
+> - *It would make LOH churn worse.* `List<DryRunFile>` goes from 8 B/element (160 KB per 20k chunk) to
+>   ~48 B/element (~960 KB), and STJ grows a `List<T>` by doubling — six times the large-array traffic to
+>   save 7%, in the same heap region item (2) above just stopped churning.
+> - *It is not client-only.* Structs cannot be pooled, so `_filePool`/`_fileListPool` would have to become
+>   array reuse, deleting an optimization documented as load-bearing for in-run peak commit, and touching
+>   the engine, service and CLI.
+>
+>   **Verdict: no.**
+>
+> **(b) Strings are a minority of deserialization, not the bulk.**
+> `Object_materialization_not_strings_dominates_chunk_deserialization` deserializes the same chunk twice,
+> the second time with every `FileName` emptied and `Detail` nulled (STJ returns the interned
+> `string.Empty` for `""`, so the stripped pass allocates no name strings): strings are **15–20%**
+> (~3–4 MB of ~20 MB; the figure is a difference of two allocation counters, so it moves a few points
+> between runs), and object materialization plus lists is **~80%**. And that 80% is **per-record**, not a
+> fixed whole-payload cost — 345 B/record at 30,674 records vs 375 at 58,340 — so it is not polymorphic
+> buffering.
+>
+> This inverts the rationale for the reader-based fold rather than removing it. The case is *not* "avoid
+> the per-name string" (worth 15–20%); it is "skip STJ's per-record object materialization entirely"
+> (worth ~80%), which a `Utf8JsonReader` loop writing straight into the store's columns would capture.
+> It also means **candidate A stays closed**: the earlier note that a reader fold "un-rejects" the UTF-8
+> name blob by also cutting a large slice of the transient was wrong — the name strings are only 15–20% of
+> decode, so A remains a ~23 MB retained-heap change on its own merits.
+>
+> **13. The columnar wire, implemented (protocol v8).** A hand-rolled reader was the wrong first move:
+> it would have added a second definition of the wire format that the compiler cannot check against the
+> property declarations, when the per-record cost could be removed with *one* source-generated definition
+> by changing the arrangement instead of bypassing the serializer. `DryRunChunkResponse` now carries a
+> column per field (`DirectoryName`/`DirectoryParentIndex`, and `DryRunFileColumns`/
+> `DryRunOperationColumns` groups) rather than lists of `DryRunDirectory`/`DryRunFile`/`DryRunOperation`.
+>
+> Measured, same fixture as finding 12 (20,000 files / 58,340 wire records):
+>
+> | | record-wise | columnar | |
+> |---|---:|---:|---|
+> | Wire frame | 7.39 MB (133 B/rec) | **3.6 MB** (62 B/rec) | **−51%** |
+> | Deserialize | 19.72 MB (355 B/rec) | **11.1 MB** (199 B/rec) | **−44%** |
+> | Decode ÷ fold | 7.2× | **3.7×** | |
+>
+> The wire shrank because a record-wise encoding repeats every property name once per record and those
+> names were ~55% of the payload. Deserialization beat the −33% the costing experiment predicted, because
+> production uses `List<T>` columns where the experiment used `T[]`: System.Text.Json fills a growable
+> buffer and then copies it to an exact array, and `List<T>` skips that final copy.
+>
+> Scaled to the measured run (~730k wire records), and remembering the frame buffer is already pooled so
+> its allocation is near zero: decode ~260 MB → ~145 MB, i.e. **~115 MB off the 605 MB (19%)**, plus half
+> the wire bytes — which also cuts the service's serialize cost and pipe traffic, so its 292 MB improves
+> too.
+>
+> **What the shape cost, and what it removed.** It removes an invariant records gave for free: columns
+> within a group must agree in length, and ragged columns would pair one file's name with another's
+> directory. `DryRunColumns.FindRaggedColumn` is the trust-boundary check, run *before* any positional
+> read, rejecting as `IPC_MALFORMED`. Against that, it deleted the converter's four DTO pools
+> (`_filePool`/`_opPool`/`_fileListPool`/`_opListPool`), their return paths, and the `FileName = ""`
+> un-pinning — recycling is now `Clear()` on buffers that keep their capacity. `DryRunReport` and the
+> record types are unchanged: the batched path has no production consumer left (no CLI), so the
+> assembling sink rehydrates columns into records via `DryRunColumns.ToRecords`, which is documented as
+> never-on-an-ingest-path.
+>
+> **The split moved again, as expected.** Post-columnar, deserialization is 11.1 MB of which strings are
+> 4.0 MB (**35%**) and lists+reader 7.1 MB (64%) — the same 4.0 MB of strings as before, now a larger
+> share of a smaller total. The guard added in finding 12 failed on exactly this and was the thing that
+> flagged it. The test is now named for what it measures rather than for a conclusion, having had two
+> conclusion-shaped names invert under it.
+>
+> **Still open: the `Utf8JsonReader` fold**, now worth ~11 MB/chunk rather than ~20 — it would capture
+> both the 64% remainder and most of the 35%, since a reader can hash a name's UTF-8 bytes and only
+> materialize strings the store has not already interned. Same drift caveat as before, same mitigation
+> (reader in Contracts beside the types, differential conformance test, enum exhaustiveness).
 
 > **Status: RESEARCH BRIEF, not a plan.** Nothing here is approved work. The deliverable is a
 > recommendation with numbers behind it — including "stop here", which is a legitimate and

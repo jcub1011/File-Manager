@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using FileManager.Contracts.DryRun;
 using FileManager.Contracts.IPC;
@@ -64,7 +64,7 @@ public sealed class DryRunRowStore : IDryRunChunkSink
     private ColumnBuffer<long>? _destFileLength;
     private Dictionary<string, string>? _names = new(StringComparer.Ordinal);
     private Dictionary<string, int>? _detailIds = new(StringComparer.Ordinal);
-    private List<DryRunOperation>? _deferredSourceOps;   // see ApplySourceOperation; normally stays null
+    private List<DeferredSourceOp>? _deferredSourceOps;   // see ApplySourceOperation; normally stays null
 
     // Detail strings are a small closed set in practice ("exclude *.tmp", "identical content
     // (SHA-256)", "kept", a conflict rename's target …) but arrive as a fresh instance per record.
@@ -127,15 +127,19 @@ public sealed class DryRunRowStore : IDryRunChunkSink
         if (IsCompleted)
             throw new InvalidOperationException("the store is completed and can no longer ingest chunks");
 
-        foreach (DryRunDirectory dir in chunk.Directories)
-            _directories.Append(dir);
+        // Column to column now that the wire is columnar too, so this is close to a bulk copy — no
+        // wire object is read, because none was built. The trust boundary has already rejected a chunk
+        // whose columns disagree in length, so indexing them in lockstep is safe here.
+        for (int i = 0; i < chunk.DirectoryName.Count; i++)
+            _directories.Append(chunk.DirectoryName[i], chunk.DirectoryParentIndex[i]);
 
-        foreach (DryRunFile file in chunk.SourceFiles)
+        DryRunFileColumns sourceFiles = chunk.SourceFiles;
+        for (int i = 0; i < sourceFiles.Count; i++)
         {
-            _srcDir.Add(file.DirIndex);
-            _srcRootDir.Add(file.RootDirIndex);
-            _srcName.Add(Intern(file.FileName));
-            _srcSize.Add(file.Length);
+            _srcDir.Add(sourceFiles.DirIndex[i]);
+            _srcRootDir.Add(sourceFiles.RootDirIndex[i]);
+            _srcName.Add(Intern(sourceFiles.FileName[i]));
+            _srcSize.Add(sourceFiles.Length[i]);
             _srcKind.Add(0);
             _srcDisposition.Add(0);
             _srcDetail.Add(-1);
@@ -144,22 +148,26 @@ public sealed class DryRunRowStore : IDryRunChunkSink
         // Only their lengths matter — a destination operation's size is the pre-existing file it
         // touches when it carries no incoming content. Nothing else about these files is displayed,
         // so nothing else is kept, and even the lengths are dropped once Complete has folded them in.
-        foreach (DryRunFile file in chunk.DestinationFiles)
-            _destFileLength!.Add(file.Length);
+        // Columnar makes this literal: the other five columns are never touched.
+        List<long> destinationLengths = chunk.DestinationFiles.Length;
+        for (int i = 0; i < destinationLengths.Count; i++)
+            _destFileLength!.Add(destinationLengths[i]);
 
-        foreach (DryRunOperation op in chunk.SourceOperations)
-            ApplySourceOperation(op, defer: true);
+        DryRunOperationColumns sourceOps = chunk.SourceOperations;
+        for (int i = 0; i < sourceOps.Count; i++)
+            ApplySourceOperation(sourceOps, i, defer: true);
 
-        foreach (DryRunOperation op in chunk.DestinationOperations)
+        DryRunOperationColumns destinationOps = chunk.DestinationOperations;
+        for (int i = 0; i < destinationOps.Count; i++)
         {
-            _opDir.Add(op.DirIndex);
-            _opRootDir.Add(op.RootDirIndex);
-            _opName.Add(Intern(op.FileName));
-            _opKind.Add((byte)op.Kind);
-            _opDetail.Add(DetailId(op.Detail));
+            _opDir.Add(destinationOps.DirIndex[i]);
+            _opRootDir.Add(destinationOps.RootDirIndex[i]);
+            _opName.Add(Intern(destinationOps.FileName[i]));
+            _opKind.Add((byte)destinationOps.Kind[i]);
+            _opDetail.Add(DetailId(destinationOps.Detail[i]));
             _opSize.Add(0);                 // resolved in Complete, once every file list is in
-            _opSource!.Add(op.SourceIndex);
-            _opSubject!.Add(op.SubjectIndex);
+            _opSource!.Add(destinationOps.SourceIndex[i]);
+            _opSubject!.Add(destinationOps.SubjectIndex[i]);
         }
     }
 
@@ -172,23 +180,36 @@ public sealed class DryRunRowStore : IDryRunChunkSink
     /// replaced read the assembled report and was order-independent by construction. Deferring rather
     /// than dropping keeps that property: an operation that somehow arrives before its file still
     /// lands, instead of silently leaving the row reading as an un-annotated Processed.</para></summary>
-    private void ApplySourceOperation(DryRunOperation op, bool defer)
+    private void ApplySourceOperation(DryRunOperationColumns ops, int index, bool defer) =>
+        ApplySourceOperation(
+            ops.SourceIndex[index], ops.Kind[index], ops.SourceDisposition[index],
+            // Resolved to an id NOW, while the chunk's strings are still valid — a deferred op must not
+            // hold a reference into a chunk the sink contract says is dead after OnChunk returns.
+            DetailId(ops.Detail[index]),
+            defer);
+
+    private void ApplySourceOperation(int i, OperationKind kind, OnSuccessAction? disposition, int detailId, bool defer)
     {
-        int i = op.SourceIndex;
         if (i < 0)
             return;
         if (i >= _srcKind.Count)
         {
             if (defer)
-                (_deferredSourceOps ??= []).Add(op);
+                (_deferredSourceOps ??= []).Add(new DeferredSourceOp(i, kind, disposition, detailId));
             return;   // still out of range after every file is in: a producer bug, dropped
         }
         if (_srcKind[i] != 0)
             return;   // first operation for this file wins
-        _srcKind[i] = (byte)(op.Kind + 1);
-        _srcDisposition[i] = op.SourceDisposition is { } disposition ? (byte)(disposition + 1) : (byte)0;
-        _srcDetail[i] = DetailId(op.Detail);
+        _srcKind[i] = (byte)(kind + 1);
+        _srcDisposition[i] = disposition is { } d ? (byte)(d + 1) : (byte)0;
+        _srcDetail[i] = detailId;
     }
+
+    /// <summary>A source operation that outran its file, held until <see cref="Complete"/> replays it.
+    /// Values are copied out rather than referencing the chunk, which is not valid after
+    /// <see cref="OnChunk"/> returns; the detail is already an id into <c>_details</c>, so nothing here
+    /// pins a wire string.</summary>
+    private readonly record struct DeferredSourceOp(int SourceIndex, OperationKind Kind, OnSuccessAction? Disposition, int DetailId);
 
     /// <summary>Deduplicates a file name against everything already ingested. A destination
     /// operation's name is almost always its source file's (a copy preserves the name), and names
@@ -229,8 +250,8 @@ public sealed class DryRunRowStore : IDryRunChunkSink
         // Any source operation that outran its file. Empty on every well-formed run.
         if (_deferredSourceOps is { } deferred)
         {
-            foreach (DryRunOperation op in deferred)
-                ApplySourceOperation(op, defer: false);
+            foreach (DeferredSourceOp op in deferred)
+                ApplySourceOperation(op.SourceIndex, op.Kind, op.Disposition, op.DetailId, defer: false);
             _deferredSourceOps = null;
         }
 
@@ -401,14 +422,9 @@ public sealed class DryRunRowStore : IDryRunChunkSink
     {
         ArgumentNullException.ThrowIfNull(report);
         DryRunRowStore store = CreateForIngest();
-        store.OnChunk(new DryRunChunkResponse
-        {
-            Directories = report.Directories,
-            SourceFiles = report.SourceFiles,
-            DestinationFiles = report.DestinationFiles,
-            SourceOperations = report.SourceOperations,
-            DestinationOperations = report.DestinationOperations,
-        });
+        store.OnChunk(DryRunColumns.ToChunk(
+            report.Directories, report.SourceFiles, report.DestinationFiles,
+            report.SourceOperations, report.DestinationOperations));
         store.Complete();
         return store;
     }

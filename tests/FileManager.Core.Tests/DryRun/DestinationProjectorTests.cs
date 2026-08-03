@@ -1,4 +1,4 @@
-using FileManager.Contracts.DryRun;
+﻿using FileManager.Contracts.DryRun;
 using FileManager.Contracts.IPC;
 using FileManager.Contracts.Primitives;
 using FileManager.Contracts.Profiles;
@@ -489,12 +489,12 @@ public sealed class DestinationProjectorTests : IDisposable
         Assert.True(frames.Count > 1, "expected the small budget to split the sweep into several frames");
         // Wire records are immutable snapshots, so recycled carriers must not have leaked into them:
         // exactly the expected file names, each exactly once, and every op resolving to its file.
-        List<DryRunDirectory> directories = [.. frames.SelectMany(f => f.Directories)];
+        List<DryRunDirectory> directories = [.. frames.SelectMany(DryRunColumns.ToDirectoryRecords)];
         string[] dirPaths = DryRunDirectoryTable.Materialize(directories);
-        List<DryRunFile> files = [.. frames.SelectMany(f => f.DestinationFiles)];
+        List<DryRunFile> files = [.. frames.SelectMany(f => DryRunColumns.ToRecords(f.DestinationFiles))];
         Assert.Equal(expected, files.Select(f => f.FileName).ToHashSet());
         Assert.All(files, f => Assert.StartsWith(_target, dirPaths[f.DirIndex]));
-        Assert.All(frames.SelectMany(f => f.DestinationOperations), o => Assert.Equal(OperationKind.Deleted, o.Kind));
+        Assert.All(frames.SelectMany(f => f.DestinationOperations.Kind), k => Assert.Equal(OperationKind.Deleted, k));
     }
 
     [Fact]

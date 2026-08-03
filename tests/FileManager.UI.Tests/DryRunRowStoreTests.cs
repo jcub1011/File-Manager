@@ -1,4 +1,4 @@
-using System.Collections;
+﻿using System.Collections;
 using FileManager.Contracts.DryRun;
 using FileManager.Contracts.IPC;
 using FileManager.Contracts.Profiles;
@@ -30,14 +30,8 @@ public sealed class DryRunRowStoreTests
         IReadOnlyList<DryRunFile> sourceFiles,
         IReadOnlyList<DryRunOperation> sourceOps,
         IReadOnlyList<DryRunFile> destinationFiles,
-        IReadOnlyList<DryRunOperation> destinationOps) => new()
-        {
-            Directories = directories,
-            SourceFiles = sourceFiles,
-            SourceOperations = sourceOps,
-            DestinationFiles = destinationFiles,
-            DestinationOperations = destinationOps,
-        };
+        IReadOnlyList<DryRunOperation> destinationOps) =>
+        DryRunColumns.ToChunk(directories, sourceFiles, destinationFiles, sourceOps, destinationOps);
 
     // ── Ingest ───────────────────────────────────────────────────────────────────────────────────
 

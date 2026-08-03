@@ -70,13 +70,34 @@ public sealed record DryRunResponse : IpcResponse { public required DryRunReport
 /// after this chunk's entries are appended. The consumer appends <see cref="Directories"/> before
 /// reading the files/ops, exactly as it already appends the file lists.
 /// </para></summary>
+/// <para><strong>Columnar, not one object per record</strong>, and this is the shape's whole point.
+/// Measured on a 20,000-file chunk (58,340 wire records), against the previous list-of-objects form:
+/// the frame shrinks <strong>7.39 MB → 3.62 MB (−52%)</strong>, because a record-wise encoding repeats
+/// every property name once per record and those names were ~55% of the payload; and deserializing it
+/// allocates <strong>19.72 MB → 13.31 MB (−33%)</strong>, because System.Text.Json no longer
+/// materializes a <c>DryRunFile</c>/<c>DryRunOperation</c> per row. The client's store is itself
+/// columnar, so folding a chunk becomes close to a bulk copy. It also lines the wire up with one
+/// source-generated definition rather than needing a hand-written reader — see
+/// <c>docs/dry-run-ui-memory-next-steps.md</c>.</para>
+/// <para><strong>Columns within a group must be the same length</strong> — that is the one invariant
+/// records gave for free and this shape does not. Ragged columns would silently misalign rows (a file's
+/// name paired with another's directory), which in a preview a user approves destructive operations from
+/// is a correctness fault, not a cosmetic one. <see cref="DryRunColumns.FindRaggedColumn"/> is the
+/// trust-boundary check, and the client rejects a ragged chunk as <c>IPC_MALFORMED</c>.</para>
+/// <para>Mutable <see cref="List{T}"/> columns rather than <c>init</c> arrays, deliberately and for the
+/// same reason <see cref="DryRunFile"/> is a mutable class: the service reuses one chunk's column buffers
+/// for the whole stream (<c>Clear</c> + refill) instead of allocating per chunk. A consumer that buffers
+/// responses across chunks must ask the converter not to recycle.</para></summary>
 public sealed record DryRunChunkResponse : IpcResponse
 {
-    public IReadOnlyList<DryRunDirectory> Directories { get; init; } = [];
-    public IReadOnlyList<DryRunFile> SourceFiles { get; init; } = [];
-    public IReadOnlyList<DryRunFile> DestinationFiles { get; init; } = [];
-    public IReadOnlyList<DryRunOperation> SourceOperations { get; init; } = [];
-    public IReadOnlyList<DryRunOperation> DestinationOperations { get; init; } = [];
+    /// <summary>The directory entries first referenced by this chunk, in global index order —
+    /// <c>DirectoryName[i]</c> and <c>DirectoryParentIndex[i]</c> are one entry.</summary>
+    public List<string> DirectoryName { get; set; } = [];
+    public List<int> DirectoryParentIndex { get; set; } = [];
+    public DryRunFileColumns SourceFiles { get; set; } = new();
+    public DryRunFileColumns DestinationFiles { get; set; } = new();
+    public DryRunOperationColumns SourceOperations { get; set; } = new();
+    public DryRunOperationColumns DestinationOperations { get; set; } = new();
 }
 /// <summary>An informational progress snapshot interleaved in a streamed dry run. Zero or more may
 /// appear anywhere in the stream before the <see cref="DryRunCompleteResponse"/> terminator; they

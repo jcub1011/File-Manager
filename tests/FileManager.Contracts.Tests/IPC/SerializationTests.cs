@@ -60,7 +60,7 @@ public sealed class SerializationTests
         { new MatchingProfilesResponse { Matches = [] }, "matching" },
         { new RunProfileResponse { QueuedCount = 1, Scanning = false, RunId = SomeId }, "run-profile-result" },
         { new DryRunResponse { Report = SampleReport() }, "dry-run-report" },
-        { new DryRunChunkResponse { Directories = SampleDirectories(), SourceFiles = [SampleWireFile()], SourceOperations = [SampleWireSourceOp()] }, "dry-run-chunk" },
+        { DryRunColumns.ToChunk(SampleDirectories(), sourceFiles: [SampleWireFile()], sourceOperations: [SampleWireSourceOp()]), "dry-run-chunk" },
         { new DryRunProgressResponse { Phase = DryRunProgressPhase.ScanningSources, SourceFiles = 1, DestinationFiles = 2 }, "dry-run-progress" },
         { new DryRunCompleteResponse { GeneratedAt = DateTimeOffset.UnixEpoch, Truncated = false }, "dry-run-complete" },
         { new RecentJobsResponse { Jobs = [] }, "recent-jobs" },
@@ -109,7 +109,7 @@ public sealed class SerializationTests
     [Fact]
     public void Current_protocol_version_is_pinned()
     {
-        Assert.Equal(7, IpcRequest.CurrentProtocolVersion);
+        Assert.Equal(8, IpcRequest.CurrentProtocolVersion);
     }
 
     /// <summary>JobPhase must stay a string on the wire (the context sets UseStringEnumConverter), so
@@ -324,29 +324,24 @@ public sealed class SerializationTests
         {
             Path = @"C:\t\one.txt", Root = @"C:\t", Kind = OperationKind.Overwrite, SourceIndex = 0, SubjectIndex = 0,
         });
-        byte[] wire = IpcSerializer.SerializeResponse(new DryRunChunkResponse
-        {
-            Directories = dirs.FlushNew(),
-            SourceFiles = [sourceFile],
-            DestinationFiles = [destinationFile],
-            SourceOperations = [sourceOp],
-            DestinationOperations = [destOp],
-        });
+        byte[] wire = IpcSerializer.SerializeResponse(DryRunColumns.ToChunk(
+            dirs.FlushNew(), [sourceFile], [destinationFile], [sourceOp], [destOp]));
 
         Assert.True(IpcSerializer.DeserializeResponse(wire).TryGetValue(out IpcResponse? reparsed));
         DryRunChunkResponse chunk = Assert.IsType<DryRunChunkResponse>(reparsed);
 
         // The table survives the round-trip and resolves the records back to the original paths.
-        string[] paths = DryRunDirectoryTable.Materialize(chunk.Directories);
-        DryRunFile parsedSource = Assert.Single(chunk.SourceFiles);
-        Assert.Equal(@"C:\a\one.txt", System.IO.Path.Join(paths[parsedSource.DirIndex], parsedSource.FileName));
-        Assert.Equal(@"C:\a", paths[parsedSource.RootDirIndex]);
-        DryRunFile parsedDestination = Assert.Single(chunk.DestinationFiles);
-        Assert.Equal(@"C:\t\one.txt", System.IO.Path.Join(paths[parsedDestination.DirIndex], parsedDestination.FileName));
-        Assert.Equal(OperationKind.Processed, Assert.Single(chunk.SourceOperations).Kind);
-        DryRunOperation parsedDestOp = Assert.Single(chunk.DestinationOperations);
-        Assert.Equal(0, parsedDestOp.SourceIndex);
-        Assert.Equal(0, parsedDestOp.SubjectIndex);
+        string[] paths = DryRunDirectoryTable.Materialize(
+            [.. chunk.DirectoryName.Select((name, i) => new DryRunDirectory(name, chunk.DirectoryParentIndex[i]))]);
+        Assert.Equal(1, chunk.SourceFiles.Count);
+        Assert.Equal(@"C:\a\one.txt", System.IO.Path.Join(paths[chunk.SourceFiles.DirIndex[0]], chunk.SourceFiles.FileName[0]));
+        Assert.Equal(@"C:\a", paths[chunk.SourceFiles.RootDirIndex[0]]);
+        Assert.Equal(1, chunk.DestinationFiles.Count);
+        Assert.Equal(@"C:\t\one.txt", System.IO.Path.Join(paths[chunk.DestinationFiles.DirIndex[0]], chunk.DestinationFiles.FileName[0]));
+        Assert.Equal(OperationKind.Processed, Assert.Single(chunk.SourceOperations.Kind));
+        Assert.Equal(1, chunk.DestinationOperations.Count);
+        Assert.Equal(0, chunk.DestinationOperations.SourceIndex[0]);
+        Assert.Equal(0, chunk.DestinationOperations.SubjectIndex[0]);
     }
 
     [Fact]

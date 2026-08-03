@@ -1,5 +1,6 @@
 using FileManager.Contracts.Primitives;
 using System;
+using System.Buffers;
 using System.Buffers.Binary;
 using System.IO;
 using System.Threading;
@@ -67,6 +68,72 @@ public static class IpcFrameCodec
             // Last resort: an unexpected exception becomes a traceable failure value (callers
             // log every failure) instead of faulting the connection task.
             return $"write failed unexpectedly: {ex.GetType().Name}: {ex.Message}";
+        }
+    }
+
+    /// <summary>Reads one frame into a caller-owned buffer instead of a fresh exact-size <c>byte[]</c>,
+    /// returning the payload length; the payload is <c>destination.WrittenSpan</c>. The read-side mirror
+    /// of <c>IpcSerializer.SerializeResponse(IpcResponse, IBufferWriter&lt;byte&gt;)</c>, and for the same
+    /// reason.
+    ///
+    /// <para>Exists for the client's streamed dry-run loop, where one run delivers many multi-megabyte
+    /// chunk frames. Measured: a 20,000-file chunk serializes to a <strong>7.4 MB</strong> frame — every
+    /// frame the array overload returns is therefore a Large Object Heap allocation, and the LOH is
+    /// uncompacted by default and only collected on a gen2, so the churn becomes lasting committed memory
+    /// rather than a transient read. A run at the streamed cap allocated <strong>133 bytes per wire
+    /// record</strong> in frame buffers alone. A caller that <c>Clear()</c>s and reuses one
+    /// <see cref="ArrayBufferWriter{T}"/> turns all of it into one buffer that grows once.</para>
+    ///
+    /// <para><c>docs/dry-run-service-memory.md</c> §11 rejected pooling this path "for no
+    /// <em>service</em>-side benefit" — correct, and scoped to the service: the server writes frames and
+    /// already pools that side. This is the consumer that benefits, and it is added alongside the array
+    /// overload rather than changing it, so no existing caller moves.</para>
+    ///
+    /// <para>Failure semantics are identical to the array overload. On failure nothing is written.</para></summary>
+    public static async Task<Result<int, string>> ReadFrameAsync(
+        Stream stream, ArrayBufferWriter<byte> destination, CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(stream);
+        ArgumentNullException.ThrowIfNull(destination);
+
+        byte[] header = new byte[HeaderBytes];
+        try
+        {
+            // First byte read separately so clean EOF at a frame boundary is distinguishable
+            // from a frame torn mid-header.
+            int first = await stream.ReadAsync(header.AsMemory(0, 1), ct).ConfigureAwait(false);
+            if (first == 0)
+                return ConnectionClosedMessage;
+            await stream.ReadExactlyAsync(header.AsMemory(1, HeaderBytes - 1), ct).ConfigureAwait(false);
+
+            int length = BinaryPrimitives.ReadInt32LittleEndian(header);
+            if (length <= 0 || length > MaxPayloadBytes)
+                return $"invalid frame length {length}";
+
+            // GetMemory may hand back more than requested; Advance commits exactly the frame's length so
+            // WrittenSpan is the payload and nothing else.
+            Memory<byte> destinationMemory = destination.GetMemory(length)[..length];
+            await stream.ReadExactlyAsync(destinationMemory, ct).ConfigureAwait(false);
+            destination.Advance(length);
+            return length;
+        }
+        catch (EndOfStreamException)
+        {
+            return "connection closed mid-frame";
+        }
+        catch (OperationCanceledException)
+        {
+            return Result<int, string>.Canceled();
+        }
+        catch (Exception ex) when (ex is IOException or ObjectDisposedException)
+        {
+            return $"read failed: {ex.Message}";
+        }
+        catch (Exception ex)
+        {
+            // Last resort: an unexpected exception becomes a traceable failure value (callers
+            // log every failure) instead of faulting the connection task.
+            return $"read failed unexpectedly: {ex.GetType().Name}: {ex.Message}";
         }
     }
 

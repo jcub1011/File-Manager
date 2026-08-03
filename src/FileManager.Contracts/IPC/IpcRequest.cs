@@ -39,9 +39,18 @@ public abstract record IpcRequest
     /// the engine never read, so it moved to the UI's own client-settings.json. Also adds
     /// EngineStatusSnapshot.ExecutablePath, so a client can tell WHICH executable is serving it, and
     /// EngineStatusSnapshot.StartupWarning, which carries a degraded-startup problem to clients that
-    /// connect after the corresponding engine-warning event was published.
+    /// connect after the corresponding engine-warning event was published;
+    /// 8 — DryRunChunkResponse became columnar: one array per field (DirectoryName/DirectoryParentIndex,
+    /// and SourceFiles/DestinationFiles/SourceOperations/DestinationOperations as column groups) instead
+    /// of a list of DryRunDirectory/DryRunFile/DryRunOperation objects. Measured on a 20,000-file chunk:
+    /// the frame drops 7.39 MB to 3.62 MB (a record-wise encoding repeats every property name once per
+    /// record, and those names were ~55% of the payload) and client-side deserialization allocates
+    /// 13.31 MB instead of 19.72 MB. See docs/dry-run-ui-memory-next-steps.md for the full figures. This
+    /// is a breaking wire change with no compatible reading — an old client would see every collection
+    /// as absent and render an empty preview, which is exactly the silent-wrong-answer this version
+    /// gate exists to prevent.
     /// A mismatched service/UI pair must fail loud (IPC_VERSION_MISMATCH), never half-parse.</summary>
-    public const int CurrentProtocolVersion = 7;
+    public const int CurrentProtocolVersion = 8;
 
     public int ProtocolVersion { get; init; } = CurrentProtocolVersion;
 }

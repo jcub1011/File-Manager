@@ -1,4 +1,4 @@
-using FileManager.Contracts.DryRun;
+﻿using FileManager.Contracts.DryRun;
 using FileManager.Contracts.IPC;
 using FileManager.Contracts.Primitives;
 using FileManager.Contracts.Profiles;
@@ -224,11 +224,11 @@ public sealed class DryRunStreamHandlerTests
         {
             if (frame is not DryRunChunkResponse chunk)
                 continue;
-            directories.AddRange(chunk.Directories);
+            directories.AddRange(DryRunColumns.ToDirectoryRecords(chunk));
             if (chunk.DestinationFiles.Count > 0)
                 chunkFrames++;
-            foreach (DryRunFile file in chunk.DestinationFiles)
-                swept.Add((file.DirIndex, file.FileName));
+            for (int i = 0; i < chunk.DestinationFiles.Count; i++)
+                swept.Add((chunk.DestinationFiles.DirIndex[i], chunk.DestinationFiles.FileName[i]));
         }
 
         // More than one sweep frame, or RecyclePrevious never ran and this proves nothing.
@@ -401,9 +401,8 @@ public sealed class DryRunStreamHandlerTests
 
     private static List<OperationKind> DeletedKinds(List<IpcResponse> frames) =>
         frames.OfType<DryRunChunkResponse>()
-            .SelectMany(f => f.DestinationOperations)
-            .Where(o => o.Kind == OperationKind.Deleted)
-            .Select(o => o.Kind)
+            .SelectMany(f => f.DestinationOperations.Kind)
+            .Where(k => k == OperationKind.Deleted)
             .ToList();
 
     [Fact]
@@ -435,7 +434,7 @@ public sealed class DryRunStreamHandlerTests
             List<IpcResponse> frames = await Collect(handler, profile.Id);
 
             List<DryRunOperation> deleted = frames.OfType<DryRunChunkResponse>()
-                .SelectMany(f => f.DestinationOperations)
+                .SelectMany(f => DryRunColumns.ToRecords(f.DestinationOperations))
                 .Where(o => o.Kind == OperationKind.Deleted)
                 .ToList();
 
@@ -478,15 +477,15 @@ public sealed class DryRunStreamHandlerTests
             List<IpcResponse> offFrames = await Collect(
                 NewHandler(off, new ScriptedStreamEngine(Chunk()), maxStreamedFiles: 500), off.Id);
             Assert.DoesNotContain(
-                offFrames.OfType<DryRunChunkResponse>().SelectMany(f => f.DestinationOperations),
-                o => o.Kind == OperationKind.Untouched);
+                offFrames.OfType<DryRunChunkResponse>().SelectMany(f => f.DestinationOperations.Kind),
+                k => k == OperationKind.Untouched);
 
             // Scan on: the sweep runs and surfaces the pre-existing file as Untouched.
             Profile on = off with { ScanDestination = true };
             List<IpcResponse> onFrames = await Collect(
                 NewHandler(on, new ScriptedStreamEngine(Chunk()), maxStreamedFiles: 500), on.Id);
             Assert.Contains(
-                onFrames.OfType<DryRunChunkResponse>().SelectMany(f => f.DestinationOperations),
+                onFrames.OfType<DryRunChunkResponse>().SelectMany(f => DryRunColumns.ToRecords(f.DestinationOperations)),
                 o => o.Kind == OperationKind.Untouched && o.FileName.Contains("preexisting"));
         }
         finally

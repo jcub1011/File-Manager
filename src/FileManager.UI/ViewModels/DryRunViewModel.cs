@@ -2766,7 +2766,14 @@ public sealed partial class DryRunViewModel : ViewModelBase
             // are dropped, so the assembled report — which used to be live alongside the rows being
             // projected out of it — never exists here at all.
             DryRunRowStore store = DryRunRowStore.CreateForIngest();
-            var run = await _gateway.DryRunAsync(profileId, store, progress, draft, ct);
+            // Only wrapped when the log will actually take the line — the meter is cheap but it is pure
+            // diagnostics, so the un-instrumented path stays the un-instrumented path.
+            DryRunIngestMeter? meter = Log.IsEnabled(Serilog.Events.LogEventLevel.Information)
+                ? new DryRunIngestMeter(store)
+                : null;
+            long streamAllocatedBefore = UiMemoryLog.AllocatedSnapshot();
+            var run = await _gateway.DryRunAsync(profileId, meter ?? (IDryRunChunkSink)store, progress, draft, ct);
+            meter?.Log(UiMemoryLog.AllocatedSnapshot() - streamAllocatedBefore);
             if (run.IsCanceled)
             {
                 Log.Debug("Dry run for profile {ProfileId} cancelled by the user", profileId);
@@ -2789,11 +2796,23 @@ public sealed partial class DryRunViewModel : ViewModelBase
             // UI context so ApplyPrepared raises its property changes on the UI thread.
             // RunCommand.IsRunning spans the preparation, so the view's progress bar keeps
             // animating instead of the window freezing.
+            long prepareAllocatedBefore = UiMemoryLog.AllocatedSnapshot();
             PreparedReport prepared = await Task.Run(() =>
             {
                 store.Complete();
                 return PrepareReport(store, completion!, ct);
             }, ct);
+            // The third phase, logged separately from the stream's two so all of a run's allocation is
+            // attributed rather than inferred. This is the one with a known shape: each tab's ComputeLoad
+            // materializes a string[] of one relative-path key per row and drops it after the sort
+            // (~147 MB at the 500k cap, measured by
+            // PrepareReport_transient_allocation_at_streamed_cap_with_realistic_deep_paths).
+            if (Log.IsEnabled(Serilog.Events.LogEventLevel.Information))
+            {
+                Log.Information(
+                    "Dry-run prepare allocation (store completion + both tabs' sort): {PrepareMb}MB",
+                    (UiMemoryLog.AllocatedSnapshot() - prepareAllocatedBefore) >> 20);
+            }
             // NOTE THE SAMPLE POINT: the store, both tabs' prepared loads AND the transient sort-key
             // arrays PrepareReport just dropped are all accounted here without a collection having been
             // forced, so this is the closest thing to the run's PEAK that can be read without

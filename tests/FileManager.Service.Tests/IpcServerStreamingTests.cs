@@ -1,4 +1,4 @@
-using FileManager.Contracts.DryRun;
+﻿using FileManager.Contracts.DryRun;
 using FileManager.Contracts.IPC;
 using FileManager.Core.IPC;
 using FileManager.Platform.Windows;
@@ -60,7 +60,7 @@ public sealed class IpcServerStreamingTests : IAsyncLifetime
                         SourceIndex = b * 4 + i,
                     }))
                     .ToList();
-                yield return new DryRunChunkResponse { Directories = dirs.FlushNew(), SourceFiles = files, SourceOperations = ops };
+                yield return DryRunColumns.ToChunk(dirs.FlushNew(), sourceFiles: files, sourceOperations: ops);
                 // An informational progress frame after every chunk: the client must relay it to the
                 // caller's IProgress and reassemble the report exactly as if it were not there.
                 yield return new DryRunProgressResponse

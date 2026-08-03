@@ -1,4 +1,4 @@
-using BenchmarkDotNet.Attributes;
+﻿using BenchmarkDotNet.Attributes;
 using FileManager.Contracts.DryRun;
 using FileManager.Contracts.IPC;
 using FileManager.Core.Benchmarks.Fixtures;
@@ -131,7 +131,7 @@ public class WireChunkConverterBenchmarks
     /// <summary>Touches every produced list so no tier's conversion can be elided, and so a tier that
     /// silently produced nothing shows up as a wrong result rather than a fast one.</summary>
     private static int Count(DryRunChunkResponse response) =>
-        response.Directories.Count + response.DestinationFiles.Count + response.DestinationOperations.Count;
+        response.DirectoryName.Count + response.DestinationFiles.Count + response.DestinationOperations.Count;
 
     /// <summary>The converter as it stood before the span-probe pass — see
     /// <see cref="WireChunkConverterBenchmarks.LegacyStringConverter"/>. It shares the production
@@ -182,12 +182,11 @@ public class WireChunkConverterBenchmarks
                 });
             }
 
-            return new DryRunChunkResponse
-            {
-                Directories = _dirs.FlushNew(),
-                DestinationFiles = files,
-                DestinationOperations = ops,
-            };
+            // The legacy tier still builds records — that is the point of the comparison — so it goes
+            // through the records-to-columns bridge to produce the same shape the production converter
+            // now emits directly.
+            return DryRunColumns.ToChunk(
+                _dirs.FlushNew(), destinationFiles: files, destinationOperations: ops);
         }
     }
 }

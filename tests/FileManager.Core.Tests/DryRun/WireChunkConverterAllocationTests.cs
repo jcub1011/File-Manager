@@ -1,4 +1,4 @@
-using FileManager.Contracts.DryRun;
+﻿using FileManager.Contracts.DryRun;
 using FileManager.Contracts.IPC;
 using FileManager.Core.DryRun;
 using FileManager.Core.IPC.Handlers;
@@ -91,9 +91,11 @@ public sealed class WireChunkConverterAllocationTests(ITestOutputHelper output)
         DryRunStreamHandler.WireChunkConverter viaFull = new();
         DryRunChunkResponse miss = viaFull.Convert(new DryRunChunk([], [file], [], [distinctOp]));
 
-        Assert.Equal(hit.Directories, miss.Directories);
-        Assert.Equal(hit.DestinationFiles, miss.DestinationFiles);
-        Assert.Equal(hit.DestinationOperations, miss.DestinationOperations);
+        // Compared as records: the column groups are plain classes with reference equality, so the
+        // rehydrated sequences are what actually assert the memo hit and the full conversion agree.
+        Assert.Equal(DryRunColumns.ToDirectoryRecords(hit), DryRunColumns.ToDirectoryRecords(miss));
+        Assert.Equal(DryRunColumns.ToRecords(hit.DestinationFiles), DryRunColumns.ToRecords(miss.DestinationFiles));
+        Assert.Equal(DryRunColumns.ToRecords(hit.DestinationOperations), DryRunColumns.ToRecords(miss.DestinationOperations));
     }
 
     /// <summary>Chunks in the destination sweep's shape: destination files + destination ops only,
