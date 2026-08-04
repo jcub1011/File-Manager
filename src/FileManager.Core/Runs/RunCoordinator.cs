@@ -82,10 +82,10 @@ public sealed class RunCoordinator(
             {
                 // Declining is not a failure and must leave the filesystem exactly as it was — nothing
                 // has been touched at this point, by construction.
+                CleanUpSnapshot(run);   // before Closed is observable — see Close()
                 run.Phase = RunPhase.Closed;
                 run.Outcome = RunOutcome.Cancelled;
                 run.ClosedAt = time.GetUtcNow();
-                CleanUpSnapshot(run);
                 PublishCompleted(run);
                 logger.LogInformation("Run {RunId} was declined; nothing was changed", runId);
                 return Result.Success();
@@ -253,6 +253,7 @@ public sealed class RunCoordinator(
 
         if (failure is not null || run.Cancelled)
         {
+            CleanUpSnapshot(run);   // before Closed is observable — see Close()
             lock (run.Gate)
             {
                 run.Phase = RunPhase.Closed;
@@ -260,7 +261,6 @@ public sealed class RunCoordinator(
                 run.PlanError = failure;
                 run.ClosedAt = time.GetUtcNow();
             }
-            CleanUpSnapshot(run);
             PublishPlanned(run, failure);
             PublishCompleted(run);
             return;
@@ -503,6 +503,11 @@ public sealed class RunCoordinator(
 
     private void Close(RunState run, RunOutcome outcome, string? planError)
     {
+        // Drop the scaffolding BEFORE the terminal phase becomes observable. Closed is what every
+        // client reads as "this run is over", and GetStatus/SnapshotDirectory are lock-free, so
+        // setting the phase first left a window in which a closed run still had its snapshot
+        // directory on disk and still handed out a path to it.
+        CleanUpSnapshot(run);
         lock (run.Gate)
         {
             run.Phase = RunPhase.Closed;
@@ -510,21 +515,31 @@ public sealed class RunCoordinator(
             run.PlanError ??= planError;
             run.ClosedAt = time.GetUtcNow();
         }
-        CleanUpSnapshot(run);
         PublishCompleted(run);
         logger.LogInformation(
             "Run {RunId} closed {Outcome}: {Succeeded} succeeded, {Skipped} skipped, {Failed} failed, {Deleted} deleted",
             run.RunId, outcome, run.Succeeded, run.SkippedJobs, run.Failed, run.Deleted);
     }
 
-    /// <summary>Drops the run's frozen work list once the run is over. Best-effort: a leftover directory
-    /// costs disk and is swept at the next startup, so a failure here must never affect an outcome.</summary>
+    /// <summary>Drops the run's frozen work list once the run is over. Best-effort: a failure here must
+    /// never affect an outcome, since the run's real record is the journal and the audit trail.
+    /// <para>[flagged] A swallowed failure leaks the directory permanently — there is no startup sweep
+    /// of <see cref="EnginePaths.RunsDirectory"/> despite what its doc comment used to claim, and
+    /// nothing else enumerates it. The warning below is the only trace.</para></summary>
     private void CleanUpSnapshot(RunState run)
     {
         if (run.Directory is null)
             return;
         if (InfrastructurePaths.TryDeleteDirectory(run.Directory) is Exception ex)
+        {
+            // Kept on the run so the path stays reportable; the startup sweep collects it later.
             logger.LogWarning(ex, "Could not delete the run snapshot at {Directory}", run.Directory);
+            return;
+        }
+        // Forget the path once it is really gone, so SnapshotDirectory stops handing out a directory
+        // that no longer exists — the plan-replay handler reads a null as RUN_NOT_FOUND, which is the
+        // truth for a closed run, where a stale path would surface as an opaque I/O error instead.
+        run.Directory = null;
     }
 
     /// <summary>Forgets long-closed runs so a long-lived service does not accumulate one per

@@ -121,6 +121,7 @@ public sealed class AtomicPlacer(
         string stagedPath = InfrastructurePaths.StagedPathFor(tp.Plan.TargetRoot, jobId, index, Path.GetFileName(finalPath));
 
         SuppressionToken? tempTok = null, finalTok = null, stagedTok = null;
+        bool tempPlaced = false;
         try
         {
             // 1. Journal target-write-begin (fsync) BEFORE the temp exists (I-WAL); register the
@@ -202,6 +203,7 @@ public sealed class AtomicPlacer(
             journalError = Journal(new TargetPlacedRecord { JobId = jobId, Seq = 0, AtUtc = time.GetUtcNow(), TargetIndex = index });
             if (journalError is not null) return journalError;
             tp.State = TargetState.Placed;
+            tempPlaced = true;
             RecordPriority(execution.Plan, finalPath);
 
             return new PlacementResult { FinalState = TargetState.Placed, StagedPath = tp.StagedPath };
@@ -219,10 +221,35 @@ public sealed class AtomicPlacer(
         }
         finally
         {
+            // Reclaim our own temp on every exit that did not place it — cancel, JobError, or an
+            // unexpected throw. Rollback also reclaims it from TargetProgress, and crash recovery from
+            // the twb record, but both are downstream of state this method may not have reached; doing
+            // it here needs nothing but the local `tempPath` and runs while this target still holds its
+            // path lock. On the placed path the rename already consumed the temp, so the flag skips it.
+            if (!tempPlaced)
+                TryReclaimTemp(tempPath);
+
             // Start the linger window on the engine's own write paths (§4.3 step 9).
             tempTok?.Release(SelfWriteSuppressionRegistry.DefaultLinger);
             finalTok?.Release(SelfWriteSuppressionRegistry.DefaultLinger);
             stagedTok?.Release(SelfWriteSuppressionRegistry.DefaultLinger);
+        }
+    }
+
+    /// <summary>Best-effort removal of a temp this placer created but did not place. Never throws: it
+    /// runs in a finally, where an exception would replace the real outcome with a cleanup error.</summary>
+    private void TryReclaimTemp(string tempPath)
+    {
+        try
+        {
+            if (File.Exists(tempPath))
+                File.Delete(tempPath);
+        }
+        catch (Exception ex)
+        {
+            // Left for rollback (TargetProgress) or crash recovery (the twb record) to retry — this is
+            // the earliest attempt, not the only one, so a failure here is a warning and not an error.
+            logger.LogWarning(ex, "Could not remove the unplaced temp \"{Temp}\"; leaving it for rollback", tempPath);
         }
     }
 

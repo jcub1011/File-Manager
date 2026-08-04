@@ -1037,6 +1037,15 @@ Placement sequence per target (normative — each numbered step maps to a §7.2 
      (`MOVEFILE_REPLACE_EXISTING`, atomic on NTFS).
 6. Journal `target-placed`.
 
+**Temp reclamation on a non-placing exit (normative).** Any exit from `PlaceTargetAsync` that did not
+complete step 5 — cancellation, a `JobError`, or an unexpected throw — best-effort deletes its own
+temp before returning. This does not replace the rollback sweep or recovery row C2; it is the earliest
+of the three, needs nothing but the local temp path, and runs while the target still holds its path
+lock. The two downstream reclaimers work from state (`TargetProgress`, the journal) that this method
+may never have reached, so relying on them alone made the temp's survival depend on how far placement
+got. Reclamation must never throw: it runs in a `finally`, where an exception would replace the real
+outcome with a cleanup error.
+
 > **Directory-metadata caveat (for the implementer):** .NET exposes no directory fsync and
 > `File.Move` does not pass `MOVEFILE_WRITE_THROUGH`, so an OS crash immediately after
 > `target-placed` can lose the rename. This is safe by design: recovery probes the filesystem
@@ -1180,6 +1189,12 @@ Ordered steps (each I/O step wrapped in `ITransientRetryPolicy`; each journals
    it was restored or the job is closing `Succeeded` (I-STAGING-KEEP).
 4. Terminal journal: all steps ok → `job-closed(Failed)`; any step failed →
    `job-closed(RollbackFailed)` + notification listing every residual path.
+
+Where a state's revert has both a restore step and a temp delete, the two are **independent and both
+always run** — chaining them so a failed restore skips the delete leaves a target that could not be
+restored *also* leaking its temp, and both failures belong in the message. A residual path is
+confirmed against the filesystem before it is reported: naming `FinalPath` unconditionally points the
+user at a file that is usually correct and hides the artifact that is not.
 
 #### IDispositionAuditLog
 
@@ -1923,6 +1938,13 @@ public sealed record SealedOutput
 /// the state machine, the lock set, suppression tokens, and per-target progress.</summary>
 public sealed class JobExecution
 {
+    // States and Targets are derived from Plan and built EAGERLY in its init accessor, on the
+    // constructing thread, before the execution is published. They must NOT be lazily built on first
+    // access: the executor fans out one task per target and all of them take that first access at
+    // once, so a `??=` let several threads each build their own array. Only the last write survived,
+    // and every target that mutated a discarded TargetProgress still read as Pending when rollback
+    // snapshotted it — leaving its temp on disk and, for a placed target, this job's content at the
+    // destination while the job reported a clean rollback.
     public required JobPlan Plan { get; init; }
     public JobStateMachine States { get; }
     public SealedOutput? Output { get; set; }

@@ -84,6 +84,41 @@ public sealed class AtomicPlacerTests : IDisposable
     }
 
     [Fact]
+    public async Task A_cancelled_placement_removes_the_temp_it_created()
+    {
+        // The placer reclaims its own temp on every exit that did not place it. Rollback and crash
+        // recovery also reclaim it, but both work off state this method may never have reached — and
+        // this attempt runs while the target still holds its path lock.
+        (JobExecution execution, string finalPath) = Setup("hello world", "out.dat");
+        using CancellationTokenSource cancel = new();
+        var time = new FakeTimeProvider();
+        // Trip the cancel from inside the read-back verify: the temp is on disk at that instant, so
+        // the cancel lands mid-placement rather than before anything was written.
+        var hasher = new FaultyFileHasher(new FileHasher(NullLogger<FileHasher>.Instance))
+        {
+            CorruptPathsMatching = path =>
+            {
+                if (path.Contains(".fmtmp-", StringComparison.OrdinalIgnoreCase))
+                    cancel.Cancel();
+                return false;
+            },
+        };
+        var placer = new AtomicPlacer(
+            hasher, _journal, new SelfWriteSuppressionRegistry(time),
+            new TransientRetryPolicy(time, NullLogger<TransientRetryPolicy>.Instance),
+            new FakeMetadataPreserver(), new SourcePriorityRegistry(), time,
+            NullLogger<AtomicPlacer>.Instance);
+
+        Result<PlacementResult, JobError> result =
+            await placer.PlaceTargetAsync(Request(execution, finalPath, finalExists: false), cancel.Token);
+
+        Assert.True(result.IsCanceled);
+        Assert.False(File.Exists(finalPath), "a cancelled placement must not leave the final file");
+        string temp = finalPath + ".fmtmp-" + execution.Plan.JobId.Short;
+        Assert.False(File.Exists(temp), $"the placer must reclaim its own temp; {temp} survived");
+    }
+
+    [Fact]
     public async Task StageOverwrites_preserves_the_prior_version_in_staging()
     {
         (JobExecution execution, string finalPath) = Setup("new content", "out.dat");

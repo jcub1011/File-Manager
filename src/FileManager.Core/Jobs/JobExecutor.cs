@@ -71,10 +71,39 @@ public sealed class JobExecutor(
         }
         catch (Exception ex)
         {
-            // Last-resort catch-and-log: the executor must never throw for a job failure.
+            // Last-resort catch-and-log: the executor must never throw for a job failure. Returning
+            // straight from here used to close the job Failed with whatever the placer had already
+            // written still on disk, so try the sweep first — this is the only path that reaches a
+            // rollback nobody anticipated needing.
             logger.LogError(ex, "Job {JobId} failed unexpectedly", plan.JobId.Short);
-            return Completed(plan, JobOutcome.Failed, null,
-                new JobError { Code = JobErrorCode.PlacementFailed, Message = ex.Message }, start);
+            JobError unexpected = new() { Code = JobErrorCode.PlacementFailed, Message = ex.Message };
+            JobCompletion? swept = await TryRollBackUnexpectedAsync(execution, unexpected, progress, start).ConfigureAwait(false);
+            return swept ?? Completed(plan, JobOutcome.Failed, null, unexpected, start);
+        }
+    }
+
+    /// <summary>Best-effort rollback for the catch-all above. Returns null when the job is not in a
+    /// state a sweep may run from (§7.1 makes RollingBack reachable only after Opened and before
+    /// Committed) or when the sweep itself fails — the caller then reports the original fault, which
+    /// is always the more useful one.</summary>
+    private async Task<JobCompletion?> TryRollBackUnexpectedAsync(
+        JobExecution execution, JobError cause, IProgress<JobProgress>? progress, long start)
+    {
+        if (execution.States.State
+            is not (JobState.Opened or JobState.Preflighted or JobState.Screened
+                or JobState.Transforming or JobState.OutputSealed or JobState.Distributing))
+        {
+            return null;
+        }
+
+        try
+        {
+            return await RollBackAsync(execution, cause, progress, start, CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "Job {JobId}: the last-resort rollback also failed", execution.Plan.JobId.Short);
+            return null;
         }
     }
 
@@ -385,11 +414,31 @@ public sealed class JobExecutor(
                 Report(progress, plan, JobPhase.Distributing, Interlocked.Increment(ref completed));
             }, CancellationToken.None);
         }
-        await Task.WhenAll(tasks).ConfigureAwait(false);
+        try
+        {
+            await Task.WhenAll(tasks).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            // A target task must not throw — PlaceOneAsync has its own catch-all — but the Task.Run
+            // boundary and linked.Cancel() are outside it. Unhandled, the throw unwinds past RunAsync's
+            // rollback branch into ExecuteAsync's catch-all, which closes the job Failed with every
+            // temp still on disk. Converting it to a JobError keeps the failure on the rollback path.
+            logger.LogError(ex, "Job {JobId}: a target task faulted during distribution", plan.JobId.Short);
+            return new JobError { Code = JobErrorCode.PlacementFailed, Message = $"a target task faulted during distribution: {ex.Message}" };
+        }
 
         foreach (JobError? error in errors)   // report the lowest-index failure
             if (error is not null)
                 return error;
+
+        // Cancellation is reported by PlaceOneAsync as "no error" on the assumption that the target
+        // which failed reports the real cause. That holds for linked.Cancel() and nothing else: when
+        // `ct` is cancelled from outside, every target returns null and this would read as success —
+        // the job would journal job-committed and DISPOSE THE SOURCE with nothing placed and every
+        // temp still on disk. An outside cancellation is a failure of the job, so it rolls back.
+        if (ct.IsCancellationRequested)
+            return CanceledDistribution();
         return null;
     }
 
@@ -549,6 +598,9 @@ public sealed class JobExecutor(
 
     private static JobError CanceledSeal() =>
         new() { Code = JobErrorCode.SourceUnreadable, Message = "canceled while sealing the source" };
+
+    private static JobError CanceledDistribution() =>
+        new() { Code = JobErrorCode.PlacementFailed, Message = "canceled while distributing to the targets" };
 
     /// <summary>The Source the payload came from, or null when its root matched none. Bounds-checked
     /// rather than trusting the index: the plan and the profile are separate fields, so a plan built

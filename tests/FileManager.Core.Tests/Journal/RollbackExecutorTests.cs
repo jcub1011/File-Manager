@@ -135,6 +135,62 @@ public sealed class RollbackExecutorTests : IDisposable
         Assert.Contains(ReadJournal(), x => x is JobClosedRecord { Outcome: JobOutcome.Failed });
     }
 
+    [Fact]
+    public void A_staged_restore_that_fails_still_removes_the_temp_and_names_it_as_residual()
+    {
+        // The two steps are independent. Chaining them with `??` meant a restore failure skipped the
+        // temp delete entirely, so a target that could not be restored ALSO leaked its temp — and the
+        // residual list named the final path, pointing the user at the wrong file.
+        string final = Path.Combine(_root, "doc.txt");
+        string staged = Path.Combine(_root, "staging", "doc.txt");
+        string temp = Path.Combine(_root, "doc.txt.fmtmp-deadbeef");
+        Directory.CreateDirectory(Path.GetDirectoryName(staged)!);
+        File.WriteAllText(final, "NEW (bad)");
+        File.WriteAllText(staged, "PRIOR (good)");
+        File.WriteAllText(temp, "temp");
+
+        // An exclusive handle on the final makes both the File.Replace and its File.Move fallback
+        // fail, without perturbing anything else. (The hash gate is disarmed here — the fixture
+        // context sets no ExpectedContentHash — so the restore really is attempted.)
+        RollbackResult? r;
+        using (new FileStream(final, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+        {
+            var result = ZeroDelay().Rollback(Context(OverwriteHandling.StageOverwrites, new TargetRollbackItem
+            {
+                TargetIndex = 0, State = TargetState.Staged, TempPath = temp, FinalPath = final, StagedPath = staged, FinalExistedBeforeJob = true,
+            }));
+            Assert.True(result.TryGetValue(out r));
+        }
+
+        Assert.False(r!.Complete);
+        Assert.False(File.Exists(temp), "the temp must be reclaimed even when the restore fails");
+        Assert.Contains(r.ResidualPaths, p => string.Equals(p, staged, StringComparison.OrdinalIgnoreCase));
+        // I-STAGING-KEEP: the unrestored prior version is kept for manual remediation, never deleted.
+        Assert.True(File.Exists(staged));
+    }
+
+    [Fact]
+    public void A_temp_only_target_whose_temp_cannot_be_deleted_names_the_temp_as_residual()
+    {
+        string final = Path.Combine(_root, "doc.txt");
+        string temp = Path.Combine(_root, "doc.txt.fmtmp-deadbeef");
+        File.WriteAllText(temp, "temp");
+
+        RollbackResult? r;
+        using (new FileStream(temp, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+        {
+            var result = ZeroDelay().Rollback(Context(OverwriteHandling.StageOverwrites, new TargetRollbackItem
+            {
+                TargetIndex = 0, State = TargetState.Verified, TempPath = temp, FinalPath = final, StagedPath = null, FinalExistedBeforeJob = false,
+            }));
+            Assert.True(result.TryGetValue(out r));
+        }
+
+        Assert.False(r!.Complete);
+        // The artifact the user has to deal with is the temp, not the final it used to name.
+        Assert.Contains(r.ResidualPaths, p => string.Equals(p, temp, StringComparison.OrdinalIgnoreCase));
+    }
+
     // A rollback executor with the inter-attempt backoff disabled so retry paths don't Thread.Sleep.
     private RollbackExecutor ZeroDelay() =>
         new(_journal, new FileHasher(NullLogger<FileHasher>.Instance), new FakeTimeProvider(), NullLogger<RollbackExecutor>.Instance) { RetryDelay = TimeSpan.Zero };

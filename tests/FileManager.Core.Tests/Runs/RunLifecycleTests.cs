@@ -484,7 +484,15 @@ public sealed class RunLifecycleTests
 
         // The frozen work list is scaffolding, not a record — the journal and the audit trail are the
         // record. Leaving it behind would accumulate a directory per run forever.
+        //
+        // Asserted with NO retry, deliberately: Closed is the signal every client takes for "this run
+        // is over", so the cleanup has to have happened BEFORE that phase is observable. Polling here
+        // would let the coordinator publish Closed with the directory still on disk and still pass,
+        // which is precisely the ordering this pins — and it used to fail about 1 full-suite run in 6.
         Assert.False(Directory.Exists(snapshot));
+        // And the path is forgotten, so the plan-replay handler reports RUN_NOT_FOUND rather than
+        // handing a client a directory that is no longer there.
+        Assert.Null(runs.SnapshotDirectory(handle.RunId));
     }
 
     [Fact]

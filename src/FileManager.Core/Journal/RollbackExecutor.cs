@@ -93,7 +93,7 @@ public sealed class RollbackExecutor(IJobJournal journal, IFileHasher hasher, Ti
 
             if (error is not null)
             {
-                residuals.Add(target.FinalPath ?? target.StagedPath ?? $"target[{target.TargetIndex}]");
+                residuals.AddRange(ResidualsFor(target, action));
                 if (target.StagedPath is not null)
                     keepStagingDirs.Add(StagingDirOf(target.StagedPath));
             }
@@ -156,6 +156,11 @@ public sealed class RollbackExecutor(IJobJournal journal, IFileHasher hasher, Ti
             case TargetState.TempWriting:
             case TargetState.TempWritten:
             case TargetState.Verified:
+                // A state that implies a temp but names no path is a contract break upstream, and it
+                // is silent otherwise: TryDeleteFile treats a null path as "nothing to do", so the
+                // file — if one exists — would leak with no residual and no log.
+                if (target.TempPath is null)
+                    logger.LogWarning("Target {Index} is {State} but recorded no temp path; any temp it wrote cannot be reclaimed", target.TargetIndex, target.State);
                 return (RollbackAction.RemovedTemp, TryDeleteFile(target.TempPath));
 
             case TargetState.Staged:
@@ -194,15 +199,20 @@ public sealed class RollbackExecutor(IJobJournal journal, IFileHasher hasher, Ti
                 return (RollbackAction.LeftInPlaceModified,
                     $"placed file \"{target.FinalPath}\" was modified externally after placement; left in place (staged prior kept)");
             }
-            string? replaceError = TryReplace(target.StagedPath, target.FinalPath)
-                ?? TryDeleteFile(target.TempPath);
+            // Both steps always run: `??` would skip the temp delete whenever the restore failed, and
+            // the two are independent — a target that could not be restored still must not also leak
+            // its temp.
+            string? replaceError = Combine(
+                TryReplace(target.StagedPath, target.FinalPath),
+                TryDeleteFile(target.TempPath));
             return (RollbackAction.UnplacedAndRestored, replaceError);
         }
 
         // Two-step fallback crashed between its moves: prior moved out, rename not yet done — the
         // final is absent, a plain move restores it; then remove the temp.
-        string? stageError = TryMove(target.StagedPath, target.FinalPath, overwrite: false)
-            ?? TryDeleteFile(target.TempPath);
+        string? stageError = Combine(
+            TryMove(target.StagedPath, target.FinalPath, overwrite: false),
+            TryDeleteFile(target.TempPath));
         return (RollbackAction.RestoredStagedBeforePlacement, stageError);
     }
 
@@ -263,6 +273,37 @@ public sealed class RollbackExecutor(IJobJournal journal, IFileHasher hasher, Ti
             return true;
         }
     }
+
+    /// <summary>Joins two independent step results so neither is lost when both fail.</summary>
+    private static string? Combine(string? first, string? second) =>
+        first is null ? second
+        : second is null ? first
+        : $"{first}; {second}";
+
+    /// <summary>What this target actually left on disk after a failed revert — the paths the user has
+    /// to deal with by hand. Naming <c>FinalPath</c> unconditionally (as this used to) pointed at a
+    /// file that is usually correct and hid the artifact that is not, so each candidate is confirmed
+    /// against the filesystem first.</summary>
+    private static IEnumerable<string> ResidualsFor(TargetRollbackItem target, RollbackAction action)
+    {
+        var found = new List<string>(3);
+        // Artifacts this job created or moved aside: both are debris wherever they survive.
+        if (Exists(target.TempPath))
+            found.Add(target.TempPath!);
+        if (Exists(target.StagedPath))
+            found.Add(target.StagedPath!);
+        // The final is a residual only when the sweep deliberately left this job's content there.
+        if (action is RollbackAction.LeftInPlaceModified or RollbackAction.LeftInPlaceUnrecoverable
+            && Exists(target.FinalPath))
+        {
+            found.Add(target.FinalPath!);
+        }
+        if (found.Count == 0)
+            found.Add(target.FinalPath ?? target.StagedPath ?? $"target[{target.TargetIndex}]");
+        return found;
+    }
+
+    private static bool Exists(string? path) => !string.IsNullOrEmpty(path) && File.Exists(path);
 
     // --- best-effort I/O with an inline 3-attempt retry; returns null on success, a message on final failure ---
 

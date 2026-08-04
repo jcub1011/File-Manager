@@ -264,14 +264,40 @@ placer temp-cleanup bug and the open ratio-guard decision.*
   client hitting an unknown `EngineEvent` discriminator throws inside `System.Text.Json` and loses its
   whole subscribe stream.
 
-### Known pre-existing defect (not introduced by this work)
-*Diagnosis notes and a suggested fix direction: [`../mirror-run-next-steps.md`](../mirror-run-next-steps.md) §1.*
-- **`JobExecutorFailureRollbackTests.A_multi_target_failure_leaves_no_target_placed_and_every_prior_intact`
-  fails roughly 1 run in 8**, finding two leftover `.fmtmp-` temps instead of none. This is the
-  cancellation/cleanup race already documented in `JobExecutorHarness.ExecuteWithRetriesAsync`: when a
-  multi-target job's sibling cancellation lands mid-placement, rollback does not reclaim the temp. It is a
-  real defect on the live path — a failed run can leave temp files in a user's target root — and worth
-  fixing on its own.
+### Fixed pre-existing defect (was not introduced by this work)
+*Full diagnosis: [`../mirror-run-next-steps.md`](../mirror-run-next-steps.md) §1.*
+- **`JobExecution.States`/`Targets` were built by a torn `??=` lazy initializer.** `DistributeAsync`
+  fans out one task per target and they all take the first access at once, so several threads each
+  built their own `TargetProgress` array and only the last write survived. Rollback then snapshotted a
+  discarded array, read `Pending`/`null` for targets that had really reached `Staged`, and did nothing
+  for them — which is what left the `.fmtmp-` temps behind roughly 1 run in 8. The same lost state
+  could leave a **placed** target un-reverted while the job reported "rolled back cleanly". Both are
+  now built eagerly in `Plan`'s `init` accessor. Three adjacent defects were fixed with it: the placer
+  now reclaims its own unplaced temp, `RevertStaged` no longer `??`-skips the temp delete when a
+  restore fails, and `DistributeAsync` no longer reads "all targets cancelled, none errored" as
+  success (which made an externally-cancelled job commit and dispose the source with nothing placed).
+
+### Fixed: `RunPhase.Closed` was observable before a run's snapshot was cleaned up
+- **`RunLifecycleTests.A_closed_run_leaves_no_snapshot_directory_behind` was failing about 1
+  full-Core run in 6** — a product ordering defect, not a test-side assumption. `RunCoordinator.Close`
+  set `run.Phase = RunPhase.Closed` under `run.Gate`, released the lock, and only *then* deleted the
+  snapshot directory. `GetStatus` is the only way a client observes a phase, so from the moment that
+  lock released, a closed run still had its scaffolding on disk. The `PlanAsync` failure path had the
+  same shape; the *decline* path already cleaned up inside the lock, which is what made the
+  inconsistency easy to miss.
+- **Fix:** all three terminal paths now clean up *before* `Closed` becomes observable, so the phase
+  every client reads as "this run is over" means it. `CleanUpSnapshot` also clears `run.Directory` on
+  success, so `SnapshotDirectory` no longer hands out a path to a deleted directory —
+  `GetRunPlanStreamHandler` reads the null as `RUN_NOT_FOUND`, which is the truth for a closed run,
+  where a stale path surfaced as an opaque I/O error instead.
+- **Proven, not just observed:** with the cleanup artificially widened to 300 ms, the test fails 3/3
+  under the old ordering and passes 3/3 under the new one. The assertion is deliberately left with no
+  retry — polling would let the coordinator publish `Closed` with the directory still present and
+  still pass, which is exactly the ordering being pinned.
+- `[flagged]` **No startup sweep of `runs/` exists**, despite what `EnginePaths.RunsDirectory` and
+  `CleanUpSnapshot` used to claim in their doc comments (both corrected). Nothing enumerates that
+  directory, so a cleanup failure — which is swallowed to a warning by design — leaks a snapshot
+  directory permanently. Worth a real sweep alongside the `.pipeline_tmp` one; not built here.
 
 
 - **CRC:** the journal/audit line checksum is CRC-32 (IEEE) via `System.IO.Hashing.Crc32`

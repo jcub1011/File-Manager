@@ -225,21 +225,37 @@ public sealed record SealedOutput
 
 /// <summary>Mutable per-job execution state, owned by one pool worker; wraps the plan,
 /// the state machine, the lock set, suppression tokens, and per-target progress.
-/// <see cref="States"/> and <see cref="Targets"/> are derived from <see cref="Plan"/> on first
-/// access — the plan is set via <c>init</c>, so they cannot be built in the constructor.</summary>
+/// <para><see cref="States"/> and <see cref="Targets"/> are derived from <see cref="Plan"/> and built
+/// EAGERLY in its <c>init</c> accessor, which runs once on the constructing thread before the
+/// execution is published. They must not be lazily built on first access: <c>JobExecutor</c> fans out
+/// one task per target and every one of them touches <see cref="Targets"/> for the first time
+/// concurrently, so a <c>??=</c> here let several threads each build their own array. Only the last
+/// write survived, and every target that mutated a discarded <see cref="TargetProgress"/> was still
+/// <see cref="TargetState.Pending"/> when rollback read it — so rollback skipped it, leaving its temp
+/// on disk and, for a target that had already been placed, its content at the destination while
+/// reporting a clean rollback.</para></summary>
 public sealed class JobExecution
 {
-    private JobStateMachine? _states;
-    private IReadOnlyList<TargetProgress>? _targets;
+    private readonly JobPlan _plan = null!;
+    private readonly JobStateMachine _states = null!;
+    private readonly IReadOnlyList<TargetProgress> _targets = null!;
 
-    public required JobPlan Plan { get; init; }
+    public required JobPlan Plan
+    {
+        get => _plan;
+        init
+        {
+            _plan = value;
+            _states = new JobStateMachine(value.JobId);
+            _targets = BuildTargets(value);
+        }
+    }
 
-    public JobStateMachine States => _states ??= new JobStateMachine(Plan.JobId);
+    public JobStateMachine States => _states;
 
     public SealedOutput? Output { get; set; }
 
-    public IReadOnlyList<TargetProgress> Targets =>
-        _targets ??= BuildTargets(Plan);
+    public IReadOnlyList<TargetProgress> Targets => _targets;
 
     private static IReadOnlyList<TargetProgress> BuildTargets(JobPlan plan)
     {

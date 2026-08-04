@@ -267,6 +267,70 @@ public sealed class JobExecutorFailureRollbackTests
         AssertSourceIntactAndNoDebris(h, source);
     }
 
+    // ---- cancellation from outside the job -------------------------------------------------------
+
+    /// <summary>Trips <paramref name="cancel"/> the first time the placer read-back-hashes a temp for
+    /// the named target. That instant is deterministic and useful: the temp exists on disk, the path
+    /// lock is held, and the cancel is observed at the next <c>ThrowIfCancellationRequested</c> inside
+    /// the retried place step — i.e. exactly "cancelled mid-placement".</summary>
+    private static void CancelWhenTempIsVerified(JobExecutorHarness h, string targetMarker, CancellationTokenSource cancel) =>
+        h.Hasher.CorruptPathsMatching = path =>
+        {
+            if (path.Contains(".fmtmp-", StringComparison.OrdinalIgnoreCase)
+                && path.Contains(targetMarker, StringComparison.OrdinalIgnoreCase))
+            {
+                cancel.Cancel();
+            }
+            return false;   // never corrupt — cancellation is the only thing under test
+        };
+
+    [Fact]
+    public async Task A_job_cancelled_mid_placement_leaves_no_temp_behind()
+    {
+        using JobExecutorHarness h = new("cancel-midplace");
+        using CancellationTokenSource cancel = new();
+        string source = h.WriteSource("doc.txt", SourceContent);
+        string[] roots = [Path.Combine(h.Root, "t1"), Path.Combine(h.Root, "t2"), Path.Combine(h.Root, "t3")];
+        string[] finals = [.. roots.Select(r => Path.Combine(r, "doc.txt"))];
+        foreach (string final in finals)
+            h.WriteExistingTarget(final, PriorContent);
+        CancelWhenTempIsVerified(h, "t2", cancel);
+
+        JobCompletion completion = await h.ExecuteWithRetriesAsync(
+            h.Plan(source, finals, h.Policy(overwrite: OverwriteHandling.StageOverwrites), targetRoots: roots),
+            cancel.Token);
+
+        Assert.True(completion.Outcome is JobOutcome.Failed or JobOutcome.RollbackFailed);
+        foreach (string final in finals)
+            Assert.Equal(PriorContent, File.ReadAllText(final));
+        foreach (string root in roots)
+            Assert.Single(Directory.GetFiles(root, "*", SearchOption.AllDirectories));
+        AssertSourceIntactAndNoDebris(h, source);
+    }
+
+    [Fact]
+    public async Task A_cancelled_job_never_commits_and_never_disposes_the_source()
+    {
+        // Cancellation is reported per-target as "no error", so distribution used to return success:
+        // the job journalled job-committed and disposed the source with NOTHING placed. The source
+        // surviving is the whole point — I-DISPOSE authorizes disposal by the commit record alone.
+        using JobExecutorHarness h = new("cancel-nocommit");
+        using CancellationTokenSource cancel = new();
+        string source = h.WriteSource("doc.txt", SourceContent);
+        string[] roots = [Path.Combine(h.Root, "t1"), Path.Combine(h.Root, "t2")];
+        string[] finals = [.. roots.Select(r => Path.Combine(r, "doc.txt"))];
+        CancelWhenTempIsVerified(h, "t1", cancel);
+
+        JobCompletion completion = await h.ExecuteWithRetriesAsync(
+            h.Plan(source, finals, h.Policy(onSuccess: OnSuccessAction.PermanentDelete), targetRoots: roots),
+            cancel.Token);
+
+        Assert.NotEqual(JobOutcome.Succeeded, completion.Outcome);
+        Assert.DoesNotContain(h.JournalRecords(), r => r is JobCommittedRecord);
+        Assert.Empty(h.Audit.ReadRecent(10).TryGetValue(out var audited) ? audited : []);
+        AssertSourceIntactAndNoDebris(h, source);
+    }
+
     // ---- retry budget (spec §12) -----------------------------------------------------------------
 
     [Fact]

@@ -6,11 +6,11 @@
 
 Mirror shipped in the "Set 3c" increment: a run plans its work into a frozen snapshot via the same
 `IProfilePlanner` the dry-run preview uses, waits for approval, then copies and — under
-`SyncMode.Mirror` — recycles the destination orphans the plan named. 1428 tests pass; the Mirror
+`SyncMode.Mirror` — recycles the destination orphans the plan named. 1436 tests pass; the Mirror
 vertical is covered end-to-end over a real named pipe against the production DI graph.
 
-This document is what is *not* done, in the order I would do it. Item 1 is a real defect and everything
-else is additive.
+This document is what is *not* done, in the order I would do it. Item 1 was a real defect and is now
+fixed (kept here for the diagnosis); everything else is additive.
 
 ---
 
@@ -18,7 +18,7 @@ else is additive.
 
 | # | Item | Why now | Size |
 | --- | --- | --- | --- |
-| 1 | [Placer leaves `.fmtmp-` temps when sibling cancellation races rollback](#1-bug-placer-leaves-fmtmp--temps-when-sibling-cancellation-races-rollback) | Real defect on the live path; causes a ~1-in-8 flaky test that will erode trust in the suite | S–M, mostly diagnosis |
+| ~~1~~ | ~~[Placer leaves `.fmtmp-` temps when sibling cancellation races rollback](#1-fixed-jobexecutiontargets-was-built-by-a-torn-lazy-initializer)~~ | **DONE** — root cause was a torn lazy initializer in `JobExecution`, not the placer | — |
 | 2 | [Decide the ratio-guard override](#2-decision-the-ratio-guard-has-no-override) | Blocks confident use against real archives | S (after a decision) |
 | 3 | [Itemized approval view](#3-itemized-approval-view-in-the-dry-run-view) | The approval step currently shows counts, not rows; the IPC is already done | M |
 | 4 | [Cancel affordance in the activity panel](#4-cancel-affordance-in-the-activity-panel) | `cancel-run` works but has no button | S |
@@ -30,94 +30,91 @@ else is additive.
 
 ---
 
-## 1. BUG: placer leaves `.fmtmp-` temps when sibling cancellation races rollback
+## 1. FIXED: `JobExecution.Targets` was built by a torn lazy initializer
 
-**Status:** pre-existing, confirmed reproducible, *not* introduced by the snapshot/Mirror work.
-**Severity:** a failed run can leave temp files in a user's target root, permanently.
+**Status:** fixed. Pre-existing, *not* introduced by the snapshot/Mirror work.
+**Severity (as found):** worse than the reported symptom — see "what it actually cost" below.
 
-### The symptom
+### What the hypothesis in this section used to say, and why it was wrong
 
-`tests/FileManager.Core.Tests/Jobs/JobExecutorFailureRollbackTests.cs` →
-`A_multi_target_failure_leaves_no_target_placed_and_every_prior_intact` fails roughly **1 run in 8**:
+This section previously asked whether `TargetProgress.TempPath` was assigned before or after the copy,
+and proposed "record-then-write" as the fix. **That discipline was already in place** and was never the
+problem: `AtomicPlacer.cs` journals `twb` (which carries the temp path), *then* sets
+`tp.TempPath`/`tp.State = TempWriting`, *then* starts the copy that creates the file. The window
+between the record and the assignment contains no `await`, so it is not a cancellation window at all.
 
-```
-Assert.Single() Failure: The collection contained 2 items
-```
+### The actual root cause
 
-at the per-root assertion (`JobExecutorFailureRollbackTests.cs:244-245`):
+`JobExecution` built its two derived members lazily:
 
 ```csharp
-foreach (string root in roots)
-    Assert.Single(Directory.GetFiles(root, "*", SearchOption.AllDirectories));
+public JobStateMachine States => _states ??= new JobStateMachine(Plan.JobId);
+public IReadOnlyList<TargetProgress> Targets => _targets ??= BuildTargets(Plan);
 ```
 
-The second file is a leftover `.fmtmp-` temp beside the restored `doc.txt`. It reproduces under load —
-it showed up in concurrent full-solution runs and in a tight Core-only loop, but the suite passes 3/3
-in isolation, which is why it reads as flaky rather than broken.
+`??=` is not atomic. `JobExecutor.DistributeAsync` fans out one `Task.Run` per target and **every one
+of them touches `Targets` for the first time simultaneously**, so several threads each ran
+`BuildTargets` and only the last write to `_targets` survived. Every target that then mutated a
+*discarded* `TargetProgress` was invisible to everyone else.
 
-### Why it happens (the existing hypothesis)
+`JobExecutor.RollBackAsync` snapshots `execution.Targets` into `TargetRollbackItem`s, so it read
+`State = Pending` and `TempPath = null` for targets that had really reached `Staged`.
+`RollbackExecutor.RevertTarget` maps `Pending` to `RollbackAction.None` — it did nothing, and the temp
+stayed on disk. The journal proves it; here is the captured reproduction:
 
-Already documented in `tests/FileManager.Core.Tests/TestSupport/JobExecutorHarness.cs:198-204`, in the
-comment on `ExecuteWithRetriesAsync`:
+```
+twb  target=2 / twb target=1 / twb target=0      <- all three began writing
+tver target=0 / tver target=1                    <- t1 and t2 verified
+tstg target=1 / tstg target=0                    <- ...and staged
+rbbegin  failedTarget=2
+trb  target=0 action=None                        <- rollback saw them as Pending
+trb  target=1 action=None
+trb  target=2 action=RemovedTemp                 <- only the thread that won the race
+close outcome=Failed
+```
 
-> Waiting 5 ms BEFORE the first advance is a real behavior change, not just a cheaper loop: it widens
-> the window in which a multi-target job's sibling-cancellation lands mid-placement, and
-> `A_multi_target_failure_leaves_no_target_placed_and_every_prior_intact` then finds a `.fmtmp-` temp
-> that rollback did not reclaim. That looks like a genuine cancellation/cleanup race in the placer
-> worth investigating on its own.
+That is why it read as flaky and load-dependent: whether a given target's mutations survived depended
+on which thread won a race.
 
-The setup that provokes it: three targets each with a prior version, `StageOverwrites`, and
-`FaultyFileHasher.CorruptPathsMatching` corrupting only `t3`'s read-back. `t3` fails verification →
-`JobExecutor.DistributeAsync` calls `linked.Cancel()` to cancel its siblings
-(`src/FileManager.Core/Jobs/JobExecutor.cs:363-391`) → a sibling that is mid-`PlaceTargetAsync`
-observes the cancel somewhere between "temp written" and "journal `twb` recorded".
+### What it actually cost
 
-### Where to look
+Leaked temps were the visible half. The same lost state meant **a target that reached `Placed` could be
+skipped by rollback entirely** — this job's content left at the destination, the prior version left in
+`.fm_staging`, and the job still reporting "rolled back cleanly". The reported 1-in-8 test failure was
+the mildest symptom of the bug, not its extent.
 
-The suspicion is a window where a temp file exists on disk but rollback cannot find it, because
-rollback reconstructs its work from `TargetProgress` / the journal:
+### The fix
 
-- `src/FileManager.Core/Placement/AtomicPlacer.cs` — `PlaceTargetAsync` (~line 109),
-  `CopyToTempAsync` (~line 229). Specifically: is `TargetProgress.TempPath` assigned **before** the
-  copy starts, or only after it completes? If after, a cancel during the copy leaves a temp that
-  `TargetProgress` never names.
-- `src/FileManager.Core/Journal/RollbackExecutor.cs` — the ordered sweep. It reclaims temps from
-  `TargetRollbackItem.TempPath`, which `JobExecutor.RollBackAsync`
-  (`src/FileManager.Core/Jobs/JobExecutor.cs:498-508`) copies straight out of `TargetProgress`. A null
-  `TempPath` means nothing to delete.
-- `JobExecutor.PlaceOneAsync`'s `catch (OperationCanceledException) { return null; }`
-  (`src/FileManager.Core/Jobs/JobExecutor.cs:460-463`) — a cancelled sibling reports no error, by
-  design, so nothing signals "this target has a temp that needs cleaning".
+`src/FileManager.Core/Jobs/Job.cs` — `States` and `Targets` are now built **eagerly in `Plan`'s `init`
+accessor**, which runs once on the constructing thread before the execution is published. No lazy
+initialization, no race, and no call-site churn (the only construction site is an object initializer).
 
-### Suggested fix direction
+Three further defects found on the same path while diagnosing, each fixed and each with its own test:
 
-Make the temp path known *before* the bytes are written, so it is reclaimable no matter when the
-cancel lands. Two candidate shapes:
+- **`AtomicPlacer` never reclaimed its own temp.** It now deletes it in the existing `finally` on any
+  exit that did not place it. Rollback and crash recovery still reclaim it too — this is the earliest
+  attempt, not the only one, and it runs while the target still holds its path lock.
+- **`RollbackExecutor.RevertStaged` chained its two steps with `??`**, so a failed restore skipped the
+  temp delete. They are independent and both now always run. Residual paths are also confirmed against
+  the filesystem rather than defaulting to `FinalPath`, which pointed the user at a file that is
+  usually fine and hid the artifact that is not.
+- **`DistributeAsync` treated "every target cancelled, none reported an error" as success.** Since
+  `PlaceOneAsync` reports cancellation as no-error, an *external* cancel made the job journal
+  `job-committed` and **dispose the source with nothing placed** — confirmed empirically by the new
+  test, which permanently deleted the source before the fix. Latent in production only because
+  `JobOrchestrator` passes `CancellationToken.None` (I-ATOMIC-JOB). Cancellation now routes to
+  rollback, a faulted target task becomes a `JobError` instead of unwinding past the rollback branch,
+  and `ExecuteAsync`'s catch-all attempts the sweep before giving up.
 
-1. **Record-then-write.** Set `TargetProgress.TempPath` (and journal `twb`) before opening the temp
-   stream rather than after. This is the write-ahead discipline the rest of the engine already uses,
-   and it is the same argument as `MirrorOrphanTrashingRecord`: name the artifact before you create it.
-2. **Best-effort sweep on cancel.** In `PlaceOneAsync`'s cancellation catch, delete the temp if one was
-   created. Cheaper, but it only narrows the window — a crash at the same instant still leaks — so
-   prefer (1) and treat this as belt-and-braces.
+### Tests
 
-Also worth checking whether `.fm_staging` can leak the same way on this path.
-
-### Acceptance
-
-- Run the suite in a loop and get 25+ consecutive clean runs of
-  `JobExecutorFailureRollbackTests` (it takes <1 s, so this is cheap):
-  ```
-  for /L %i in (1,1,25) do dotnet test tests/FileManager.Core.Tests/FileManager.Core.Tests.csproj ^
-      --no-build --filter "FullyQualifiedName~JobExecutorFailureRollbackTests"
-  ```
-- Add a **deterministic** regression test rather than relying on the race: inject a cancel at a chosen
-  point inside placement (a seam on `IAtomicPlacer` or a `FaultyFileHasher`-style hook that cancels
-  during `CopyToTempAsync`) and assert `LeftoverArtifacts()` is empty. The value of the fix is being
-  able to prove it, and a timing-dependent test cannot.
-- Once deterministic, revisit `JobExecutorHarness.ExecuteWithRetriesAsync`'s advance-then-poll ordering:
-  the comment says the loop is shaped the way it is *because* of this race, so the workaround should
-  come out with it.
+`JobExecutionTests` (new) pins the shared-state invariant with threads released together;
+`AtomicPlacerTests.A_cancelled_placement_removes_the_temp_it_created`;
+`RollbackExecutorTests` gains the failed-restore and residual-naming cases;
+`JobExecutorFailureRollbackTests` gains `A_job_cancelled_mid_placement_leaves_no_temp_behind` and
+`A_cancelled_job_never_commits_and_never_disposes_the_source`. Each was confirmed to fail against the
+unfixed code. `JobExecutorHarness.ExecuteWithRetriesAsync` is back to the cheaper delay-then-advance
+loop and its workaround comment is gone; `JobExecutorFailureRollbackTests` ran 25/25 clean.
 
 ---
 
@@ -440,7 +437,7 @@ dotnet build File-Manager.slnx
 dotnet test File-Manager.slnx
 ```
 
-Expect **1428 tests, 0 failures** and **19 warnings** (the pre-existing baseline: CA1416 in
+Expect **1436 tests, 0 failures** and **19 warnings** (the pre-existing baseline: CA1416 in
 Platform.Windows.Tests, xUnit1031/2031 in Core.Tests, and one CS9107 in
 `src/FileManager.Core/Files/FileSystemService.cs`). Note the "src is warning-free" claim in older docs
 is stale — that CS9107 predates this work.

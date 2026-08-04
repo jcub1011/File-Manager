@@ -192,20 +192,16 @@ internal sealed class JobExecutorHarness : IDisposable
 
     /// <summary>Runs the executor, pumping the retry policy's clock so a retried operation does not
     /// wait real seconds. Use for any test that injects a transient failure.</summary>
-    public async Task<JobCompletion> ExecuteWithRetriesAsync(JobPlan plan)
+    /// <param name="ct">Cancels the job from OUTSIDE, the way no production caller does today
+    /// (<c>JobOrchestrator</c> passes <c>None</c> per I-ATOMIC-JOB) — so a test can prove distribution
+    /// treats an external cancel as a failure to roll back rather than as success to commit.</param>
+    public async Task<JobCompletion> ExecuteWithRetriesAsync(JobPlan plan, CancellationToken ct = default)
     {
-        Task<JobCompletion> run = Executor.ExecuteAsync(plan);
-        // Advance-then-poll, deliberately in that order and deliberately unconditional. Waiting 5 ms
-        // BEFORE the first advance is a real behavior change, not just a cheaper loop: it widens the
-        // window in which a multi-target job's sibling-cancellation lands mid-placement, and
-        // A_multi_target_failure_leaves_no_target_placed_and_every_prior_intact then finds a .fmtmp-
-        // temp that rollback did not reclaim. That looks like a genuine cancellation/cleanup race in
-        // the placer worth investigating on its own; until then this loop stays as it is, because the
-        // cost it saves is a few milliseconds of test time.
+        Task<JobCompletion> run = Executor.ExecuteAsync(plan, progress: null, ct);
         while (!run.IsCompleted)
         {
-            RetryClock.Advance(TimeSpan.FromSeconds(2));
             await Task.Delay(5);
+            RetryClock.Advance(TimeSpan.FromSeconds(2));
         }
         return await run;
     }
