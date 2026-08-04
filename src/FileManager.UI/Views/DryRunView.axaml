@@ -369,18 +369,19 @@
                                Text="{Binding PlanSummary}" TextWrapping="Wrap" />
                     <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="8"
                                 HorizontalAlignment="Right">
-                        <!-- Danger-styled, and it is the only button in the app that begins moving files.
-                             Every phase before this one was read-only by construction. -->
-                        <Button Classes="danger" Command="{Binding ApproveRunCommand}"
-                                ToolTip.Tip="Starts the run. This copies the files listed above and, for a Mirror profile, removes the ones marked for removal.">
-                            <StackPanel Orientation="Horizontal" Spacing="6">
-                                <PathIcon Data="{StaticResource IconPlay}" Width="11" Height="11"
-                                          VerticalAlignment="Center" />
-                                <TextBlock Text="Approve Run" />
-                            </StackPanel>
+                        <!-- Icon-only, matching the tab-header strip. Amber play = go but look first, red
+                             trash = throw the plan away. Amber rather than the green used for Preview
+                             because this is still the only button in the app that begins moving files —
+                             every phase before it was read-only by construction — and with the "Approve
+                             Run" label gone the colour and the tooltip are all that is left to say so. -->
+                        <Button Classes="iconButton onChrome tintWarning" Command="{Binding ApproveRunCommand}"
+                                ToolTip.Tip="Approve Run — starts the run. This copies the files listed above and, for a Mirror profile, removes the ones marked for removal.">
+                            <PathIcon Data="{StaticResource IconPlay}" Width="14" Height="14" />
                         </Button>
-                        <Button Content="Discard" Command="{Binding DeclineRunCommand}"
-                                ToolTip.Tip="Throws this plan away. Nothing is changed." />
+                        <Button Classes="iconButton onChrome tintDanger" Command="{Binding DeclineRunCommand}"
+                                ToolTip.Tip="Discard — throws this plan away. Nothing is changed.">
+                            <PathIcon Data="{StaticResource IconTrash}" Width="14" Height="14" />
+                        </Button>
                     </StackPanel>
                 </Grid>
             </StackPanel>

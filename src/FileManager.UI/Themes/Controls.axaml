@@ -113,6 +113,19 @@
     <Style Selector="Button.iconButton:pressed /template/ ContentPresenter">
         <Setter Property="Background" Value="{DynamicResource Brush.Item.Selected}" />
     </Style>
+    <!-- Same button, sitting on a chrome-coloured bar rather than a panel. The two states above are
+         lifts off Brush.Panel.Background and all but vanish against Brush.Chrome.Background — in the
+         dark variant Brush.Item.Hover (#2A2D2E) is actually a shade DARKER than the chrome it would
+         sit on (#2D2D30), so hovering reads as nothing at all. A translucent mid-grey shows up on
+         either surface in either variant, which is the trick Button.caption already uses to stay
+         visible on the title bar. Must follow the two rules above to win: equal-priority setters
+         resolve by document order. -->
+    <Style Selector="Button.iconButton.onChrome:pointerover /template/ ContentPresenter">
+        <Setter Property="Background" Value="#22808080" />
+    </Style>
+    <Style Selector="Button.iconButton.onChrome:pressed /template/ ContentPresenter">
+        <Setter Property="Background" Value="#38808080" />
+    </Style>
     <!-- Idle glyphs sit at the secondary weight and brighten on hover — softer and more
          cohesive than stark full-contrast icons. -->
     <Style Selector="Button.iconButton PathIcon">
@@ -120,6 +133,33 @@
     </Style>
     <Style Selector="Button.iconButton:pointerover PathIcon">
         <Setter Property="Foreground" Value="{DynamicResource Brush.Text.Primary}" />
+    </Style>
+
+    <!-- Tint variants for icon-only buttons whose glyph is their whole label: the colour carries the
+         meaning the solid-fill text buttons used to (accent = commit, red = destructive, green =
+         inspect). One constant tint across idle and hover — the hover fill behind the glyph is the
+         feedback. These must stay AFTER the two rules above: equal-priority style setters are resolved
+         by document order, so an earlier tint would lose the hover state back to Brush.Text.Primary.
+         Tinting via a class rather than a Foreground on the PathIcon itself is deliberate — a local
+         value on the element outranks every one of these styles at once, hover rule included. -->
+    <Style Selector="Button.iconButton.tintAccent PathIcon">
+        <Setter Property="Foreground" Value="{DynamicResource Brush.Accent}" />
+    </Style>
+    <Style Selector="Button.iconButton.tintDanger PathIcon">
+        <Setter Property="Foreground" Value="{DynamicResource Brush.Danger}" />
+    </Style>
+    <Style Selector="Button.iconButton.tintSuccess PathIcon">
+        <Setter Property="Foreground" Value="{DynamicResource Brush.Success}" />
+    </Style>
+    <!-- Amber: go, but look before you do. For Approve Run, which is irreversible without being an
+         outright destructive action of its own. -->
+    <Style Selector="Button.iconButton.tintWarning PathIcon">
+        <Setter Property="Foreground" Value="{DynamicResource Brush.Warning}" />
+    </Style>
+    <!-- Fluent greys a disabled button through its template's ContentPresenter foreground, which every
+         explicit PathIcon foreground above defeats — so say it outright. Last, so it beats the tints. -->
+    <Style Selector="Button.iconButton:disabled PathIcon">
+        <Setter Property="Foreground" Value="{DynamicResource Brush.Text.Disabled}" />
     </Style>
 
     <!-- Caption buttons (minimize/maximize/close). WindowDecorations="BorderOnly" keeps the OS

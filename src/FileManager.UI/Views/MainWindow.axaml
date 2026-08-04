@@ -150,19 +150,33 @@
                     <StackPanel Orientation="Horizontal" Spacing="8"
                                 DataContext="{Binding Editor}" x:DataType="vm:ProfileEditorViewModel"
                                 IsVisible="{Binding #ProfileTab.IsSelected}">
-                        <!-- Undo/Redo come first, ahead of the commit actions: they act on the edits in
-                             progress rather than resolving the draft. They run the same commands the
-                             Ctrl+Z / Ctrl+Y shortcuts in ProfileEditorView do, so the buttons and the
-                             keyboard cannot drift apart. -->
+                        <!-- Icon-only throughout, so the whole strip reads as one toolbar. The glyph tints
+                             carry what the old solid fills did: accent = commit, red = destructive,
+                             green = go. Every button names itself in a tooltip, since nothing else does. -->
+                        <!-- Discard leads, even though it reads out of order next to Undo/Redo: it is the
+                             only button here that comes and goes (IsDirty), and this group is right-anchored,
+                             so appearing at the head grows the group leftwards and leaves every other button
+                             under the cursor where it was. Anywhere else it shifts its neighbours.
+                             The ✕ runs a size smaller than the rest: a bare cross fills its box corner to
+                             corner and optically overshoots the outline glyphs beside it at a matched 14. -->
+                        <Button Classes="iconButton" Command="{Binding DiscardCommand}"
+                                IsVisible="{Binding IsDirty}" ToolTip.Tip="Discard changes">
+                            <PathIcon Data="{StaticResource IconClose}" Width="12" Height="12" />
+                        </Button>
+                        <!-- Undo/Redo sit ahead of the commit actions: they act on the edits in progress
+                             rather than resolving the draft. They run the same commands the Ctrl+Z / Ctrl+Y
+                             shortcuts in ProfileEditorView do, so the buttons and the keyboard cannot drift
+                             apart. -->
                         <Button Classes="iconButton" Command="{Binding History.UndoCommand}" ToolTip.Tip="Undo (Ctrl+Z)">
                             <PathIcon Data="{StaticResource IconUndo}" Width="14" Height="14" />
                         </Button>
                         <Button Classes="iconButton" Command="{Binding History.RedoCommand}" ToolTip.Tip="Redo (Ctrl+Y)">
                             <PathIcon Data="{StaticResource IconRedo}" Width="14" Height="14" />
                         </Button>
-                        <Button Content="Save" Command="{Binding SaveCommand}" Classes="accent" />
-                        <Button Content="Discard changes" Command="{Binding DiscardCommand}"
-                                IsVisible="{Binding IsDirty}" />
+                        <Button Classes="iconButton tintAccent" Command="{Binding SaveCommand}"
+                                ToolTip.Tip="Save">
+                            <PathIcon Data="{StaticResource IconSave}" Width="14" Height="14" />
+                        </Button>
                     </StackPanel>
 
                     <!-- Delete takes the selected list row (it acts on the PERSISTED profile); Preview
@@ -170,22 +184,21 @@
                          shell scope, so no DataContext override here. -->
                     <StackPanel Orientation="Horizontal" Spacing="8"
                                 IsVisible="{Binding #ProfileTab.IsSelected}">
-                        <Button Content="Delete" Classes="danger"
+                        <Button Classes="iconButton tintDanger"
                                 Command="{Binding DeleteProfileCommand}"
                                 CommandParameter="{Binding List.SelectedProfile}"
                                 IsEnabled="{Binding List.CanDeleteSelected}"
-                                ToolTip.Tip="Delete this profile" />
-                        <Button Classes="accent"
+                                ToolTip.Tip="Delete — permanently removes this profile">
+                            <PathIcon Data="{StaticResource IconTrash}" Width="14" Height="14" />
+                        </Button>
+                        <!-- A spyglass, not a play triangle: this button inspects, and the only button in
+                             the app that starts moving files is Approve Run. With the label gone the glyph
+                             is the whole argument, so the tooltip still spells out what a preview does. -->
+                        <Button Classes="iconButton tintSuccess"
                                 Command="{Binding PreviewProfileCommand}"
                                 CommandParameter="{Binding List.SelectedProfile}"
-                                ToolTip.Tip="Works out exactly what this profile will do and shows it on the Preview tab. Nothing is copied or deleted until you approve it there.">
-                            <StackPanel Orientation="Horizontal" Spacing="6">
-                                <!-- A spyglass, not a play triangle: this button inspects, and the only
-                                     button in the app that starts moving files is Approve Run. -->
-                                <PathIcon Data="{StaticResource IconSearch}" Width="12" Height="12"
-                                          VerticalAlignment="Center" />
-                                <TextBlock Text="Preview" />
-                            </StackPanel>
+                                ToolTip.Tip="Preview — works out exactly what this profile will do and shows it on the Preview tab. Nothing is copied or deleted until you approve it there.">
+                            <PathIcon Data="{StaticResource IconSearch}" Width="14" Height="14" />
                         </Button>
                     </StackPanel>
 
@@ -193,22 +206,26 @@
                          so this group stays at shell scope and reads the child VM for its busy state. -->
                     <StackPanel Orientation="Horizontal" Spacing="6"
                                 IsVisible="{Binding #PreviewTab.IsSelected}">
-                        <Button Classes="accent"
-                                Command="{Binding PreviewProfileCommand}"
-                                CommandParameter="{Binding List.SelectedProfile}"
-                                IsEnabled="{Binding !DryRun.IsPreviewing}">
-                            <StackPanel Orientation="Horizontal" Spacing="6">
-                                <PathIcon Data="{StaticResource IconSearch}" Width="12" Height="12"
-                                          VerticalAlignment="Center" />
-                                <TextBlock Text="Preview" />
-                            </StackPanel>
-                        </Button>
                         <!-- Planning a large profile is minutes of walking, and free to abandon: nothing
                              has been touched. Only offered once the engine has accepted the run, which is
-                             when there is an id to cancel. -->
-                        <Button Content="Cancel" Command="{Binding DryRun.CancelPreviewCommand}"
+                             when there is an id to cancel. Like Discard on the Profile tab it leads the
+                             group: it is the one button here that comes and goes, and a right-anchored
+                             group only stays still under the cursor if the transient member is at the head. -->
+                        <Button Classes="iconButton" Command="{Binding DryRun.CancelPreviewCommand}"
                                 IsVisible="{Binding DryRun.PlanningRunId,
-                                                    Converter={x:Static ObjectConverters.IsNotNull}}" />
+                                                    Converter={x:Static ObjectConverters.IsNotNull}}"
+                                ToolTip.Tip="Cancel — stops planning. Nothing has been touched.">
+                            <PathIcon Data="{StaticResource IconClose}" Width="12" Height="12" />
+                        </Button>
+                        <!-- A refresh arrow rather than the Profile tab's spyglass: arriving here the plan
+                             is already on screen, so this button's job is to redo it, not to go look. -->
+                        <Button Classes="iconButton tintSuccess"
+                                Command="{Binding PreviewProfileCommand}"
+                                CommandParameter="{Binding List.SelectedProfile}"
+                                IsEnabled="{Binding !DryRun.IsPreviewing}"
+                                ToolTip.Tip="Preview — re-plans this profile from scratch">
+                            <PathIcon Data="{StaticResource IconRefresh}" Width="14" Height="14" />
+                        </Button>
                     </StackPanel>
                 </StackPanel>
             </Grid>
