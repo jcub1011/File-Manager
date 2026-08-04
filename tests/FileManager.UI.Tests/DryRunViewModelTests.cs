@@ -1412,6 +1412,79 @@ public sealed class DryRunViewModelTests
 
         VolumeSpaceRow e = viewModel.Space.Volumes.Single(v => v.VolumeRoot == "E:");
         Assert.False(e.HasWarning);
+
+        // No deferred reclaim in this projection, so no "freed at end" figure and no remedy offered.
+        Assert.False(d.HasDeferredReclaim);
+        Assert.DoesNotContain("proactively", d.WarningText);
+    }
+
+    [Fact]
+    public async Task A_tight_drive_whose_peak_holds_doomed_mirror_files_is_told_how_to_reclaim_them()
+    {
+        var (viewModel, gateway) = NewViewModel();
+        gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value) with
+        {
+            Space = new SpaceProjection
+            {
+                TotalBytesWritten = 5000,
+                TotalNetChangeBytes = 400,
+                SafetyMarginBytes = 100,
+                Volumes =
+                [
+                    // Peak (950) crosses capacity − margin (900), and 300 of it is orphans that a
+                    // delete-after-copy Mirror keeps on disk until the run ends.
+                    new VolumeSpaceEstimate
+                    {
+                        VolumeRoot = "D:", CapacityKnown = true, TotalCapacityBytes = 1000, UsedNowBytes = 500,
+                        FreeNowBytes = 500, ClusterBytes = 1, BytesWrittenBytes = 5000, NetChangeBytes = 400,
+                        SettledUsedBytes = 900, DeferredReclaimBytes = 500, MirrorDeferredReclaimBytes = 300,
+                        RealisticPeakUsedBytes = 950, SafeCeilingUsedBytes = 980,
+                    },
+                ],
+            },
+        };
+
+        await viewModel.RunAsync(CancellationToken.None);
+
+        VolumeSpaceRow d = Assert.Single(viewModel.Space!.Volumes);
+        Assert.True(d.HasDeferredReclaim);
+        Assert.Equal(ByteSize.Format(500), d.DeferredReclaimText);          // the whole deferred total
+        Assert.Contains(ByteSize.Format(300), d.WarningText);               // only the actionable share
+        Assert.Contains("proactively", d.WarningText);
+    }
+
+    [Fact]
+    public async Task Deferred_space_with_no_mirror_share_is_reported_without_offering_a_remedy()
+    {
+        var (viewModel, gateway) = NewViewModel();
+        gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value) with
+        {
+            Space = new SpaceProjection
+            {
+                TotalBytesWritten = 5000,
+                TotalNetChangeBytes = 400,
+                SafetyMarginBytes = 100,
+                Volumes =
+                [
+                    // All the deferred space is sources awaiting disposal — nothing the user can
+                    // retime, so naming a Mirror remedy would be advice they cannot act on.
+                    new VolumeSpaceEstimate
+                    {
+                        VolumeRoot = "D:", CapacityKnown = true, TotalCapacityBytes = 1000, UsedNowBytes = 500,
+                        FreeNowBytes = 500, ClusterBytes = 1, BytesWrittenBytes = 5000, NetChangeBytes = 400,
+                        SettledUsedBytes = 900, DeferredReclaimBytes = 500, MirrorDeferredReclaimBytes = 0,
+                        RealisticPeakUsedBytes = 950, SafeCeilingUsedBytes = 980,
+                    },
+                ],
+            },
+        };
+
+        await viewModel.RunAsync(CancellationToken.None);
+
+        VolumeSpaceRow d = Assert.Single(viewModel.Space!.Volumes);
+        Assert.True(d.IsDanger);
+        Assert.True(d.HasDeferredReclaim);
+        Assert.DoesNotContain("proactively", d.WarningText);
     }
 
     [Fact]

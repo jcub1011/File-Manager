@@ -116,7 +116,8 @@ public sealed class DryRunStreamHandler(
         // Byte/space projection, folded from the same chunks as they stream by (no extra buffering).
         // A chunk's op indices are global; passing the running (emitted, destinationCount) as bases
         // lets the estimator resolve them against the chunk's own file lists.
-        var estimator = new DryRunSpaceEstimator(volumes, config.PreflightSafetyMarginBytes);
+        var estimator = new DryRunSpaceEstimator(
+            volumes, config.PreflightSafetyMarginBytes, profile.Policies.MirrorDeletion);
         bool stageOverwrites = profile.Policies.OverwriteHandling == OverwriteHandling.StageOverwrites;
         // Phase attribution for the whole streamed run (the engine logs its own scan/evaluate split):
         // total wall time, the destination sweep, and the estimator's cumulative share. The estimator

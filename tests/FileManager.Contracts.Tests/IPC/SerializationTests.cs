@@ -365,6 +365,8 @@ public sealed class SerializationTests
                     BytesWrittenBytes = 5_000_000,
                     NetChangeBytes = -1_234,
                     SettledUsedBytes = 499_998_766,
+                    DeferredReclaimBytes = 12_000_000,
+                    MirrorDeferredReclaimBytes = 9_000_000,
                     RealisticPeakUsedBytes = 520_000_000,
                     SafeCeilingUsedBytes = 560_000_000,
                     Folders = [new FolderSpaceBreakdown { Root = @"D:\backup", BytesWrittenBytes = 5_000_000, NetChangeBytes = -1_234, FileCount = 3 }],
@@ -388,6 +390,8 @@ public sealed class SerializationTests
         Assert.Equal("D:", volume.VolumeRoot);
         Assert.True(volume.CapacityKnown);
         Assert.Equal(4096, volume.ClusterBytes);
+        Assert.Equal(12_000_000, volume.DeferredReclaimBytes);
+        Assert.Equal(9_000_000, volume.MirrorDeferredReclaimBytes);
         Assert.Equal(560_000_000, volume.SafeCeilingUsedBytes);
         FolderSpaceBreakdown folder = Assert.Single(volume.Folders);
         Assert.Equal(@"D:\backup", folder.Root);
@@ -476,6 +480,22 @@ public sealed class SerializationTests
         Profile? parsed = JsonSerializer.Deserialize(obj.ToJsonString(), FileManagerJsonContext.Default.Profile);
         Assert.NotNull(parsed);
         Assert.Equal(SampleProfile().Name, parsed!.Name);   // the rest parsed fine, stale field dropped
+    }
+
+    [Fact]
+    public void Profile_saved_before_MirrorDeletion_existed_loads_as_delete_after_copy()
+    {
+        // The additive-field contract: a profile written before the policy was introduced has no
+        // MirrorDeletion member, and must land on the safe timing rather than on whatever the
+        // source generator leaves behind (it does not run property initializers for absent members).
+        string json = Encoding.UTF8.GetString(JsonSerializer.SerializeToUtf8Bytes(
+            SampleProfile(), FileManagerJsonContext.Default.Profile));
+        JsonObject obj = JsonNode.Parse(json)!.AsObject();
+        obj["Policies"]!.AsObject().Remove("MirrorDeletion");
+
+        Profile? parsed = JsonSerializer.Deserialize(obj.ToJsonString(), FileManagerJsonContext.Default.Profile);
+        Assert.NotNull(parsed);
+        Assert.Equal(MirrorDeletion.AfterCopy, parsed!.Policies.MirrorDeletion);
     }
 
     [Fact]

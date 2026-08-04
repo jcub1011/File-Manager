@@ -10,11 +10,15 @@ using Serilog;
 namespace FileManager.UI.Controls;
 
 /// <summary>A render-only horizontal bar showing one destination volume's storage picture as nested
-/// increments against the volume's total capacity. Painted end-to-end so each colour's right edge is
-/// a threshold: <c>used-now (CSU) → +at-rest (SUAR) → +transient (RPSU) → +worst-case (APSU)</c>,
-/// with the remainder free. A dashed line marks <c>capacity − safety-margin</c>. Colours stay calm
-/// unless a threshold crosses that line: the worst-case headroom turns amber when the safe ceiling
-/// crosses it, and the transient + worst-case turn red when the realistic peak crosses it.
+/// increments against the volume's total capacity. Every figure it draws is a threshold measured from
+/// zero, so every band is a bar from zero to its threshold and the bands are painted largest-first —
+/// each smaller bar covers the one under it, leaving each colour's right edge at its own threshold and
+/// the remainder free. Typically that reads <c>used-now (CSU) → +at-rest (SUAR) → +transient (RPSU) →
+/// +worst-case (APSU)</c>, but the order is decided by the values, not assumed: a run that frees space
+/// settles below where the volume started, and the "will free" band takes the place of the at-rest one.
+/// A dashed line marks <c>capacity − safety-margin</c>. Colours stay calm unless a threshold crosses
+/// that line: the worst-case headroom turns amber when the safe ceiling crosses it, and the transient
+/// + worst-case turn red when the realistic peak crosses it.
 /// <para>
 /// Each coloured band is labelled with its acronym when the band is wide enough; a per-band tooltip
 /// (expanded form + acronym, e.g. "Realistic Peak Storage Usage (RPSU)") is shown on hover for every
@@ -46,8 +50,9 @@ public sealed class StorageBar : Control
     private const double CornerRadius = 3;
     private const double DefaultHeight = 20;
 
-    // The bands painted by the last Render, left→right, for hover hit-testing. Overlapping bands are
-    // resolved by scanning newest-first so the visually-topmost band wins the tooltip.
+    // The visible span of each band painted by the last Render, for hover hit-testing. Spans are the
+    // uncovered slices of the layered bars, so they never overlap and any scan order finds the same
+    // band; kept as a scan for the handful of entries involved.
     private readonly List<(double X0, double X1, string Tip)> _bands = [];
     private string? _currentTip;
 
@@ -146,46 +151,47 @@ public sealed class StorageBar : Control
 
             double scale = w / cap;
             double Clamp(double v) => Math.Clamp(v, 0, cap) * scale;
-            void Seg(double from, double to, IBrush brush, string acronym, string expanded, IBrush labelBrush)
-            {
-                double x0 = Clamp(from);
-                double x1 = Clamp(to);
-                if (x1 <= x0)
-                    return;
-                context.DrawRectangle(brush, null, new Rect(x0, 0, x1 - x0, h));
-                _bands.Add((x0, x1, $"{expanded} ({acronym})"));
-                DrawLabel(context, x0, x1, h, acronym, labelBrush);
-            }
 
-            double used = UsedNowBytes;
-            double settled = SettledBytes;
-            double peak = Math.Max(settled, RealisticPeakBytes);
-            double ceiling = Math.Max(peak, SafeCeilingBytes);
             double marginLine = cap - MarginBytes;
-
             bool overRed = RealisticPeakBytes > marginLine;
             bool overAmber = SafeCeilingBytes > marginLine;
 
-            // Used-now baseline; then the at-rest delta (green growth, or a faint "will free" band when
-            // the run net-frees space on this volume).
-            if (settled >= used)
+            // Largest band first: every figure is a threshold from zero, so each smaller bar simply
+            // covers the one beneath it and no band needs to know where the others landed.
+            StorageBand[] bands = StorageBandLayout.Compute(
+                UsedNowBytes, SettledBytes, RealisticPeakBytes, SafeCeilingBytes);
+
+            foreach (StorageBand band in bands)
             {
-                Seg(0, used, usedNow, "CSU", "Current Storage Used", LabelLight);
-                Seg(used, settled, added, "SUAR", "Storage Used At Rest", LabelLight);
-            }
-            else
-            {
-                // Net-frees space: the grey that remains is the settled at-rest total; the faint band
-                // above it is what the run releases.
-                Seg(0, settled, usedNow, "SUAR", "Storage Used At Rest", LabelLight);
-                Seg(settled, used, freed, "Freed", "Space Freed", LabelDark);
+                double x1 = Clamp(band.Threshold);
+                if (x1 > 0)
+                    context.DrawRectangle(BrushFor(band.Kind), null, new Rect(0, 0, x1, h));
             }
 
-            // Transient (settled → realistic peak) and worst-case headroom (peak → safe ceiling).
-            Seg(settled, peak, overRed ? red : transient,
-                "RPSU", "Realistic Peak Storage Usage", LabelLight);
-            Seg(peak, ceiling, overRed ? red : overAmber ? amber : WorstCalmBrush,
-                "APSU", "Absolute Peak Storage Usage", overRed ? LabelLight : LabelDark);
+            // Labels and hover targets go on afterwards, over the finished stack, and describe the
+            // visible slice of each band rather than its full bar — the covered part belongs to
+            // whichever smaller band is painted on top of it.
+            foreach (StorageBand band in bands)
+            {
+                if (!band.IsVisible)
+                    continue;
+                double x0 = Clamp(band.VisibleFrom);
+                double x1 = Clamp(band.Threshold);
+                if (x1 <= x0)
+                    continue;   // survives clamping only as a hairline; nothing to label or hover
+                (string acronym, string expanded) = NameOf(band.Kind);
+                _bands.Add((x0, x1, $"{expanded} ({acronym})"));
+                DrawLabel(context, x0, x1, h, acronym, LabelBrushFor(band.Kind, overRed));
+            }
+
+            IBrush BrushFor(StorageBandKind kind) => kind switch
+            {
+                StorageBandKind.CurrentUsed => usedNow,
+                StorageBandKind.UsedAtRest => added,
+                StorageBandKind.Freed => freed,
+                StorageBandKind.RealisticPeak => overRed ? red : transient,
+                _ => overRed ? red : overAmber ? amber : WorstCalmBrush,
+            };
 
             if (marginLine > 0 && marginLine < cap)
             {
@@ -198,6 +204,25 @@ public sealed class StorageBar : Control
             Log.Warning(ex, "StorageBar failed to render");
         }
     }
+
+    // The bar's vocabulary: the acronym printed in the band and the expanded form its tooltip carries.
+    private static (string Acronym, string Expanded) NameOf(StorageBandKind kind) => kind switch
+    {
+        StorageBandKind.CurrentUsed => ("CSU", "Current Storage Used"),
+        StorageBandKind.UsedAtRest => ("SUAR", "Storage Used At Rest"),
+        StorageBandKind.Freed => ("Freed", "Space Freed"),
+        StorageBandKind.RealisticPeak => ("RPSU", "Realistic Peak Storage Usage"),
+        _ => ("APSU", "Absolute Peak Storage Usage"),
+    };
+
+    // Label ink is chosen for contrast against the band's own fill: the two pale bands take dark text,
+    // and the worst-case band flips to light once the danger colour turns it red.
+    private static IBrush LabelBrushFor(StorageBandKind kind, bool overRed) => kind switch
+    {
+        StorageBandKind.Freed => LabelDark,
+        StorageBandKind.AbsolutePeak => overRed ? LabelLight : LabelDark,
+        _ => LabelLight,
+    };
 
     // Prints the acronym centred in a band only when it fits with padding; otherwise the band relies
     // on its hover tooltip alone.

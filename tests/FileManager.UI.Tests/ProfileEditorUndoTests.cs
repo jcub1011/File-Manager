@@ -180,6 +180,20 @@ public sealed class ProfileEditorUndoTests
         Assert.Equal(ConflictResolution.Skip, editor.ConflictResolution);
     }
 
+    [Fact]
+    public void Mirror_deletion_picks_are_undoable()
+    {
+        var (editor, _) = NewEditor();
+        editor.LoadNew();
+
+        editor.MirrorDeletion = MirrorDeletion.Proactive;
+        Assert.True(editor.IsDirty);
+
+        editor.History.UndoCommand.Execute(null);
+        Assert.Equal(MirrorDeletion.AfterCopy, editor.MirrorDeletion);
+        Assert.False(editor.IsDirty);
+    }
+
     // ============================ The SyncMode → ScanDestination coupling ============================
 
     [Fact]

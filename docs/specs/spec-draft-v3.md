@@ -500,7 +500,8 @@ are not portable across OSes).
     "OnSuccess": "MoveToTrash",
     "ArchiveFolder": null,
     "OnFailure": "AbortRestoreAndClean",
-    "MetadataOnConflict": "WarnAndContinue"
+    "MetadataOnConflict": "WarnAndContinue",
+    "MirrorDeletion": "AfterCopy"
   },
 
   "Filters": {
@@ -528,6 +529,12 @@ are not portable across OSes).
 > `VerificationMethod ∈ {XXH3-128 (default), SHA256, SizeTimestamp (reserved), None}`;
 > `ConflictResolution ∈ {Overwrite, OverwriteIfNewer, RenameSuffix, Skip}`;
 > `OverwriteHandling ∈ {DirectOverwrite, StageOverwrites}`;
+> `MirrorDeletion ∈ {AfterCopy (default), Proactive}` — when a Mirror run removes the destination
+> files that no longer exist in the Source. `AfterCopy` deletes only once the copies are placed and
+> verified (safer, but the volume must hold both at once); `Proactive` deletes first to free the space
+> (suits a nearly-full destination, at the cost of losing the old copy before its replacement exists).
+> Optional/additive — absent in an existing profile means `AfterCopy`. Inert outside `Mirror`. The
+> dry-run space projection reflects the choice in its peak figures ([§8](#8-dry-run));
 > `SyncMode ∈ {AdditiveArchive, Mirror (reserved)}`;
 > `TargetLayout ∈ {PreserveStructure, Flatten}`;
 > `ArgumentMode ∈ {Literal, Shell (reserved)}`;

@@ -193,6 +193,11 @@
                         <TextBlock FontSize="11" Opacity="0.7" ToolTip.Tip="Storage Used At Rest">
                             <Run Text="SUAR " /><Run Text="{Binding SettledUsedText}" />
                         </TextBlock>
+                        <TextBlock FontSize="11" Opacity="0.4" Text="·" IsVisible="{Binding HasDeferredReclaim}" />
+                        <TextBlock FontSize="11" Opacity="0.7" IsVisible="{Binding HasDeferredReclaim}"
+                                   ToolTip.Tip="Space this run only gives back once it finishes, so the peak carries it throughout: files awaiting deletion, and sources awaiting disposal.">
+                            <Run Text="Freed At End " /><Run Text="{Binding DeferredReclaimText}" />
+                        </TextBlock>
                     </StackPanel>
 
                     <StackPanel Orientation="Horizontal" HorizontalAlignment="Left" IsVisible="{Binding HasWarning}">

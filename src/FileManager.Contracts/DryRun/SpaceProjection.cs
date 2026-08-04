@@ -30,9 +30,11 @@ public sealed record SpaceProjection
     public long SafetyMarginBytes { get; init; }
 }
 
-/// <summary>One destination volume's space picture. The four "used" figures are nested thresholds —
-/// <c>UsedNow ≤ SettledUsed ≤ RealisticPeakUsed ≤ SafeCeilingUsed</c> — so the UI can paint them as
-/// end-to-end increments on a single capacity-width bar.</summary>
+/// <summary>One destination volume's space picture. <c>SettledUsed ≤ RealisticPeakUsed ≤
+/// SafeCeilingUsed</c> always holds, so the UI can paint the run's growth as end-to-end increments on
+/// a single capacity-width bar. <c>UsedNow</c> is the bar's other anchor and is <em>not</em> bounded
+/// by settled: a run that net-frees space settles below where it started, and the released bytes are
+/// drawn as their own band.</summary>
 public sealed record VolumeSpaceEstimate
 {
     /// <summary>The volume's display root (drive root like <c>C:</c> or a UNC share root).</summary>
@@ -60,12 +62,25 @@ public sealed record VolumeSpaceEstimate
     /// <summary>At-rest used space after the run: <c>UsedNow + NetChange</c>.</summary>
     public long SettledUsedBytes { get; init; }
 
-    /// <summary>Concurrency-aware peak used space during the run: settled + staged-overwrite
-    /// retention + the transient temp copies of the ~N files in flight at once.</summary>
+    /// <summary>Bytes counted in <see cref="SettledUsedBytes"/> as freed that are nevertheless still
+    /// on disk for the duration of the run, so both peak figures carry them: permanently-deleted
+    /// source originals (disposed only after each file's own copy commits), plus — when the profile's
+    /// <c>MirrorDeletion</c> is <c>AfterCopy</c> — the Mirror orphans awaiting deletion. Zero when
+    /// nothing is deferred.</summary>
+    public long DeferredReclaimBytes { get; init; }
+
+    /// <summary>The share of <see cref="DeferredReclaimBytes"/> that is Mirror orphans, i.e. the part a
+    /// profile can take off the peak by switching to <c>MirrorDeletion.Proactive</c>. Always zero when
+    /// it already is Proactive, or outside Mirror. Kept separate so the UI only offers that remedy when
+    /// it would actually help — the source-disposition share is not negotiable.</summary>
+    public long MirrorDeferredReclaimBytes { get; init; }
+
+    /// <summary>Concurrency-aware peak used space during the run: settled + deferred reclaim +
+    /// staged-overwrite retention + the transient temp copies of the ~N files in flight at once.</summary>
     public long RealisticPeakUsedBytes { get; init; }
 
-    /// <summary>Fully pessimistic upper bound: settled + staged-overwrite retention + every temp copy
-    /// coexisting + workspace need. If this fits, the run is guaranteed to fit.</summary>
+    /// <summary>Fully pessimistic upper bound: settled + deferred reclaim + staged-overwrite retention
+    /// + every temp copy coexisting + workspace need. If this fits, the run is guaranteed to fit.</summary>
     public long SafeCeilingUsedBytes { get; init; }
 
     /// <summary>Per-target-root byte attribution within this volume (the drill-down). Empty when the

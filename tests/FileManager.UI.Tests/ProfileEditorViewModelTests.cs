@@ -126,10 +126,34 @@ public sealed class ProfileEditorViewModelTests
         Assert.Equal(VerificationMethod.XxHash128, draft.Policies.VerificationMethod);
         Assert.Equal(OnSuccessAction.KeepSource, draft.Policies.OnSuccess);
         Assert.Equal(OverwriteHandling.StageOverwrites, draft.Policies.OverwriteHandling);
+        Assert.Equal(MirrorDeletion.AfterCopy, draft.Policies.MirrorDeletion);
         SourceConfig source = Assert.Single(draft.Sources);
         Assert.Equal(2, source.SettleDelaySeconds);
         Assert.Equal(500, source.StabilityIntervalMs);
         Assert.False(editor.IsDirty);
+    }
+
+    [Fact]
+    public void Mirror_deletion_shows_only_in_mirror_and_survives_a_round_trip_through_the_other_mode()
+    {
+        var (editor, _) = NewEditor();
+        editor.LoadNew();
+        Assert.False(editor.ShowMirrorDeletion);   // AdditiveArchive never deletes destination files
+
+        editor.SyncMode = SyncMode.Mirror;
+        Assert.True(editor.ShowMirrorDeletion);
+        editor.MirrorDeletion = MirrorDeletion.Proactive;
+
+        // Unlike ScanDestination the value is never forced or reset, so leaving Mirror and coming back
+        // finds the choice the user made rather than the default.
+        editor.SyncMode = SyncMode.AdditiveArchive;
+        Assert.False(editor.ShowMirrorDeletion);
+        Assert.Equal(MirrorDeletion.Proactive, editor.MirrorDeletion);
+        Assert.Equal(MirrorDeletion.Proactive, editor.BuildProfile().Policies.MirrorDeletion);
+
+        editor.SyncMode = SyncMode.Mirror;
+        Assert.True(editor.ShowMirrorDeletion);
+        Assert.Equal(MirrorDeletion.Proactive, editor.MirrorDeletion);
     }
 
     [Fact]

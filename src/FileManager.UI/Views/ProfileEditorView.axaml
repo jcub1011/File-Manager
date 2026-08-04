@@ -130,7 +130,7 @@
 
                 <!-- policies -->
                 <Border Classes="sectionHeader"><TextBlock Text="Policies" /></Border>
-                <Grid ColumnDefinitions="140,*" RowDefinitions="Auto,Auto,Auto,Auto,Auto,Auto" Margin="0,0,0,4">
+                <Grid ColumnDefinitions="140,*" RowDefinitions="Auto,Auto,Auto,Auto,Auto,Auto,Auto" Margin="0,0,0,4">
                     <TextBlock Grid.Row="0" Grid.Column="0" Classes="fieldLabel" Text="On conflict" />
                     <ComboBox Grid.Row="0" Grid.Column="1" ItemsSource="{Binding ConflictResolutionOptions}"
                               SelectedItem="{Binding ConflictResolution}" Margin="0,2" MinWidth="220">
@@ -149,8 +149,20 @@
                             </DataTemplate>
                         </ComboBox.ItemTemplate>
                     </ComboBox>
-                    <TextBlock Grid.Row="2" Grid.Column="0" Classes="fieldLabel" Text="Verification" />
-                    <ComboBox Grid.Row="2" Grid.Column="1" ItemsSource="{Binding VerificationOptions}"
+                    <TextBlock Grid.Row="2" Grid.Column="0" Classes="fieldLabel" Text="Mirror deletion"
+                               IsVisible="{Binding ShowMirrorDeletion}" />
+                    <ComboBox Grid.Row="2" Grid.Column="1" ItemsSource="{Binding MirrorDeletionOptions}"
+                              SelectedItem="{Binding MirrorDeletion}" Margin="0,2" MinWidth="220"
+                              IsVisible="{Binding ShowMirrorDeletion}"
+                              ToolTip.Tip="When a Mirror run removes the destination files that no longer exist in the source. Deleting after the copy is safer — nothing is thrown away until its replacement is in place and verified — but the drive must hold both at once. Deleting proactively frees that space first, which suits a nearly-full drive, at the cost of losing the old copy before the new one exists.">
+                        <ComboBox.ItemTemplate>
+                            <DataTemplate x:DataType="prof:MirrorDeletion">
+                                <TextBlock Text="{Binding Converter={x:Static conv:EnumTitleConverters.MirrorDeletion}}" />
+                            </DataTemplate>
+                        </ComboBox.ItemTemplate>
+                    </ComboBox>
+                    <TextBlock Grid.Row="3" Grid.Column="0" Classes="fieldLabel" Text="Verification" />
+                    <ComboBox Grid.Row="3" Grid.Column="1" ItemsSource="{Binding VerificationOptions}"
                               SelectedItem="{Binding VerificationMethod}" Margin="0,2" MinWidth="220">
                         <ComboBox.ItemTemplate>
                             <DataTemplate x:DataType="prof:VerificationMethod">
@@ -158,8 +170,8 @@
                             </DataTemplate>
                         </ComboBox.ItemTemplate>
                     </ComboBox>
-                    <TextBlock Grid.Row="3" Grid.Column="0" Classes="fieldLabel" Text="On success" />
-                    <ComboBox Grid.Row="3" Grid.Column="1" ItemsSource="{Binding OnSuccessOptions}"
+                    <TextBlock Grid.Row="4" Grid.Column="0" Classes="fieldLabel" Text="On success" />
+                    <ComboBox Grid.Row="4" Grid.Column="1" ItemsSource="{Binding OnSuccessOptions}"
                               SelectedItem="{Binding OnSuccess}" Margin="0,2" MinWidth="220">
                         <ComboBox.ItemTemplate>
                             <DataTemplate x:DataType="prof:OnSuccessAction">
@@ -167,13 +179,13 @@
                             </DataTemplate>
                         </ComboBox.ItemTemplate>
                     </ComboBox>
-                    <TextBlock Grid.Row="4" Grid.Column="0" Classes="fieldLabel" Text="Archive folder"
+                    <TextBlock Grid.Row="5" Grid.Column="0" Classes="fieldLabel" Text="Archive folder"
                                IsVisible="{Binding ShowArchiveFolder}" />
-                    <TextBox Grid.Row="4" Grid.Column="1" Text="{Binding ArchiveFolder}" Margin="0,2"
+                    <TextBox Grid.Row="5" Grid.Column="1" Text="{Binding ArchiveFolder}" Margin="0,2"
                              PlaceholderText="Absolute archive folder path"
                              IsVisible="{Binding ShowArchiveFolder}" />
-                    <TextBlock Grid.Row="5" Grid.Column="0" Classes="fieldLabel" Text="Metadata loss" />
-                    <ComboBox Grid.Row="5" Grid.Column="1" ItemsSource="{Binding MetadataOptions}"
+                    <TextBlock Grid.Row="6" Grid.Column="0" Classes="fieldLabel" Text="Metadata loss" />
+                    <ComboBox Grid.Row="6" Grid.Column="1" ItemsSource="{Binding MetadataOptions}"
                               SelectedItem="{Binding MetadataOnConflict}" Margin="0,2" MinWidth="220">
                         <ComboBox.ItemTemplate>
                             <DataTemplate x:DataType="prof:MetadataOnConflict">

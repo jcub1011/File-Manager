@@ -18,11 +18,19 @@ namespace FileManager.Core.DryRun;
 /// One estimator instance per dry run (it holds mutable per-run state). Volume capacity/cluster is
 /// queried at most once per distinct volume and cached; a failed query is fail-soft
 /// (<see cref="VolumeSpaceEstimate.CapacityKnown"/> is false) rather than fatal.
+/// </para>
+/// <para>
+/// Reclaimed bytes are sequenced, not just summed. Space a run gives back only at the end — Mirror
+/// orphans under <see cref="MirrorDeletion.AfterCopy"/>, and permanently-deleted source originals,
+/// which are disposed per file after that file's copy commits — is subtracted from the at-rest total
+/// but added back into both peak figures, because it is still on disk while the copies land. Crediting
+/// it up front would understate the peak, the one direction a "will it fit" preview must not err in.
 /// </para></summary>
 public sealed class DryRunSpaceEstimator
 {
     private readonly IVolumeInfoProvider _volumes;
     private readonly long _safetyMargin;
+    private readonly MirrorDeletion _mirrorDeletion;
     private readonly Dictionary<string, VolumeTally> _byVolume = new(StringComparer.Ordinal);
     // Memoizes root path → tally so the volume-key normalization (GetFullPath + GetPathRoot + lower)
     // runs once per distinct root instead of once per operation. The distinct roots of a run are the
@@ -30,10 +38,18 @@ public sealed class DryRunSpaceEstimator
     // _byVolume stays canonical: two roots on one volume resolve to the same shared tally.
     private readonly Dictionary<string, VolumeTally> _byRoot = new(StringComparer.OrdinalIgnoreCase);
 
-    public DryRunSpaceEstimator(IVolumeInfoProvider volumes, long safetyMarginBytes)
+    /// <param name="mirrorDeletion">The profile's Mirror deletion timing. It decides only whether the
+    /// orphans' bytes are already gone when the copies land (<see cref="MirrorDeletion.Proactive"/>)
+    /// or still occupied throughout the run (<see cref="MirrorDeletion.AfterCopy"/>); the at-rest
+    /// total is the same either way. Ignored outside Mirror, where nothing is swept as Deleted.</param>
+    public DryRunSpaceEstimator(
+        IVolumeInfoProvider volumes,
+        long safetyMarginBytes,
+        MirrorDeletion mirrorDeletion = MirrorDeletion.AfterCopy)
     {
         _volumes = volumes;
         _safetyMargin = safetyMarginBytes;
+        _mirrorDeletion = mirrorDeletion;
     }
 
     /// <summary>Folds one streamed chunk into the running tallies. <paramref name="sourceBase"/> /
@@ -90,7 +106,11 @@ public sealed class DryRunSpaceEstimator
                         VolumeTally v = VolumeFor(op.Root);
                         v.HasDestinationActivity = true;
                         long old = RoundUp(Length(destinationFiles, op.SubjectIndex - destBase), v.Cluster);
-                        v.NetChange -= old;
+                        // Tallied apart from NetChange because *when* these bytes come back is a
+                        // profile policy: Finalize subtracts them from the at-rest total either way,
+                        // but only credits them against the peak under Proactive. The folder rows are
+                        // at-rest attribution only, so they take the credit unconditionally.
+                        v.MirrorReclaimed += old;
                         v.Folder(op.Root).NetChange -= old;
                     }
                     break;
@@ -106,6 +126,9 @@ public sealed class DryRunSpaceEstimator
             // counting either as freed would overstate the space that comes back — the unsafe
             // direction for a "will it fit" preview. Recorded per source volume; applied in Finalize
             // only to volumes that also receive writes, so a pure source drive is not reported.
+            // Applied to the at-rest total only: disposition runs per file after that file's copy has
+            // committed (SourceDispositionService), so the projection never assumes a source original
+            // is gone while the run is still placing files.
             if (op.SourceDisposition == OnSuccessAction.PermanentDelete && op.SourceIndex >= 0)
             {
                 IPhysicalFileView sf = sourceFiles[op.SourceIndex - sourceBase];
@@ -128,15 +151,23 @@ public sealed class DryRunSpaceEstimator
         foreach (VolumeTally v in _byVolume.Values.Where(v => v.HasDestinationActivity)
                      .OrderBy(v => v.VolumeRoot, StringComparer.OrdinalIgnoreCase))
         {
-            long net = v.NetChange - v.SourceFreed;
+            long net = v.NetChange - v.MirrorReclaimed - v.SourceFreed;
             long usedNow = v.CapacityKnown ? Math.Max(0, v.TotalCapacity - v.FreeNow) : 0;
             long settled = usedNow + net;
+
+            // Bytes the run gives back only once it is over, so they are still occupied while the
+            // copies land — added back on top of the at-rest total to reach the peak. Permanently
+            // deleted sources always qualify (disposition trails each file's own commit). Mirror
+            // orphans qualify unless the profile clears them out first, which is the whole point of
+            // the Proactive setting: it trades that safety for a lower peak.
+            long mirrorDeferred = _mirrorDeletion == MirrorDeletion.AfterCopy ? v.MirrorReclaimed : 0;
+            long deferredReclaim = v.SourceFreed + mirrorDeferred;
 
             // The transient temp copies (one per in-flight placement, released on rename) never exceed
             // every temp coexisting, so the concurrency-bounded term is clamped by the all-writes sum.
             long realisticTemp = Math.Min(v.AllWritesRounded, (long)workers * v.MaxIncomingRounded);
-            long peak = settled + v.StagingRetention + realisticTemp;
-            long ceiling = settled + v.StagingRetention + v.AllWritesRounded;
+            long peak = settled + deferredReclaim + v.StagingRetention + realisticTemp;
+            long ceiling = settled + deferredReclaim + v.StagingRetention + v.AllWritesRounded;
 
             List<FolderSpaceBreakdown> folders = v.Folders.Count <= 1
                 ? []
@@ -162,6 +193,8 @@ public sealed class DryRunSpaceEstimator
                 BytesWrittenBytes = v.BytesWritten,
                 NetChangeBytes = net,
                 SettledUsedBytes = settled,
+                DeferredReclaimBytes = deferredReclaim,
+                MirrorDeferredReclaimBytes = mirrorDeferred,
                 RealisticPeakUsedBytes = peak,
                 SafeCeilingUsedBytes = ceiling,
                 Folders = folders,
@@ -233,8 +266,9 @@ public sealed class DryRunSpaceEstimator
         public long BytesWritten { get; set; }       // raw incoming (I/O)
         public long AllWritesRounded { get; set; }    // Σ rounded incoming over all writes
         public long MaxIncomingRounded { get; set; }
-        public long NetChange { get; set; }           // rounded, signed (destination side)
+        public long NetChange { get; set; }           // rounded, signed (destination side, adds only)
         public long StagingRetention { get; set; }    // rounded old sizes held under .fm_staging
+        public long MirrorReclaimed { get; set; }     // rounded bytes freed by Mirror orphan deletions
         public long SourceFreed { get; set; }         // rounded bytes freed by permanent-deleted sources
 
         private readonly Dictionary<string, FolderTally> _folders = new(StringComparer.OrdinalIgnoreCase);

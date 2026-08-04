@@ -96,6 +96,11 @@ public sealed record PolicySettings
     public string? ArchiveFolder { get; init; }                   // required when OnSuccess = MoveToArchive
     public required OnFailureAction OnFailure { get; init; }
     public required MetadataOnConflict MetadataOnConflict { get; init; }
+
+    /// <summary>When a Mirror run removes the destination files that no longer exist in the source.
+    /// Only meaningful under <see cref="SyncMode.Mirror"/>. Optional/additive: absent in legacy JSON
+    /// deserializes to the zero slot, <see cref="MirrorDeletion.AfterCopy"/>.</summary>
+    public MirrorDeletion MirrorDeletion { get; init; }
 }
 
 public sealed record FilterSet
@@ -161,6 +166,17 @@ public enum OverwriteHandling
     DirectOverwrite,
     [Tooltip("Stage Overwrites")]
     StageOverwrites,
+}
+
+public enum MirrorDeletion
+{
+    // AfterCopy occupies the zero slot so the enum default matches the app default: a legacy profile
+    // with no MirrorDeletion member deserializes to the safe choice (the source-generated
+    // deserializer does not run property initializers for absent members).
+    [Tooltip("Delete After Copy", "Copy and verify everything first, then remove the destination files. Safer, but the drive must hold both the incoming data and the files awaiting deletion at the same time.")]
+    AfterCopy,
+    [Tooltip("Delete Proactively", "Remove the destination files first, then copy. Needs far less free space, but the old copy is gone before its replacement exists.")]
+    Proactive,
 }
 
 public enum VerificationMethod

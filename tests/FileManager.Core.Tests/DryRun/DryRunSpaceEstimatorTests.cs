@@ -112,23 +112,89 @@ public sealed class DryRunSpaceEstimatorTests
         Assert.Equal(4096, s.RealisticPeakUsedBytes - d.RealisticPeakUsedBytes);
     }
 
-    [Fact]
-    public void Mirror_deletes_reduce_the_net_change()
+    // One orphan (10 KB) plus one incoming file (1 KB) on the same volume — enough for the deletion
+    // timing to move the peak while leaving the at-rest total alone.
+    private static DryRunSpaceEstimator MirrorScenario(FakeVolumes volumes, MirrorDeletion timing)
+    {
+        var estimator = new DryRunSpaceEstimator(volumes, 0, timing);
+        estimator.Accumulate(
+            sourceFiles: [Pf(@"C:\src\a.dat", @"C:\src", 1000)],
+            destinationFiles: [Pf(@"D:\dst\orphan.dat", @"D:\dst", 10_000)],
+            sourceOperations: [Src(0, @"C:\src\a.dat", @"C:\src")],
+            destinationOperations:
+            [
+                Dst(OperationKind.New, @"D:\dst\a.dat", @"D:\dst", sourceIndex: 0),
+                Dst(OperationKind.Deleted, @"D:\dst\orphan.dat", @"D:\dst", subjectIndex: 0),
+            ],
+            sourceBase: 0, destBase: 0, stageOverwrites: false);
+        return estimator;
+    }
+
+    [Theory]
+    [InlineData(MirrorDeletion.AfterCopy)]
+    [InlineData(MirrorDeletion.Proactive)]
+    public void Mirror_deletes_reduce_the_net_change_whichever_way_they_are_timed(MirrorDeletion timing)
     {
         var volumes = new FakeVolumes();
         volumes.Caps["d:"] = (Total: 1_000_000, Free: 500_000, Cluster: 1);
-        var estimator = new DryRunSpaceEstimator(volumes, 0);
 
-        estimator.Accumulate(
-            sourceFiles: [],
-            destinationFiles: [Pf(@"D:\dst\orphan.dat", @"D:\dst", 10_000)],
-            sourceOperations: [],
-            destinationOperations: [Dst(OperationKind.Deleted, @"D:\dst\orphan.dat", @"D:\dst", subjectIndex: 0)],
-            sourceBase: 0, destBase: 0, stageOverwrites: false);
+        VolumeSpaceEstimate v = Single(MirrorScenario(volumes, timing).Finalize(1));
 
-        VolumeSpaceEstimate v = Single(estimator.Finalize(1));
-        Assert.Equal(-10_000, v.NetChangeBytes);
-        Assert.Equal(0, v.BytesWrittenBytes);
+        // Timing decides when the bytes come back, never whether they do: the volume ends the run
+        // 9 KB lighter either way.
+        Assert.Equal(1000 - 10_000, v.NetChangeBytes);
+        Assert.Equal(1000, v.BytesWrittenBytes);
+        Assert.Equal(500_000 - 9000, v.SettledUsedBytes);
+    }
+
+    [Fact]
+    public void Deleting_after_the_copy_keeps_the_doomed_files_in_the_peak()
+    {
+        var volumes = new FakeVolumes();
+        volumes.Caps["d:"] = (Total: 1_000_000, Free: 500_000, Cluster: 1);
+
+        VolumeSpaceEstimate v = Single(MirrorScenario(volumes, MirrorDeletion.AfterCopy).Finalize(1));
+
+        // The orphan is still on disk while the copy lands, so the peak has to carry it: settled is
+        // 9 KB below where the volume started, but usage on the way there climbs above it.
+        Assert.Equal(10_000, v.DeferredReclaimBytes);
+        Assert.Equal(10_000, v.MirrorDeferredReclaimBytes);
+        Assert.Equal(v.SettledUsedBytes + 10_000 + 1000, v.RealisticPeakUsedBytes);
+        Assert.True(v.RealisticPeakUsedBytes > v.UsedNowBytes);
+    }
+
+    [Fact]
+    public void Deleting_proactively_takes_the_reclaimed_bytes_off_the_peak()
+    {
+        var volumes = new FakeVolumes();
+        volumes.Caps["d:"] = (Total: 1_000_000, Free: 500_000, Cluster: 1);
+
+        VolumeSpaceEstimate after = Single(MirrorScenario(volumes, MirrorDeletion.AfterCopy).Finalize(1));
+        VolumeSpaceEstimate pro = Single(MirrorScenario(volumes, MirrorDeletion.Proactive).Finalize(1));
+
+        // Nothing is deferred: the orphan is gone before the copy starts.
+        Assert.Equal(0, pro.DeferredReclaimBytes);
+        Assert.Equal(0, pro.MirrorDeferredReclaimBytes);
+        Assert.Equal(pro.SettledUsedBytes + 1000, pro.RealisticPeakUsedBytes);
+
+        // Which is exactly the trade the setting offers: the same run, 10 KB lower at its peak.
+        Assert.Equal(after.SettledUsedBytes, pro.SettledUsedBytes);
+        Assert.Equal(10_000, after.RealisticPeakUsedBytes - pro.RealisticPeakUsedBytes);
+        Assert.Equal(10_000, after.SafeCeilingUsedBytes - pro.SafeCeilingUsedBytes);
+    }
+
+    [Theory]
+    [InlineData(MirrorDeletion.AfterCopy)]
+    [InlineData(MirrorDeletion.Proactive)]
+    public void The_peak_never_falls_below_the_settled_total(MirrorDeletion timing)
+    {
+        var volumes = new FakeVolumes();
+        volumes.Caps["d:"] = (Total: 1_000_000, Free: 500_000, Cluster: 1);
+
+        VolumeSpaceEstimate v = Single(MirrorScenario(volumes, timing).Finalize(1));
+
+        Assert.True(v.SettledUsedBytes <= v.RealisticPeakUsedBytes);
+        Assert.True(v.RealisticPeakUsedBytes <= v.SafeCeilingUsedBytes);
     }
 
     [Fact]
@@ -214,6 +280,13 @@ public sealed class DryRunSpaceEstimatorTests
         VolumeSpaceEstimate v = Single(estimator.Finalize(1));
         Assert.Equal(1000, v.BytesWrittenBytes);
         Assert.Equal(0, v.NetChangeBytes);   // +1000 written, -1000 freed by the permanent delete
+
+        // ...but only at rest. Disposition trails each file's own copy, so the original is still there
+        // while the replacement is being written: the peak carries both, and no MirrorDeletion setting
+        // changes that (this share of the deferred total is not attributed to Mirror).
+        Assert.Equal(1000, v.DeferredReclaimBytes);
+        Assert.Equal(0, v.MirrorDeferredReclaimBytes);
+        Assert.Equal(v.SettledUsedBytes + 1000 + 1000, v.RealisticPeakUsedBytes);
     }
 
     [Fact]

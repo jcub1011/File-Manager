@@ -67,6 +67,8 @@ public sealed partial class ProfileEditorViewModel : ViewModelBase, IUndoTrackab
         [ConflictResolution.Skip, ConflictResolution.RenameSuffix, ConflictResolution.Overwrite, ConflictResolution.OverwriteIfNewer];
     public IReadOnlyList<OverwriteHandling> OverwriteHandlingOptions { get; } =
         [OverwriteHandling.StageOverwrites, OverwriteHandling.DirectOverwrite];
+    public IReadOnlyList<MirrorDeletion> MirrorDeletionOptions { get; } =
+        [MirrorDeletion.AfterCopy, MirrorDeletion.Proactive];
     public IReadOnlyList<VerificationMethod> VerificationOptions { get; } =
         [VerificationMethod.XxHash128, VerificationMethod.Sha256, VerificationMethod.None];  // SizeTimestamp is [reserved]
     public IReadOnlyList<OnSuccessAction> OnSuccessOptions { get; } =
@@ -86,6 +88,7 @@ public sealed partial class ProfileEditorViewModel : ViewModelBase, IUndoTrackab
     [ObservableProperty] public partial TargetLayout TargetLayout { get; set; } = TargetLayout.PreserveStructure;
     [ObservableProperty] public partial ConflictResolution ConflictResolution { get; set; } = ConflictResolution.Skip;
     [ObservableProperty] public partial OverwriteHandling OverwriteHandling { get; set; } = OverwriteHandling.StageOverwrites;
+    [ObservableProperty] public partial MirrorDeletion MirrorDeletion { get; set; } = MirrorDeletion.AfterCopy;
     [ObservableProperty] public partial VerificationMethod VerificationMethod { get; set; } = VerificationMethod.XxHash128;
     [ObservableProperty] public partial OnSuccessAction OnSuccess { get; set; } = OnSuccessAction.KeepSource;
     [ObservableProperty] public partial string ArchiveFolder { get; set; } = "";
@@ -116,6 +119,11 @@ public sealed partial class ProfileEditorViewModel : ViewModelBase, IUndoTrackab
     /// <summary>The destination sweep is optional in AdditiveArchive but mandatory in Mirror (its
     /// only source of Deleted-orphan previews), so the checkbox is locked on in Mirror.</summary>
     public bool CanEditScanDestination => SyncMode != SyncMode.Mirror;
+
+    /// <summary>Only Mirror deletes destination files, so the timing choice is hidden — not disabled —
+    /// outside it. Unlike <see cref="ScanDestination"/> the value is never forced: it stays as the user
+    /// left it and simply goes inert, so switching away and back does not lose the choice.</summary>
+    public bool ShowMirrorDeletion => SyncMode == SyncMode.Mirror;
 
     // Fully-qualified param type: the property is also named SyncMode, so the unqualified name would
     // bind to the property, not the enum, in this position (mirrors OnConcurrencyModeChanged).
@@ -151,6 +159,7 @@ public sealed partial class ProfileEditorViewModel : ViewModelBase, IUndoTrackab
             }
         }
         OnPropertyChanged(nameof(CanEditScanDestination));
+        OnPropertyChanged(nameof(ShowMirrorDeletion));
     }
 
     /// <summary>Opens an undo batch around a <see cref="SyncMode"/> switch, so the mode change and the
@@ -198,8 +207,9 @@ public sealed partial class ProfileEditorViewModel : ViewModelBase, IUndoTrackab
     /// inverted into an explicit opt-in. <see cref="HasProfile"/> and <see cref="IsNew"/> say which
     /// profile is open, not what was edited. <see cref="CanAcknowledgeAndSave"/>,
     /// <see cref="LocalError"/>, <see cref="StatusMessage"/> and <see cref="ShowUnsavedWarning"/> are
-    /// transient chrome. <see cref="ShowArchiveFolder"/> and <see cref="CanEditScanDestination"/> are
-    /// derived from properties that are already tracked, so recording them would double a step.</summary>
+    /// transient chrome. <see cref="ShowArchiveFolder"/>, <see cref="CanEditScanDestination"/> and
+    /// <see cref="ShowMirrorDeletion"/> are derived from properties that are already tracked, so
+    /// recording them would double a step.</summary>
     public IEnumerable<UndoableProperty> UndoableProperties =>
     [
         UndoableProperty.For(nameof(ProfileName), () => ProfileName, v => ProfileName = v, coalesce: true),
@@ -209,6 +219,7 @@ public sealed partial class ProfileEditorViewModel : ViewModelBase, IUndoTrackab
         UndoableProperty.For(nameof(TargetLayout), () => TargetLayout, v => TargetLayout = v),
         UndoableProperty.For(nameof(ConflictResolution), () => ConflictResolution, v => ConflictResolution = v),
         UndoableProperty.For(nameof(OverwriteHandling), () => OverwriteHandling, v => OverwriteHandling = v),
+        UndoableProperty.For(nameof(MirrorDeletion), () => MirrorDeletion, v => MirrorDeletion = v),
         UndoableProperty.For(nameof(VerificationMethod), () => VerificationMethod, v => VerificationMethod = v),
         UndoableProperty.For(nameof(OnSuccess), () => OnSuccess, v => OnSuccess = v),
         UndoableProperty.For(nameof(ArchiveFolder), () => ArchiveFolder, v => ArchiveFolder = v, coalesce: true),
@@ -295,6 +306,7 @@ public sealed partial class ProfileEditorViewModel : ViewModelBase, IUndoTrackab
         TargetLayout = TargetLayout.PreserveStructure;
         ConflictResolution = ConflictResolution.Skip;              // safest default
         OverwriteHandling = OverwriteHandling.StageOverwrites;
+        MirrorDeletion = MirrorDeletion.AfterCopy;                 // safest default
         VerificationMethod = VerificationMethod.XxHash128;
         OnSuccess = OnSuccessAction.KeepSource;
         ArchiveFolder = "";
@@ -328,6 +340,7 @@ public sealed partial class ProfileEditorViewModel : ViewModelBase, IUndoTrackab
         TargetLayout = profile.TargetLayout;
         ConflictResolution = profile.Policies.ConflictResolution;
         OverwriteHandling = profile.Policies.OverwriteHandling;
+        MirrorDeletion = profile.Policies.MirrorDeletion;
         VerificationMethod = profile.Policies.VerificationMethod;
         OnSuccess = profile.Policies.OnSuccess;
         ArchiveFolder = profile.Policies.ArchiveFolder ?? "";
@@ -403,6 +416,9 @@ public sealed partial class ProfileEditorViewModel : ViewModelBase, IUndoTrackab
                 ArchiveFolder = string.IsNullOrWhiteSpace(ArchiveFolder) ? null : ArchiveFolder.Trim(),
                 OnFailure = OnFailureAction.AbortRestoreAndClean,
                 MetadataOnConflict = MetadataOnConflict,
+                // Stored even outside Mirror (where it is inert), so switching a profile to Mirror
+                // later finds the choice the user last made rather than a silent reset.
+                MirrorDeletion = MirrorDeletion,
             },
             Filters = filters,
             Logging = new LoggingSettings { Verbosity = Verbosity, NotifyOnFailure = NotifyOnFailure },

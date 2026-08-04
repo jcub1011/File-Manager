@@ -16,6 +16,7 @@ public static class EnumTitleConverters
     public static readonly FuncValueConverter<TargetLayout, string> TargetLayout = new(v => v.GetTitle());
     public static readonly FuncValueConverter<ConflictResolution, string> ConflictResolution = new(v => v.GetTitle());
     public static readonly FuncValueConverter<OverwriteHandling, string> OverwriteHandling = new(v => v.GetTitle());
+    public static readonly FuncValueConverter<MirrorDeletion, string> MirrorDeletion = new(v => v.GetTitle());
     public static readonly FuncValueConverter<VerificationMethod, string> VerificationMethod = new(v => v.GetTitle());
     public static readonly FuncValueConverter<OnSuccessAction, string> OnSuccessAction = new(v => v.GetTitle());
     public static readonly FuncValueConverter<MetadataOnConflict, string> MetadataOnConflict = new(v => v.GetTitle());

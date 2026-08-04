@@ -2527,6 +2527,9 @@ public sealed class VolumeSpaceRow
         SettledUsedText = ByteSize.Format(v.SettledUsedBytes);
         PeakText = ByteSize.Format(v.RealisticPeakUsedBytes);
         CeilingText = ByteSize.Format(v.SafeCeilingUsedBytes);
+        HasDeferredReclaim = v.DeferredReclaimBytes > 0;
+        DeferredReclaimText = ByteSize.Format(v.DeferredReclaimBytes);
+        MirrorDeferredReclaimText = ByteSize.Format(v.MirrorDeferredReclaimBytes);
 
         Folders = v.Folders
             .Select(f => new FolderSpaceRow(f))
@@ -2544,6 +2547,18 @@ public sealed class VolumeSpaceRow
         {
             IsWarning = true;
             WarningText = "The worst-case usage is close to filling this drive.";
+        }
+
+        // The peak is carrying orphans that Mirror only removes after the copies land. Naming the
+        // amount turns a dead end into a decision, because "Delete Proactively" takes exactly this off
+        // the peak — and the reader cannot weigh that trade without the number. Deliberately gated on
+        // the Mirror share: the source-disposition share of the deferred total has no such remedy, so
+        // offering one for it would be advice the user cannot act on.
+        if (v.MirrorDeferredReclaimBytes > 0 && HasWarning)
+        {
+            WarningText +=
+                $" {MirrorDeferredReclaimText} of that is files awaiting deletion; deleting them" +
+                " proactively would keep them off the peak.";
         }
     }
 
@@ -2565,6 +2580,12 @@ public sealed class VolumeSpaceRow
     public string SettledUsedText { get; }
     public string PeakText { get; }
     public string CeilingText { get; }
+
+    /// <summary>Space the run gives back only once it finishes, so the peak carries it throughout:
+    /// permanently-deleted sources, plus Mirror orphans on a delete-after-copy profile.</summary>
+    public bool HasDeferredReclaim { get; }
+    public string DeferredReclaimText { get; }
+    public string MirrorDeferredReclaimText { get; }
 
     public IReadOnlyList<FolderSpaceRow> Folders { get; }
     public bool HasFolders => Folders.Count > 0;
