@@ -153,11 +153,14 @@ public sealed class DryRunFrameSizeTests
 
     private static DryRunStreamHandler NewHandler(
         Profile profile, IDryRunEngine engine, int sweptFiles, int filesPerDirectory = 200) =>
-        new(NullLogger<DryRunStreamHandler>.Instance, engine, new FakeCatalog(profile), TimeProvider.System,
-            new DestinationProjector(
-                NullLogger<DestinationProjector>.Instance, new FakeVolumeInfoProvider(),
-                new SyntheticScanScheduler(sweptFiles, filesPerDirectory)),
-            new FakeVolumeInfoProvider(), new EngineConfig(),
+        new(NullLogger<DryRunStreamHandler>.Instance,
+            new ProfilePlanner(
+                NullLogger<ProfilePlanner>.Instance, engine,
+                new DestinationProjector(
+                    NullLogger<DestinationProjector>.Instance, new FakeVolumeInfoProvider(),
+                    new SyntheticScanScheduler(sweptFiles, filesPerDirectory)),
+                new FakeVolumeInfoProvider(), new EngineConfig()),
+            new FakeCatalog(profile), TimeProvider.System,
             new EngineEventBus(NullLogger<EngineEventBus>.Instance), NullMemoryTrimCoordinator.Instance)
         // Sizes are serialized inline, but CollectWithSizes also buffers the frame OBJECTS for the
         // post-hoc swept-count check — recycling would corrupt those (the seam's documented case).

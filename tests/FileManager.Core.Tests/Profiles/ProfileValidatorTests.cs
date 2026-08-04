@@ -1,4 +1,4 @@
-using FileManager.Contracts.IPC;
+﻿using FileManager.Contracts.IPC;
 using FileManager.Contracts.Profiles;
 using FileManager.Core.Filtering;
 using FileManager.Core.Profiles;
@@ -31,11 +31,25 @@ public sealed class ProfileValidatorTests
             "PROFILE_SCHEMA_VERSION", ValidationSeverity.Error);
 
     [Fact]
-    public void Mirror_sync_mode_is_allowed()
+    public void Mirror_sync_mode_is_allowed_but_must_be_ACKNOWLEDGED()
     {
-        // Mirror is no longer reserved: it is selectable and fully previewed by the dry run (the
-        // executor's actual Mirror deletion is a separate follow-up, guarded at the run entry point).
-        Assert.Empty(Validate(TestProfiles.Valid() with { SyncMode = SyncMode.Mirror }));
+        // Mirror is not reserved — it is implemented — but it is the only mode that deletes files the
+        // user never put in the source, so saving one costs a single explicit acknowledgment. A
+        // BlockingWarning, not an Error: the profile is legal, the consequence just has to be read.
+        IReadOnlyList<ValidationIssue> issues = Validate(TestProfiles.Valid() with { SyncMode = SyncMode.Mirror });
+
+        ValidationIssue issue = Assert.Single(issues);
+        Assert.Equal("PROFILE_MIRROR_DELETES", issue.Code);
+        Assert.Equal(ValidationSeverity.BlockingWarning, issue.Severity);
+        // The consequence that would otherwise be reported as data loss has to be in the words.
+        Assert.Contains("filters", issue.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(issues, i => i.Severity == ValidationSeverity.Error);
+    }
+
+    [Fact]
+    public void AdditiveArchive_needs_no_acknowledgment()
+    {
+        Assert.Empty(Validate(TestProfiles.Valid()));
     }
 
     [Fact]

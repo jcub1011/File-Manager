@@ -1,4 +1,4 @@
-using CommunityToolkit.Mvvm.ComponentModel;
+﻿using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using FileManager.Contracts.IPC;
 using FileManager.Contracts.Profiles;
@@ -59,8 +59,9 @@ public sealed partial class ProfileEditorViewModel : ViewModelBase, IUndoTrackab
     public Action? Discarded { get; set; }
 
     // ----- enum options (static arrays: AOT-safe, no Enum.GetValues reflection) -----
-    // Mirror is selectable: the dry run fully previews its deletions. The executor does not yet
-    // perform Mirror deletion — that is a follow-up for whoever builds the run pipeline.
+    // Mirror is selectable and implemented: a run plans its orphan deletions through the same planner
+    // the preview uses, then removes them to the Recycle Bin. Saving one requires acknowledging a
+    // blocking warning (PROFILE_MIRROR_DELETES) because it deletes at the TARGET.
     public IReadOnlyList<SyncMode> SyncModeOptions { get; } = [SyncMode.AdditiveArchive, SyncMode.Mirror];
     public IReadOnlyList<TargetLayout> TargetLayoutOptions { get; } = [TargetLayout.PreserveStructure, TargetLayout.Flatten];
     public IReadOnlyList<ConflictResolution> ConflictResolutionOptions { get; } =

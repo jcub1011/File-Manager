@@ -70,6 +70,12 @@ namespace FileManager.UI
                 viewModel.ConfirmRunProfile = async message =>
                     await new ConfirmWindow(message, "Run now", "Cancel", confirmIsDanger: true)
                         .ShowDialog<bool>(window);
+                // The second gate, and the one that shows real numbers: by the time this appears the run
+                // has worked out exactly what it will copy and — for Mirror — what it will remove, and
+                // still touched nothing. Declining here costs the user only the scan.
+                viewModel.ConfirmRunPlan = async message =>
+                    await new ConfirmWindow(message, "Go ahead", "Cancel", confirmIsDanger: true)
+                        .ShowDialog<bool>(window);
                 // Modal rather than an inline bar so the same confirmation appears whichever entry
                 // point asked (Profile tab button, list row menu, collapsed rail menu).
                 viewModel.ConfirmDeleteProfile = async message =>

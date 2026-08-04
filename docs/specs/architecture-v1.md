@@ -1566,7 +1566,7 @@ mismatch is handled with `[JsonStringEnumMemberName]` (.NET 10, AOT-safe):
 public enum SyncMode
 {
     AdditiveArchive,
-    Mirror,               /// [reserved — fails v1 validation]
+    Mirror,
 }
 
 public enum TargetLayout { PreserveStructure, Flatten }
@@ -2471,15 +2471,41 @@ Template per feature: what v1 ships / where it plugs in / what NOT to build now.
 these shapes are load-bearing for the future — do not "simplify" them away during
 implementation.
 
-### 10.1 `SyncMode.Mirror` [Post-v1]
+### 10.1 `SyncMode.Mirror` [IMPLEMENTED]
 
-- **v1 ships:** the enum member; `PROFILE_RESERVED_VALUE` rejection.
-- **Plugs in at:** a future *reconcile pass* will be a sibling *producer* into `ITriggerQueue` /
-  a sibling of `IJobExecutor` — per spec §3.1.1 its deletions are not file-arrival-driven and
-  need their own design (spec Appendix B prerequisite). Its Target deletions will flow through
-  the already-existing `ITrashService` and `IDispositionAuditLog`; its journaling extends the
-  `JournalRecord` hierarchy (NDJSON + discriminators are additive by construction).
-- **Do not build:** a `TriggerKind.Reconcile` member, reconcile scheduling, or diff logic.
+Mirror is built. It is no longer reserved, and this section records the shape rather than a plan.
+
+- **How its deletions are decided.** Not by a diff of its own. A run's first phase captures the work via
+  `IProfilePlanner` — the same component the streamed dry run uses — into a frozen snapshot under
+  `runs/<run-id>/`. The orphans in that snapshot are the `OperationKind.Deleted` destination operations
+  the sweep produced, i.e. exactly the rows the preview displayed. `IMirrorDeletionPass` reads them back
+  and removes them; it computes nothing. That is what makes "the live run deletes what the preview showed"
+  a structural property rather than a hope.
+- **Where it plugs in.** `IMirrorDeletionPass` is a **sibling of `IJobExecutor`**, driven by
+  `IRunCoordinator` — deliberately *not* a producer into `ITriggerQueue`, because a deletion is not
+  driven by a file arriving and the per-file Job model cannot express one (spec §3.1.1). There is no
+  `TriggerKind.Reconcile`.
+- **Ordering.** `MirrorDeletion.AfterCopy` runs the pass after the run's completion barrier;
+  `Proactive` runs it before the copies are queued. Because the work list is already frozen, Proactive
+  costs no second enumeration.
+- **Durability.** A write-ahead `mrdel` record is fsync'd BEFORE each trash move, so no destination file
+  is removed without a durable record naming it; `mrdone` follows. New `JournalRecord` discriminators:
+  `mropen`, `mrdel`, `mrdone`, `mrclose` (appended, never reordered). Deletions go to the Recycle Bin via
+  `ITrashService` — never hard-deleted (spec §3.1.1) — and each is recorded in
+  `IReconcileAuditLog` (`audit/mirror-YYYYMM.ndjsonl`), a sibling of the disposition trail rather than a
+  widened `DispositionAuditRecord`.
+- **Recovery.** A reconcile record's `JobId` is a PASS id, so `CrashRecovery` partitions
+  `MirrorReconcileRecord` out before grouping and takes **no action** on an interrupted pass — the file
+  is either still on disk or already recoverable from the bin, and both re-deleting and restoring would be
+  wrong. It is reported via `RecoveryReport.UnfinishedMirrorDeletions`.
+- **Safety.** The pass is fail-closed; see the gate matrix in `MirrorDeletionPass.Refuse` and the
+  documented decisions in `implementation-progress.md`. New defaulted `EngineConfig` knobs:
+  `MirrorBarrierTimeout`, `MirrorQuiescenceWindow`, `MirrorLockWaitTimeout`, `MirrorMaxOrphans`,
+  `MirrorMaxDeleteFraction`, `MirrorRatioFloor`, `MirrorMaxConsecutiveJournalFailures`.
+- **Validation.** Saving a Mirror profile raises the blocking warning `PROFILE_MIRROR_DELETES`, which the
+  client must acknowledge — the same mechanism as `PROFILE_UNVERIFIED_DELETE`.
+- **Not done:** emptied directories are not removed; a scoped (path-narrowed) run copies but never
+  deletes; source selection is a seam (`ISourceSelector`) with no strategy behind it yet — the intended one is throughput-driven dispatch, not a media-type ranking (see `docs/mirror-run-next-steps.md` §8–§9).
 
 ### 10.2 `ArgumentMode.Shell` [Post-v1]
 

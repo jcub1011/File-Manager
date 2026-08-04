@@ -151,9 +151,15 @@ public enum TriggerKind { Watcher, Schedule, CatchUp, ManualShell, Cli }
 /// (see <see cref="FileManager.Core.Files.FileSystemEntry"/>); consumers that have it can skip a
 /// redundant source stat. Null when the payload was produced without an enumeration snapshot (e.g. a
 /// single-file scope), in which case consumers stat on demand.</summary>
+/// <param name="RunId">The manual run this payload belongs to, when it belongs to one. Lets a
+/// run-scoped consumer count its own jobs to completion (the Mirror deletion barrier) and drop its own
+/// pending work on cancellation. Engine-internal and additive: <see cref="Payload"/> is never
+/// journalled (<c>JobOpenedRecord</c> snapshots a <see cref="SourceSnapshot"/>, not a payload) and
+/// never on the wire, so this is not a schema change.</param>
 public sealed record Payload(
     Guid ProfileId, string SourcePath, string SourceRoot, TriggerKind Trigger, DateTimeOffset EnqueuedAt,
-    FileMetadata? Metadata = null);
+    FileMetadata? Metadata = null,
+    Guid? RunId = null);
 
 /// <summary>Immutable snapshot at journal-open; recovery compares the filesystem against it.</summary>
 public sealed record SourceSnapshot
@@ -285,6 +291,17 @@ public sealed record JobCompletion(
     /// on the Succeeded path. The journal records it in <c>job-closed</c>; this carries it out to the
     /// orchestrator, which is the only component that can put it in front of the user.</summary>
     public string? DispositionError { get; init; }
+
+    /// <summary>The destination paths this job actually resolved, one per target, AFTER conflict
+    /// resolution.
+    /// <para>Feeds the Mirror deletion pass's self-write guard, and it is a structural guard rather
+    /// than a nicety: conflict resolution runs under the path lock at execution time and can
+    /// legitimately choose a different final path than the plan's read-only probe predicted (a
+    /// <c>RenameSuffix</c> candidate that became occupied in between). Such a path is absent from the
+    /// plan's survivor set, so without this list it would look like an orphan that the very same run
+    /// had just created.</para>
+    /// <para>Empty for a job that never reached distribution.</para></summary>
+    public IReadOnlyList<string> ResolvedFinalPaths { get; init; } = [];
 }
 
 /// <summary>One intra-job progress sample, pushed by the executor at each §4.3 phase boundary and

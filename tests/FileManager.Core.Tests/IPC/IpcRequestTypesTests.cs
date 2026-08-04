@@ -1,4 +1,4 @@
-using FileManager.Contracts.IPC;
+﻿using FileManager.Contracts.IPC;
 using FileManager.Contracts.Settings;
 using FileManager.Core.IPC;
 using System.Reflection;
@@ -50,6 +50,9 @@ public sealed class IpcRequestTypesTests
             nameof(UpdateSettingsRequest) => new UpdateSettingsRequest { Settings = GlobalSettings.Default },
             nameof(RelocateProfilesRequest) => new RelocateProfilesRequest { NewDirectory = "x" },
             nameof(ShutdownRequest) => new ShutdownRequest(),
+            nameof(ApproveRunRequest) => new ApproveRunRequest { RunId = id, Approve = true },
+            nameof(CancelRunRequest) => new CancelRunRequest { RunId = id },
+            nameof(GetRunPlanStreamRequest) => new GetRunPlanStreamRequest { RunId = id },
             _ => throw new InvalidOperationException(
                 $"{type.Name} is in IpcRequest's [JsonDerivedType] table but this test cannot construct it — add a case"),
         };

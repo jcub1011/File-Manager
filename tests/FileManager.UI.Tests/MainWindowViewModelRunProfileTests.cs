@@ -40,13 +40,16 @@ public sealed class MainWindowViewModelRunProfileTests
     }
 
     [Fact]
-    public async Task Run_now_sends_one_request_per_source_root()
+    public async Task Run_now_sends_ONE_request_for_the_whole_profile()
     {
+        // This used to be one request per source root, which is wrong for Mirror: an orphan is "a
+        // destination file no source writes to", so the decision needs the COMPLETE source set. Two
+        // independent runs would each see the other source's files as orphans.
         (MainWindowViewModel shell, FakeIpcGateway gateway) = NewShell();
 
         await shell.RunProfileNowAsync(Row());
 
-        Assert.Equal([(ProfileId, @"C:\in\a"), (ProfileId, @"C:\in\b")], gateway.RunProfileCalls);
+        Assert.Equal([(ProfileId, (string?)null)], gateway.RunProfileCalls);
         Assert.Null(shell.List.ErrorMessage);
     }
 
@@ -101,7 +104,7 @@ public sealed class MainWindowViewModelRunProfileTests
 
         await shell.RunProfileNowAsync(Row());
 
-        Assert.Equal(2, gateway.RunProfileCalls.Count);
+        Assert.Single(gateway.RunProfileCalls);
     }
 
     [Fact]
@@ -135,15 +138,16 @@ public sealed class MainWindowViewModelRunProfileTests
     }
 
     [Fact]
-    public async Task Per_source_failures_aggregate_into_the_list_banner()
+    public async Task A_refused_run_lands_in_the_list_banner()
     {
+        // One request now, so there is nothing to aggregate: a refusal is THE outcome and belongs in
+        // the banner the user has to act on.
         (MainWindowViewModel shell, FakeIpcGateway gateway) = NewShell();
-        gateway.RunProfileResults[@"C:\in\b"] = new IpcError("PATH_NOT_FOUND", "path does not exist");
+        gateway.RunProfileResult = new IpcError("RUN_NOT_STARTED", "the service is shutting down");
 
         await shell.RunProfileNowAsync(Row());
 
-        Assert.Contains("Started 1 of 2", shell.List.ErrorMessage);
-        Assert.Contains(@"C:\in\b", shell.List.ErrorMessage);
+        Assert.Contains("shutting down", shell.List.ErrorMessage);
     }
 
     [Fact]

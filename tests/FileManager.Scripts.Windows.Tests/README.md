@@ -74,16 +74,24 @@ There is no CLI that takes a config path. The engine loads profiles from
   category's `profiles\*.json` into your real root
   (`%LOCALAPPDATA%\FileManager\profiles\`). The absolute source/target paths in
   the JSON keep working from anywhere.
-- **Trigger a `DryRun`.** `DryRun` is the working end-to-end path today;
-  `RunProfile` still returns `NOT_IMPLEMENTED`, so use dry-run to preview.
+- **Trigger a `DryRun`** to preview without running anything.
+- **Trigger a `RunProfile`** for a real run. It is two-phase: the request is
+  accepted immediately, the engine plans the whole profile into a frozen work
+  list, and a `run-planned` event reports the counts (including how many files
+  would be **removed** from the targets). Nothing is copied or deleted until an
+  `approve-run` follows. Send `run-profile` with a **null `Path`** for a
+  whole-profile run — a path-scoped run is supported but refuses to delete
+  anything, because an orphan can only be identified over the complete source
+  set.
 
 Expected dry-run classifications per environment:
 
 - **additive-archive** — every source file `New`; nested folders recreated under
   the target (PreserveStructure).
 - **mirror** — matching files unchanged; `stale-orphan.txt` and
-  `old\deep-orphan.txt` previewed as `Deleted` (a real Mirror run would recycle
-  them; deletion is not executed in v1).
+  `old\deep-orphan.txt` previewed as `Deleted`. A real Mirror run **does** recycle
+  them: approve the run and both move to the Recycle Bin, with a row appended to
+  `audit\mirror-YYYYMM.ndjsonl`. Re-run it and nothing further is deleted.
 - **conflict-resolution** — depends on the profile: `Overwrite` overwrites all;
   `OverwriteIfNewer` overwrites `newer.txt` but keeps `older.txt`; `RenameSuffix`
   writes suffixed copies; `Skip` leaves the target untouched.

@@ -1,4 +1,4 @@
-using FileManager.Contracts.IPC;
+﻿using FileManager.Contracts.IPC;
 using FileManager.Contracts.Profiles;
 using FileManager.Core.Filtering;
 using FileManager.Core.Jobs;
@@ -79,6 +79,7 @@ public sealed class ProfileValidator(
                 "OnSuccess is MoveToArchive but no ArchiveFolder is configured."));
 
         CheckVerificationPolicy(candidate, issues);
+        CheckMirrorDeletes(candidate, issues);
         CheckHighRiskSources(candidate, sources, issues);
         CheckCrossProfile(candidate, sources, targets, otherActiveProfiles, issues);
 
@@ -89,12 +90,10 @@ public sealed class ProfileValidator(
 
     private static void CheckReservedValues(Profile candidate, List<ValidationIssue> issues)
     {
-        // SyncMode.Mirror is selectable and fully modeled by the dry run — including the
-        // MirrorDeletion timing policy, which the space projection honors — but the executor does not
-        // yet perform destination deletion, and nothing in the run path refuses a Mirror profile
-        // either: it currently runs as AdditiveArchive. Mirror is intentionally NOT reserved here so
-        // such a profile can be saved and dry-run-previewed until the reconcile pass lands
-        // (architecture-v1.md §10.1).
+        // SyncMode.Mirror is implemented: a run plans its orphans through the same planner the preview
+        // uses and removes them to the Recycle Bin (architecture-v1.md §10.1). It is therefore not
+        // reserved — but it IS destructive at the target, which CheckMirrorDeletes below makes the user
+        // acknowledge once.
         if (candidate.Policies.VerificationMethod == VerificationMethod.SizeTimestamp)
             issues.Add(Error("PROFILE_RESERVED_VALUE",
                 "VerificationMethod \"SizeTimestamp\" is reserved for a future release."));
@@ -227,6 +226,25 @@ public sealed class ProfileValidator(
         if (!TimeZoneInfo.TryFindSystemTimeZoneById(schedule.Timezone, out _))
             issues.Add(Error("PROFILE_TIMEZONE_INVALID",
                 $"Schedule timezone \"{schedule.Timezone}\" is not a known IANA or Windows timezone ID."));
+    }
+
+    /// <summary>Makes the user acknowledge, once, that a Mirror profile deletes at the TARGET.
+    ///
+    /// <para>Every other destructive policy in a profile acts on the source, and the run confirmation
+    /// names those. Mirror is the only mode that removes files the user did not put in the source at
+    /// all — including files an earlier version of this same profile copied there, which is what happens
+    /// the first time someone tightens a filter. That is faithful to the preview and correct, and it is
+    /// also the single most surprising thing this application can do, so it gets the same one-time
+    /// blocking acknowledgment as <c>PROFILE_UNVERIFIED_DELETE</c>.</para></summary>
+    private static void CheckMirrorDeletes(Profile candidate, List<ValidationIssue> issues)
+    {
+        if (candidate.SyncMode != SyncMode.Mirror)
+            return;
+        issues.Add(new ValidationIssue(ValidationSeverity.BlockingWarning, "PROFILE_MIRROR_DELETES",
+            "Mirror mode removes files from the target folder(s) when they are not in the source set — "
+            + "to the Recycle Bin, never permanently. That includes files excluded by this profile's "
+            + "filters, so tightening a filter deletes copies this profile made earlier. Save requires "
+            + "explicit acknowledgment."));
     }
 
     private static void CheckVerificationPolicy(Profile candidate, List<ValidationIssue> issues)

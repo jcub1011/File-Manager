@@ -1,4 +1,4 @@
-using System.Security.Cryptography;
+﻿using System.Security.Cryptography;
 using FileManager.Contracts.Primitives;
 using FileManager.Contracts.Profiles;
 using FileManager.Core;
@@ -43,6 +43,90 @@ public sealed class CrashRecoveryTests : IDisposable
     {
         _journal.Dispose();
         Directory.Delete(_root, recursive: true);
+    }
+
+    // ---- Mirror reconcile records (§10.1) --------------------------------------------------------
+    // A reconcile pass's JobId is a PASS id, not a job's. Recovery must therefore never treat such a
+    // group as a job to resolve — and, just as importantly, must take NO action on it: a file that was
+    // about to be recycled is either still on disk or already in the bin, and recovery cannot tell
+    // which. Re-deleting would destroy a file the pass never reached; restoring would re-create an
+    // orphan the user explicitly approved removing. Both are wrong, and neither is necessary, because
+    // the next Mirror run re-plans from scratch.
+
+    [Fact]
+    public void An_interrupted_reconcile_pass_is_reported_BY_PATH_and_nothing_is_touched()
+    {
+        Guid passId = Guid.NewGuid();
+        string orphan = Path.Combine(_root, "target", "stale.txt");
+        Directory.CreateDirectory(Path.GetDirectoryName(orphan)!);
+        File.WriteAllText(orphan, "still here");
+        // A write-ahead record with no completion: the crash landed between the append and the move.
+        _journal.Append(new MirrorReconcileOpenedRecord
+        {
+            JobId = passId, Seq = 0, AtUtc = DateTimeOffset.UnixEpoch,
+            ProfileId = Guid.NewGuid(), RunId = Guid.NewGuid(), Timing = MirrorDeletion.AfterCopy,
+            TargetRoots = [Path.GetDirectoryName(orphan)!], OrphanCount = 1, OrphanBytes = 10,
+        });
+        _journal.Append(new MirrorOrphanTrashingRecord
+        {
+            JobId = passId, Seq = 0, AtUtc = DateTimeOffset.UnixEpoch,
+            Path = orphan, TargetRoot = Path.GetDirectoryName(orphan)!, SizeBytes = 10,
+        });
+
+        Result<RecoveryReport, JobError> recovered = _recovery.Recover();
+
+        Assert.True(recovered.TryGetValue(out RecoveryReport? report));
+        Assert.Equal(orphan, Assert.Single(report!.UnfinishedMirrorDeletions));
+        // Reported, not acted on.
+        Assert.True(File.Exists(orphan), "recovery must not delete a file the interrupted pass did not");
+        Assert.Empty(_trash.Trashed);
+        // And it is NOT counted as a recovered job: it never was one.
+        Assert.Equal(0, report.JobsRecovered);
+    }
+
+    [Fact]
+    public void A_COMPLETED_reconcile_pass_reports_nothing_unfinished()
+    {
+        Guid passId = Guid.NewGuid();
+        string orphan = Path.Combine(_root, "target", "gone.txt");
+        _journal.Append(new MirrorOrphanTrashingRecord
+        {
+            JobId = passId, Seq = 0, AtUtc = DateTimeOffset.UnixEpoch,
+            Path = orphan, TargetRoot = Path.Combine(_root, "target"), SizeBytes = 4,
+        });
+        _journal.Append(new MirrorOrphanTrashedRecord
+        {
+            JobId = passId, Seq = 0, AtUtc = DateTimeOffset.UnixEpoch, Path = orphan,
+        });
+        _journal.Append(new MirrorReconcileClosedRecord
+        {
+            JobId = passId, Seq = 0, AtUtc = DateTimeOffset.UnixEpoch,
+            Outcome = MirrorReconcileOutcome.Completed, Deleted = 1, Skipped = 0, BytesDeleted = 4,
+        });
+
+        Result<RecoveryReport, JobError> recovered = _recovery.Recover();
+
+        Assert.True(recovered.TryGetValue(out RecoveryReport? report));
+        Assert.Empty(report!.UnfinishedMirrorDeletions);
+    }
+
+    [Fact]
+    public void A_reconcile_pass_alongside_a_real_crashed_job_does_not_disturb_its_recovery()
+    {
+        // The partition has to be a partition: a pass's records sitting in the same journal segment as a
+        // genuinely crashed job must not make recovery skip, double-count, or mis-group that job.
+        Guid passId = Guid.NewGuid();
+        _journal.Append(new MirrorOrphanTrashingRecord
+        {
+            JobId = passId, Seq = 0, AtUtc = DateTimeOffset.UnixEpoch,
+            Path = Path.Combine(_root, "target", "x.txt"), TargetRoot = Path.Combine(_root, "target"), SizeBytes = 1,
+        });
+
+        Result<RecoveryReport, JobError> recovered = _recovery.Recover();
+
+        Assert.True(recovered.TryGetValue(out RecoveryReport? report));
+        Assert.Equal(0, report!.JobsRecovered);
+        Assert.Single(report.UnfinishedMirrorDeletions);
     }
 
     private static string Sha(string content)

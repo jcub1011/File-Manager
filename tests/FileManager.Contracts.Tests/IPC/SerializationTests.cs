@@ -34,6 +34,9 @@ public sealed class SerializationTests
         { new GetSettingsRequest(), "get-settings" },
         { new UpdateSettingsRequest { Settings = GlobalSettings.Default }, "update-settings" },
         { new ShutdownRequest(), "shutdown" },
+        { new ApproveRunRequest { RunId = SomeId, Approve = true }, "approve-run" },
+        { new CancelRunRequest { RunId = SomeId }, "cancel-run" },
+        { new GetRunPlanStreamRequest { RunId = SomeId }, "get-run-plan-stream" },
     };
 
     [Theory]
@@ -58,7 +61,7 @@ public sealed class SerializationTests
         { new ProfileResponse { Profile = SampleProfile() }, "profile" },
         { new ValidationResponse { Issues = [new ValidationIssue(ValidationSeverity.BlockingWarning, "C", "m")] }, "validation" },
         { new MatchingProfilesResponse { Matches = [] }, "matching" },
-        { new RunProfileResponse { QueuedCount = 1, Scanning = false, RunId = SomeId }, "run-profile-result" },
+        { new RunProfileResponse { RunId = SomeId }, "run-profile-result" },
         { new DryRunResponse { Report = SampleReport() }, "dry-run-report" },
         { DryRunColumns.ToChunk(SampleDirectories(), sourceFiles: [SampleWireFile()], sourceOperations: [SampleWireSourceOp()]), "dry-run-chunk" },
         { new DryRunProgressResponse { Phase = DryRunProgressPhase.ScanningSources, SourceFiles = 1, DestinationFiles = 2 }, "dry-run-progress" },
@@ -86,6 +89,9 @@ public sealed class SerializationTests
         { new JobStartedEvent { AtUtc = DateTimeOffset.UnixEpoch, JobId = SomeId, ProfileId = SomeId, SourcePath = @"C:\x" }, "job-started" },
         { new JobProgressEvent { AtUtc = DateTimeOffset.UnixEpoch, JobId = SomeId, Phase = JobPhase.Distributing, TargetsCompleted = 1, TargetCount = 2 }, "job-progress" },
         { new RunQueuedEvent { AtUtc = DateTimeOffset.UnixEpoch, ProfileId = SomeId, ScopePath = "C:/in", QueuedCount = 3, RunId = SomeId }, "run-queued" },
+        { new RunPlannedEvent { AtUtc = DateTimeOffset.UnixEpoch, RunId = SomeId, ProfileId = SomeId, PlannedCopies = 7, PlannedDeletes = 2, PlannedCopyBytes = 900, PlannedDeleteBytes = 80, Truncated = false }, "run-planned" },
+        { new RunProgressEvent { AtUtc = DateTimeOffset.UnixEpoch, RunId = SomeId, Phase = "Executing", Completed = 3, Total = 7, Deleted = 1 }, "run-progress" },
+        { new RunCompletedEvent { AtUtc = DateTimeOffset.UnixEpoch, RunId = SomeId, ProfileId = SomeId, Outcome = "Succeeded", Succeeded = 7, Skipped = 0, Failed = 0, Deleted = 2, BytesDeleted = 80 }, "run-completed" },
         { new PauseChangedEvent { AtUtc = DateTimeOffset.UnixEpoch, Paused = true }, "pause-changed" },
         { new ProfilesChangedEvent { AtUtc = DateTimeOffset.UnixEpoch }, "profiles-changed" },
         { new EngineWarningEvent { AtUtc = DateTimeOffset.UnixEpoch, Message = "w" }, "engine-warning" },
@@ -109,7 +115,7 @@ public sealed class SerializationTests
     [Fact]
     public void Current_protocol_version_is_pinned()
     {
-        Assert.Equal(8, IpcRequest.CurrentProtocolVersion);
+        Assert.Equal(9, IpcRequest.CurrentProtocolVersion);
     }
 
     /// <summary>JobPhase must stay a string on the wire (the context sets UseStringEnumConverter), so

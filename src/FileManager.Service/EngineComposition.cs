@@ -14,6 +14,8 @@ using FileManager.Core.Placement;
 using FileManager.Core.Platform;
 using FileManager.Core.Preflight;
 using FileManager.Core.Profiles;
+using FileManager.Core.Runs;
+using FileManager.Core.Runs.Reconcile;
 using FileManager.Core.Scanning;
 using FileManager.Core.Settings;
 using FileManager.Core.Watching;
@@ -58,6 +60,11 @@ internal static class EngineComposition
         services.AddSingleton<IConflictResolver, ConflictResolver>();
         services.AddSingleton<DestinationProjector>();
         services.AddSingleton<IDryRunEngine, DryRunEngine>();
+        // The source-phase → survivor-set → destination-sweep sequencing, shared by the streamed
+        // dry-run handler and the live run pipeline. Sharing it is what keeps a preview and a real
+        // run from ever describing different work — which under SyncMode.Mirror is the difference
+        // between a previewed deletion and an unpreviewed one.
+        services.AddSingleton<IProfilePlanner, ProfilePlanner>();
         services.AddSingleton<IIpcEndpointProvider, WindowsIpcEndpointProvider>();
         services.AddSingleton<IAutostartRegistrar, WindowsAutostartRegistrar>();
 
@@ -77,6 +84,10 @@ internal static class EngineComposition
         services.AddSingleton<SourcePriorityRegistry>();
         services.AddSingleton<IJobJournal, JobJournal>();
         services.AddSingleton<IDispositionAuditLog, DispositionAuditLog>();
+        // A SIBLING trail to the disposition one, not a widened record: a Mirror orphan is a
+        // destination file removed because no source writes to it, which is not an OnSuccess
+        // disposition of a source and must never read like one in the no-loss audit trail.
+        services.AddSingleton<IReconcileAuditLog, MirrorDeletionAuditLog>();
         services.AddSingleton<ITransientRetryPolicy, TransientRetryPolicy>();
         services.AddSingleton<IVolumeInfoProvider, WindowsVolumeInfoProvider>();
         services.AddSingleton<IMetadataPreserver, WindowsMetadataPreserver>();
@@ -101,6 +112,22 @@ internal static class EngineComposition
         services.AddSingleton<IProfileMatcher, ProfileMatcher>();
         services.AddSingleton<JobPlanFactory>();
         services.AddSingleton<IJobExecutor, JobExecutor>();
+
+        // Snapshot-driven runs (plan → approve → execute) and the Mirror deletion phase. Registered
+        // BEFORE the orchestrator because the orchestrator settles every payload against its run — a
+        // dependency that only goes one way, so there is no cycle: the coordinator never knows about
+        // the orchestrator.
+        services.AddSingleton<IMirrorDeletionPass, MirrorDeletionPass>();
+        // A seam, not a feature: this reproduces today's §3.4 priority rule exactly. It exists so a
+        // future speed/byte-balancing strategy for contested destination paths is a planning-only
+        // change — see ISourceSelector's doc for the recorded intent and its platform prerequisite.
+        services.AddSingleton<ISourceSelector, PrioritySourceSelector>();
+        // Concrete + interface, the MemoryTrimCoordinator pattern: RunProfileHandler and
+        // JobOrchestrator both write to run state, so both must resolve THE SAME instance.
+        services.AddSingleton<RunCoordinator>();
+        services.AddSingleton<IRunCoordinator>(sp => sp.GetRequiredService<RunCoordinator>());
+        services.AddSingleton<IRunSettleSink>(sp => sp.GetRequiredService<RunCoordinator>());
+
         services.AddSingleton<IJobOrchestrator, JobOrchestrator>();
 
         // Explicit dispatch table — no reflection-based handler discovery (§1 AOT constraints).
@@ -111,6 +138,10 @@ internal static class EngineComposition
         services.AddSingleton<IIpcRequestHandler, GetStatusHandler>();
         services.AddSingleton<IIpcRequestHandler, GetMatchingProfilesHandler>();
         services.AddSingleton<IIpcRequestHandler, RunProfileHandler>();
+        services.AddSingleton<IIpcRequestHandler, ApproveRunHandler>();
+        services.AddSingleton<IIpcRequestHandler, CancelRunHandler>();
+        // Streaming handler: IpcServer type-tests the table's values for IIpcStreamingRequestHandler.
+        services.AddSingleton<IIpcRequestHandler, GetRunPlanStreamHandler>();
         services.AddSingleton<IIpcRequestHandler, SetPausedHandler>();
         services.AddSingleton<IIpcRequestHandler, GetRecentJobsHandler>();
         services.AddSingleton<IIpcRequestHandler, GetJobLogHandler>();

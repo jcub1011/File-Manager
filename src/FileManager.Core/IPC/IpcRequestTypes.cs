@@ -25,6 +25,9 @@ public static class IpcRequestTypes
     public const string UpdateSettings = "update-settings";
     public const string RelocateProfiles = "relocate-profiles";
     public const string Shutdown = "shutdown";
+    public const string ApproveRun = "approve-run";
+    public const string CancelRun = "cancel-run";
+    public const string GetRunPlanStream = "get-run-plan-stream";
 
     public static string DiscriminatorOf(IpcRequest request) => request switch
     {
@@ -46,6 +49,9 @@ public static class IpcRequestTypes
         UpdateSettingsRequest => UpdateSettings,
         RelocateProfilesRequest => RelocateProfiles,
         ShutdownRequest => Shutdown,
+        ApproveRunRequest => ApproveRun,
+        CancelRunRequest => CancelRun,
+        GetRunPlanStreamRequest => GetRunPlanStream,
         _ => throw new System.ArgumentOutOfRangeException(nameof(request),
             $"unmapped request type {request.GetType().Name} — add it here and to IpcRequest's [JsonDerivedType] table"),
     };

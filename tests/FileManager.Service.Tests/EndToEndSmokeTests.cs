@@ -19,6 +19,7 @@ using FileManager.Core.Placement;
 using FileManager.Core.Platform;
 using FileManager.Core.Preflight;
 using FileManager.Core.Profiles;
+using FileManager.Core.Runs;
 using FileManager.Core.Settings;
 using FileManager.Core.Scanning;
 using FileManager.Core.Watching;
@@ -238,15 +239,27 @@ public sealed class EndToEndSmokeTests : IAsyncLifetime
             });
             await Task.Delay(300);   // let the subscription's ack land before the run
 
-            // Run.
+            // Run. A run PLANS first and touches nothing until it is approved, so this is two steps.
             var run = await client.RequestAsync<RunProfileResponse>(
                 new RunProfileRequest { ProfileId = profile.Id, Path = sourceFile });
             Assert.True(run.TryGetValue(out RunProfileResponse? runResponse));
-            Assert.Equal(1, runResponse!.QueuedCount);      // single file — the count is exact
-            Assert.False(runResponse.Scanning);
+            Assert.NotEqual(Guid.Empty, runResponse!.RunId);
+
+            string targetFile = Path.Combine(TargetDir, "report.txt");
+
+            // The plan arrives, with an exact count — and NOTHING has been written yet. That gap is the
+            // whole reason the run is two-phase: it is the moment the user can still say no.
+            RunPlannedEvent planned = await WaitForEventAsync<RunPlannedEvent>(events, TimeSpan.FromSeconds(10));
+            Assert.Equal(runResponse.RunId, planned.RunId);
+            Assert.Equal(1, planned.PlannedCopies);
+            Assert.Null(planned.Error);
+            Assert.False(File.Exists(targetFile), "a planned-but-unapproved run must not have written anything");
+
+            var approved = await client.RequestAsync<OkResponse>(
+                new ApproveRunRequest { RunId = runResponse.RunId, Approve = true });
+            Assert.True(approved.TryGetValue(out OkResponse? _));
 
             // The file appears at the target with identical content.
-            string targetFile = Path.Combine(TargetDir, "report.txt");
             bool placed = await WaitForAsync(() => File.Exists(targetFile), TimeSpan.FromSeconds(10));
             if (!placed)
             {
@@ -327,7 +340,14 @@ public sealed class EndToEndSmokeTests : IAsyncLifetime
 
             var run = await client.RequestAsync<RunProfileResponse>(
                 new RunProfileRequest { ProfileId = profile.Id, Path = sourceFile });
-            Assert.True(run.IsSuccess);
+            Assert.True(run.TryGetValue(out RunProfileResponse? accepted));
+
+            // Plan, then approve. A disposition as consequential as MoveToArchive is exactly what the
+            // approval step exists for: the source is about to leave the source tree.
+            RunPlannedEvent planned = await pump.WaitForAsync<RunPlannedEvent>(TimeSpan.FromSeconds(15));
+            Assert.Equal(1, planned.PlannedCopies);
+            await client.RequestAsync<OkResponse>(
+                new ApproveRunRequest { RunId = accepted!.RunId, Approve = true });
 
             JobCompletedEvent completed = await pump.WaitForAsync<JobCompletedEvent>(TimeSpan.FromSeconds(15));
             Assert.Equal("Succeeded", completed.Job.Outcome);
@@ -363,17 +383,28 @@ public sealed class EndToEndSmokeTests : IAsyncLifetime
 
             await using SubscriptionPump pump = await SubscriptionPump.StartAsync();
 
-            // A folder run cannot report its count in the reply — enumeration is off the IPC thread.
+            // The reply cannot carry a count — planning scans the whole source set off the IPC thread
+            // (§8 rule 5) — so the counts arrive on the plan event instead.
             var run = await client.RequestAsync<RunProfileResponse>(
                 new RunProfileRequest { ProfileId = profile.Id, Path = SourceDir });
             Assert.True(run.TryGetValue(out RunProfileResponse? runResponse));
-            Assert.True(runResponse!.Scanning);
-            Assert.Equal(0, runResponse.QueuedCount);
+            Assert.NotEqual(Guid.Empty, runResponse!.RunId);
 
-            RunQueuedEvent queued = await pump.WaitForAsync<RunQueuedEvent>(TimeSpan.FromSeconds(10));
-            Assert.Equal(profile.Id, queued.ProfileId);
-            Assert.Equal(2, queued.QueuedCount);
-            Assert.Null(queued.Error);
+            RunPlannedEvent planned = await pump.WaitForAsync<RunPlannedEvent>(TimeSpan.FromSeconds(10));
+            Assert.Equal(profile.Id, planned.ProfileId);
+            Assert.Equal(runResponse.RunId, planned.RunId);
+            Assert.Equal(2, planned.PlannedCopies);
+            // AdditiveArchive never removes anything at a target, whatever is sitting there.
+            Assert.Equal(0, planned.PlannedDeletes);
+            Assert.Null(planned.Error);
+
+            // Declining leaves the filesystem exactly as it was, and closes the run.
+            await client.RequestAsync<OkResponse>(
+                new ApproveRunRequest { RunId = runResponse.RunId, Approve = false });
+            RunCompletedEvent closed = await pump.WaitForAsync<RunCompletedEvent>(TimeSpan.FromSeconds(10));
+            Assert.Equal("Cancelled", closed.Outcome);
+            Assert.Equal(0, closed.Succeeded);
+            Assert.Empty(Directory.GetFiles(TargetDir, "*", SearchOption.AllDirectories));
         }
     }
 
@@ -467,10 +498,19 @@ public sealed class EndToEndSmokeTests : IAsyncLifetime
             Assert.True(paused.IsSuccess);
 
             var run = await client.RequestAsync<RunProfileResponse>(new RunProfileRequest { ProfileId = profile.Id, Path = sourceFile });
-            Assert.True(run.IsSuccess);
+            Assert.True(run.TryGetValue(out RunProfileResponse? accepted));
+
+            // Planning is read-only, so it proceeds while paused; approving then enqueues the work and
+            // the PAUSE GATE is what holds it. Both halves matter: a paused engine must still let you
+            // see what a run would do, and must still not do it.
+            await using SubscriptionPump pump = await SubscriptionPump.StartAsync();
+            await WaitForAsync(
+                () => client.RequestAsync<StatusResponse>(new GetStatusRequest()).GetAwaiter().GetResult().IsSuccess,
+                TimeSpan.FromSeconds(2));
+            await client.RequestAsync<OkResponse>(new ApproveRunRequest { RunId = accepted!.RunId, Approve = true });
 
             string targetFile = Path.Combine(TargetDir, "held.txt");
-            Assert.True(await WaitForAsync(() => QueuedCount(client) >= 1, TimeSpan.FromSeconds(5)), "the payload never queued");
+            Assert.True(await WaitForAsync(() => QueuedCount(client) >= 1, TimeSpan.FromSeconds(10)), "the payload never queued");
             await Task.Delay(300);
             Assert.False(File.Exists(targetFile), "a paused engine must not place the file");
 
@@ -498,6 +538,24 @@ public sealed class EndToEndSmokeTests : IAsyncLifetime
             await Task.Delay(25);
         }
         return condition();
+    }
+
+    /// <summary>Waits for one event of a type to turn up in a list a subscription pump is appending to,
+    /// under the same lock the pump writes with.</summary>
+    private static async Task<T> WaitForEventAsync<T>(List<EngineEvent> events, TimeSpan timeout)
+        where T : EngineEvent
+    {
+        T? found = null;
+        bool arrived = await WaitForAsync(
+            () =>
+            {
+                lock (events)
+                    found = events.OfType<T>().FirstOrDefault();
+                return found is not null;
+            },
+            timeout);
+        Assert.True(arrived, $"no {typeof(T).Name} arrived within {timeout}");
+        return found!;
     }
 
     [Fact]
@@ -528,6 +586,99 @@ public sealed class EndToEndSmokeTests : IAsyncLifetime
             var reread = await client.RequestAsync<SettingsResponse>(new GetSettingsRequest());
             Assert.True(reread.TryGetValue(out SettingsResponse? rereadResponse));
             Assert.Equal(3, rereadResponse!.Settings.ScanThreading.MaxScanThreads.Value);
+        }
+    }
+
+    /// <summary>The whole Mirror vertical over the real pipe: plan, approve, copy, and remove the
+    /// destination file no source writes to.
+    ///
+    /// <para>This is the test that says the feature works. Everything else verifies a layer; this drives
+    /// the production object graph — real planner, real snapshot on disk, real journal, real audit log,
+    /// real orchestrator and executor — from an IPC client, and then looks at the filesystem.</para></summary>
+    [Fact]
+    public async Task A_mirror_run_plans_then_copies_and_REMOVES_the_orphan_over_the_real_pipe()
+    {
+        NoopTrashService.Trashed.Clear();
+        File.WriteAllText(Path.Combine(SourceDir, "keep.txt"), "kept content");
+        string orphan = Path.Combine(TargetDir, "stale.txt");
+        File.WriteAllText(orphan, "no source writes here any more");
+
+        var connected = await IpcClient.ConnectAsync();
+        Assert.True(connected.TryGetValue(out IpcClient? client));
+        await using (client)
+        {
+            Profile profile = NewProfile() with { SyncMode = SyncMode.Mirror, ScanDestination = true };
+            // Mirror deletes at the target, so saving one requires acknowledging that once.
+            var saved = await client!.RequestAsync<ValidationResponse>(
+                new SaveProfileRequest { Profile = profile, AcknowledgeWarnings = true });
+            Assert.True(saved.TryGetValue(out ValidationResponse? validation));
+            Assert.DoesNotContain(validation!.Issues, i => i.Severity == ValidationSeverity.Error);
+
+            await using SubscriptionPump pump = await SubscriptionPump.StartAsync();
+
+            var run = await client.RequestAsync<RunProfileResponse>(
+                new RunProfileRequest { ProfileId = profile.Id });   // whole profile — Mirror requires it
+            Assert.True(run.TryGetValue(out RunProfileResponse? accepted));
+
+            // The plan names the orphan BEFORE anything is touched. This is what the user approves.
+            RunPlannedEvent planned = await pump.WaitForAsync<RunPlannedEvent>(TimeSpan.FromSeconds(15));
+            Assert.Equal(1, planned.PlannedCopies);
+            Assert.Equal(1, planned.PlannedDeletes);
+            Assert.False(planned.Truncated);
+            Assert.True(File.Exists(orphan), "a planned-but-unapproved run must not have deleted anything");
+
+            await client.RequestAsync<OkResponse>(
+                new ApproveRunRequest { RunId = accepted!.RunId, Approve = true });
+
+            RunCompletedEvent completed = await pump.WaitForAsync<RunCompletedEvent>(TimeSpan.FromSeconds(20));
+            Assert.Equal(nameof(RunOutcome.Succeeded), completed.Outcome);
+            Assert.Equal(1, completed.Succeeded);
+            Assert.Equal(1, completed.Deleted);
+            Assert.Null(completed.DeletionAbortReason);
+
+            // The copy landed...
+            string copied = Path.Combine(TargetDir, "keep.txt");
+            Assert.True(File.Exists(copied));
+            Assert.Equal("kept content", File.ReadAllText(copied));
+            // ...and the orphan went to the Recycle Bin, by that exact path.
+            Assert.Contains(orphan, NoopTrashService.Trashed);
+            Assert.False(File.Exists(orphan));
+        }
+    }
+
+    /// <summary>The other half of the promise: an AdditiveArchive run over the same shape removes
+    /// NOTHING. "Nothing at a Target is ever removed" is that mode's defining guarantee.</summary>
+    [Fact]
+    public async Task An_additive_run_over_the_same_shape_removes_NOTHING()
+    {
+        NoopTrashService.Trashed.Clear();
+        File.WriteAllText(Path.Combine(SourceDir, "keep.txt"), "kept content");
+        string untouched = Path.Combine(TargetDir, "stale.txt");
+        File.WriteAllText(untouched, "left alone");
+
+        var connected = await IpcClient.ConnectAsync();
+        Assert.True(connected.TryGetValue(out IpcClient? client));
+        await using (client)
+        {
+            Profile profile = NewProfile() with { ScanDestination = true };
+            await client!.RequestAsync<ValidationResponse>(
+                new SaveProfileRequest { Profile = profile, AcknowledgeWarnings = false });
+            await using SubscriptionPump pump = await SubscriptionPump.StartAsync();
+
+            var run = await client.RequestAsync<RunProfileResponse>(
+                new RunProfileRequest { ProfileId = profile.Id });
+            Assert.True(run.TryGetValue(out RunProfileResponse? accepted));
+            RunPlannedEvent planned = await pump.WaitForAsync<RunPlannedEvent>(TimeSpan.FromSeconds(15));
+            Assert.Equal(0, planned.PlannedDeletes);
+
+            await client.RequestAsync<OkResponse>(
+                new ApproveRunRequest { RunId = accepted!.RunId, Approve = true });
+            RunCompletedEvent completed = await pump.WaitForAsync<RunCompletedEvent>(TimeSpan.FromSeconds(20));
+
+            Assert.Equal(0, completed.Deleted);
+            Assert.Empty(NoopTrashService.Trashed);
+            Assert.True(File.Exists(untouched));
+            Assert.Equal("left alone", File.ReadAllText(untouched));
         }
     }
 
@@ -566,7 +717,18 @@ internal sealed class NoopAutostartRegistrar : IAutostartRegistrar
 
 /// <summary>No-op trash so the e2e test never touches the real Recycle Bin (all profiles use
 /// OnSuccess=KeepSource anyway).</summary>
+/// <summary>Stands in for the Recycle Bin so the e2e test never recycles the developer's files — but
+/// RECORDS what it was asked to remove, and actually removes it, so a Mirror run can be verified end to
+/// end (the deletion reached the platform boundary AND the destination no longer holds the file).</summary>
 internal sealed class NoopTrashService : ITrashService
 {
-    public Result MoveToTrash(string absolutePath) => Result.Success();
+    public static System.Collections.Concurrent.ConcurrentBag<string> Trashed { get; } = [];
+
+    public Result MoveToTrash(string absolutePath)
+    {
+        Trashed.Add(absolutePath);
+        try { File.Delete(absolutePath); }
+        catch (IOException) { /* the assertion is on the recorded path; a locked file must not throw here */ }
+        return Result.Success();
+    }
 }

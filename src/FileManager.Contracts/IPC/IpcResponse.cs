@@ -37,21 +37,19 @@ public sealed record ProfileListResponse : IpcResponse { public required IReadOn
 public sealed record ProfileResponse : IpcResponse { public required Profile Profile { get; init; } }
 public sealed record ValidationResponse : IpcResponse { public required IReadOnlyList<ValidationIssue> Issues { get; init; } }
 public sealed record MatchingProfilesResponse : IpcResponse { public required IReadOnlyList<ProfileMatchDto> Matches { get; init; } }
-/// <summary>Answer to a RunProfileRequest (§4.9). A single-file run is enqueued synchronously, so
-/// <see cref="QueuedCount"/> is exact (1) and <see cref="Scanning"/> is false. A folder run starts a
-/// background recursive enumeration so the reply stays prompt (§8 rule 5): Scanning is true,
-/// QueuedCount is 0, and the final count — including 0 for "nothing matched" — arrives later as a
-/// <see cref="RunQueuedEvent"/> for the same (ProfileId, ScopePath).
-/// <para>Queued means <em>accepted</em>, not copied: the job's own filter gate (§4.3 step 4) may
-/// still skip the file, and an identical run already pending is coalesced by the trigger queue.</para></summary>
+/// <summary>Answer to a RunProfileRequest (§4.9): the run has been ACCEPTED and is now planning. It has
+/// not copied or deleted anything, and it will not until it is approved.
+/// <para>The reply is deliberately this thin. A run's first act is to scan and evaluate its whole
+/// source set, which cannot be done inside an IPC round trip (§8 rule 5) — so the work list, its
+/// totals, and whether it is safe arrive later as a <see cref="RunPlannedEvent"/>, and the itemized
+/// rows are fetched on demand with <c>get-run-plan-stream</c>. Everything a caller needs to follow its
+/// own run is <see cref="RunId"/>.</para></summary>
 public sealed record RunProfileResponse : IpcResponse
 {
-    public required int QueuedCount { get; init; }
-    public required bool Scanning { get; init; }
-
-    /// <summary>Correlates this reply with the <see cref="RunQueuedEvent"/> that later reports the
-    /// enumeration's outcome. The event bus is a broadcast, so without a correlation id every connected
-    /// client announced "Queued N file(s) from …" for runs it never requested.</summary>
+    /// <summary>Identifies this run for the whole of its life: the <see cref="RunPlannedEvent"/> /
+    /// <see cref="RunProgressEvent"/> / <see cref="RunCompletedEvent"/> stream, the approve and cancel
+    /// requests, and the plan replay. The event bus is a broadcast, so this is also how a client tells
+    /// its own run's events from another client's.</summary>
     public required Guid RunId { get; init; }
 }
 public sealed record DryRunResponse : IpcResponse { public required DryRunReport Report { get; init; } }

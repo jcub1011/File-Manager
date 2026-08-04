@@ -207,7 +207,9 @@ public sealed class JobExecutor(
             states.Transition(JobState.Closed);
             TryAppend(Close(plan, JobOutcome.Skipped, SkipReason.UnchangedAtAllTargets));
             Log(plan, "skipped (unchanged at all targets)");
-            return Completed(plan, JobOutcome.Skipped, SkipReason.UnchangedAtAllTargets, null, start);
+            // Carries its resolved paths: every target already holds this content, so those paths are
+            // emphatically NOT orphans and a Mirror pass must never remove them.
+            return CompletedWithPaths(execution, JobOutcome.Skipped, SkipReason.UnchangedAtAllTargets, null, start);
         }
 
         // Commit point (I-DISPOSE): source disposition is authorized by this record and nothing else.
@@ -238,7 +240,8 @@ public sealed class JobExecutor(
         // the durable record, but the orchestrator is the only thing that can tell the user, and
         // reporting a Succeeded with a null Error is how "your sources were not disposed of" used to
         // reach nobody at all.
-        return Completed(plan, JobOutcome.Succeeded, null, null, start) with { DispositionError = dispositionError };
+        return CompletedWithPaths(execution, JobOutcome.Succeeded, null, null, start)
+            with { DispositionError = dispositionError };
     }
 
     // ---- phases ----------------------------------------------------------------------------------
@@ -527,14 +530,19 @@ public sealed class JobExecutor(
         if (complete)
         {
             Log(plan, "rolled back cleanly");
-            return Completed(plan, JobOutcome.Failed, null, cause, start);
+            // Resolved paths ride out even on the failure paths. A failed copy job already suppresses
+            // the whole Mirror deletion phase, so this is belt-and-braces — but the guard's safe
+            // direction is "do not delete", and a residual left by an incomplete rollback can still
+            // hold this run's content.
+            return CompletedWithPaths(execution, JobOutcome.Failed, null, cause, start);
         }
 
         // Residuals are empty when rollback failed before it could enumerate them (its own journal
         // append failed, so `result` carries a JobError rather than a RollbackResult).
         IReadOnlyList<string> residuals = outcome?.ResidualPaths ?? [];
         Log(plan, $"rollback incomplete; residual paths: {string.Join(", ", residuals)}");
-        return Completed(plan, JobOutcome.RollbackFailed, null, cause, start) with { ResidualPaths = residuals };
+        return CompletedWithPaths(execution, JobOutcome.RollbackFailed, null, cause, start)
+            with { ResidualPaths = residuals };
     }
 
     // ---- helpers ---------------------------------------------------------------------------------
@@ -574,6 +582,25 @@ public sealed class JobExecutor(
 
     private JobCompletion Completed(JobPlan plan, JobOutcome outcome, SkipReason? skip, JobError? error, long start) =>
         new(plan.JobId, outcome, skip, error, time.GetElapsedTime(start));
+
+    /// <summary>As <see cref="Completed"/>, plus the destination paths this execution actually resolved.
+    /// Used on the terminal paths that reached target processing, so a run-scoped consumer (the Mirror
+    /// deletion pass) can be certain it never removes a path this job wrote to — including one that
+    /// conflict resolution chose at execution time and the plan therefore never predicted.</summary>
+    private JobCompletion CompletedWithPaths(
+        JobExecution execution, JobOutcome outcome, SkipReason? skip, JobError? error, long start) =>
+        Completed(execution.Plan, outcome, skip, error, start) with { ResolvedFinalPaths = ResolvedPaths(execution) };
+
+    /// <summary>Each target's post-conflict-resolution final path, falling back to the prospective one
+    /// for a target that never got as far as resolving (so the set is a superset of what was written —
+    /// the safe direction for a guard that decides what NOT to delete).</summary>
+    private static IReadOnlyList<string> ResolvedPaths(JobExecution execution)
+    {
+        List<string> paths = new(execution.Targets.Count);
+        foreach (TargetProgress tp in execution.Targets)
+            paths.Add(tp.FinalPath ?? tp.Plan.ProspectiveFinalPath);
+        return paths;
+    }
 
     private void Log(JobPlan plan, string line) => jobLog.Append(plan.JobId.Value, line);
 

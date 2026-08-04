@@ -42,7 +42,19 @@ public sealed class CrashRecovery(
             return readError;
         read.TryGetValue(out IReadOnlyList<JournalRecord>? all);
 
-        var byJob = all!.GroupBy(r => r.JobId).ToDictionary(g => g.Key, g => g.OrderBy(r => r.Seq).ToList());
+        // Partition the Mirror reconcile pass's records out BEFORE grouping. Their JobId is a PASS id,
+        // so a pass would otherwise land in byJob as a group with no JobOpenedRecord. Today that
+        // happens to be harmless (RecoverJob returns early on a missing open), but relying on an
+        // accident to keep recovery away from deletion records is not good enough — the explicit split
+        // is what guarantees no future change to that early return can turn a reconcile group into
+        // something recovery acts on.
+        List<MirrorReconcileRecord> reconcileRecords = [.. all!.OfType<MirrorReconcileRecord>()];
+        IReadOnlyList<string> unfinishedDeletions = ReportUnfinishedReconcilePasses(reconcileRecords);
+
+        var byJob = all!
+            .Where(r => r is not MirrorReconcileRecord)
+            .GroupBy(r => r.JobId)
+            .ToDictionary(g => g.Key, g => g.OrderBy(r => r.Seq).ToList());
         var knownJobs = new HashSet<Guid>(byJob.Keys);
 
         int recovered = 0, forward = 0, rolledBack = 0, cleaned = 0;
@@ -104,11 +116,54 @@ public sealed class CrashRecovery(
             RolledBack = rolledBack,
             CleanedPrePlacement = cleaned,
             QuarantinedPaths = quarantinedPaths,
+            UnfinishedMirrorDeletions = unfinishedDeletions,
         };
         if (recovered > 0 || quarantinedPaths.Count > 0)
             logger.LogInformation("Crash recovery: {Recovered} recovered ({Forward} forward, {Back} rolled back, {Clean} pre-placement), {Quarantined} quarantined",
                 recovered, forward, rolledBack, cleaned, quarantinedPaths.Count);
         return report;
+    }
+
+    /// <summary>Reports — and only reports — Mirror orphan deletions that were journalled as about to
+    /// happen but never journalled as finished.
+    ///
+    /// <para><b>Recovery takes no action on these, deliberately, and there is no correct action to
+    /// take.</b> A <c>mrdel</c> without its <c>mrdone</c> means the process died between the
+    /// write-ahead record and the trash call, so the file is either still on disk or already in the
+    /// Recycle Bin — and recovery cannot tell which. Deleting it again would destroy a file the pass
+    /// never got to (and which the user may have since restored on purpose); restoring it would
+    /// re-create an orphan the user explicitly approved removing. Both directions are wrong, and both
+    /// are unnecessary: the next Mirror run re-plans from scratch and removes the orphan again if it
+    /// is still there, which is what makes the pass idempotent.</para>
+    ///
+    /// <para>Note that <see cref="IJobJournal.Rotate"/> in the serial tail of <see cref="Recover"/>
+    /// compacts these records away. That is intended — the journal is the crash-consistency mechanism,
+    /// while <see cref="Audit.IReconcileAuditLog"/> is the permanent trail — but it means the warning
+    /// has to be raised from THIS pass, the one that read them. It cannot be recovered later.</para></summary>
+    private IReadOnlyList<string> ReportUnfinishedReconcilePasses(List<MirrorReconcileRecord> records)
+    {
+        if (records.Count == 0)
+            return [];
+
+        List<string> unfinished = [];
+        foreach (IGrouping<Guid, MirrorReconcileRecord> pass in records.GroupBy(r => r.JobId))
+        {
+            if (pass.OfType<MirrorReconcileClosedRecord>().Any())
+                continue;   // the pass finished and said so
+            HashSet<string> settled = new(
+                pass.OfType<MirrorOrphanTrashedRecord>().Select(r => r.Path), StringComparer.OrdinalIgnoreCase);
+            foreach (MirrorOrphanTrashingRecord pending in pass.OfType<MirrorOrphanTrashingRecord>())
+                if (!settled.Contains(pending.Path))
+                    unfinished.Add(pending.Path);
+        }
+
+        if (unfinished.Count > 0)
+            logger.LogWarning(
+                "Crash recovery: {Count} mirror deletion(s) were interrupted and their outcome is unknown — " +
+                "each file is either still at its destination or in the Recycle Bin, and recovery has " +
+                "deliberately left it alone. First: \"{First}\"",
+                unfinished.Count, unfinished[0]);
+        return unfinished;
     }
 
     private enum RecoveryOutcome { CompletedForward, RolledBack, CleanedPrePlacement }

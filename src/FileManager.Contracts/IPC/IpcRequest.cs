@@ -24,6 +24,9 @@ namespace FileManager.Contracts.IPC;
 [JsonDerivedType(typeof(UpdateSettingsRequest), "update-settings")]
 [JsonDerivedType(typeof(RelocateProfilesRequest), "relocate-profiles")]
 [JsonDerivedType(typeof(ShutdownRequest), "shutdown")]
+[JsonDerivedType(typeof(ApproveRunRequest), "approve-run")]
+[JsonDerivedType(typeof(CancelRunRequest), "cancel-run")]
+[JsonDerivedType(typeof(GetRunPlanStreamRequest), "get-run-plan-stream")]
 public abstract record IpcRequest
 {
     /// <summary>The protocol this build speaks. History: 1 — original wire format; 2 — dry-run
@@ -49,8 +52,17 @@ public abstract record IpcRequest
     /// is a breaking wire change with no compatible reading — an old client would see every collection
     /// as absent and render an empty preview, which is exactly the silent-wrong-answer this version
     /// gate exists to prevent.
-    /// A mismatched service/UI pair must fail loud (IPC_VERSION_MISMATCH), never half-parse.</summary>
-    public const int CurrentProtocolVersion = 8;
+    /// A mismatched service/UI pair must fail loud (IPC_VERSION_MISMATCH), never half-parse.
+    /// 9 — manual runs became snapshot-driven and two-phase. run-profile's Path is now OPTIONAL (null
+    /// means the whole profile, which is what SyncMode.Mirror needs: its orphan set is only sound over
+    /// the complete source set) and its reply carries a RunId that is now a real run rather than just a
+    /// correlation token. New approve-run / cancel-run requests, and get-run-plan-stream replays a
+    /// pending run's frozen work list as the same DryRunChunkResponse frames a preview uses. New
+    /// run-planned / run-progress / run-completed engine events: an old client hitting an unknown
+    /// EngineEvent discriminator throws inside System.Text.Json and loses its whole subscribe stream,
+    /// which is precisely the half-parse this gate exists to prevent. (Engine-internal, NOT on the wire:
+    /// Payload.RunId, JobCompletion.ResolvedFinalPaths, ITriggerQueue.Enqueue's return value.)</summary>
+    public const int CurrentProtocolVersion = 9;
 
     public int ProtocolVersion { get; init; } = CurrentProtocolVersion;
 }
@@ -70,7 +82,38 @@ public sealed record GetMatchingProfilesRequest : IpcRequest { public required s
 public sealed record RunProfileRequest : IpcRequest
 {
     public required Guid ProfileId { get; init; }
-    public required string Path { get; init; }        // file or folder (folder → recursive per MaxDepth)
+
+    /// <summary>A file or folder to narrow the run to, or <b>null for the whole profile</b> (every
+    /// Source).
+    /// <para>Null is the normal case and what the GUI sends. It is also a requirement rather than a
+    /// convenience under <see cref="Profiles.SyncMode.Mirror"/>: an orphan is "a destination file no
+    /// source writes to", which can only be decided over the COMPLETE source set, so a narrowed run
+    /// refuses to delete anything.</para></summary>
+    public string? Path { get; init; }
+}
+
+/// <summary>Approves (or declines) a run that finished planning and is waiting. Declining closes the
+/// run and changes nothing — at that point nothing has been touched.</summary>
+public sealed record ApproveRunRequest : IpcRequest
+{
+    public required Guid RunId { get; init; }
+    public required bool Approve { get; init; }
+}
+
+/// <summary>Cancels a run at any phase. Planning stops, pending work is dropped, and the orphan-deletion
+/// phase is skipped. Jobs already in flight are never interrupted (I-ATOMIC-JOB).</summary>
+public sealed record CancelRunRequest : IpcRequest
+{
+    public required Guid RunId { get; init; }
+}
+
+/// <summary>Replays a pending run's frozen work list, as the same <c>DryRunChunkResponse</c> frames a
+/// preview streams. Deliberately the same wire shape: the approval view IS the dry-run view, so the
+/// client needs no second renderer, and what the user approves is displayed by the code path they
+/// already trust.</summary>
+public sealed record GetRunPlanStreamRequest : IpcRequest
+{
+    public required Guid RunId { get; init; }
 }
 public sealed record SetPausedRequest : IpcRequest { public required bool Paused { get; init; } }
 public sealed record DryRunRequest : IpcRequest

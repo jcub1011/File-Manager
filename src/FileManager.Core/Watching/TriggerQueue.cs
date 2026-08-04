@@ -42,7 +42,7 @@ public sealed class TriggerQueue : ITriggerQueue, IDisposable
         get { lock (_gate) return _queue.Count; }
     }
 
-    public void Enqueue(Payload payload)
+    public EnqueueOutcome Enqueue(Payload payload)
     {
         ArgumentNullException.ThrowIfNull(payload);
         string key = KeyOf(payload);
@@ -53,13 +53,52 @@ public sealed class TriggerQueue : ITriggerQueue, IDisposable
                 // Coalesce: one entry per (profile, source) while pending. Keep the FIFO position;
                 // refresh to the newest payload (freshest metadata/trigger/timestamp). Availability
                 // is unchanged, so no wakeup is needed.
+                // The displaced payload is REPORTED, not just dropped: if it belonged to a run that is
+                // counting jobs, that run has to stop expecting one for it.
+                Payload displaced = existing.Value;
                 existing.Value = payload;
-                return;
+                return new EnqueueOutcome(Queued: false, Displaced: displaced);
             }
             LinkedListNode<Payload> node = _queue.AddLast(payload);
             _index[key] = node;
         }
         Wake();
+        return new EnqueueOutcome(Queued: true, Displaced: null);
+    }
+
+    public int PendingCountForRun(Guid runId)
+    {
+        int count = 0;
+        lock (_gate)
+        {
+            foreach (Payload pending in _queue)
+                if (pending.RunId == runId)
+                    count++;
+        }
+        return count;
+    }
+
+    public int DropRun(Guid runId)
+    {
+        int dropped = 0;
+        lock (_gate)
+        {
+            LinkedListNode<Payload>? node = _queue.First;
+            while (node is not null)
+            {
+                LinkedListNode<Payload>? next = node.Next;
+                if (node.Value.RunId == runId)
+                {
+                    _index.Remove(KeyOf(node.Value));
+                    _queue.Remove(node);
+                    dropped++;
+                }
+                node = next;
+            }
+        }
+        if (dropped > 0)
+            _logger.LogInformation("Dropped {Count} pending payload(s) for cancelled run {RunId}", dropped, runId);
+        return dropped;
     }
 
     public async IAsyncEnumerable<Payload> DequeueAsync([EnumeratorCancellation] CancellationToken ct = default)

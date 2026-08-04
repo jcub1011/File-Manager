@@ -72,14 +72,22 @@ public sealed class DryRunStreamHandlerTests
     {
         FileSystemService fileSystem = new(NullLogger<FileSystemService>.Instance);
         ScanScheduler scheduler = new(NullLogger<ScanScheduler>.Instance, fileSystem, new FakeSettingsProvider());
-        return new(NullLogger<DryRunStreamHandler>.Instance, engine, new FakeCatalog(profile), TimeProvider.System,
-            new DestinationProjector(NullLogger<DestinationProjector>.Instance, new FakeVolumeInfoProvider(), scheduler),
-            new FakeVolumeInfoProvider(), new EngineConfig(),
+        return new(NullLogger<DryRunStreamHandler>.Instance, NewPlanner(engine, scheduler),
+            new FakeCatalog(profile), TimeProvider.System,
             eventBus ?? new EngineEventBus(NullLogger<EngineEventBus>.Instance), NullMemoryTrimCoordinator.Instance)
         // These tests buffer whole-stream frame lists (Collect) and inspect chunk contents after the
         // fact, so wire-DTO recycling must be off; Wire_frames_are_byte_identical... covers on-vs-off.
         { MaxStreamedFiles = maxStreamedFiles, RecycleWireRecords = false };
     }
+
+    /// <summary>The planner the handler delegates its phase sequencing to, over a REAL
+    /// <see cref="DestinationProjector"/> on the given scheduler — so these tests still drive the
+    /// actual survivor accumulation and destination sweep, just one layer further down than they used
+    /// to. Only the fake engine and the platform boundary are substituted.</summary>
+    private static ProfilePlanner NewPlanner(IDryRunEngine engine, IScanScheduler scheduler) =>
+        new(NullLogger<ProfilePlanner>.Instance, engine,
+            new DestinationProjector(NullLogger<DestinationProjector>.Instance, new FakeVolumeInfoProvider(), scheduler),
+            new FakeVolumeInfoProvider(), new EngineConfig());
 
     private static async Task<List<IpcResponse>> Collect(DryRunStreamHandler handler, Guid profileId) =>
         await Collect(handler, new DryRunStreamRequest { ProfileId = profileId });
@@ -97,9 +105,8 @@ public sealed class DryRunStreamHandlerTests
     {
         FileSystemService fileSystem = new(NullLogger<FileSystemService>.Instance);
         ScanScheduler scheduler = new(NullLogger<ScanScheduler>.Instance, fileSystem, new FakeSettingsProvider());
-        return new(NullLogger<DryRunStreamHandler>.Instance, engine, new FakeCatalog(), TimeProvider.System,
-            new DestinationProjector(NullLogger<DestinationProjector>.Instance, new FakeVolumeInfoProvider(), scheduler),
-            new FakeVolumeInfoProvider(), new EngineConfig(),
+        return new(NullLogger<DryRunStreamHandler>.Instance, NewPlanner(engine, scheduler),
+            new FakeCatalog(), TimeProvider.System,
             new EngineEventBus(NullLogger<EngineEventBus>.Instance), NullMemoryTrimCoordinator.Instance)
         { MaxStreamedFiles = maxStreamedFiles, RecycleWireRecords = false };
     }
@@ -154,10 +161,9 @@ public sealed class DryRunStreamHandlerTests
         ScanScheduler scheduler = new(
             NullLogger<ScanScheduler>.Instance, fileSystem, new FakeSettingsProvider(settings));
         return new(
-            NullLogger<DryRunStreamHandler>.Instance, new FakeStreamEngine(totalFiles: 100, chunkSize: 7),
+            NullLogger<DryRunStreamHandler>.Instance,
+            NewPlanner(new FakeStreamEngine(totalFiles: 100, chunkSize: 7), scheduler),
             new FakeCatalog(profile), TimeProvider.System,
-            new DestinationProjector(NullLogger<DestinationProjector>.Instance, new FakeVolumeInfoProvider(), scheduler),
-            new FakeVolumeInfoProvider(), new EngineConfig(),
             new EngineEventBus(NullLogger<EngineEventBus>.Instance), NullMemoryTrimCoordinator.Instance)
         { MaxStreamedFiles = 1_000, RecycleWireRecords = recycle };
     }
@@ -690,9 +696,8 @@ public sealed class DryRunStreamHandlerTests
     }
 
     private static DryRunStreamHandler NewHandler(Profile profile, IDryRunEngine engine, IScanScheduler scheduler) =>
-        new(NullLogger<DryRunStreamHandler>.Instance, engine, new FakeCatalog(profile), TimeProvider.System,
-            new DestinationProjector(NullLogger<DestinationProjector>.Instance, new FakeVolumeInfoProvider(), scheduler),
-            new FakeVolumeInfoProvider(), new EngineConfig(),
+        new(NullLogger<DryRunStreamHandler>.Instance, NewPlanner(engine, scheduler),
+            new FakeCatalog(profile), TimeProvider.System,
             new EngineEventBus(NullLogger<EngineEventBus>.Instance), NullMemoryTrimCoordinator.Instance)
         { MaxStreamedFiles = 1_000_000, RecycleWireRecords = false };
 

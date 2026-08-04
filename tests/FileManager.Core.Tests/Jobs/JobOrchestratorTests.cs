@@ -1,7 +1,8 @@
-using FileManager.Contracts.IPC;
+﻿using FileManager.Contracts.IPC;
 using FileManager.Contracts.Profiles;
 using FileManager.Core.Jobs;
 using FileManager.Core.Observability;
+using FileManager.Core.Runs;
 using FileManager.Core.Tests.TestSupport;
 using FileManager.Core.Watching;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -42,7 +43,7 @@ public sealed class JobOrchestratorTests : IDisposable
 
         _orchestrator = new JobOrchestrator(_queue, catalog, _executor, planFactory, _bus, jobLog,
             new FakePauseState(), config, TimeProvider.System, NullMemoryTrimCoordinator.Instance,
-            NullLogger<JobOrchestrator>.Instance);
+            NullRunSettleSink.Instance, NullLogger<JobOrchestrator>.Instance);
     }
 
     private Payload PayloadFor(Guid profileId) =>
@@ -152,7 +153,11 @@ public sealed class JobOrchestratorTests : IDisposable
 
         public int PendingCount => 0;
 
-        public void Enqueue(Payload payload) { }
+        public EnqueueOutcome Enqueue(Payload payload) => new(Queued: true, Displaced: null);
+
+        public int DropRun(Guid runId) => 0;
+
+        public int PendingCountForRun(Guid runId) => 0;
 
         public async IAsyncEnumerable<Payload> DequeueAsync(
             [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
@@ -242,7 +247,7 @@ public sealed class JobOrchestratorTests : IDisposable
             queue, new FakeProfileCatalog(profile), executor, new JobPlanFactory(paths, config), _bus,
             new JobLogStore(paths, TimeProvider.System, NullLogger<JobLogStore>.Instance),
             new FakePauseState(), config, TimeProvider.System, NullMemoryTrimCoordinator.Instance,
-            NullLogger<JobOrchestrator>.Instance);
+            NullRunSettleSink.Instance, NullLogger<JobOrchestrator>.Instance);
     }
 
     [Fact]

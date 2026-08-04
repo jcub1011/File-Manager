@@ -40,6 +40,13 @@ public sealed record EnginePaths
     /// default resolves against the process-global %LOCALAPPDATA%, which a test cannot move.</summary>
     public string ScratchDirectory => Path.Combine(Root, "scratch");
 
+    /// <summary>Frozen work lists for live runs: runs/&lt;run-id&gt;/{plan.json, items.ndjsonl}. A run
+    /// captures what it is going to do BEFORE it does any of it, then executes from that capture, so
+    /// the work cannot drift with the filesystem underneath it and the user can approve an itemized
+    /// list rather than an intention. Deleted when a run closes; a directory left behind belongs to a
+    /// run that died and is swept at startup.</summary>
+    public string RunsDirectory => Path.Combine(Root, "runs");
+
     /// <summary>Machine-level settings (§9): a single settings.json at the root.</summary>
     public string SettingsFilePath => Path.Combine(Root, "settings.json");
 

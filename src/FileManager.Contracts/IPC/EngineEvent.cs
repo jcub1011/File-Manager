@@ -13,6 +13,9 @@ namespace FileManager.Contracts.IPC;
 [JsonDerivedType(typeof(ProfilesChangedEvent), "profiles-changed")]
 [JsonDerivedType(typeof(RunQueuedEvent), "run-queued")]
 [JsonDerivedType(typeof(EngineWarningEvent), "engine-warning")]
+[JsonDerivedType(typeof(RunPlannedEvent), "run-planned")]
+[JsonDerivedType(typeof(RunProgressEvent), "run-progress")]
+[JsonDerivedType(typeof(RunCompletedEvent), "run-completed")]
 public abstract record EngineEvent
 {
     public required DateTimeOffset AtUtc { get; init; }
@@ -84,3 +87,54 @@ public sealed record RunQueuedEvent : EngineEvent
     public string? Error { get; init; }
 }
 public sealed record EngineWarningEvent : EngineEvent { public required string Message { get; init; } }
+
+/// <summary>A run has finished planning and is waiting to be approved. NOTHING has been touched yet:
+/// this event is the moment the user can still say no, and the counts are what they are saying yes to.
+/// <para>The itemized work list is fetched separately with <c>get-run-plan-stream</c> — it can be
+/// hundreds of thousands of rows and does not belong on a broadcast event.</para></summary>
+public sealed record RunPlannedEvent : EngineEvent
+{
+    public required Guid RunId { get; init; }
+    public required Guid ProfileId { get; init; }
+    public required int PlannedCopies { get; init; }
+    /// <summary>Destination files that will be moved to the Recycle Bin. Non-zero only under
+    /// <c>SyncMode.Mirror</c>, and the most consequential number in this event.</summary>
+    public required int PlannedDeletes { get; init; }
+    public required long PlannedCopyBytes { get; init; }
+    public required long PlannedDeleteBytes { get; init; }
+    /// <summary>The plan does not cover everything it was asked to. Copies may still proceed; orphan
+    /// deletion will refuse outright, because an incomplete plan's orphan list cannot be trusted.</summary>
+    public required bool Truncated { get; init; }
+    /// <summary>Set when planning failed outright — there is no work list, and the run is already
+    /// closed.</summary>
+    public string? Error { get; init; }
+}
+
+/// <summary>Best-effort run-level progress. Throttled and lossy like <see cref="JobProgressEvent"/>;
+/// <see cref="RunCompletedEvent"/> is authoritative. Unlike a job's progress this has a real
+/// denominator, because the work list was frozen before execution started.</summary>
+public sealed record RunProgressEvent : EngineEvent
+{
+    public required Guid RunId { get; init; }
+    public required string Phase { get; init; }
+    public required int Completed { get; init; }
+    public required int Total { get; init; }
+    public required int Deleted { get; init; }
+}
+
+/// <summary>A run reached its terminal state. The only authoritative statement of what a run did.</summary>
+public sealed record RunCompletedEvent : EngineEvent
+{
+    public required Guid RunId { get; init; }
+    public required Guid ProfileId { get; init; }
+    public required string Outcome { get; init; }
+    public required int Succeeded { get; init; }
+    public required int Skipped { get; init; }
+    public required int Failed { get; init; }
+    public required int Deleted { get; init; }
+    public required long BytesDeleted { get; init; }
+    /// <summary>Why the orphan-deletion phase removed nothing. Non-null means the copies may well have
+    /// succeeded while the destructive half was refused — which the user must be told, because the
+    /// destination is then NOT a mirror of the source.</summary>
+    public string? DeletionAbortReason { get; init; }
+}

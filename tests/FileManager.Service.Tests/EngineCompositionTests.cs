@@ -1,4 +1,4 @@
-using FileManager.Core;
+﻿using FileManager.Core;
 using FileManager.Core.IPC;
 using FileManager.Core.Jobs;
 using FileManager.Core.Journal;
@@ -78,7 +78,9 @@ public sealed class EngineCompositionTests : IDisposable
 
         Assert.Equal(expected.OrderBy(d => d, StringComparer.Ordinal),
                      table.Keys.OrderBy(d => d, StringComparer.Ordinal));
-        Assert.Equal(17, table.Count);
+        // The set equality above is the real assertion; this is the belt-and-braces count, which must
+        // move deliberately whenever a request type is added.
+        Assert.Equal(20, table.Count);
     }
 
     [Fact]

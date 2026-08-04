@@ -3,6 +3,7 @@ using FileManager.Contracts.Primitives;
 using FileManager.Contracts.Profiles;
 using FileManager.Core.Observability;
 using FileManager.Core.Profiles;
+using FileManager.Core.Runs;
 using FileManager.Core.Watching;
 using Microsoft.Extensions.Logging;
 using System;
@@ -29,6 +30,7 @@ public sealed class JobOrchestrator(
     EngineConfig config,
     TimeProvider time,
     IMemoryTrimCoordinator trimCoordinator,
+    IRunSettleSink runs,
     ILogger<JobOrchestrator> logger) : IJobOrchestrator
 {
     private readonly ConcurrentDictionary<Task, byte> _running = new();
@@ -123,8 +125,17 @@ public sealed class JobOrchestrator(
         }
     }
 
+    /// <summary>Runs one payload to a terminal state.
+    ///
+    /// <para><b>Settle discipline.</b> Every exit path must report to the payload's run exactly once, or
+    /// that run's completion barrier waits out its whole deadline and its Mirror deletion phase is then
+    /// refused for a reason that has nothing to do with safety. There are five exits — profile missing,
+    /// profile inactive, plan-build failure, the normal completion tail, and the catch-all — and the
+    /// <c>finally</c> below is what makes a sixth one added later safe by default. Do not replace it
+    /// with per-branch calls.</para></summary>
     private async Task RunJobAsync(Payload payload, SemaphoreSlim workers)
     {
+        JobCompletion? settled = null;
         try
         {
             // A payload whose profile no longer exists OR is inactive is dropped with a logged skip
@@ -186,6 +197,7 @@ public sealed class JobOrchestrator(
                 Interlocked.Decrement(ref _jobsInFlight);
             }
 
+            settled = completion;
             PublishCompletion(profile, plan, completion, startedAt);
         }
         catch (Exception ex)
@@ -197,6 +209,12 @@ public sealed class JobOrchestrator(
         }
         finally
         {
+            // Settle EXACTLY once, from the one place every exit path passes through — including the
+            // three silent drops above, which produce no completion at all but must still be counted
+            // or the run they belong to never finishes waiting for them. `settled` stays null on those
+            // paths, which is how the coordinator tells "dropped" from "ran and had an outcome".
+            if (payload.RunId is { } runId)
+                runs.Settled(runId, settled);
             workers.Release();
         }
     }

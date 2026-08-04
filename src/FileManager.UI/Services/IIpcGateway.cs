@@ -63,8 +63,17 @@ public interface IIpcGateway
     /// "accepted", never "finished": a single file yields an exact <c>QueuedCount</c>, while a folder
     /// yields <c>Scanning = true</c> and reports its final count later as a <see cref="RunQueuedEvent"/>.
     /// PROFILE_NOT_FOUND / PROFILE_INACTIVE / PATH_NOT_FOUND surface as an <see cref="IpcError"/>.</summary>
+    /// <summary>Starts a run. <paramref name="path"/> null means the whole profile, which is what the
+    /// window sends and what Mirror requires. The run PLANS first and touches nothing until
+    /// <see cref="ApproveRunAsync"/>; the plan's counts arrive as a <c>run-planned</c> event.</summary>
     Task<Result<RunProfileResponse, IpcError>> RunProfileAsync(
-        Guid profileId, string path, CancellationToken ct = default);
+        Guid profileId, string? path = null, CancellationToken ct = default);
+
+    /// <summary>Approves a planned run (starts the work) or declines it (closes it, changing nothing).</summary>
+    Task<Result<bool, IpcError>> ApproveRunAsync(Guid runId, bool approve, CancellationToken ct = default);
+
+    /// <summary>Cancels a run. Work not yet started is dropped; work in flight finishes.</summary>
+    Task<Result<bool, IpcError>> CancelRunAsync(Guid runId, CancellationToken ct = default);
 
     /// <summary>Sets the global pause flag. The service publishes <c>pause-changed</c> only on an
     /// actual transition, so a caller must treat this ack — not an echoed event — as its confirmation.</summary>

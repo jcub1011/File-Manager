@@ -2,6 +2,7 @@
 using CommunityToolkit.Mvvm.Input;
 using FileManager.Contracts;
 using FileManager.Contracts.IPC;
+using FileManager.Contracts.Primitives;
 using FileManager.Contracts.Profiles;
 using FileManager.Contracts.Settings;
 using FileManager.UI.Services;
@@ -225,31 +226,23 @@ public sealed partial class MainWindowViewModel : ViewModelBase
             ActivityVisible = true;   // the payoff: the user watches the run land
             List.ErrorMessage = null;
 
-            // run-profile takes ONE path, but a profile has N sources, and "Run now" means run the
-            // profile — so submit one request per source root (spec §8's stance for the GUI's sibling
-            // operation: never narrow the scan).
-            List<string> problems = [];
-            int accepted = 0;
-            foreach (SourceConfig source in profile.Sources)
+            // ONE request for the whole profile. This used to be one per source root, which is wrong
+            // for Mirror: an orphan is "a destination file no source writes to", so the decision can
+            // only be made over the complete source set — N independent runs would each see the other
+            // sources' files as orphans.
+            var run = await _gateway.RunProfileAsync(profile.Id, path: null);
+            if (run.IsCanceled)
+                return;
+            if (run.TryGetError(out IpcError? runError))
             {
-                var run = await _gateway.RunProfileAsync(profile.Id, source.Path);
-                if (run.IsCanceled)
-                    return;
-                if (run.TryGetError(out IpcError? runError))
-                {
-                    problems.Add($"{source.Path} ({runError.Message})");
-                    continue;
-                }
-                // Remember the run id so the broadcast run-queued event can be recognized as OURS.
-                run.TryGetValue(out RunProfileResponse? started);
-                RememberOwnRun(started!.RunId);
-                accepted++;
+                List.ErrorMessage = $"Could not run \"{item.Name}\": {runError.Message}";
+                return;
             }
-
-            if (problems.Count > 0)
-                List.ErrorMessage = accepted > 0
-                    ? $"Started {accepted} of {profile.Sources.Count} source(s). Not started: {string.Join("; ", problems)}"
-                    : $"Could not run \"{item.Name}\": {string.Join("; ", problems)}";
+            run.TryGetValue(out RunProfileResponse? started);
+            // Remembered so the broadcast run-planned/run-completed events can be recognized as OURS —
+            // and, for run-planned, so this window is the one that asks for approval.
+            RememberOwnRun(started!.RunId);
+            Activity.ShowNotice($"Working out what \"{item.Name}\" will do…");
         }
         catch (Exception ex)
         {
@@ -284,8 +277,98 @@ public sealed partial class MainWindowViewModel : ViewModelBase
         await List.DeleteAsync(item);
     }
 
-    /// <summary>The confirmation text. This is the ONLY place the user learns which roots will be
-    /// walked and what happens to the source files afterwards, so it names both.</summary>
+    /// <summary>Set by the composition root to approve a planned run once its itemized totals are known.
+    /// A null callback APPROVES, so a headless test is not blocked — matching how
+    /// <see cref="ConfirmRunProfile"/> treats a null.</summary>
+    public Func<string, Task<bool>>? ConfirmRunPlan { get; set; }
+
+    /// <summary>Shows the plan's totals and approves or declines the run.
+    /// <para>This is the moment the two-phase run exists for: the work list is frozen, nothing has been
+    /// touched, and the numbers shown are the numbers that will happen. A plan that failed outright is
+    /// reported instead of asked about — there is nothing to approve.</para></summary>
+    private async Task ApproveOrDeclineRunAsync(RunPlannedEvent planned)
+    {
+        try
+        {
+            if (planned.Error is { } planError)
+            {
+                _ownRunIds.Remove(planned.RunId);
+                List.ErrorMessage = $"Could not work out what to run: {planError}";
+                return;
+            }
+            if (planned.PlannedCopies == 0 && planned.PlannedDeletes == 0)
+            {
+                _ownRunIds.Remove(planned.RunId);
+                await _gateway.ApproveRunAsync(planned.RunId, approve: false);
+                Activity.ShowNotice("Nothing to do — everything is already up to date.");
+                return;
+            }
+
+            bool approve = ConfirmRunPlan is null || await ConfirmRunPlan(BuildPlanConfirmation(planned));
+            var answered = await _gateway.ApproveRunAsync(planned.RunId, approve);
+            if (answered.TryGetError(out IpcError? error))
+            {
+                _ownRunIds.Remove(planned.RunId);
+                List.ErrorMessage = $"Could not {(approve ? "start" : "cancel")} the run: {error.Message}";
+                return;
+            }
+            if (!approve)
+            {
+                _ownRunIds.Remove(planned.RunId);
+                Activity.ShowNotice("Run cancelled — nothing was changed.");
+            }
+        }
+        catch (Exception ex)
+        {
+            // Last-resort catch-all (directive): this is a fire-and-forget continuation off the event
+            // pump, so it has no exception boundary of its own.
+            Log.Error(ex, "Approving run {RunId} failed", planned.RunId);
+            _ownRunIds.Remove(planned.RunId);
+            List.ErrorMessage = $"Could not start the run: {ex.Message}";
+        }
+    }
+
+    /// <summary>The approval text: what the frozen plan says will happen, in counts. The deletion line
+    /// leads when there is one, because it is the only irreversible-feeling part.</summary>
+    private static string BuildPlanConfirmation(RunPlannedEvent planned)
+    {
+        string text = "Ready to run." + Environment.NewLine + Environment.NewLine
+            + $"    {planned.PlannedCopies} file(s) to copy or update"
+            + $" ({ByteSize.Format(planned.PlannedCopyBytes)})";
+        if (planned.PlannedDeletes > 0)
+            text += Environment.NewLine
+                + $"    {planned.PlannedDeletes} file(s) to REMOVE from the target folder(s)"
+                + $" ({ByteSize.Format(planned.PlannedDeleteBytes)}) — these go to the Recycle Bin";
+        if (planned.Truncated)
+            text += Environment.NewLine + Environment.NewLine
+                + "NOTE: this plan does not cover everything that was scanned, so it may be incomplete."
+                + (planned.PlannedDeletes > 0
+                    ? " No files will be removed from the targets."
+                    : "");
+        text += Environment.NewLine + Environment.NewLine + "Go ahead?";
+        return text;
+    }
+
+    private static string DescribeRunOutcome(RunCompletedEvent completed)
+    {
+        string counts = $"{completed.Succeeded} copied, {completed.Skipped} skipped";
+        if (completed.Failed > 0)
+            counts += $", {completed.Failed} FAILED";
+        if (completed.Deleted > 0)
+            counts += $", {completed.Deleted} removed ({ByteSize.Format(completed.BytesDeleted)})";
+        string text = $"Run finished ({completed.Outcome}): {counts}.";
+        if (completed.DeletionAbortReason is { } reason)
+            text += $" No files were removed from the targets — {reason}";
+        return text;
+    }
+
+    /// <summary>The pre-flight confirmation: which roots will be walked, what happens to the sources,
+    /// and — for Mirror — that files will be removed from the TARGETS.
+    /// <para>The Mirror wording is not decoration. Mirror's destructive half acts on the destination, so
+    /// a dialog that names only the source disposition describes the safe half of the run and stays
+    /// silent about the half that deletes. The filter caveat is here for the same reason: an excluded
+    /// source file contributes no survivor, so tightening a filter on a Mirror profile removes files it
+    /// previously copied — correct, faithful to the preview, and utterly surprising if unsaid.</para></summary>
     private static string BuildRunConfirmation(Profile profile)
     {
         string roots = string.Join(Environment.NewLine, profile.Sources.Select(s => "    " + s.Path));
@@ -297,10 +380,24 @@ public sealed partial class MainWindowViewModel : ViewModelBase
             OnSuccessAction.PermanentDelete => "each source file will then be PERMANENTLY DELETED",
             _ => $"the source disposition is {profile.Policies.OnSuccess}",
         };
-        return $"Run \"{profile.Name}\" now?" + Environment.NewLine + Environment.NewLine
-            + "This performs a REAL run. Files under:" + Environment.NewLine
+
+        string text = $"Run \"{profile.Name}\" now?" + Environment.NewLine + Environment.NewLine
+            + "Files under:" + Environment.NewLine
             + roots + Environment.NewLine
             + $"will be copied to {profile.Targets.Count} target(s), and {disposition}.";
+
+        if (profile.SyncMode == SyncMode.Mirror)
+        {
+            text += Environment.NewLine + Environment.NewLine
+                + "This is a MIRROR profile: any file in the target folder(s) that is not in the "
+                + "source set will be MOVED TO THE RECYCLE BIN. That includes files excluded by this "
+                + "profile's filters, so tightening a filter removes copies this profile made earlier.";
+        }
+
+        text += Environment.NewLine + Environment.NewLine
+            + "Nothing is copied or deleted yet — you will see exactly what the run intends to do, and "
+            + "can approve or cancel it then.";
+        return text;
     }
 
     /// <summary>Re-seeds everything the lossy event stream cannot be trusted for. Called by the event
@@ -348,6 +445,23 @@ public sealed partial class MainWindowViewModel : ViewModelBase
                             ? $"Nothing in {queued.ScopePath} matched this profile."
                             : $"Queued {queued.QueuedCount} file(s) from {queued.ScopePath}.");
                 }
+                break;
+            case RunPlannedEvent planned:
+                // Only OUR run: the bus is a broadcast, and a second window must not be asked to
+                // approve work this user did not start. The id stays remembered until the run closes,
+                // because run-completed needs it too.
+                if (_ownRunIds.Contains(planned.RunId))
+                    _ = ApproveOrDeclineRunAsync(planned);
+                break;
+            case RunProgressEvent runProgress:
+                if (_ownRunIds.Contains(runProgress.RunId))
+                    Activity.ShowNotice(
+                        $"Running: {runProgress.Completed} of {runProgress.Total} file(s)"
+                        + (runProgress.Deleted > 0 ? $", {runProgress.Deleted} removed" : "") + "…");
+                break;
+            case RunCompletedEvent runCompleted:
+                if (_ownRunIds.Remove(runCompleted.RunId))
+                    Activity.ShowNotice(DescribeRunOutcome(runCompleted));
                 break;
             case EngineWarningEvent warning:
                 // The activity panel's notice bar, NOT List.ErrorMessage — that danger banner is

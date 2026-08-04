@@ -1,4 +1,4 @@
-using FileManager.Contracts.IPC;
+﻿using FileManager.Contracts.IPC;
 using FileManager.Contracts.Primitives;
 using FileManager.Contracts.Profiles;
 using FileManager.UI.Tests.Fakes;
@@ -95,7 +95,7 @@ public sealed class MainWindowViewModelEventRoutingTests
         FakeIpcGateway gateway = new()
         {
             GetResult = SingleSourceProfile(),
-            RunProfileResult = new RunProfileResponse { QueuedCount = 0, Scanning = true, RunId = runId },
+            RunProfileResult = new RunProfileResponse { RunId = runId },
         };
         MainWindowViewModel shell = NewShell(gateway);
         shell.ConfirmRunProfile = null;                      // no dialog in a headless test

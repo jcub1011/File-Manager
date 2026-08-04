@@ -1,6 +1,6 @@
 ﻿# Implementation Progress & Roadmap: File Manager v1
 
-**Last updated:** 2026-07-30
+**Last updated:** 2026-08-04
 **Companion to:** [`architecture-v1.md`](architecture-v1.md) (authoritative shape) and
 [`spec-draft-v3.md`](spec-draft-v3.md) (authoritative behavior).
 
@@ -42,8 +42,19 @@ Three coherent increments are complete:
    real files), an **activity panel** with live progress and per-job log drill-down, and a **pause
    toggle** in the status bar. Manually triggered only — no watcher/scheduler, no transformers yet.
 
-**Test status:** 1121 tests passing across the solution (Core 509, UI 434, Contracts 135,
-Platform.Windows 14, Service 29). 0 errors. A clean build emits 18 analyzer warnings, all in test
+4. **Snapshot-driven runs + `SyncMode.Mirror`.** A manual run is now a first-class object with a
+   lifecycle — **plan → await approval → execute → close** — instead of an anonymous burst of jobs. Its
+   first act is to capture the work via the *same* planner the dry-run preview uses
+   (`IProfilePlanner`, extracted so a preview and a real run cannot describe different work), spool it
+   to a frozen snapshot under `runs/<run-id>/`, and publish `run-planned` with exact counts. Nothing is
+   touched until `approve-run`. Executing then reads the snapshot back: copies flow through the
+   unchanged `ITriggerQueue` → `JobOrchestrator` → `IJobExecutor` path, and — for Mirror —
+   `IMirrorDeletionPass` removes the destination orphans the plan named, **to the Recycle Bin, never
+   hard-deleted**, write-ahead journalled and recorded in a dedicated `audit/mirror-YYYYMM.ndjsonl`
+   trail. Runs report aggregate progress and a terminal `run-completed`, and can be cancelled.
+
+**Test status:** 1426 tests passing across the solution (Core 674, UI 559, Contracts 150,
+Platform.Windows 14, Service 31). 0 errors. One pre-existing flaky test is documented below. A clean build emits 18 analyzer warnings, all in test
 projects (xUnit1031/xUnit2031 in Core.Tests, CA1416 platform-guard notices in Platform.Windows.Tests);
 `src/` is warning-free.
 
@@ -118,6 +129,7 @@ triggers and transformers are the next sets.
 | `IRollbackExecutor` | ✅ | §4.7 ordered sweep, I-STAGING-KEEP. |
 | `ICrashRecovery` | ✅ | §7.3 tables + forward gate + orphan sweep; wired recovery-first. |
 | `IDispositionAuditLog` | ✅ | |
+| `IReconcileAuditLog` | ✅ | A **sibling** trail (`audit/mirror-YYYYMM.ndjsonl`), not a widened `DispositionAuditRecord` — a destination orphan is not a source disposition and must not read like one. |
 
 ### §4.8 Disposition
 | Component | Status | Note |
@@ -138,6 +150,7 @@ triggers and transformers are the next sets.
 | Component | Status | Note |
 | --- | --- | --- |
 | `IDryRunEngine` | ✅ | Transformer profiles report `Unknown (requires transform)`. |
+| `IProfilePlanner` | ✅ | THE source-phase → survivor-set → destination-sweep sequence, shared by the streamed dry-run handler and the run pipeline so a preview and a real run cannot drift. |
 | `IEngineEventBus` / `IJobLogStore` | ✅ | In-proc pub/sub bridged to IPC broadcast; per-job log files + an in-memory recent-jobs ring. |
 | `JobProgressPublisher` | ✅ | Per-job, throttled to 100 ms, monotonically clamped (distribution reports from parallel target tasks). |
 
@@ -160,6 +173,20 @@ triggers and transformers are the next sets.
 
 ## Roadmap (remaining sets, in dependency order)
 
+### Set 3c — Mirror follow-ups
+*Detailed in [`../mirror-run-next-steps.md`](../mirror-run-next-steps.md), including the pre-existing
+placer temp-cleanup bug and the open ratio-guard decision.*
+- Render a pending run's itemized work list in the dry-run view (`get-run-plan-stream` already serves it
+  as `DryRunChunkResponse` frames; the approval prompt currently shows counts only).
+- A Cancel affordance in the activity panel (`cancel-run` and the gateway method exist).
+- Volume-aware dispatch: spread in-flight reads across source volumes instead of letting the FIFO
+  concentrate them. Self-calibrating on least-outstanding-work per volume, so it needs no hardware
+  probing and helps every multi-source run.
+- Duplicate source election on the same signal (the `ISourceSelector` seam, which moves to dispatch
+  time). Gated on deciding "dispose all replicas" — see the doc.
+- Remove emptied directories at a Mirror destination.
+- `get-recent-reconciles`, so a deletion pass appears in the activity history.
+
 ### Set 4 — Transformers *(next)*
 - `IArgumentParser` / `ITokenExpander` / `IProcessRunner` / `ITransformerChainRunner`.
 - The executor's transform phase (workspace, `output-sealed`); 2×/1× workspace preflight
@@ -178,6 +205,74 @@ triggers and transformers are the next sets.
 ---
 
 ## Notable decisions & documented limitations
+
+### Snapshot-driven runs & Mirror (Set 3c)
+- **A run executes from a frozen snapshot, produced by the preview's own planner.** `IProfilePlanner`
+  was extracted from `DryRunStreamHandler` so the source-phase / survivor-set / sweep sequencing exists
+  once. The run writes its output to `runs/<run-id>/` and executes from that, which means the deletions a
+  Mirror run performs are provably the deletions the preview showed — there is no second computation to
+  disagree with the first. It also freezes the work list, gives progress a real denominator, and creates
+  the barrier point at which "every copy has landed, now remove the orphans" can be expressed at all.
+- **The executor stays authoritative.** It re-screens and re-checks-unchanged, so it can only ever do
+  LESS than the plan predicted, never more. That asymmetry is what makes the plan safe to treat as a
+  ceiling, and it is why `RunCopyItem.PlannedKind` is advisory (display and progress) rather than an
+  instruction.
+- **Only `Processed` source operations become work.** A filter-excluded file and a file already identical
+  at every target both produce no copy item — exactly what the preview showed for them. A file that
+  changes between planning and execution is therefore picked up by the NEXT run rather than silently
+  altering the run the user approved.
+- **Tightening a filter on a Mirror profile deletes files it copied earlier.** An excluded source file
+  contributes no destination operation, so no survivor, so its previously-copied destination reads as an
+  orphan. This matches the dry run exactly (verified against `DestinationProjector.AccumulateSurvivors`),
+  which is why it stands — but it is the single most surprising thing the app can do, so it is named in
+  the run confirmation and gated behind the new blocking `PROFILE_MIRROR_DELETES` acknowledgment.
+- **Deletion is fail-closed.** Any doubt deletes nothing and says why: a truncated plan, ANY enumeration
+  fault (including a warning-level unreadable subdirectory — deliberately stricter than the dry run,
+  which only flags such a report), a scoped run, a missing source root, any failed/rolled-back copy job,
+  a paused engine, a barrier that timed out, an orphan count over the cap, or a per-root ratio guard.
+  A job's `DispositionError` is deliberately **not** a gate: disposition concerns the source, while the
+  destination copies are proven placed.
+- **The ratio guard is a judgement call.** Refusing a pass that would remove >50% of a target root (at
+  ≥20 orphans) is what catches a `TargetLayout` flip and a source share that remounted empty — both
+  produce a plan every other gate calls healthy. It has a false-positive mode (a legitimate large
+  cleanup) and there is **no override yet**; that needs deciding before this ships widely.
+- **Scoped runs never reconcile.** An orphan can only be identified over the complete source set, so a
+  run narrowed to a path copies but deletes nothing. The GUI always sends a whole-profile run; the
+  long-run answer for automation is the Set 5 scheduler or a dedicated `reconcile-profile` request.
+- **Crash recovery takes NO action on an interrupted deletion pass**, and there is no correct action to
+  take: the file is either still on disk or already in the Recycle Bin and recovery cannot tell which.
+  Re-deleting would destroy a file the pass never reached; restoring would re-create an orphan the user
+  approved removing. It is reported by path (`RecoveryReport.UnfinishedMirrorDeletions`) and left alone;
+  the next Mirror run re-plans and removes anything still there. Note `journal.Rotate()` discards those
+  records, so the warning must be raised by the same recovery pass that read them.
+- **Two audit files.** `audit-*.ndjsonl` (source dispositions) and `mirror-*.ndjsonl` (destination
+  orphans) rather than one widened record: there is no honest `OnSuccessAction` for "the mirror removed a
+  stale copy", and stamping `MoveToTrash` would make it indistinguishable from "your policy recycled your
+  original". If a combined viewer is ever wanted, a polymorphic `AuditRecord` base is easier now than
+  after both files exist in the field.
+- **Empty directories are never removed**, so a Mirror destination accumulates an empty skeleton where a
+  source subtree used to be. Pinned by a test so it reads as a decision.
+- **A deletion pass does not appear in the recent-jobs ring.** `JobSummary` requires a `SourcePath` and a
+  `JobOutcome`; a pass has neither, and faking them is the kind of small lie that later reads as truth.
+  A proper `get-recent-reconciles` is the follow-up. The pass IS drillable via `get-job-log` on its pass
+  id, which reuses `JobId` precisely so that works for free.
+- **`ITriggerQueue.Enqueue` now returns an `EnqueueOutcome`** and the queue gained `DropRun` /
+  `PendingCountForRun`. Coalescing silently replaces a pending payload, so a run counting its own jobs
+  must learn which payload was displaced or its barrier waits out the whole deadline.
+- **Protocol 9.** `run-profile`'s `Path` is optional, `approve-run` / `cancel-run` /
+  `get-run-plan-stream` are new, and three run events joined the stream. The bump is mandatory: an old
+  client hitting an unknown `EngineEvent` discriminator throws inside `System.Text.Json` and loses its
+  whole subscribe stream.
+
+### Known pre-existing defect (not introduced by this work)
+*Diagnosis notes and a suggested fix direction: [`../mirror-run-next-steps.md`](../mirror-run-next-steps.md) §1.*
+- **`JobExecutorFailureRollbackTests.A_multi_target_failure_leaves_no_target_placed_and_every_prior_intact`
+  fails roughly 1 run in 8**, finding two leftover `.fmtmp-` temps instead of none. This is the
+  cancellation/cleanup race already documented in `JobExecutorHarness.ExecuteWithRetriesAsync`: when a
+  multi-target job's sibling cancellation lands mid-placement, rollback does not reclaim the temp. It is a
+  real defect on the live path — a failed run can leave temp files in a user's target root — and worth
+  fixing on its own.
+
 
 - **CRC:** the journal/audit line checksum is CRC-32 (IEEE) via `System.IO.Hashing.Crc32`
   (`NdjsonFrame`). Non-load-bearing — the same function frames the write and validates the read.

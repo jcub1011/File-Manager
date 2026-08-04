@@ -104,9 +104,17 @@ public sealed class IpcGateway(Func<string?>? serviceExePath = null, TimeProvide
             new ShutdownRequest(), static _ => true, ct);
 
     public Task<Result<RunProfileResponse, IpcError>> RunProfileAsync(
-        Guid profileId, string path, CancellationToken ct = default) =>
+        Guid profileId, string? path = null, CancellationToken ct = default) =>
         RequestAsync<RunProfileResponse, RunProfileResponse>(
             new RunProfileRequest { ProfileId = profileId, Path = path }, static r => r, ct);
+
+    public Task<Result<bool, IpcError>> ApproveRunAsync(Guid runId, bool approve, CancellationToken ct = default) =>
+        RequestAsync<OkResponse, bool>(
+            new ApproveRunRequest { RunId = runId, Approve = approve }, static _ => true, ct);
+
+    public Task<Result<bool, IpcError>> CancelRunAsync(Guid runId, CancellationToken ct = default) =>
+        RequestAsync<OkResponse, bool>(
+            new CancelRunRequest { RunId = runId }, static _ => true, ct);
 
     public Task<Result<bool, IpcError>> SetPausedAsync(bool paused, CancellationToken ct = default) =>
         RequestAsync<OkResponse, bool>(

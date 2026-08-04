@@ -176,10 +176,10 @@ internal sealed class FakeIpcGateway : IIpcGateway
 
     // ---- live single-job surface ------------------------------------------------------------------
 
-    public List<(Guid ProfileId, string Path)> RunProfileCalls { get; } = [];
+    public List<(Guid ProfileId, string? Path)> RunProfileCalls { get; } = [];
 
     public Result<RunProfileResponse, IpcError> RunProfileResult { get; set; } =
-        new RunProfileResponse { QueuedCount = 1, Scanning = false, RunId = Guid.NewGuid() };
+        new RunProfileResponse { RunId = Guid.NewGuid() };
 
     /// <summary>Per-path override, so one test can script an accepted root and a failing one.</summary>
     public Dictionary<string, Result<RunProfileResponse, IpcError>> RunProfileResults { get; } =
@@ -214,11 +214,31 @@ internal sealed class FakeIpcGateway : IIpcGateway
     public TaskCompletionSource? SubscribeIdleGate { get; set; }
 
     public Task<Result<RunProfileResponse, IpcError>> RunProfileAsync(
-        Guid profileId, string path, CancellationToken ct = default)
+        Guid profileId, string? path = null, CancellationToken ct = default)
     {
         RunProfileCalls.Add((profileId, path));
         return Task.FromResult(
-            RunProfileResults.TryGetValue(path, out var scripted) ? scripted : RunProfileResult);
+            path is not null && RunProfileResults.TryGetValue(path, out var scripted)
+                ? scripted
+                : RunProfileResult);
+    }
+
+    public List<(Guid RunId, bool Approve)> ApproveRunCalls { get; } = [];
+    public Result<bool, IpcError> ApproveRunResult { get; set; } = true;
+
+    public Task<Result<bool, IpcError>> ApproveRunAsync(Guid runId, bool approve, CancellationToken ct = default)
+    {
+        ApproveRunCalls.Add((runId, approve));
+        return Task.FromResult(ApproveRunResult);
+    }
+
+    public List<Guid> CancelRunCalls { get; } = [];
+    public Result<bool, IpcError> CancelRunResult { get; set; } = true;
+
+    public Task<Result<bool, IpcError>> CancelRunAsync(Guid runId, CancellationToken ct = default)
+    {
+        CancelRunCalls.Add(runId);
+        return Task.FromResult(CancelRunResult);
     }
 
     public async Task<Result<bool, IpcError>> SetPausedAsync(bool paused, CancellationToken ct = default)

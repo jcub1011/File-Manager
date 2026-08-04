@@ -137,7 +137,7 @@ public enum SyncMode
     [Tooltip("Additive Archive")]
     AdditiveArchive,
     [Tooltip("Mirror")]
-    Mirror,               /// [reserved — fails v1 validation]
+    Mirror,
 }
 
 public enum TargetLayout
