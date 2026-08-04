@@ -67,7 +67,7 @@ public sealed partial class SettingsViewModel : ViewModelBase
             ["appearance", "colour", "color", "dark mode", "light mode"]);
 
         ServiceExePath = Setting.Text(
-            "application.serviceExePath", "Service executable path",
+            "application.serviceExePath", "Service Executable Path",
             "Full path to FileManager.Service.exe. Leave blank to use the copy installed beside this " +
             "app. Set it only if the status bar says the service executable could not be found — this " +
             "setting is saved on this computer and takes effect without restarting the app.",
@@ -77,28 +77,28 @@ public sealed partial class SettingsViewModel : ViewModelBase
             actionButtonText: "Browse…", actionCommand: BrowseServiceExePathCommand);
 
         StartupMode = Setting.Choice(
-            "startup.serviceMode", "Startup mode",
+            "startup.serviceMode", "Startup Mode",
             "When the background service runs. Run on Startup launches it at Windows login. Start on Program Open starts it when this app opens and leaves it running. Start and Stop with Program starts it on open and stops it when the app closes (warning first if jobs are running).",
             [ServiceStartupMode.RunOnStartup, ServiceStartupMode.StartOnProgramOpen, ServiceStartupMode.StartAndStopWithProgram],
             ["service", "background", "autostart", "auto start", "login", "boot", "windows"]);
 
         MaxScanThreads = Setting.AutoNumber(
-            "performance.maxScanThreads", "Max scan threads",
+            "performance.maxScanThreads", "Max Scan Threads",
             $"Caps the total number of directory-enumeration threads across all profiles. Auto uses cores × 4 ({ScanAutoDefault} on this machine, capped at 64).",
             ["performance", "concurrency", "parallel", "cpu", "workers", "enumeration", "threads"]);
 
         PerDriveDefault = Setting.AutoNumber(
-            "performance.perDriveDefault", "Per-drive default",
+            "performance.perDriveDefault", "Per-Drive Default",
             $"Caps the enumeration threads used on any one drive. Auto uses cores × 2 ({PerDriveAutoDefault} on this machine).",
             ["performance", "concurrency", "parallel", "cpu", "workers", "disk", "volume", "threads"]);
 
         MaxHashThreads = Setting.AutoNumber(
-            "performance.maxHashThreads", "Max hash threads",
+            "performance.maxHashThreads", "Max Hash Threads",
             $"Caps parallel file hashing during a dry run. Auto uses cores − 1 ({HashAutoDefault} on this machine).",
             ["performance", "concurrency", "parallel", "cpu", "workers", "hash", "checksum", "verify", "threads"]);
 
         MaxScanDepth = Setting.AutoNumber(
-            "performance.maxScanDepth", "Max scan depth",
+            "performance.maxScanDepth", "Max Scan Depth",
             "A safety stop for directory trees that loop back on themselves — most often a symlink on a "
             + $"network share, which Windows cannot flag as a link. Auto uses {GlobalSettings.DefaultMaxScanDepth} "
             + "levels below each scan root; nothing below the limit is scanned. Raise it only for a "
@@ -107,20 +107,20 @@ public sealed partial class SettingsViewModel : ViewModelBase
              "junction", "reparse", "network", "share", "safety", "limit"]);
 
         DriveOverrides = new DriveOverridesSettingViewModel(
-            "performance.driveOverrides", "Per-drive overrides",
+            "performance.driveOverrides", "Per-Drive Overrides",
             "Override the per-drive budget for a whole drive type, or for a specific volume key (highest precedence). Precedence: specific drive → drive type → per-drive default.",
             PerDriveAutoDefault,
             drives ?? new SystemDrives(),
             ["performance", "advanced", "drive", "disk", "volume", "network", "removable", "optical", "override"]);
 
         ScratchDirectory = Setting.Text(
-            "storage.scratchDirectory", "Dry-run scratch directory",
+            "storage.scratchDirectory", "Dry-Run Scratch Directory",
             "Where the service spills a large dry run's findings to disk before streaming them to this window. Small runs stay in memory and never touch it. Leftover snapshots are purged on service startup.",
             ["storage", "folder", "directory", "path", "temp", "spill", "dry run", "location"],
             actionButtonText: "Browse…", actionCommand: BrowseScratchDirectoryCommand);
 
         ReleaseMemoryAfterLargeOperations = Setting.Bool(
-            "performance.releaseMemory", "Release memory after large operations",
+            "performance.releaseMemory", "Optimize Memory",
             "After a large dry run settles, ask the service to compact and hand its peak memory back " +
             "to Windows. Without this the service keeps showing that peak in Task Manager until it " +
             "restarts. The collection is brief and only ever runs while the service is idle. Turn it " +
@@ -130,7 +130,7 @@ public sealed partial class SettingsViewModel : ViewModelBase
             checkBoxLabel: "Release memory when idle");
 
         ProfilesDirectory = Setting.Text(
-            "storage.profilesDirectory", "Profiles storage",
+            "storage.profilesDirectory", "Profiles Storage",
             "Where profile files are stored. Change… applies immediately: it asks whether to move the existing profiles into the new folder (defaulting to no), then switches the service to it.",
             ["storage", "folder", "directory", "path", "profiles", "location", "move"],
             readOnly: true,
@@ -201,17 +201,17 @@ public sealed partial class SettingsViewModel : ViewModelBase
     private void BuildCatalog()
     {
         SettingsCategoryViewModel performance = new(
-            "performance", "Scan performance", "Thread budgets and scan limits shared across all profiles.")
+            "performance", "Scan Performance", "Thread budgets and scan limits shared across all profiles.")
         { RequiresService = true };
 
         Categories.Add(new SettingsCategoryViewModel(
             "application", "Application")
             .With(Theme, ServiceExePath));
-        Categories.Add(new SettingsCategoryViewModel("startup", "Service startup") { RequiresService = true }
+        Categories.Add(new SettingsCategoryViewModel("startup", "Service Startup") { RequiresService = true }
             .With(StartupMode));
         Categories.Add(performance.With(
             MaxScanThreads, PerDriveDefault, MaxHashThreads, MaxScanDepth, ReleaseMemoryAfterLargeOperations));
-        Categories.Add(new SettingsCategoryViewModel("performance.advanced", "Per-drive overrides", parent: performance)
+        Categories.Add(new SettingsCategoryViewModel("performance.advanced", "Per-Drive Overrides", parent: performance)
             { RequiresService = true }
             .With(DriveOverrides));
         Categories.Add(new SettingsCategoryViewModel("storage", "Storage") { RequiresService = true }
@@ -380,12 +380,14 @@ public sealed partial class SettingsViewModel : ViewModelBase
     {
         if (value is null)
             return;
-        SettingItemViewModel? target = value.Setting ?? FirstVisibleSetting(value);
-        if (target is not null)
-            SelectSetting(target);
+        if (value.Setting is { } setting)
+            SelectSetting(setting);
+        else if (value.Category is { } category)
+            SelectCategory(category);
     }
 
-    /// <summary>The setting the tree last navigated to, or null before any navigation.</summary>
+    /// <summary>The setting the tree last navigated to, or null before any navigation, or once a category
+    /// (rather than a setting) was navigated to instead.</summary>
     public SettingItemViewModel? SelectedSetting { get; private set; }
 
     private void SelectSetting(SettingItemViewModel item)
@@ -400,30 +402,26 @@ public sealed partial class SettingsViewModel : ViewModelBase
         ScrollToRequested?.Invoke(this, item);
     }
 
+    /// <summary>Selecting a category shows its own header rather than jumping into one of its settings —
+    /// so no setting card stays highlighted while the header is the navigation target.</summary>
+    private void SelectCategory(SettingsCategoryViewModel category)
+    {
+        History.BreakMerge();
+        if (SelectedSetting is not null)
+        {
+            SelectedSetting.IsSelected = false;
+            SelectedSetting = null;
+        }
+        ScrollToCategoryRequested?.Invoke(this, category);
+    }
+
     /// <summary>Raised when a setting should be brought into view. Handled by the window, because
     /// scrolling is a view concern and the VM stays window-agnostic (mirrors <see cref="RequestClose"/>).</summary>
     public event EventHandler<SettingItemViewModel>? ScrollToRequested;
 
-    /// <summary>The first visible setting under a category branch, so selecting a category jumps to the
-    /// top of that section even when a search has hidden its leading settings.</summary>
-    private static SettingItemViewModel? FirstVisibleSetting(SettingsNavNodeViewModel node)
-    {
-        if (node.Category is not null)
-        {
-            foreach (SettingItemViewModel item in node.Category.Items)
-            {
-                if (item.IsVisible)
-                    return item;
-            }
-        }
-        foreach (SettingsNavNodeViewModel child in node.Children)
-        {
-            SettingItemViewModel? found = child.Setting is { IsVisible: true } leaf ? leaf : FirstVisibleSetting(child);
-            if (found is not null)
-                return found;
-        }
-        return null;
-    }
+    /// <summary>Raised when a category's own header should be brought into view (mirrors
+    /// <see cref="ScrollToRequested"/>).</summary>
+    public event EventHandler<SettingsCategoryViewModel>? ScrollToCategoryRequested;
 
     // ============================ Shell state ============================
 

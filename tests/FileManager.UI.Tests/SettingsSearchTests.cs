@@ -175,24 +175,28 @@ public sealed class SettingsSearchTests
     }
 
     [Fact]
-    public void Selecting_a_category_jumps_to_its_first_visible_setting()
+    public void Selecting_a_category_asks_the_view_to_scroll_to_that_categorys_header()
     {
         SettingsViewModel vm = New();
+        List<SettingsCategoryViewModel> requested = [];
+        vm.ScrollToCategoryRequested += (_, category) => requested.Add(category);
 
-        vm.SelectedNavNode = vm.NavNodes.Single(n => n.Category?.Id == "performance");
+        SettingsNavNodeViewModel node = vm.NavNodes.Single(n => n.Category?.Id == "performance");
+        vm.SelectedNavNode = node;
 
-        Assert.Same(Item(vm, "performance.maxScanThreads"), vm.SelectedSetting);
+        Assert.Same(node.Category, Assert.Single(requested));
     }
 
     [Fact]
-    public void Selecting_a_category_skips_settings_the_search_has_hidden()
+    public void Selecting_a_category_leaves_no_setting_highlighted()
     {
         SettingsViewModel vm = New();
-        vm.SearchText = "hashing";   // hides Max scan threads and Per-drive default
+        vm.SelectedNavNode = Leaf(vm, "application.theme");   // give it a setting to clear
 
         vm.SelectedNavNode = vm.NavNodes.Single(n => n.Category?.Id == "performance");
 
-        Assert.Same(Item(vm, "performance.maxHashThreads"), vm.SelectedSetting);
+        Assert.Null(vm.SelectedSetting);
+        Assert.False(Item(vm, "application.theme").IsSelected);
     }
 
     [Fact]

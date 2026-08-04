@@ -1,7 +1,8 @@
 <Styles xmlns="https://github.com/avaloniaui"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:ctrl="using:FileManager.UI.Controls"
-        xmlns:st="using:FileManager.UI.ViewModels.Settings">
+        xmlns:st="using:FileManager.UI.ViewModels.Settings"
+        xmlns:converters="using:Avalonia.Controls.Converters">
 
     <!-- Status indicator (dry-run): a colour-tinted glyph + optional count. Replaces the old filled
          status pills; the icon carries the meaning (pair with ToolTip.Tip), the text an optional
@@ -21,6 +22,70 @@
                     </StackPanel>
                 </ControlTemplate>
             </Setter>
+        </ControlTheme>
+
+        <!-- Per-level indent for the settings navigation tree, much tighter than Fluent's default 16px
+             (see SettingsNavTreeViewItemTheme below, which is the only consumer). -->
+        <x:Double x:Key="SettingsTreeIndent">6</x:Double>
+
+        <!-- A re-templated TreeViewItem for the settings navigation tree only (assigned via
+             TreeView.settingsNav's ItemContainerTheme). BasedOn the Fluent default so every visual state
+             (hover/selected/disabled) is inherited unchanged; only the Template is replaced, shrinking the
+             expand/collapse chevron's reserved space from Fluent's fixed ~36px (12px margin either side of
+             a 12px glyph, present on every row including leaves and top-level items) down to ~24px, on top
+             of the smaller per-level indent above. -->
+        <ControlTheme x:Key="SettingsNavTreeViewItemTheme" TargetType="TreeViewItem"
+                      BasedOn="{StaticResource {x:Type TreeViewItem}}">
+            <Setter Property="Template">
+                <ControlTemplate>
+                    <StackPanel>
+                        <Border Name="PART_LayoutRoot"
+                                Classes="TreeViewItemLayoutRoot"
+                                Focusable="True"
+                                Background="{TemplateBinding Background}"
+                                BorderBrush="{TemplateBinding BorderBrush}"
+                                BorderThickness="{TemplateBinding BorderThickness}"
+                                CornerRadius="{TemplateBinding CornerRadius}"
+                                MinHeight="{TemplateBinding MinHeight}"
+                                TemplatedControl.IsTemplateFocusTarget="True">
+                            <Grid Name="PART_Header" ColumnDefinitions="Auto,*">
+                                <Grid.Margin>
+                                    <MultiBinding Converter="{x:Static converters:TreeViewItemIndentConverter.Instance}">
+                                        <Binding Path="Level" RelativeSource="{RelativeSource TemplatedParent}" />
+                                        <DynamicResource ResourceKey="SettingsTreeIndent" />
+                                    </MultiBinding>
+                                </Grid.Margin>
+                                <Panel Name="PART_ExpandCollapseChevronContainer" Margin="4,0,4,0">
+                                    <ToggleButton Name="PART_ExpandCollapseChevron"
+                                                  Theme="{StaticResource FluentTreeViewExpandCollapseChevron}"
+                                                  Width="10" Height="10"
+                                                  Focusable="False"
+                                                  IsChecked="{TemplateBinding IsExpanded, Mode=TwoWay}" />
+                                </Panel>
+                                <ContentPresenter Name="PART_HeaderPresenter"
+                                                  Grid.Column="1"
+                                                  Focusable="False"
+                                                  Background="Transparent"
+                                                  Content="{TemplateBinding Header}"
+                                                  ContentTemplate="{TemplateBinding HeaderTemplate}"
+                                                  HorizontalAlignment="{TemplateBinding HorizontalAlignment}"
+                                                  VerticalAlignment="{TemplateBinding VerticalAlignment}"
+                                                  Margin="{TemplateBinding Padding}" />
+                            </Grid>
+                        </Border>
+                        <ItemsPresenter Name="PART_ItemsPresenter"
+                                        IsVisible="{TemplateBinding IsExpanded}"
+                                        ItemsPanel="{TemplateBinding ItemsPanel}" />
+                    </StackPanel>
+                </ControlTemplate>
+            </Setter>
+
+            <Style Selector="^:empty /template/ ToggleButton#PART_ExpandCollapseChevron">
+                <Setter Property="IsVisible" Value="False" />
+            </Style>
+            <Style Selector="^:empty /template/ Panel#PART_ExpandCollapseChevronContainer">
+                <Setter Property="Width" Value="10" />
+            </Style>
         </ControlTheme>
     </Styles.Resources>
 
@@ -448,6 +513,7 @@
         <Setter Property="Background" Value="Transparent" />
         <Setter Property="BorderThickness" Value="0" />
         <Setter Property="Padding" Value="0" />
+        <Setter Property="ItemContainerTheme" Value="{StaticResource SettingsNavTreeViewItemTheme}" />
     </Style>
     <Style Selector="TreeView.settingsNav TreeViewItem" x:DataType="st:SettingsNavNodeViewModel">
         <Setter Property="IsVisible" Value="{Binding IsVisible}" />

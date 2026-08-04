@@ -69,7 +69,10 @@ namespace FileManager.UI.Views
             Unsubscribe();
             _subscribed = DataContext as SettingsViewModel;
             if (_subscribed is not null)
+            {
                 _subscribed.ScrollToRequested += OnScrollToRequested;
+                _subscribed.ScrollToCategoryRequested += OnScrollToCategoryRequested;
+            }
         }
 
         private void OnWindowClosed(object? sender, EventArgs e) => Unsubscribe();
@@ -77,15 +80,27 @@ namespace FileManager.UI.Views
         private void Unsubscribe()
         {
             if (_subscribed is not null)
+            {
                 _subscribed.ScrollToRequested -= OnScrollToRequested;
+                _subscribed.ScrollToCategoryRequested -= OnScrollToCategoryRequested;
+            }
             _subscribed = null;
         }
 
-        /// <summary>Puts the setting the navigation tree selected at the top of the viewport. Deliberately
-        /// sets <c>Offset</c> rather than calling <c>BringIntoView</c>: the latter scrolls the minimum
+        // The anchor is the Border.settingCard the per-kind DataTemplate wraps every setting in.
+        private void OnScrollToRequested(object? sender, SettingItemViewModel item) =>
+            ScrollAnchorIntoView("settingCard", item);
+
+        // The anchor is the Border.sectionHeader the document wraps every category header in.
+        private void OnScrollToCategoryRequested(object? sender, SettingsCategoryViewModel category) =>
+            ScrollAnchorIntoView("sectionHeader", category);
+
+        /// <summary>Puts the <see cref="Border"/> tagged with <paramref name="anchorClass"/> whose
+        /// <c>DataContext</c> is <paramref name="target"/> at the top of the viewport. Deliberately sets
+        /// <c>Offset</c> rather than calling <c>BringIntoView</c>: the latter scrolls the minimum
         /// distance, which would park a setting below the fold at the *bottom* edge instead of where the
         /// eye is looking.</summary>
-        private void OnScrollToRequested(object? sender, SettingItemViewModel item)
+        private void ScrollAnchorIntoView(string anchorClass, object target)
         {
             // The target may have only just become visible (a search was cleared), so its anchor may not
             // be laid out — and an un-laid-out control has no position to scroll to.
@@ -94,12 +109,12 @@ namespace FileManager.UI.Views
             if (SettingsScroll.Content is not Control content)
                 return;
 
-            // The anchor is the Border.settingCard the per-kind DataTemplate wraps every setting in. A
-            // visual-descendant walk rather than a container lookup because the settings live in a nested
-            // ItemsControl (category → items), so there is no single container collection to index.
+            // A visual-descendant walk rather than a container lookup because the settings/categories live
+            // in a nested ItemsControl (category → items), so there is no single container collection to
+            // index.
             Border? anchor = SettingsHost.GetVisualDescendants()
                 .OfType<Border>()
-                .FirstOrDefault(b => b.Classes.Contains("settingCard") && ReferenceEquals(b.DataContext, item));
+                .FirstOrDefault(b => b.Classes.Contains(anchorClass) && ReferenceEquals(b.DataContext, target));
             if (anchor is null)
                 return;
 
