@@ -369,18 +369,20 @@
                                Text="{Binding PlanSummary}" TextWrapping="Wrap" />
                     <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="8"
                                 HorizontalAlignment="Right">
-                        <!-- Icon-only, matching the tab-header strip. Amber play = go but look first, red
-                             trash = throw the plan away. Amber rather than the green used for Preview
-                             because this is still the only button in the app that begins moving files —
-                             every phase before it was read-only by construction — and with the "Approve
-                             Run" label gone the colour and the tooltip are all that is left to say so. -->
-                        <Button Classes="iconButton onChrome tintWarning" Command="{Binding ApproveRunCommand}"
-                                ToolTip.Tip="Approve Run — starts the run. This copies the files listed above and, for a Mirror profile, removes the ones marked for removal.">
-                            <PathIcon Data="{StaticResource IconPlay}" Width="14" Height="14" />
-                        </Button>
+                        <!-- Icon-only, matching the tab-header strip. Red trash = throw the plan away, amber
+                             play = go but look first. Abandon on the left, commit on the right, the same
+                             order the Profile tab's strip and the Settings footer use.
+                             Amber rather than the green used for Preview because this is still the only
+                             button in the app that begins moving files — every phase before it was read-only
+                             by construction — and with the "Approve Run" label gone the colour and the
+                             tooltip are all that is left to say so. -->
                         <Button Classes="iconButton onChrome tintDanger" Command="{Binding DeclineRunCommand}"
                                 ToolTip.Tip="Discard — throws this plan away. Nothing is changed.">
-                            <PathIcon Data="{StaticResource IconTrash}" Width="14" Height="14" />
+                            <PathIcon Data="{StaticResource IconTrash}" Width="16" Height="16" />
+                        </Button>
+                        <Button Classes="iconButton onChrome tintWarning" Command="{Binding ApproveRunCommand}"
+                                ToolTip.Tip="Approve Run — starts the run. This copies the files listed above and, for a Mirror profile, removes the ones marked for removal.">
+                            <PathIcon Data="{StaticResource IconPlay}" Width="16" Height="16" />
                         </Button>
                     </StackPanel>
                 </Grid>

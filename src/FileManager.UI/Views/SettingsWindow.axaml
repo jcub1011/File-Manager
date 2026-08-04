@@ -212,8 +212,8 @@
                            Foreground="{DynamicResource Brush.Text.Primary}" />
             </StackPanel>
 
-            <!-- The tooltip tracks the footer button's wording so the X tells the same story about
-                 pending edits as the labelled button does. -->
+            <!-- The tooltip tracks the footer close button's wording so both routes out of the window
+                 tell the same story about pending edits. -->
             <Button Grid.Column="2" Classes="caption close"
                     chrome:WindowDecorationProperties.ElementRole="CloseButton"
                     Click="OnCloseClick" ToolTip.Tip="{Binding CloseButtonText}">
@@ -239,24 +239,42 @@
                      the Ctrl+Z / Ctrl+Y shortcuts do, so the buttons and the keyboard cannot drift. -->
                 <Grid ColumnDefinitions="Auto,*">
                     <StackPanel Grid.Column="0" Orientation="Horizontal" Spacing="8">
-                        <Button Classes="iconButton" Command="{Binding History.UndoCommand}" ToolTip.Tip="Undo (Ctrl+Z)">
-                            <PathIcon Data="{StaticResource IconUndo}" Width="14" Height="14" />
+                        <!-- onChrome, like the rest of this footer: the default iconButton hover is a lift
+                             off Brush.Panel.Background and is invisible on this bar's chrome fill. -->
+                        <Button Classes="iconButton onChrome" Command="{Binding History.UndoCommand}" ToolTip.Tip="Undo (Ctrl+Z)">
+                            <PathIcon Data="{StaticResource IconUndo}" Width="16" Height="16" />
                         </Button>
-                        <Button Classes="iconButton" Command="{Binding History.RedoCommand}" ToolTip.Tip="Redo (Ctrl+Y)">
-                            <PathIcon Data="{StaticResource IconRedo}" Width="14" Height="14" />
+                        <Button Classes="iconButton onChrome" Command="{Binding History.RedoCommand}" ToolTip.Tip="Redo (Ctrl+Y)">
+                            <PathIcon Data="{StaticResource IconRedo}" Width="16" Height="16" />
                         </Button>
                     </StackPanel>
                     <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="8" HorizontalAlignment="Right">
-                        <!-- Save and Discard both leave the window open: this is a settings document,
+                        <!-- Discard, Save, Close — the same left-to-right order the Profile tab's strip uses,
+                             so the two windows do not disagree about where Discard sits.
+                             Save and Discard both leave the window open: this is a settings document,
                              not a wizard, so committing or abandoning a change should not also decide
-                             that the user is finished. Only Close and the title-bar X close it. -->
-                        <Button Content="Save" Command="{Binding SaveCommand}" Classes="accent" IsEnabled="{Binding !IsBusy}" />
-                        <Button Content="Discard changes" Command="{Binding DiscardChangesCommand}"
-                                ToolTip.Tip="Put every setting back the way it was last saved" />
-                        <!-- Sized to its label, like every other button here. A MinWidth wide enough to
-                             hold "Close without saving" would leave "Close" swimming in padding; the
-                             button growing when there are unsaved edits is the lesser cost. -->
-                        <Button Content="{Binding CloseButtonText}" Click="OnCloseClick" />
+                             that the user is finished. Only Close and the title-bar X close it. Icon-only
+                             now, matching the main window's strips — so the tooltips carry the wording the
+                             labels used to, and Close keeps its bound text there rather than dropping the
+                             distinction between "Close" and "Close without saving". -->
+                        <!-- One size down, as everywhere else: a bare cross fills its box corner to corner
+                             and overshoots the outline glyphs beside it at a matched size. -->
+                        <Button x:Name="FooterDiscardButton"
+                                Classes="iconButton onChrome" Command="{Binding DiscardChangesCommand}"
+                                ToolTip.Tip="Discard changes — put every setting back the way it was last saved">
+                            <PathIcon Data="{StaticResource IconClose}" Width="14" Height="14" />
+                        </Button>
+                        <Button Classes="iconButton onChrome tintAccent" Command="{Binding SaveCommand}"
+                                IsEnabled="{Binding !IsBusy}" ToolTip.Tip="Save">
+                            <PathIcon Data="{StaticResource IconSave}" Width="16" Height="16" />
+                        </Button>
+                        <!-- Named for the smoke test: with the label gone, CloseButtonText is only visible
+                             in the tooltip, so the test can no longer find this button by its content. -->
+                        <Button x:Name="FooterCloseButton"
+                                Classes="iconButton onChrome tintDanger" Click="OnCloseClick"
+                                ToolTip.Tip="{Binding CloseButtonText}">
+                            <PathIcon Data="{StaticResource IconTrash}" Width="16" Height="16" />
+                        </Button>
                     </StackPanel>
                 </Grid>
             </StackPanel>

@@ -388,22 +388,22 @@ public sealed class SettingsWindowSmokeTests(HeadlessSessionFixture headless)
             window.Show();
             window.UpdateLayout();
 
-            Button close = window.GetVisualDescendants().OfType<Button>()
-                .Single(b => Equals(b.Content, "Close"));
+            // Both footer buttons are icon-only, so the wording that used to be their Content now lives
+            // in the tooltip and they are found by name rather than by label.
+            Button close = Assert.IsType<Button>(window.FindControl<Button>("FooterCloseButton"));
             // Its own button, and separate from Close: discarding puts the settings back without
             // deciding the user is finished with the window.
-            Button discard = window.GetVisualDescendants().OfType<Button>()
-                .Single(b => Equals(b.Content, "Discard changes"));
+            Button discard = Assert.IsType<Button>(window.FindControl<Button>("FooterDiscardButton"));
             Assert.False(discard.IsEffectivelyEnabled);
 
             vm.Theme.Value = ThemeMode.Dark;
             window.UpdateLayout();
-            Assert.Equal("Close without saving", close.Content);
+            Assert.Equal("Close without saving", ToolTip.GetTip(close));
             Assert.True(discard.IsEffectivelyEnabled);
 
             vm.History.UndoCommand.Execute(null);
             window.UpdateLayout();
-            Assert.Equal("Close", close.Content);
+            Assert.Equal("Close", ToolTip.GetTip(close));
             Assert.False(discard.IsEffectivelyEnabled);
         }, CancellationToken.None);
     }

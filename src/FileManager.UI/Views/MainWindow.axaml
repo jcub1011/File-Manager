@@ -158,24 +158,24 @@
                              so appearing at the head grows the group leftwards and leaves every other button
                              under the cursor where it was. Anywhere else it shifts its neighbours.
                              The ✕ runs a size smaller than the rest: a bare cross fills its box corner to
-                             corner and optically overshoots the outline glyphs beside it at a matched 14. -->
+                             corner and optically overshoots the outline glyphs beside it at a matched size. -->
                         <Button Classes="iconButton" Command="{Binding DiscardCommand}"
                                 IsVisible="{Binding IsDirty}" ToolTip.Tip="Discard changes">
-                            <PathIcon Data="{StaticResource IconClose}" Width="12" Height="12" />
+                            <PathIcon Data="{StaticResource IconClose}" Width="14" Height="14" />
                         </Button>
                         <!-- Undo/Redo sit ahead of the commit actions: they act on the edits in progress
                              rather than resolving the draft. They run the same commands the Ctrl+Z / Ctrl+Y
                              shortcuts in ProfileEditorView do, so the buttons and the keyboard cannot drift
                              apart. -->
                         <Button Classes="iconButton" Command="{Binding History.UndoCommand}" ToolTip.Tip="Undo (Ctrl+Z)">
-                            <PathIcon Data="{StaticResource IconUndo}" Width="14" Height="14" />
+                            <PathIcon Data="{StaticResource IconUndo}" Width="16" Height="16" />
                         </Button>
                         <Button Classes="iconButton" Command="{Binding History.RedoCommand}" ToolTip.Tip="Redo (Ctrl+Y)">
-                            <PathIcon Data="{StaticResource IconRedo}" Width="14" Height="14" />
+                            <PathIcon Data="{StaticResource IconRedo}" Width="16" Height="16" />
                         </Button>
                         <Button Classes="iconButton tintAccent" Command="{Binding SaveCommand}"
                                 ToolTip.Tip="Save">
-                            <PathIcon Data="{StaticResource IconSave}" Width="14" Height="14" />
+                            <PathIcon Data="{StaticResource IconSave}" Width="16" Height="16" />
                         </Button>
                     </StackPanel>
 
@@ -189,7 +189,7 @@
                                 CommandParameter="{Binding List.SelectedProfile}"
                                 IsEnabled="{Binding List.CanDeleteSelected}"
                                 ToolTip.Tip="Delete — permanently removes this profile">
-                            <PathIcon Data="{StaticResource IconTrash}" Width="14" Height="14" />
+                            <PathIcon Data="{StaticResource IconTrash}" Width="16" Height="16" />
                         </Button>
                         <!-- A spyglass, not a play triangle: this button inspects, and the only button in
                              the app that starts moving files is Approve Run. With the label gone the glyph
@@ -198,7 +198,7 @@
                                 Command="{Binding PreviewProfileCommand}"
                                 CommandParameter="{Binding List.SelectedProfile}"
                                 ToolTip.Tip="Preview — works out exactly what this profile will do and shows it on the Preview tab. Nothing is copied or deleted until you approve it there.">
-                            <PathIcon Data="{StaticResource IconSearch}" Width="14" Height="14" />
+                            <PathIcon Data="{StaticResource IconSearch}" Width="16" Height="16" />
                         </Button>
                     </StackPanel>
 
@@ -215,7 +215,7 @@
                                 IsVisible="{Binding DryRun.PlanningRunId,
                                                     Converter={x:Static ObjectConverters.IsNotNull}}"
                                 ToolTip.Tip="Cancel — stops planning. Nothing has been touched.">
-                            <PathIcon Data="{StaticResource IconClose}" Width="12" Height="12" />
+                            <PathIcon Data="{StaticResource IconClose}" Width="14" Height="14" />
                         </Button>
                         <!-- A refresh arrow rather than the Profile tab's spyglass: arriving here the plan
                              is already on screen, so this button's job is to redo it, not to go look. -->
@@ -224,7 +224,7 @@
                                 CommandParameter="{Binding List.SelectedProfile}"
                                 IsEnabled="{Binding !DryRun.IsPreviewing}"
                                 ToolTip.Tip="Preview — re-plans this profile from scratch">
-                            <PathIcon Data="{StaticResource IconRefresh}" Width="14" Height="14" />
+                            <PathIcon Data="{StaticResource IconRefresh}" Width="16" Height="16" />
                         </Button>
                     </StackPanel>
                 </StackPanel>
