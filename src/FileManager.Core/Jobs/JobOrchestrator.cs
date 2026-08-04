@@ -138,23 +138,36 @@ public sealed class JobOrchestrator(
         JobCompletion? settled = null;
         try
         {
-            // A payload whose profile no longer exists OR is inactive is dropped with a logged skip
-            // (§4.3 failure semantics). The lookup stays on catalog.All so the two cases stay
-            // distinguishable in the log — and this is the gate that covers EVERY trigger, not just
-            // run-profile, and closes the window where a profile is deactivated between enqueue and
-            // dequeue (or while a folder scan is still enqueuing).
-            Profile? profile = catalog.All.FirstOrDefault(p => p.Id == payload.ProfileId);
+            // A payload that belongs to a RUN is built from the profile that run was PLANNED against,
+            // not from the live catalog. The user approved a frozen work list computed from that
+            // profile, and the Mirror deletion pass reads it back from the same snapshot — resolving the
+            // catalog here let one run copy with one profile's targets while deleting per another's.
+            // It is also the only way a run planned from an unsaved draft can copy at all: that profile
+            // is in no catalog, so the lookup below would drop every one of its payloads.
+            //
+            // Consequently a run-tagged payload does NOT stop because its profile was deactivated or
+            // deleted mid-run. That is deliberate: the user approved this specific plan, and cancel-run
+            // is how it is stopped. The catalog gates still cover every OTHER trigger (watcher, shell),
+            // including the window where a profile is deactivated between enqueue and dequeue.
+            Profile? profile = payload.RunId is { } plannedRunId ? runs.PlannedProfile(plannedRunId) : null;
             if (profile is null)
             {
-                logger.LogInformation("Dropping payload for {SourcePath}: profile {ProfileId} no longer exists",
-                    payload.SourcePath, payload.ProfileId);
-                return;
-            }
-            if (!profile.Active)
-            {
-                logger.LogInformation("Dropping payload for {SourcePath}: profile {ProfileId} ({Name}) is inactive",
-                    payload.SourcePath, profile.Id, profile.Name);
-                return;
+                // A payload whose profile no longer exists OR is inactive is dropped with a logged skip
+                // (§4.3 failure semantics). The lookup stays on catalog.All so the two cases stay
+                // distinguishable in the log.
+                profile = catalog.All.FirstOrDefault(p => p.Id == payload.ProfileId);
+                if (profile is null)
+                {
+                    logger.LogInformation("Dropping payload for {SourcePath}: profile {ProfileId} no longer exists",
+                        payload.SourcePath, payload.ProfileId);
+                    return;
+                }
+                if (!profile.Active)
+                {
+                    logger.LogInformation("Dropping payload for {SourcePath}: profile {ProfileId} ({Name}) is inactive",
+                        payload.SourcePath, profile.Id, profile.Name);
+                    return;
+                }
             }
 
             Result<JobPlan, JobError> planResult = planFactory.Build(profile, payload);

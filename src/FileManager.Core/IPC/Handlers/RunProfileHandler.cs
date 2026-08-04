@@ -26,7 +26,12 @@ namespace FileManager.Core.IPC.Handlers;
 /// A narrowed run is still supported (a shell invocation on one folder), but it must be contained: a
 /// path under no Source of the profile is refused outright rather than silently running the profile's
 /// disposition, up to PermanentDelete, against a file the profile was never configured to
-/// touch.</para></summary>
+/// touch.</para>
+///
+/// <para><b>InlineProfile.</b> A request may carry an unsaved draft to plan instead of a persisted
+/// profile, exactly as <c>dry-run-stream</c> can. This is what lets the GUI's Preview tab BE this run's
+/// planning phase: the user previews what is on screen, and approving executes that same frozen plan.
+/// Every gate below applies to whichever profile was resolved — a draft is not a way around them.</para></summary>
 public sealed class RunProfileHandler(
     IProfileCatalog catalog,
     IRunCoordinator runs,
@@ -37,8 +42,9 @@ public sealed class RunProfileHandler(
     public Task<IpcResponse> HandleAsync(IpcRequest request, CancellationToken ct = default)
     {
         var typed = (RunProfileRequest)request;
-        // catalog.All, not Active, so "no such profile" and "inactive" stay distinguishable.
-        Profile? profile = catalog.All.FirstOrDefault(p => p.Id == typed.ProfileId);
+        // A supplied draft IS the profile — no catalog lookup, so a never-saved profile is runnable.
+        // Otherwise catalog.All, not Active, so "no such profile" and "inactive" stay distinguishable.
+        Profile? profile = typed.InlineProfile ?? catalog.All.FirstOrDefault(p => p.Id == typed.ProfileId);
         if (profile is null)
             return Reply(new ErrorResponse
             {

@@ -65,17 +65,9 @@ namespace FileManager.UI
                     await new ImportPreviewWindow { DataContext = preview }.ShowDialog<bool>(window);
                 viewModel.ConfirmClose = async message =>
                     await new ConfirmWindow(message).ShowDialog<bool>(window);
-                // A manual run moves real files and applies the profile's source disposition, so it
-                // always confirms, danger-styled — the same friction the close-time warning uses.
-                viewModel.ConfirmRunProfile = async message =>
-                    await new ConfirmWindow(message, "Run now", "Cancel", confirmIsDanger: true)
-                        .ShowDialog<bool>(window);
-                // The second gate, and the one that shows real numbers: by the time this appears the run
-                // has worked out exactly what it will copy and — for Mirror — what it will remove, and
-                // still touched nothing. Declining here costs the user only the scan.
-                viewModel.ConfirmRunPlan = async message =>
-                    await new ConfirmWindow(message, "Go ahead", "Cancel", confirmIsDanger: true)
-                        .ShowDialog<bool>(window);
+                // No run confirmation dialogs: a run's planning phase touches nothing, and the Preview
+                // tab's footer is where the user sees the actual rows and approves them. A modal showing
+                // counts was standing in for that view; now that the view exists, it is the friction.
                 // Modal rather than an inline bar so the same confirmation appears whichever entry
                 // point asked (Profile tab button, list row menu, collapsed rail menu).
                 viewModel.ConfirmDeleteProfile = async message =>

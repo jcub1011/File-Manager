@@ -61,8 +61,13 @@ public abstract record IpcRequest
     /// run-planned / run-progress / run-completed engine events: an old client hitting an unknown
     /// EngineEvent discriminator throws inside System.Text.Json and loses its whole subscribe stream,
     /// which is precisely the half-parse this gate exists to prevent. (Engine-internal, NOT on the wire:
-    /// Payload.RunId, JobCompletion.ResolvedFinalPaths, ITriggerQueue.Enqueue's return value.)</summary>
-    public const int CurrentProtocolVersion = 9;
+    /// Payload.RunId, JobCompletion.ResolvedFinalPaths, ITriggerQueue.Enqueue's return value.)
+    /// 10 — run-profile gained InlineProfile, so a run can be planned from an unsaved draft exactly as
+    /// dry-run-stream already could. This is what makes the GUI's Preview tab the run's own plan phase
+    /// rather than a separate throwaway simulation. An old service would ignore the field and silently
+    /// plan the PERSISTED profile instead of the draft on screen — a wrong answer that looks right,
+    /// which is the whole reason this gate exists.</summary>
+    public const int CurrentProtocolVersion = 10;
 
     public int ProtocolVersion { get; init; } = CurrentProtocolVersion;
 }
@@ -90,6 +95,15 @@ public sealed record RunProfileRequest : IpcRequest
     /// source writes to", which can only be decided over the COMPLETE source set, so a narrowed run
     /// refuses to delete anything.</para></summary>
     public string? Path { get; init; }
+
+    /// <summary>When set, the run plans this in-memory draft (unsaved edits) directly instead of
+    /// resolving <see cref="ProfileId"/> against the persisted catalog. Its Id should match ProfileId.
+    /// Same shape and meaning as <see cref="DryRunStreamRequest.InlineProfile"/> — deliberately, because
+    /// the GUI's preview IS this request's planning phase.
+    /// <para>The draft is frozen into the run's snapshot, and <c>JobOrchestrator</c> executes a
+    /// run-tagged payload against that frozen profile rather than the catalog, so the copies and the
+    /// Mirror deletions both honour the draft the user actually approved.</para></summary>
+    public Profile? InlineProfile { get; init; }
 }
 
 /// <summary>Approves (or declines) a run that finished planning and is waiting. Declining closes the

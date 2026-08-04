@@ -26,9 +26,9 @@ public sealed record ProfileListItem(Guid ProfileId, string Name, bool Active, s
     /// ancestor lookup). Takes this row as its parameter.</summary>
     public ICommand? ExportCommand { get; init; }
 
-    /// <summary>Bound by the row's right-click "Run now…" menu item, stamped the same way as
-    /// <see cref="ExportCommand"/>. Takes this row as its parameter. This starts a REAL run that moves
-    /// files, so the shell confirms before submitting.</summary>
+    /// <summary>Bound by the row's right-click "Preview…" menu item, stamped the same way as
+    /// <see cref="ExportCommand"/>. Takes this row as its parameter. It opens the profile and previews
+    /// what a run would do; nothing moves until the user approves the plan on the Preview tab.</summary>
     public ICommand? RunCommand { get; init; }
 
     /// <summary>Bound by the row's right-click "Delete…" menu item, stamped the same way as

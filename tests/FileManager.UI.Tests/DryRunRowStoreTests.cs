@@ -88,6 +88,43 @@ public sealed class DryRunRowStoreTests
     }
 
     [Fact]
+    public void A_run_plans_replay_pairs_destinations_sent_in_their_OWN_chunks()
+    {
+        // The frame split a plan replay actually uses: every source row first, then every destination row,
+        // so a destination operation arrives in a chunk carrying no source files at all and refers back to
+        // a source several frames earlier by global index. A preview's frames never look like this — its
+        // per-file bundles keep a source and its destinations together — so nothing else here covers it,
+        // and getting it wrong shows source rows with no targets.
+        DryRunFile a = Pf(@"C:\s\a.txt", @"C:\s", 10);
+        DryRunOperation aSrc = Op(@"C:\s\a.txt", @"C:\s", OperationKind.Processed, sourceIndex: 0,
+            disposition: OnSuccessAction.KeepSource);
+        DryRunFile b = Pf(@"C:\s\b.txt", @"C:\s", 20);
+        DryRunOperation bSrc = Op(@"C:\s\b.txt", @"C:\s", OperationKind.Processed, sourceIndex: 1,
+            disposition: OnSuccessAction.KeepSource);
+        DryRunOperation aDst = Op(@"C:\t\a.txt", @"C:\t", OperationKind.New, sourceIndex: 0);
+        DryRunOperation bDst = Op(@"C:\t\b.txt", @"C:\t", OperationKind.New, sourceIndex: 1);
+        DryRunFile orphanFile = Pf(@"C:\t\gone.txt", @"C:\t", 99);
+        DryRunOperation orphan = Op(@"C:\t\gone.txt", @"C:\t", OperationKind.Deleted, subjectIndex: 0);
+
+        DryRunRowStore store = DryRunRowStore.CreateForIngest();
+        store.OnChunk(Chunk([.. _dirs.Entries], [a, b], [aSrc, bSrc], [], []));   // pass 1: sources
+        store.OnChunk(Chunk([], [], [], [], [aDst, bDst]));                       // pass 2a: projection
+        store.OnChunk(Chunk([], [], [], [orphanFile], [orphan]));                 // pass 2b: orphans
+        store.Complete();
+
+        Assert.Equal(2, store.SourceCount);
+        // Each source keeps its own target — the whole point. A collapsed or empty range here is the
+        // empty-fan-out defect.
+        Assert.Equal(1, store.TargetEnd(0) - store.TargetStart(0));
+        Assert.Equal(1, store.TargetEnd(1) - store.TargetStart(1));
+        Assert.Equal(@"C:\t\a.txt", Path.Combine(store.OpDirPath(store.TargetStart(0)), store.OpFileName(store.TargetStart(0))));
+        Assert.Equal(@"C:\t\b.txt", Path.Combine(store.OpDirPath(store.TargetStart(1)), store.OpFileName(store.TargetStart(1))));
+        // And the orphan's subject still resolves across the split, so its size is the existing file's.
+        Assert.Equal(3, store.OperationCount);
+        Assert.Equal(99, store.OpSize(2));
+    }
+
+    [Fact]
     public void A_source_operation_that_arrives_before_its_file_still_lands()
     {
         // The engine emits whole per-file bundles, so this should not happen — but the batch

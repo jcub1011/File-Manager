@@ -209,11 +209,36 @@ public sealed class IpcClient : IAsyncDisposable
     /// assembled report. See <see cref="IDryRunChunkSink"/> for the sink's contract; the framing,
     /// gating, poisoning and error semantics are identical to the assembling overload — which is
     /// implemented on top of this method, so there is one reassembly loop, not two.</summary>
-    public async Task<Result<DryRunCompletion, IpcError>> DryRunStreamAsync(
+    public Task<Result<DryRunCompletion, IpcError>> DryRunStreamAsync(
         DryRunStreamRequest request, IDryRunChunkSink sink,
         IProgress<DryRunProgress>? progress = null, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(request);
+        return ChunkStreamAsync(request, sink, progress, ct);
+    }
+
+    /// <summary>Replays a pending run's frozen work list — the plan it will execute if approved — through
+    /// the same reassembly loop a preview uses.
+    /// <para>Not a convenience: the service answers <c>get-run-plan-stream</c> with the identical
+    /// <see cref="DryRunChunkResponse"/> frames, precisely so the approval view can BE the dry-run view.
+    /// A separate loop here would be a second implementation of the same trust-boundary checks.</para>
+    /// <para>RUN_NOT_FOUND (the run closed, or was never this client's) and RUN_PLAN_UNAVAILABLE surface
+    /// as an <see cref="IpcError"/>. No progress frames arrive on this path — the plan already exists, so
+    /// there is nothing to discover.</para></summary>
+    public Task<Result<DryRunCompletion, IpcError>> RunPlanStreamAsync(
+        GetRunPlanStreamRequest request, IDryRunChunkSink sink, CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        return ChunkStreamAsync(request, sink, progress: null, ct);
+    }
+
+    /// <summary>The one reassembly loop behind every chunk-streamed request. Takes the request as the
+    /// base type because the framing, gating, poisoning and validation are identical for all of them —
+    /// only the discriminator differs, and it never reads a field off the request.</summary>
+    private async Task<Result<DryRunCompletion, IpcError>> ChunkStreamAsync(
+        IpcRequest request, IDryRunChunkSink sink,
+        IProgress<DryRunProgress>? progress, CancellationToken ct)
+    {
         ArgumentNullException.ThrowIfNull(sink);
 
         try

@@ -13,10 +13,6 @@ internal sealed class FakeIpcGateway : IIpcGateway
 {
     public List<(Profile Profile, bool Acknowledge)> SaveCalls { get; } = [];
     public List<Guid> DeleteCalls { get; } = [];
-    public List<Guid> DryRunCalls { get; } = [];
-    /// <summary>The inline draft passed to each DryRunAsync call (null when the persisted-profile
-    /// path was used), recorded in lockstep with <see cref="DryRunCalls"/>.</summary>
-    public List<Profile?> DryRunDrafts { get; } = [];
     public List<GlobalSettings> SaveSettingsCalls { get; } = [];
     public List<(string NewDirectory, bool MoveExisting)> RelocateCalls { get; } = [];
 
@@ -34,6 +30,10 @@ internal sealed class FakeIpcGateway : IIpcGateway
 
     public Result<bool, IpcError> DeleteResult { get; set; } = true;
 
+    /// <summary>The row set a test expects to see. Named for the report shape rather than the request:
+    /// there is no dry-run request left on this seam, and <see cref="RunPlanResults"/> is where this is
+    /// replayed from. Kept because a whole <c>DryRunReport</c> is still the readable way to describe an
+    /// expected set of rows.</summary>
     public Result<DryRunReport, IpcError> DryRunResult { get; set; } =
         new DryRunReport
         {
@@ -52,16 +52,6 @@ internal sealed class FakeIpcGateway : IIpcGateway
         new RelocateProfilesResponse { Settings = GlobalSettings.Default };
     public Result<bool, IpcError> ShutdownResult { get; set; } = true;
     public int ShutdownCalls { get; private set; }
-
-    /// <summary>When set, DryRunAsync awaits this before returning (cancellation tests).</summary>
-    public TaskCompletionSource? DryRunGate { get; set; }
-
-    /// <summary>When set, DryRunAsync throws it (unexpected-exception tests).</summary>
-    public Exception? DryRunException { get; set; }
-
-    /// <summary>When set, DryRunAsync reports these to the caller's IProgress (synchronously, in
-    /// order) before returning — progress-caption tests.</summary>
-    public IReadOnlyList<DryRunProgress>? ScriptedProgress { get; set; }
 
     public Task<Result<EngineStatusSnapshot, IpcError>> GetStatusAsync(CancellationToken ct = default) =>
         Task.FromResult(StatusResult);
@@ -83,45 +73,6 @@ internal sealed class FakeIpcGateway : IIpcGateway
     {
         DeleteCalls.Add(profileId);
         return Task.FromResult(DeleteResult);
-    }
-
-    /// <summary>Replays <see cref="DryRunResult"/> to the caller's sink as a single chunk — the same
-    /// shape the real gateway delivers, just in one frame instead of many — and returns its run-level
-    /// facts. Tests keep scripting a whole <c>DryRunReport</c>, which stays the convenient way to
-    /// describe an expected run; only the delivery mechanism changed.</summary>
-    public async Task<Result<DryRunCompletion, IpcError>> DryRunAsync(
-        Guid profileId, IDryRunChunkSink sink, IProgress<DryRunProgress>? progress = null,
-        Profile? draft = null, CancellationToken ct = default)
-    {
-        DryRunCalls.Add(profileId);
-        DryRunDrafts.Add(draft);
-        if (DryRunException is not null)
-            throw DryRunException;
-        if (ScriptedProgress is not null && progress is not null)
-            foreach (DryRunProgress update in ScriptedProgress)
-                progress.Report(update);
-        if (DryRunGate is not null)
-        {
-            try
-            {
-                await DryRunGate.Task.WaitAsync(ct);
-            }
-            catch (OperationCanceledException)
-            {
-                // Mirror the real gateway: cancellation is a Canceled result, never a throw.
-                return Result<DryRunCompletion, IpcError>.Canceled();
-            }
-        }
-
-        if (DryRunResult.IsCanceled)
-            return Result<DryRunCompletion, IpcError>.Canceled();
-        if (DryRunResult.TryGetError(out IpcError? error))
-            return error;
-        DryRunResult.TryGetValue(out DryRunReport? report);
-        sink.OnChunk(DryRunColumns.ToChunk(
-            report!.Directories, report.SourceFiles, report.DestinationFiles,
-            report.SourceOperations, report.DestinationOperations));
-        return new DryRunCompletion(report.GeneratedAt, report.Truncated, report.Space);
     }
 
     public Task<Result<GlobalSettings, IpcError>> GetSettingsAsync(CancellationToken ct = default) =>
@@ -189,7 +140,7 @@ internal sealed class FakeIpcGateway : IIpcGateway
     public Result<bool, IpcError> SetPausedResult { get; set; } = true;
 
     /// <summary>When set, SetPausedAsync awaits this before returning (poll-race tests). Mirrors
-    /// <see cref="DryRunGate"/>.</summary>
+    /// <see cref="RunPlanGate"/>.</summary>
     public TaskCompletionSource? SetPausedGate { get; set; }
 
     public List<int> RecentJobsCalls { get; } = [];
@@ -213,14 +164,78 @@ internal sealed class FakeIpcGateway : IIpcGateway
     /// than hot-looping reconnects for the rest of the test. Null parks until cancellation.</summary>
     public TaskCompletionSource? SubscribeIdleGate { get; set; }
 
+    /// <summary>The inline draft passed to each RunProfileAsync call (null when the persisted-profile
+    /// path was used), recorded in lockstep with <see cref="RunProfileCalls"/>. The preview flow always
+    /// sends a draft, so "which profile is this run planning" is asserted from here.</summary>
+    public List<Profile?> RunProfileDrafts { get; } = [];
+
     public Task<Result<RunProfileResponse, IpcError>> RunProfileAsync(
-        Guid profileId, string? path = null, CancellationToken ct = default)
+        Guid profileId, string? path = null, Profile? draft = null, CancellationToken ct = default)
     {
         RunProfileCalls.Add((profileId, path));
+        RunProfileDrafts.Add(draft);
         return Task.FromResult(
             path is not null && RunProfileResults.TryGetValue(path, out var scripted)
                 ? scripted
                 : RunProfileResult);
+    }
+
+    public List<Guid> RunPlanStreamCalls { get; } = [];
+
+    /// <summary>The plan replayed to the caller's sink, keyed by run id, with
+    /// <see cref="RunPlanResult"/> as the fallback for any other run. Scripted as a whole
+    /// <c>DryRunReport</c> for the same reason <see cref="DryRunResult"/> is: it is the readable way to
+    /// describe an expected row set, and the real service delivers the identical frames.</summary>
+    public Dictionary<Guid, Result<DryRunReport, IpcError>> RunPlanResults { get; } = [];
+
+    public Result<DryRunReport, IpcError> RunPlanResult { get; set; } =
+        new DryRunReport
+        {
+            ProfileId = Guid.Empty,
+            GeneratedAt = DateTimeOffset.UnixEpoch,
+            Directories = [],
+            SourceFiles = [],
+            DestinationFiles = [],
+            SourceOperations = [],
+            DestinationOperations = [],
+        };
+
+    /// <summary>When set, GetRunPlanStreamAsync awaits this before returning (supersede / cancellation
+    /// tests, where a second preview must start while the first is still streaming).</summary>
+    public TaskCompletionSource? RunPlanGate { get; set; }
+
+    /// <summary>When set, GetRunPlanStreamAsync throws it (unexpected-exception tests).</summary>
+    public Exception? RunPlanException { get; set; }
+
+    public async Task<Result<DryRunCompletion, IpcError>> GetRunPlanStreamAsync(
+        Guid runId, IDryRunChunkSink sink, CancellationToken ct = default)
+    {
+        RunPlanStreamCalls.Add(runId);
+        if (RunPlanException is not null)
+            throw RunPlanException;
+        if (RunPlanGate is not null)
+        {
+            try
+            {
+                await RunPlanGate.Task.WaitAsync(ct);
+            }
+            catch (OperationCanceledException)
+            {
+                return Result<DryRunCompletion, IpcError>.Canceled();
+            }
+        }
+
+        Result<DryRunReport, IpcError> scripted =
+            RunPlanResults.TryGetValue(runId, out var forRun) ? forRun : RunPlanResult;
+        if (scripted.IsCanceled)
+            return Result<DryRunCompletion, IpcError>.Canceled();
+        if (scripted.TryGetError(out IpcError? planError))
+            return planError;
+        scripted.TryGetValue(out DryRunReport? plan);
+        sink.OnChunk(DryRunColumns.ToChunk(
+            plan!.Directories, plan.SourceFiles, plan.DestinationFiles,
+            plan.SourceOperations, plan.DestinationOperations));
+        return new DryRunCompletion(plan.GeneratedAt, plan.Truncated, plan.Space);
     }
 
     public List<(Guid RunId, bool Approve)> ApproveRunCalls { get; } = [];

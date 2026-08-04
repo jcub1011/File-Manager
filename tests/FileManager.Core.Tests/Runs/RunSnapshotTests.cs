@@ -86,6 +86,157 @@ public sealed class RunSnapshotTests
         Assert.Empty(RunPlanHarness.Copies(dir));
     }
 
+    // ---- the display halves (source and destination projections) ---------------------------------
+    // Display only: nothing in execution reads these, and they hold WIDER sets than the executable halves.
+    // copies.ndjsonl lists only files there is work for and deletes.ndjsonl only orphans, so a view built
+    // from those two shows an empty panel wherever a profile is already up to date or removes nothing —
+    // which reads as "the preview found nothing".
+
+    [Fact]
+    public async Task Every_scanned_source_gets_a_source_item_keyed_by_its_plan_ordinal()
+    {
+        using RunPlanHarness h = new("snap-source-ordinals");
+        h.WriteSource("a.txt", "aaa");
+        h.WriteSource("nested/b.txt", "bb");
+
+        (string dir, _, _) = await h.PlanAsync(h.AdditiveProfile());
+
+        List<RunSourceItem> sources = RunPlanHarness.Sources(dir);
+        List<RunDestinationItem> destinations = RunPlanHarness.Destinations(dir);
+        Assert.Equal(2, sources.Count);
+        Assert.All(sources, s => Assert.Equal(h.SourceDir, s.SourceRoot));
+        Assert.All(sources, s => Assert.Equal(OperationKind.Processed, s.Kind));
+        // An ordinal is a position in sources.ndjsonl, so every destination resolves to the source whose
+        // content lands there.
+        Assert.Equal([0, 1], destinations.Select(d => d.SourceOrdinal).Order());
+        foreach (RunDestinationItem destination in destinations)
+        {
+            string sourceName = Path.GetFileName(sources[destination.SourceOrdinal].Path);
+            Assert.EndsWith(sourceName, destination.Path, StringComparison.Ordinal);
+        }
+        RunSnapshotHeader header = RunPlanHarness.Header(dir);
+        Assert.Equal(sources.Count, header.SourceItemCount);
+        Assert.Equal(destinations.Count, header.DestinationItemCount);
+    }
+
+    [Fact]
+    public async Task An_ALREADY_SYNCHRONIZED_profile_still_records_every_source_it_looked_at()
+    {
+        // The reported symptom, at its source: a Mirror profile whose files are all already at the target
+        // has NO copy items, so a source list read from copies.ndjsonl is empty and the user cannot tell
+        // "everything is up to date" from "the scan found nothing".
+        using RunPlanHarness h = new("snap-source-synced");
+        h.WriteSource("same.txt", "identical");
+        h.WriteTarget("same.txt", "identical");
+
+        (string dir, _, _) = await h.PlanAsync(h.MirrorProfile());
+
+        Assert.Empty(RunPlanHarness.Copies(dir));
+        RunSourceItem source = Assert.Single(RunPlanHarness.Sources(dir));
+        Assert.EndsWith("same.txt", source.Path, StringComparison.Ordinal);
+        Assert.Equal(OperationKind.SkippedUnchanged, source.Kind);
+        // No disposition on a file that will not be processed, or it would count toward the disposal total
+        // for work that never happens.
+        Assert.Null(source.Disposition);
+    }
+
+    [Fact]
+    public async Task A_FILTERED_source_is_recorded_with_the_rule_that_excluded_it()
+    {
+        using RunPlanHarness h = new("snap-source-filtered");
+        h.WriteSource("keep.txt", "keep");
+        h.WriteSource("drop.tmp", "drop");
+
+        (string dir, _, _) = await h.PlanAsync(
+            h.AdditiveProfile() with { Filters = new FilterSet { ExcludeGlob = ["*.tmp"] } });
+
+        Assert.Equal(2, RunPlanHarness.Sources(dir).Count);
+        RunSourceItem dropped = Assert.Single(
+            RunPlanHarness.Sources(dir), s => s.Path.EndsWith("drop.tmp", StringComparison.Ordinal));
+        Assert.Equal(OperationKind.SkippedByFilter, dropped.Kind);
+        Assert.NotNull(dropped.Detail);
+    }
+
+    [Fact]
+    public async Task A_source_items_disposition_is_what_makes_a_trashed_original_legible()
+    {
+        using RunPlanHarness h = new("snap-source-disposition");
+        h.WriteSource("moved.txt", "content");
+        Profile profile = h.AdditiveProfile();
+
+        (string dir, _, _) = await h.PlanAsync(profile with
+        {
+            Policies = profile.Policies with { OnSuccess = OnSuccessAction.MoveToTrash },
+        });
+
+        Assert.Equal(OnSuccessAction.MoveToTrash, Assert.Single(RunPlanHarness.Sources(dir)).Disposition);
+    }
+
+    [Fact]
+    public async Task A_destination_that_already_exists_records_the_file_it_acts_on()
+    {
+        // Size and mtime of the EXISTING file, which is what makes an overwrite legible as destructive.
+        using RunPlanHarness h = new("snap-dest-subject");
+        h.WriteSource("clash.txt", "new content");
+        h.WriteTarget("clash.txt", "old");
+
+        (string dir, _, _) = await h.PlanAsync(h.AdditiveProfile(scanDestination: true));
+
+        RunDestinationItem item = Assert.Single(RunPlanHarness.Destinations(dir));
+        Assert.NotNull(item.SubjectPath);
+        Assert.EndsWith("clash.txt", item.SubjectPath, StringComparison.Ordinal);
+        Assert.Equal(3, item.SubjectSizeBytes);
+        Assert.NotNull(item.SubjectLastWriteUtc);
+    }
+
+    [Fact]
+    public async Task A_destination_that_does_not_exist_yet_records_NO_subject()
+    {
+        using RunPlanHarness h = new("snap-dest-no-subject");
+        h.WriteSource("fresh.txt", "fresh");
+
+        (string dir, _, _) = await h.PlanAsync(h.AdditiveProfile(scanDestination: true));
+
+        RunDestinationItem item = Assert.Single(RunPlanHarness.Destinations(dir));
+        Assert.Equal(OperationKind.New, item.Kind);
+        Assert.Null(item.SubjectPath);
+        Assert.Null(item.SubjectSizeBytes);
+    }
+
+    [Fact]
+    public async Task An_ORPHAN_is_recorded_as_a_deletion_and_NOT_also_as_a_destination()
+    {
+        // Counted twice, a client reading both files would report one orphan as two — and the deletion
+        // pass's whole reason for a separate small file is that it never has to read the other halves.
+        using RunPlanHarness h = new("snap-dest-no-orphans");
+        h.WriteSource("keep.txt", "keep");
+        h.WriteTarget("orphan.txt", "orphaned");
+
+        (string dir, _, _) = await h.PlanAsync(h.MirrorProfile());
+
+        Assert.Equal("orphan.txt", Path.GetFileName(Assert.Single(RunPlanHarness.Deletes(dir)).Path));
+        List<RunDestinationItem> destinations = RunPlanHarness.Destinations(dir);
+        Assert.DoesNotContain(destinations, d => d.Kind == OperationKind.Deleted);
+        Assert.DoesNotContain(destinations, d => d.Path.EndsWith("orphan.txt", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task An_unchanged_sources_destination_is_still_attributed_to_it()
+    {
+        // An unchanged file writes no copy item but still projects a destination — that is what keeps its
+        // target off the orphan list. Because the ordinal indexes the SOURCE list rather than the copy
+        // list, that destination is still attributed to the file it belongs to instead of floating free.
+        using RunPlanHarness h = new("snap-dest-unchanged");
+        h.WriteSource("same.txt", "identical");
+        h.WriteTarget("same.txt", "identical");
+
+        (string dir, _, _) = await h.PlanAsync(h.AdditiveProfile(scanDestination: true));
+
+        Assert.Empty(RunPlanHarness.Copies(dir));
+        Assert.Single(RunPlanHarness.Sources(dir));
+        Assert.Equal(0, Assert.Single(RunPlanHarness.Destinations(dir)).SourceOrdinal);
+    }
+
     // ---- delete items (Mirror orphans) -----------------------------------------------------------
 
     [Fact]

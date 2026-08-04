@@ -131,11 +131,14 @@
             <!-- Document area: tabs, with each tab's primary action buttons overlaid at the
                  right of the header strip (context-switched by the active tab's IsSelected). -->
             <Grid Grid.Column="2" Margin="8,6,10,8" IsVisible="{Binding Editor.HasProfile}">
-                <TabControl Classes="documents">
+                <!-- SelectedIndex is bound because a preview NAVIGATES: pressing Preview on the Profile
+                     tab has to land the user on the Preview tab where the rows appear. No IsEnabled gate
+                     on the Preview tab — a programmatic selection would fight it. -->
+                <TabControl Classes="documents" SelectedIndex="{Binding SelectedTabIndex}">
                     <TabItem x:Name="ProfileTab" Header="Profile">
                         <v:ProfileEditorView DataContext="{Binding Editor}" />
                     </TabItem>
-                    <TabItem x:Name="DryRunTab" Header="Dry Run" IsEnabled="{Binding DryRun.CanRun}">
+                    <TabItem x:Name="PreviewTab" Header="Preview">
                         <v:DryRunView DataContext="{Binding DryRun}" />
                     </TabItem>
                 </TabControl>
@@ -162,9 +165,9 @@
                                 IsVisible="{Binding IsDirty}" />
                     </StackPanel>
 
-                    <!-- Delete + Run act on the PERSISTED profile, not the draft, so this group stays
-                         at shell scope (no DataContext override) and takes the selected list row as its
-                         parameter. Both disable when there is no saved row (a brand-new draft). -->
+                    <!-- Delete takes the selected list row (it acts on the PERSISTED profile); Preview
+                         takes it only to name the profile, since it plans the editor's draft. Both stay at
+                         shell scope, so no DataContext override here. -->
                     <StackPanel Orientation="Horizontal" Spacing="8"
                                 IsVisible="{Binding #ProfileTab.IsSelected}">
                         <Button Content="Delete" Classes="danger"
@@ -172,47 +175,40 @@
                                 CommandParameter="{Binding List.SelectedProfile}"
                                 IsEnabled="{Binding List.CanDeleteSelected}"
                                 ToolTip.Tip="Delete this profile" />
-                        <Button Classes="success"
-                                Command="{Binding RunProfileNowCommand}"
+                        <Button Classes="accent"
+                                Command="{Binding PreviewProfileCommand}"
                                 CommandParameter="{Binding List.SelectedProfile}"
-                                IsEnabled="{Binding List.CanRunSelected}"
-                                ToolTip.Tip="Performs a real run: moves files and applies the source disposition.">
+                                ToolTip.Tip="Works out exactly what this profile will do and shows it on the Preview tab. Nothing is copied or deleted until you approve it there.">
                             <StackPanel Orientation="Horizontal" Spacing="6">
-                                <PathIcon Data="{StaticResource IconPlay}" Width="11" Height="11"
+                                <!-- A spyglass, not a play triangle: this button inspects, and the only
+                                     button in the app that starts moving files is Approve Run. -->
+                                <PathIcon Data="{StaticResource IconSearch}" Width="12" Height="12"
                                           VerticalAlignment="Center" />
-                                <TextBlock Text="Run" />
+                                <TextBlock Text="Preview" />
                             </StackPanel>
                         </Button>
                     </StackPanel>
 
+                    <!-- Preview tab: re-previewing is the shell's command (it owns the run's lifecycle),
+                         so this group stays at shell scope and reads the child VM for its busy state. -->
                     <StackPanel Orientation="Horizontal" Spacing="6"
-                                DataContext="{Binding DryRun}" x:DataType="vm:DryRunViewModel"
-                                IsVisible="{Binding #DryRunTab.IsSelected}">
-                        <!-- Split button: the primary press runs the dry run with the currently selected scan
-                             choice; the dropdown changes that choice (checkmark = active). "No Destination
-                             Scan" is disabled in Mirror mode, where the destination sweep is mandatory. -->
-                        <SplitButton Classes="accent" Command="{Binding RunCommand}" Content="{Binding RunButtonLabel}">
-                            <SplitButton.Flyout>
-                                <MenuFlyout>
-                                    <MenuItem Header="{Binding WithScanLabel}"
-                                              Command="{Binding SelectWithScanCommand}">
-                                        <MenuItem.Icon>
-                                            <TextBlock Text="✓" IsVisible="{Binding RunWithDestinationScan}" />
-                                        </MenuItem.Icon>
-                                    </MenuItem>
-                                    <MenuItem Header="{Binding NoScanLabel}"
-                                              Command="{Binding SelectNoScanCommand}"
-                                              IsEnabled="{Binding CanChooseNoScan}"
-                                              ToolTip.Tip="Mirror mode always scans the destinations to detect files to delete.">
-                                        <MenuItem.Icon>
-                                            <TextBlock Text="✓" IsVisible="{Binding !RunWithDestinationScan}" />
-                                        </MenuItem.Icon>
-                                    </MenuItem>
-                                </MenuFlyout>
-                            </SplitButton.Flyout>
-                        </SplitButton>
-                        <Button Content="Cancel" Command="{Binding RunCancelCommand}"
-                                IsVisible="{Binding RunCommand.IsRunning}" />
+                                IsVisible="{Binding #PreviewTab.IsSelected}">
+                        <Button Classes="accent"
+                                Command="{Binding PreviewProfileCommand}"
+                                CommandParameter="{Binding List.SelectedProfile}"
+                                IsEnabled="{Binding !DryRun.IsPreviewing}">
+                            <StackPanel Orientation="Horizontal" Spacing="6">
+                                <PathIcon Data="{StaticResource IconSearch}" Width="12" Height="12"
+                                          VerticalAlignment="Center" />
+                                <TextBlock Text="Preview" />
+                            </StackPanel>
+                        </Button>
+                        <!-- Planning a large profile is minutes of walking, and free to abandon: nothing
+                             has been touched. Only offered once the engine has accepted the run, which is
+                             when there is an id to cancel. -->
+                        <Button Content="Cancel" Command="{Binding DryRun.CancelPreviewCommand}"
+                                IsVisible="{Binding DryRun.PlanningRunId,
+                                                    Converter={x:Static ObjectConverters.IsNotNull}}" />
                     </StackPanel>
                 </StackPanel>
             </Grid>

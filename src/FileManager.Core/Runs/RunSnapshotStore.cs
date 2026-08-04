@@ -1,4 +1,4 @@
-using FileManager.Contracts.DryRun;
+﻿using FileManager.Contracts.DryRun;
 using FileManager.Contracts.Primitives;
 using FileManager.Contracts.Profiles;
 using FileManager.Core.DryRun;
@@ -19,10 +19,21 @@ namespace FileManager.Core.Runs;
 /// holds its work list in memory.
 ///
 /// <para><b>Layout</b> — <c>&lt;RunsDirectory&gt;/&lt;run-id&gt;/</c> holding <c>plan.json</c> (the
-/// header, written last, once planning has produced its totals) plus <c>copies.ndjsonl</c> and
-/// <c>deletes.ndjsonl</c>. Two item files rather than one with a discriminator: the deletion pass
-/// then reads only the (small) half it needs, without parsing — or even touching — the copy half,
-/// which on a large run is the overwhelming majority of the bytes.</para>
+/// header, written last, once planning has produced its totals) plus <c>copies.ndjsonl</c>,
+/// <c>deletes.ndjsonl</c>, and — for display only — <c>sources.ndjsonl</c> and
+/// <c>destinations.ndjsonl</c>. Separate files rather than one with a
+/// discriminator, so each reader touches only what it needs: the deletion pass parses the small delete
+/// half without reading the copy half (the overwhelming majority of the bytes on a large run), execution
+/// reads only copies, and the destination projection — which nothing in execution reads at all — stays
+/// out of both their ways.</para>
+///
+/// <para><b>The two display files exist purely to be looked at</b>, and they hold different SETS from the
+/// executable ones: <c>copies.ndjsonl</c> lists only files there is work for, while
+/// <c>sources.ndjsonl</c> lists every file the plan LOOKED at. That difference is the whole reason they
+/// are separate — an already-synchronized profile has no copies at all, so a view built from the copy list
+/// shows an empty panel where the honest answer is "these files, every one already up to date". Together
+/// they roughly double a snapshot's size; they are bounded by the same file cap the plan is, and the whole
+/// directory is deleted when the run closes.</para>
 ///
 /// <para><b>Durability</b> is deliberately weaker than the journal's. Losing a snapshot means a run
 /// must be planned again; it is not data loss, and the journal plus
@@ -37,6 +48,8 @@ internal sealed class RunSnapshotWriter : IDisposable
     private readonly ILogger _logger;
     private FileStream? _copies;
     private FileStream? _deletes;
+    private FileStream? _sources;
+    private FileStream? _destinations;
     private string? _failure;
 
     public RunSnapshotWriter(string runDirectory, ILogger logger)
@@ -48,6 +61,8 @@ internal sealed class RunSnapshotWriter : IDisposable
             Directory.CreateDirectory(runDirectory);
             _copies = Open(RunSnapshotPaths.CopiesFileName);
             _deletes = Open(RunSnapshotPaths.DeletesFileName);
+            _sources = Open(RunSnapshotPaths.SourcesFileName);
+            _destinations = Open(RunSnapshotPaths.DestinationsFileName);
         }
         catch (Exception ex)
         {
@@ -64,6 +79,8 @@ internal sealed class RunSnapshotWriter : IDisposable
 
     public int CopyCount { get; private set; }
     public int DeleteCount { get; private set; }
+    public int SourceCount { get; private set; }
+    public int DestinationCount { get; private set; }
     public long CopyBytes { get; private set; }
     public long DeleteBytes { get; private set; }
 
@@ -89,13 +106,39 @@ internal sealed class RunSnapshotWriter : IDisposable
     /// each paired to the file it names through its global <c>SubjectIndex</c> less the chunk's
     /// destination base. A reparse-point orphan is classified <see cref="OperationKind.Unknown"/> by
     /// the sweep, never <c>Deleted</c>, so it is excluded here by construction rather than by a
-    /// special case.</para></summary>
+    /// special case.</para>
+    ///
+    /// <para><b>The two display halves are written from wider sets.</b> Every scanned source becomes a
+    /// <see cref="RunSourceItem"/> whatever the plan decided about it, and every non-<c>Deleted</c>
+    /// destination operation becomes a <see cref="RunDestinationItem"/> keyed to the source whose content
+    /// lands there. Nothing in execution reads either; see their records for why they exist.</para></summary>
     public void Consume(PlanChunk chunk, Profile profile)
     {
         if (_failure is not null || chunk.PhaseStarted)
             return;
 
         DryRunChunk slice = chunk.Chunk;
+
+        // The display source list: EVERY scanned file, whatever the plan decided about it, in plan order —
+        // so an item's ordinal is the source index the plan assigned it and a destination row can name it.
+        // Driven off the files rather than the operations because the files are the row set: a file whose
+        // operation went missing must still appear, or it silently vanishes from the view.
+        for (int i = 0; i < slice.SourceFiles.Count; i++)
+        {
+            IPhysicalFileView file = slice.SourceFiles[i];
+            IFileOperationView? op = i < slice.SourceOperations.Count ? slice.SourceOperations[i] : null;
+            Write(_sources, RunSnapshotJsonContext.Default.RunSourceItem, new RunSourceItem
+            {
+                Path = file.Path,
+                SourceRoot = file.Root,
+                SizeBytes = file.Length,
+                LastWriteUtc = file.LastWritten,
+                Kind = op?.Kind ?? OperationKind.Unknown,
+                Disposition = op?.SourceDisposition,
+                Detail = op?.Detail,
+            });
+            SourceCount++;
+        }
 
         for (int i = 0; i < slice.SourceOperations.Count; i++)
         {
@@ -124,7 +167,10 @@ internal sealed class RunSnapshotWriter : IDisposable
         foreach (IFileOperationView op in slice.DestinationOperations)
         {
             if (op.Kind != OperationKind.Deleted)
+            {
+                WriteDestination(op, chunk, slice);
                 continue;
+            }
             int local = op.SubjectIndex - chunk.DestinationBase;
             if (local < 0 || local >= slice.DestinationFiles.Count)
             {
@@ -150,6 +196,47 @@ internal sealed class RunSnapshotWriter : IDisposable
         }
     }
 
+    /// <summary>Records one non-orphan destination operation. Both index resolutions are best-effort by
+    /// design: a projection row that cannot be placed is dropped, because this half is what the plan is
+    /// SHOWN as and never what it does. Contrast the <c>Deleted</c> branch above, which logs a warning
+    /// when it drops one — an unpaired deletion is a safety matter, an unpaired display row is not.</summary>
+    private void WriteDestination(IFileOperationView op, PlanChunk chunk, DryRunChunk slice)
+    {
+        // The plan's own global source index IS the ordinal, because sources.ndjsonl holds every scanned
+        // source in plan order. The sweep's own finds name no source and keep -1.
+        int ordinal = op.SourceIndex;
+
+        // The pre-existing file, when there is one. Its path is NOT necessarily the op's: a Rename's path
+        // is the suffixed new name while its subject is the file that forced the suffix.
+        string? subjectPath = null;
+        long? subjectSize = null;
+        DateTimeOffset? subjectWritten = null;
+        if (op.SubjectIndex >= 0)
+        {
+            int localSubject = op.SubjectIndex - chunk.DestinationBase;
+            if (localSubject >= 0 && localSubject < slice.DestinationFiles.Count)
+            {
+                IPhysicalFileView subject = slice.DestinationFiles[localSubject];
+                subjectPath = subject.Path;
+                subjectSize = subject.Length;
+                subjectWritten = subject.LastWritten;
+            }
+        }
+
+        Write(_destinations, RunSnapshotJsonContext.Default.RunDestinationItem, new RunDestinationItem
+        {
+            Path = op.Path,
+            TargetRoot = op.Root,
+            Kind = op.Kind,
+            SourceOrdinal = ordinal,
+            Detail = op.Detail,
+            SubjectPath = subjectPath,
+            SubjectSizeBytes = subjectSize,
+            SubjectLastWriteUtc = subjectWritten,
+        });
+        DestinationCount++;
+    }
+
     /// <summary>Flushes the item files and writes the header. Call once, after the plan stream has
     /// completed; the header's presence is what marks a snapshot as complete and executable.</summary>
     public Result Complete(RunSnapshotHeader header)
@@ -160,6 +247,8 @@ internal sealed class RunSnapshotWriter : IDisposable
         {
             _copies!.Flush(flushToDisk: false);
             _deletes!.Flush(flushToDisk: false);
+            _sources!.Flush(flushToDisk: false);
+            _destinations!.Flush(flushToDisk: false);
             byte[] json = JsonSerializer.SerializeToUtf8Bytes(header, RunSnapshotJsonContext.Default.RunSnapshotHeader);
             string path = Path.Combine(_directory, RunSnapshotPaths.HeaderFileName);
             using FileStream stream = new(path, FileMode.Create, FileAccess.Write, FileShare.Read);
@@ -196,8 +285,12 @@ internal sealed class RunSnapshotWriter : IDisposable
     {
         _copies?.Dispose();
         _deletes?.Dispose();
+        _sources?.Dispose();
+        _destinations?.Dispose();
         _copies = null;
         _deletes = null;
+        _sources = null;
+        _destinations = null;
     }
 }
 
@@ -208,6 +301,8 @@ internal static class RunSnapshotPaths
     public const string HeaderFileName = "plan.json";
     public const string CopiesFileName = "copies.ndjsonl";
     public const string DeletesFileName = "deletes.ndjsonl";
+    public const string SourcesFileName = "sources.ndjsonl";
+    public const string DestinationsFileName = "destinations.ndjsonl";
 
     public static string DirectoryFor(EnginePaths paths, Guid runId) =>
         Path.Combine(paths.RunsDirectory, runId.ToString("N"));
@@ -245,6 +340,19 @@ internal static class RunSnapshotReader
     public static IEnumerable<RunDeleteItem> ReadDeletes(string runDirectory, ILogger logger) =>
         Read(Path.Combine(runDirectory, RunSnapshotPaths.DeletesFileName),
             RunSnapshotJsonContext.Default.RunDeleteItem, logger);
+
+    /// <summary>Every source the plan looked at, in plan order, so an item's ordinal is its source index.
+    /// A missing file yields nothing, which is the correct reading of a snapshot written before the display
+    /// halves existed.</summary>
+    public static IEnumerable<RunSourceItem> ReadSources(string runDirectory, ILogger logger) =>
+        Read(Path.Combine(runDirectory, RunSnapshotPaths.SourcesFileName),
+            RunSnapshotJsonContext.Default.RunSourceItem, logger);
+
+    /// <summary>The plan's destination projection. A missing file yields nothing, which is the correct
+    /// reading of a snapshot written before this half existed.</summary>
+    public static IEnumerable<RunDestinationItem> ReadDestinations(string runDirectory, ILogger logger) =>
+        Read(Path.Combine(runDirectory, RunSnapshotPaths.DestinationsFileName),
+            RunSnapshotJsonContext.Default.RunDestinationItem, logger);
 
     /// <summary>Streams framed NDJSON items. A line that fails its CRC or will not deserialize is
     /// SKIPPED with a warning rather than failing the read.
@@ -302,4 +410,6 @@ internal static class RunSnapshotReader
 [JsonSerializable(typeof(RunSnapshotHeader))]
 [JsonSerializable(typeof(RunCopyItem))]
 [JsonSerializable(typeof(RunDeleteItem))]
+[JsonSerializable(typeof(RunSourceItem))]
+[JsonSerializable(typeof(RunDestinationItem))]
 internal sealed partial class RunSnapshotJsonContext : JsonSerializerContext;

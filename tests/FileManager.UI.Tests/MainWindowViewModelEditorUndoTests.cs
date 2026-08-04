@@ -73,20 +73,19 @@ public sealed class MainWindowViewModelEditorUndoTests
     }
 
     [Fact]
-    public void Undo_keeps_the_dry_run_split_button_in_step_with_the_restored_sync_mode()
+    public void Undo_keeps_the_preview_footers_Mirror_warning_in_step_with_the_restored_sync_mode()
     {
-        // Undo restores through the property setters, so the shell's SyncMode / ScanDestination
-        // subscription fires the same way a user edit does.
+        // Undo restores through the property setters, so the shell's SyncMode subscription fires the same
+        // way a user edit does — and the footer must not keep warning about deletions the profile no
+        // longer does.
         var (shell, _) = NewShell();
         shell.Editor.LoadNew();
         shell.Editor.SyncMode = SyncMode.Mirror;
-        Assert.True(shell.DryRun.RunWithDestinationScan);
-        Assert.False(shell.DryRun.CanChooseNoScan);
+        Assert.Contains("MIRROR", shell.DryRun.MirrorWarning);
 
         shell.Editor.History.UndoCommand.Execute(null);
 
-        Assert.False(shell.DryRun.RunWithDestinationScan);
-        Assert.True(shell.DryRun.CanChooseNoScan);
+        Assert.Equal("", shell.DryRun.MirrorWarning);
     }
 
     // ============================ Confined to the selected profile ============================

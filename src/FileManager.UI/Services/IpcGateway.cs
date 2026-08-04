@@ -1,4 +1,4 @@
-using FileManager.Contracts.DryRun;
+﻿using FileManager.Contracts.DryRun;
 using FileManager.Contracts.IPC;
 using FileManager.Contracts.Primitives;
 using FileManager.Contracts.Profiles;
@@ -104,9 +104,10 @@ public sealed class IpcGateway(Func<string?>? serviceExePath = null, TimeProvide
             new ShutdownRequest(), static _ => true, ct);
 
     public Task<Result<RunProfileResponse, IpcError>> RunProfileAsync(
-        Guid profileId, string? path = null, CancellationToken ct = default) =>
+        Guid profileId, string? path = null, Profile? draft = null, CancellationToken ct = default) =>
         RequestAsync<RunProfileResponse, RunProfileResponse>(
-            new RunProfileRequest { ProfileId = profileId, Path = path }, static r => r, ct);
+            new RunProfileRequest { ProfileId = profileId, Path = path, InlineProfile = draft },
+            static r => r, ct);
 
     public Task<Result<bool, IpcError>> ApproveRunAsync(Guid runId, bool approve, CancellationToken ct = default) =>
         RequestAsync<OkResponse, bool>(
@@ -199,41 +200,35 @@ public sealed class IpcGateway(Func<string?>? serviceExePath = null, TimeProvide
         }
     }
 
-    public async Task<Result<DryRunCompletion, IpcError>> DryRunAsync(
-        Guid profileId, IDryRunChunkSink sink, IProgress<DryRunProgress>? progress = null,
-        Profile? draft = null, CancellationToken ct = default)
+    public async Task<Result<DryRunCompletion, IpcError>> GetRunPlanStreamAsync(
+        Guid runId, IDryRunChunkSink sink, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(sink);
 
-        // Own connection: cancel = dispose, leaving the shared channel clean. May start the service:
-        // this path runs once per explicit user action, so it cannot become the runaway loop the
-        // shared channel's 2 s poll can — that is what the cooldown in EnsureConnectedAsync guards.
+        // Own connection: a cancelled stream leaves unread frames on the pipe, so it must be discardable
+        // without desyncing the shared channel. May start the service — this path runs once per explicit
+        // user action, so it cannot become the runaway loop the shared channel's 2 s poll can.
         var connected = await ServiceLauncher
             .ConnectOrStartAsync(_serviceExePath?.Invoke(), allowStart: true, ct).ConfigureAwait(false);
         if (connected.IsCanceled)
             return Result<DryRunCompletion, IpcError>.Canceled();
         if (connected.TryGetError(out string? connectError))
         {
-            Log.Warning("Dry-run could not connect to the service: {Error}", connectError);
+            Log.Warning("Run-plan stream could not connect to the service: {Error}", connectError);
             return new IpcError("SERVICE_UNAVAILABLE", connectError);
         }
         connected.TryGetValue(out IpcClient? client);
 
         await using (client)
         {
-            // Streamed: the run arrives as many small frames, so it is not bounded by the single-frame
-            // size cap (no ~50k-file truncation), and each frame is handed to the sink and dropped
-            // rather than accumulated. The GUI always simulates every source (ScopePath stays null)
-            // and focuses the result in the view; scoped enumeration remains a service/CLI capability.
-            var response = await client!.DryRunStreamAsync(
-                new DryRunStreamRequest { ProfileId = profileId, ScopePath = null, InlineProfile = draft },
-                sink, progress, ct).ConfigureAwait(false);
+            var response = await client!.RunPlanStreamAsync(
+                new GetRunPlanStreamRequest { RunId = runId }, sink, ct).ConfigureAwait(false);
             if (response.IsCanceled)
                 return Result<DryRunCompletion, IpcError>.Canceled();
             if (response.TryGetError(out IpcError? error))
             {
-                Log.Warning("Dry-run IPC request for profile {ProfileId} failed: {Code} {Message}",
-                    profileId, error.Code, error.Message);
+                Log.Warning("Run-plan stream for run {RunId} failed: {Code} {Message}",
+                    runId, error.Code, error.Message);
                 return error;
             }
             response.TryGetValue(out DryRunCompletion? completion);

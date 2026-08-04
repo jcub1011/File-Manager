@@ -98,8 +98,9 @@ public sealed class MainWindowViewModelEventRoutingTests
             RunProfileResult = new RunProfileResponse { RunId = runId },
         };
         MainWindowViewModel shell = NewShell(gateway);
-        shell.ConfirmRunProfile = null;                      // no dialog in a headless test
-        await shell.RunProfileNowAsync(new ProfileListItem(ProfileId, "Photos", true, "Manual"));
+        // A preview plans the editor's draft, so the editor has to be holding one for the run to start.
+        shell.Editor.Load(SingleSourceProfile());
+        await shell.PreviewProfileAsync(new ProfileListItem(ProfileId, "Photos", true, "Manual"));
 
         shell.HandleEngineEvent(RunQueued(runId, count, error));
 

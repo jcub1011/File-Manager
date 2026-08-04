@@ -116,6 +116,9 @@ public sealed class RunCoordinator(
     public string? SnapshotDirectory(Guid runId) =>
         _runs.TryGetValue(runId, out RunState? run) ? run.Directory : null;
 
+    public Profile? PlannedProfile(Guid runId) =>
+        _runs.TryGetValue(runId, out RunState? run) ? run.Profile : null;
+
     public void Settled(Guid runId, JobCompletion? completion)
     {
         if (!_runs.TryGetValue(runId, out RunState? run))
@@ -230,6 +233,8 @@ public sealed class RunCoordinator(
                     DeleteItemCount = writer.DeleteCount,
                     CopyBytes = writer.CopyBytes,
                     DeleteBytes = writer.DeleteBytes,
+                    SourceItemCount = writer.SourceCount,
+                    DestinationItemCount = writer.DestinationCount,
                     Truncated = state.Truncated,
                     SweepFaultDetail = state.SweepFaultDetail,
                     Space = state.Space,

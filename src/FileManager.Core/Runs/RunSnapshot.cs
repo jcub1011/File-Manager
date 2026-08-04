@@ -51,6 +51,16 @@ public sealed record RunSnapshotHeader
     /// <summary>Total bytes the deletion items name — what a Mirror run will reclaim.</summary>
     public required long DeleteBytes { get; init; }
 
+    /// <summary>Items in <c>sources.ndjsonl</c> and <c>destinations.ndjsonl</c>: the plan as it is SHOWN —
+    /// every source it looked at, and every destination it projected. Display only; no phase of execution
+    /// reads either file.
+    /// <para>Both are zero for a snapshot written before these existed, which reads as "no projection
+    /// recorded" and renders as a plan with nothing to display. That is exactly what such a snapshot
+    /// contains, so the absence is honest rather than a parse failure.</para></summary>
+    public int SourceItemCount { get; init; }
+
+    public int DestinationItemCount { get; init; }
+
     /// <summary>Set when the plan does not cover everything it was asked to (the source scan or the
     /// destination sweep hit a bound, or a target root could not be fully walked).
     /// <para><b>Load-bearing for safety.</b> A truncated plan's orphan set is unsound — a file that
@@ -115,6 +125,88 @@ public sealed record RunDeleteItem
 
     public required long SizeBytes { get; init; }
     public required DateTimeOffset LastWriteUtc { get; init; }
+}
+
+/// <summary>One source file the plan looked at, and what it decided about it — <b>including the ones it
+/// decided to do nothing with</b>.
+///
+/// <para><b>Display only</b>, and deliberately NOT the same set as <see cref="RunCopyItem"/>. A copy item
+/// exists only where there is work: a file the filters excluded, or one already identical at every target,
+/// produces none. That is right for execution and wrong for display — a Mirror profile that is already up
+/// to date has no copies at all, so a view built from the copy list shows an empty source panel, which
+/// reads as "the preview found nothing" rather than "everything is already up to date".</para>
+///
+/// <para>Written for every scanned source in plan order, so an item's ordinal here IS the source index the
+/// plan assigned it, and a <see cref="RunDestinationItem.SourceOrdinal"/> resolves against it
+/// directly.</para></summary>
+public sealed record RunSourceItem
+{
+    public required string Path { get; init; }
+
+    /// <summary>The Source root this file was found under — the facet key, and what the relative-path
+    /// alignment between the two tabs is computed against.</summary>
+    public required string SourceRoot { get; init; }
+
+    public required long SizeBytes { get; init; }
+    public required DateTimeOffset LastWriteUtc { get; init; }
+
+    /// <summary>What the plan decided: Processed, SkippedByFilter, or SkippedUnchanged.</summary>
+    public required OperationKind Kind { get; init; }
+
+    /// <summary>What happens to the original after a successful copy. Null when the file does not
+    /// process, which is what keeps a skipped file out of the disposal count.</summary>
+    public OnSuccessAction? Disposition { get; init; }
+
+    /// <summary>Display string carried through verbatim: the deciding filter rule, or the unchanged
+    /// reason.</summary>
+    public string? Detail { get; init; }
+}
+
+/// <summary>One destination path the plan projected, and what it projected for it: where a copy lands,
+/// or a pre-existing file the run leaves alone.
+///
+/// <para><b>Display only.</b> Nothing in execution reads these — <c>JobPlanFactory</c> re-resolves every
+/// destination from the profile and the executor re-checks each one, which is what keeps the plan a
+/// ceiling rather than an instruction. They exist because the approval view IS the dry-run view: without
+/// them the Preview tab can say WHICH files a run reads and nothing at all about where they go, and its
+/// overwrite and rename counts — the blast radius the whole view is for — read zero.</para>
+///
+/// <para><b>Orphans are not here.</b> A <see cref="OperationKind.Deleted"/> destination goes to
+/// <see cref="RunDeleteItem"/> instead, so the deletion pass still reads only the small half it needs and
+/// no orphan is counted twice by a client reading both.</para></summary>
+public sealed record RunDestinationItem
+{
+    /// <summary>The resulting destination path — which may not exist yet (a New or renamed path).</summary>
+    public required string Path { get; init; }
+
+    /// <summary>The Target root this path sits under: the facet key, and what the relative-path
+    /// alignment between the two tabs is computed against.</summary>
+    public required string TargetRoot { get; init; }
+
+    /// <summary>What the plan projected for this path. Unlike <see cref="RunCopyItem.PlannedKind"/> this
+    /// is per-destination and therefore meaningful: New / Overwrite / Rename / SkippedUnchanged /
+    /// SkipConflict / Untouched / Unknown.</summary>
+    public required OperationKind Kind { get; init; }
+
+    /// <summary>Which source file's content lands here — its ordinal in <c>sources.ndjsonl</c>, which is
+    /// the source index the plan assigned it — or <c>-1</c> for a destination no source writes into (a
+    /// pre-existing file the sweep found, or the original kept beside a renamed copy).
+    /// <para>Resolved against the source file, NOT the copy list: an unchanged file still projects a
+    /// destination (that is what keeps its target off the orphan list) while producing no copy item at
+    /// all, so a copy-relative index could not name it.</para></summary>
+    public required int SourceOrdinal { get; init; }
+
+    /// <summary>Display string carried through verbatim: the existing file's mtime, the suffixed rename
+    /// name, or the unchanged reason.</summary>
+    public string? Detail { get; init; }
+
+    /// <summary>The pre-existing file this destination acts on, when there is one — its own path, which
+    /// for a rename is NOT <see cref="Path"/> (the rename's path is the suffixed new name, its subject is
+    /// the file that forced the suffix). Null means nothing is there yet.</summary>
+    public string? SubjectPath { get; init; }
+
+    public long? SubjectSizeBytes { get; init; }
+    public DateTimeOffset? SubjectLastWriteUtc { get; init; }
 }
 
 /// <summary>A snapshot's items, as read back. The reader streams, so callers that only need the

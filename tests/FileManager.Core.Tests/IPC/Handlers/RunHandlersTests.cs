@@ -91,6 +91,65 @@ public sealed class RunHandlersTests : IDisposable
         Assert.Single(runs.Begun);
     }
 
+    // ---- planning an unsaved draft ----------------------------------------------------------------
+    // The GUI's Preview tab IS this request's planning phase, so it sends the profile on screen — unsaved
+    // edits included — rather than asking the engine to resolve a persisted one that may differ.
+
+    [Fact]
+    public async Task An_INLINE_profile_is_planned_in_place_of_the_persisted_one()
+    {
+        Profile persisted = Profile();
+        // Same id, different targets: if the handler resolved the catalog, the plan would be built from
+        // the wrong destination and the user would approve a list of somewhere they never named.
+        Profile draft = persisted with { Targets = [new TargetConfig { Path = Path.Combine(_root, "draft-target") }] };
+        (RunProfileHandler handler, FakeRunCoordinator runs) = HandlerFor(persisted);
+
+        IpcResponse response = await handler.HandleAsync(
+            new RunProfileRequest { ProfileId = persisted.Id, InlineProfile = draft });
+
+        Assert.IsType<RunProfileResponse>(response);
+        Assert.Equal(draft, Assert.Single(runs.Begun).Profile);
+    }
+
+    [Fact]
+    public async Task A_NEVER_SAVED_profile_can_be_run_from_its_draft_alone()
+    {
+        // There is no catalog entry to find, and that is the point: a brand-new profile is previewable
+        // before it is ever saved.
+        Profile draft = TestProfiles.Valid(_sourceDir, Path.Combine(_root, "target")) with { Id = Guid.NewGuid() };
+        (RunProfileHandler handler, FakeRunCoordinator runs) = HandlerFor(Profile());
+
+        IpcResponse response = await handler.HandleAsync(
+            new RunProfileRequest { ProfileId = draft.Id, InlineProfile = draft });
+
+        Assert.IsType<RunProfileResponse>(response);
+        Assert.Equal(draft.Id, Assert.Single(runs.Begun).Profile.Id);
+    }
+
+    [Fact]
+    public async Task Every_refusal_still_applies_to_an_INLINE_profile()
+    {
+        // A draft is not a way around the gates: an inactive or sourceless one is refused exactly as a
+        // persisted one is, and the scope check reads the draft's own Sources.
+        Profile persisted = Profile();
+        (RunProfileHandler handler, FakeRunCoordinator runs) = HandlerFor(persisted);
+
+        IpcResponse inactive = await handler.HandleAsync(new RunProfileRequest
+        {
+            ProfileId = persisted.Id,
+            InlineProfile = persisted with { Active = false },
+        });
+        IpcResponse sourceless = await handler.HandleAsync(new RunProfileRequest
+        {
+            ProfileId = persisted.Id,
+            InlineProfile = persisted with { Sources = [] },
+        });
+
+        Assert.Equal("PROFILE_INACTIVE", Assert.IsType<ErrorResponse>(inactive).Code);
+        Assert.Equal("PROFILE_NO_SOURCES", Assert.IsType<ErrorResponse>(sourceless).Code);
+        Assert.Empty(runs.Begun);
+    }
+
     // ---- refusals ---------------------------------------------------------------------------------
 
     [Fact]
@@ -239,7 +298,10 @@ public sealed class RunHandlersTests : IDisposable
     /// every other double in this suite.</summary>
     private sealed class FakeRunCoordinator : IRunCoordinator
     {
-        public List<(Guid ProfileId, string? ScopePath)> Begun { get; } = [];
+        // The whole profile, not just its id: run-profile may carry an unsaved draft to plan instead of
+        // the persisted one, and "which profile actually reached the coordinator" is the point of those
+        // cases.
+        public List<(Profile Profile, string? ScopePath)> Begun { get; } = [];
         public List<(Guid RunId, bool Approve)> Approvals { get; } = [];
         public List<Guid> Cancellations { get; } = [];
 
@@ -251,7 +313,7 @@ public sealed class RunHandlersTests : IDisposable
         {
             if (BeginError is not null)
                 return BeginError;
-            Begun.Add((profile.Id, scopePath));
+            Begun.Add((profile, scopePath));
             return new RunHandle { RunId = Guid.NewGuid(), ProfileId = profile.Id };
         }
 
@@ -273,6 +335,7 @@ public sealed class RunHandlersTests : IDisposable
 
         public RunStatus? GetStatus(Guid runId) => null;
         public void Settled(Guid runId, JobCompletion? completion) { }
+        public Profile? PlannedProfile(Guid runId) => null;
         public void Coalesced(Guid runId) { }
         public string? SnapshotDirectory(Guid runId) => null;
         public Task StopAsync() => Task.CompletedTask;

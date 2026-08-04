@@ -21,42 +21,32 @@ public sealed class DryRunViewModelTests
         return (viewModel, gateway);
     }
 
-    // ── Split run button: destination-scan choice ───────────────────────────────────────────────
+    // ── The footer's Mirror warning ─────────────────────────────────────────────────────────────
 
     [Fact]
-    public void ApplySyncSettings_additive_follows_the_profile_default_and_allows_the_no_scan_option()
+    public void Only_a_MIRROR_profile_warns_about_removing_files_from_the_targets()
     {
         var (viewModel, _) = NewViewModel();
 
-        viewModel.ApplySyncSettings(SyncMode.AdditiveArchive, profileScanDestination: false);
-        Assert.False(viewModel.RunWithDestinationScan);
-        Assert.True(viewModel.CanChooseNoScan);
-        Assert.Equal("Dry Run (No Destination Scan)", viewModel.RunButtonLabel);
+        viewModel.ApplySyncMode(SyncMode.AdditiveArchive);
+        Assert.Equal("", viewModel.MirrorWarning);
 
-        viewModel.ApplySyncSettings(SyncMode.AdditiveArchive, profileScanDestination: true);
-        Assert.True(viewModel.RunWithDestinationScan);
-        Assert.Equal("Dry Run (With Destination Scan)", viewModel.RunButtonLabel);
+        viewModel.ApplySyncMode(SyncMode.Mirror);
+        Assert.Contains("MIRROR", viewModel.MirrorWarning);
+        // The filter caveat is load-bearing, not padding: tightening a filter on a Mirror profile removes
+        // copies the profile made earlier, which nothing else on screen says.
+        Assert.Contains("filters", viewModel.MirrorWarning);
     }
 
     [Fact]
-    public void ApplySyncSettings_mirror_forces_the_scan_on_and_disables_the_no_scan_option()
+    public void Closing_the_profile_drops_the_Mirror_warning()
     {
         var (viewModel, _) = NewViewModel();
+        viewModel.ApplySyncMode(SyncMode.Mirror);
 
-        viewModel.ApplySyncSettings(SyncMode.Mirror, profileScanDestination: false);
-        Assert.True(viewModel.RunWithDestinationScan);
-        Assert.False(viewModel.CanChooseNoScan);
-    }
+        viewModel.ClearProfile();
 
-    [Fact]
-    public void SelectNoScan_is_ignored_while_the_no_scan_option_is_disabled()
-    {
-        var (viewModel, _) = NewViewModel();
-        viewModel.ApplySyncSettings(SyncMode.Mirror, profileScanDestination: false);
-
-        viewModel.SelectNoScanCommand.Execute(null);
-
-        Assert.True(viewModel.RunWithDestinationScan);   // Mirror stays scanned
+        Assert.Equal("", viewModel.MirrorWarning);
     }
 
     // ── New-model fixture helpers ──────────────────────────────────────────────────────────────
@@ -188,34 +178,8 @@ public sealed class DryRunViewModelTests
         Assert.False(viewModel.CanRun);
     }
 
-    [Fact]
-    public async Task Run_sends_the_editor_draft_inline_when_a_provider_is_attached()
-    {
-        var (viewModel, gateway) = NewViewModel();
-        Profile draft = ProfileFactory.Sample();
-        viewModel.SetProfile(null, "New Profile");           // unsaved draft (no persisted id)
-        viewModel.DraftProvider = () => (draft, null);
-        gateway.DryRunResult = SampleReport(draft.Id);
-
-        await viewModel.RunAsync(CancellationToken.None);
-
-        // RunAsync sends a copy of the draft with the split button's scan choice applied; with the
-        // default (no-scan) choice matching the sample's ScanDestination, it is value-equal to the draft.
-        Assert.Equal(draft, Assert.Single(gateway.DryRunDrafts));
-        Assert.Equal(draft.Id, Assert.Single(gateway.DryRunCalls));
-    }
-
-    [Fact]
-    public async Task Run_surfaces_a_draft_parse_error_and_skips_the_gateway()
-    {
-        var (viewModel, gateway) = NewViewModel();
-        viewModel.DraftProvider = () => (null, "Max depth must be a non-negative whole number (or empty).");
-
-        await viewModel.RunAsync(CancellationToken.None);
-
-        Assert.Equal("Max depth must be a non-negative whole number (or empty).", viewModel.ErrorMessage);
-        Assert.Empty(gateway.DryRunCalls);
-    }
+    // Sending the editor's draft, and refusing on a draft parse error, now belong to the shell command
+    // that starts the run — see MainWindowViewModelPreviewTests.
 
     [Fact]
     public async Task Blast_radius_banner_reflects_the_report()
@@ -223,7 +187,7 @@ public sealed class DryRunViewModelTests
         var (viewModel, gateway) = NewViewModel();
         gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value);
 
-        await viewModel.RunAsync(CancellationToken.None);
+        await RunPlans.PreviewAsync(viewModel, gateway);
 
         Assert.True(viewModel.HasReport);
         Assert.Equal(4, viewModel.TotalFiles);
@@ -239,7 +203,7 @@ public sealed class DryRunViewModelTests
         var (viewModel, gateway) = NewViewModel();
         gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value);
 
-        await viewModel.RunAsync(CancellationToken.None);
+        await RunPlans.PreviewAsync(viewModel, gateway);
 
         // Untouched = filtered-out + unchanged (junk.tmp + same.txt).
         Assert.Equal(2, viewModel.Sources.UntouchedCount);
@@ -253,7 +217,7 @@ public sealed class DryRunViewModelTests
     {
         var (viewModel, gateway) = NewViewModel();
         gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value);
-        await viewModel.RunAsync(CancellationToken.None);
+        await RunPlans.PreviewAsync(viewModel, gateway);
 
         DryRunFileRow clobber = viewModel.Sources.VisibleRows.Single(r => r.SourcePath.EndsWith("clobber.txt"));
         Assert.True(clobber.IsProcessed);
@@ -269,7 +233,7 @@ public sealed class DryRunViewModelTests
         // targets (Overwrite + Rename), and the kept original surfaces only in the Destinations view.
         var (viewModel, gateway) = NewViewModel();
         gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value);
-        await viewModel.RunAsync(CancellationToken.None);
+        await RunPlans.PreviewAsync(viewModel, gateway);
 
         DryRunFileRow clobber = viewModel.Sources.VisibleRows.Single(r => r.SourcePath.EndsWith("clobber.txt"));
         Assert.Equal(2, clobber.Targets.Count);
@@ -288,7 +252,7 @@ public sealed class DryRunViewModelTests
     {
         var (viewModel, gateway) = NewViewModel();
         gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value);
-        await viewModel.RunAsync(CancellationToken.None);
+        await RunPlans.PreviewAsync(viewModel, gateway);
 
         var paths = viewModel.Sources.VisibleRows.Select(r => r.SourcePath).ToList();
         Assert.Equal(paths.OrderBy(p => p, StringComparer.OrdinalIgnoreCase).ToList(), paths);
@@ -305,7 +269,7 @@ public sealed class DryRunViewModelTests
             (@"C:\src\a\a.txt", @"C:\src", @"D:\dst\a\a.txt", @"D:\dst"),
             (@"C:\src\m.txt", @"C:\src", @"D:\dst\m.txt", @"D:\dst"));
 
-        await viewModel.RunAsync(CancellationToken.None);
+        await RunPlans.PreviewAsync(viewModel, gateway);
 
         var sourceRel = viewModel.Sources.VisibleRows
             .Select(r => System.IO.Path.GetRelativePath(r.SourceRoot!, r.SourcePath)).ToList();
@@ -341,7 +305,7 @@ public sealed class DryRunViewModelTests
             destinationFiles: [],
             destinationOps: []);
 
-        await viewModel.RunAsync(CancellationToken.None);
+        await RunPlans.PreviewAsync(viewModel, gateway);
 
         var order = viewModel.Sources.VisibleRows.Select(r => r.Disposition).ToList();
         Assert.Equal(
@@ -383,7 +347,7 @@ public sealed class DryRunViewModelTests
                 DstOp(OperationKind.New, @"D:\dst\a.txt", @"D:\dst", sourceIndex: 2, detail: "two"),
             ]);
 
-        await viewModel.RunAsync(CancellationToken.None);
+        await RunPlans.PreviewAsync(viewModel, gateway);
 
         var details = viewModel.Destinations.VisibleRows.Select(r => r.Primary.Detail).ToList();
         Assert.Equal(new[] { "one", "two", "z" }, details);
@@ -413,7 +377,7 @@ public sealed class DryRunViewModelTests
         var (viewModel, gateway) = NewViewModel();
         gateway.DryRunResult = Report(viewModel.ProfileId!.Value, sourceFiles, sourceOps, [], destinationOps);
 
-        await viewModel.RunAsync(CancellationToken.None);
+        await RunPlans.PreviewAsync(viewModel, gateway);
 
         AssertStableByName(viewModel.Sources.VisibleRows.Select(r => (r.FileName, r.DecidingFilter!)).ToList());
         AssertStableByName(viewModel.Destinations.VisibleRows.Select(r => (r.FileName, r.Primary.Detail!)).ToList());
@@ -458,7 +422,7 @@ public sealed class DryRunViewModelTests
     {
         var (viewModel, gateway) = NewViewModel();
         gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value);
-        await viewModel.RunAsync(CancellationToken.None);
+        await RunPlans.PreviewAsync(viewModel, gateway);
 
         // fresh (New) + clobber's renamed suffix path (New) = 2; clobber overwrite = 1;
         // clobber's original path kept + same.txt unchanged = 2 Untouched.
@@ -487,7 +451,7 @@ public sealed class DryRunViewModelTests
                 DstOp(OperationKind.New, @"C:\b\report.docx", @"C:\b", sourceIndex: 0),
                 DstOp(OperationKind.Overwrite, @"C:\c\report.docx", @"C:\c", sourceIndex: 0),
             ]);
-        await viewModel.RunAsync(CancellationToken.None);
+        await RunPlans.PreviewAsync(viewModel, gateway);
 
         DryRunDestinationRow row = Assert.Single(viewModel.Destinations.VisibleRows);
         Assert.True(row.HasSource);
@@ -519,7 +483,7 @@ public sealed class DryRunViewModelTests
                 DstOp(OperationKind.Deleted, @"C:\t\orphan.txt", @"C:\t", subjectIndex: 1),
             ]);
 
-        await viewModel.RunAsync(CancellationToken.None);
+        await RunPlans.PreviewAsync(viewModel, gateway);
 
         Assert.Equal(1, viewModel.Destinations.NewCount);
         Assert.Equal(1, viewModel.Destinations.DeletedCount);
@@ -534,7 +498,7 @@ public sealed class DryRunViewModelTests
     {
         var (viewModel, gateway) = NewViewModel();
         gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value);
-        await viewModel.RunAsync(CancellationToken.None);
+        await RunPlans.PreviewAsync(viewModel, gateway);
 
         // Two target roots (C:\t, C:\t2) so the destination facet appears in the Sources tab.
         Assert.True(viewModel.Sources.ShowDestinationFacet);
@@ -551,7 +515,7 @@ public sealed class DryRunViewModelTests
     {
         var (viewModel, gateway) = NewViewModel();
         gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value);
-        await viewModel.RunAsync(CancellationToken.None);
+        await RunPlans.PreviewAsync(viewModel, gateway);
 
         Assert.True(viewModel.Destinations.ShowDestinationFacet);
         viewModel.Destinations.DestinationFacets.Single(f => f.Key == @"C:\t").IsSelected = false;
@@ -564,7 +528,7 @@ public sealed class DryRunViewModelTests
     {
         var (viewModel, gateway) = NewViewModel();
         gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value);
-        await viewModel.RunAsync(CancellationToken.None);
+        await RunPlans.PreviewAsync(viewModel, gateway);
 
         // No selection → the list is unfiltered.
         Assert.False(viewModel.Sources.AnyStatusSelected);
@@ -591,7 +555,7 @@ public sealed class DryRunViewModelTests
     {
         var (viewModel, gateway) = NewViewModel();
         gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value);
-        await viewModel.RunAsync(CancellationToken.None);
+        await RunPlans.PreviewAsync(viewModel, gateway);
 
         // Processed OR Deleted — clobber.txt carries both, so the union is fresh + clobber (a
         // both-statuses row shows once, not twice).
@@ -614,7 +578,7 @@ public sealed class DryRunViewModelTests
     {
         var (viewModel, gateway) = NewViewModel();
         gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value);
-        await viewModel.RunAsync(CancellationToken.None);
+        await RunPlans.PreviewAsync(viewModel, gateway);
 
         // New only: keeps fresh.txt and clobber.txt's rename target, dropping clobber's Overwrite
         // entry and the untouched rows entirely.
@@ -634,7 +598,7 @@ public sealed class DryRunViewModelTests
     {
         var (viewModel, gateway) = NewViewModel();
         gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value);
-        await viewModel.RunAsync(CancellationToken.None);
+        await RunPlans.PreviewAsync(viewModel, gateway);
 
         // Processed matches fresh + clobber; the search AND-restricts it to fresh.
         viewModel.Sources.StatusFilters.Single(f => f.Key == "processed").IsSelected = true;
@@ -647,7 +611,7 @@ public sealed class DryRunViewModelTests
     {
         var (viewModel, gateway) = NewViewModel();
         gateway.DryRunResult = MultiSourceReport(viewModel.ProfileId!.Value);
-        await viewModel.RunAsync(CancellationToken.None);
+        await RunPlans.PreviewAsync(viewModel, gateway);
 
         Assert.True(viewModel.Sources.ShowSourceFacet);
         Assert.Equal(2, viewModel.Sources.SourceFacets.Count);
@@ -664,7 +628,7 @@ public sealed class DryRunViewModelTests
     {
         var (viewModel, gateway) = NewViewModel();
         gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value);   // all under C:\s
-        await viewModel.RunAsync(CancellationToken.None);
+        await RunPlans.PreviewAsync(viewModel, gateway);
 
         Assert.False(viewModel.Sources.ShowSourceFacet);
         Assert.Empty(viewModel.Sources.SourceFacets);
@@ -675,7 +639,7 @@ public sealed class DryRunViewModelTests
     {
         var (viewModel, gateway) = NewViewModel();
         gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value);
-        await viewModel.RunAsync(CancellationToken.None);
+        await RunPlans.PreviewAsync(viewModel, gateway);
 
         viewModel.Sources.SearchText = "fresh";
         Assert.EndsWith("fresh.txt", Assert.Single(viewModel.Sources.VisibleRows).SourcePath);
@@ -710,7 +674,7 @@ public sealed class DryRunViewModelTests
     {
         var (viewModel, gateway) = NewViewModel();
         gateway.DryRunResult = NestedSourcesReport(viewModel.ProfileId!.Value);
-        await viewModel.RunAsync(CancellationToken.None);
+        await RunPlans.PreviewAsync(viewModel, gateway);
 
         viewModel.Sources.ShowTree = true;
 
@@ -741,7 +705,7 @@ public sealed class DryRunViewModelTests
         }
         var (viewModel, gateway) = NewViewModel();
         gateway.DryRunResult = Report(viewModel.ProfileId!.Value, sourceFiles, sourceOps, [], []);
-        await viewModel.RunAsync(CancellationToken.None);
+        await RunPlans.PreviewAsync(viewModel, gateway);
 
         viewModel.Sources.ShowTree = true;
         await viewModel.Sources.PendingRebuild;
@@ -769,7 +733,7 @@ public sealed class DryRunViewModelTests
         }
         var (viewModel, gateway) = NewViewModel();
         gateway.DryRunResult = Report(viewModel.ProfileId!.Value, sourceFiles, sourceOps, [], []);
-        await viewModel.RunAsync(CancellationToken.None);
+        await RunPlans.PreviewAsync(viewModel, gateway);
 
         viewModel.Sources.ShowTree = true;
         await viewModel.Sources.PendingRebuild;
@@ -797,7 +761,7 @@ public sealed class DryRunViewModelTests
         }
         var (viewModel, gateway) = NewViewModel();
         gateway.DryRunResult = Report(viewModel.ProfileId!.Value, sourceFiles, sourceOps, [], []);
-        await viewModel.RunAsync(CancellationToken.None);
+        await RunPlans.PreviewAsync(viewModel, gateway);
 
         viewModel.Sources.ShowTree = true;
         await viewModel.Sources.PendingRebuild;
@@ -820,7 +784,7 @@ public sealed class DryRunViewModelTests
         // the heap for collapsed subtrees.
         var (viewModel, gateway) = NewViewModel();
         gateway.DryRunResult = NestedSourcesReport(viewModel.ProfileId!.Value);
-        await viewModel.RunAsync(CancellationToken.None);
+        await RunPlans.PreviewAsync(viewModel, gateway);
         viewModel.Sources.ShowTree = true;
 
         DryRunTreeNode sub = Assert.Single(viewModel.Sources.Tree);
@@ -856,7 +820,7 @@ public sealed class DryRunViewModelTests
                 SrcOp(2, @"C:\r\a\s2\f2.txt", @"C:\r", OperationKind.Processed, OnSuccessAction.KeepSource),
             ],
             destinationFiles: [], destinationOps: []);
-        await viewModel.RunAsync(CancellationToken.None);
+        await RunPlans.PreviewAsync(viewModel, gateway);
 
         viewModel.Sources.ShowTree = true;
         await viewModel.Sources.PendingRebuild;
@@ -914,7 +878,7 @@ public sealed class DryRunViewModelTests
                 SrcOp(2, @"C:\r\a\s2\f2.txt", @"C:\r", OperationKind.Processed, OnSuccessAction.KeepSource),
             ],
             destinationFiles: [], destinationOps: []);
-        await viewModel.RunAsync(CancellationToken.None);
+        await RunPlans.PreviewAsync(viewModel, gateway);
 
         viewModel.Sources.ShowTree = true;
         await viewModel.Sources.PendingRebuild;
@@ -964,7 +928,7 @@ public sealed class DryRunViewModelTests
                 SrcOp(2, @"C:\p\sub\z.txt", @"C:\p", OperationKind.Processed, OnSuccessAction.KeepSource),
             ],
             destinationFiles: [], destinationOps: []);
-        await viewModel.RunAsync(CancellationToken.None);
+        await RunPlans.PreviewAsync(viewModel, gateway);
         viewModel.Sources.ShowTree = true;
 
         DryRunTreeNode sub = Assert.Single(viewModel.Sources.Tree);
@@ -994,7 +958,7 @@ public sealed class DryRunViewModelTests
                 SrcOp(2, @"C:\p\sub\deep\b.txt", @"C:\p", OperationKind.Processed, OnSuccessAction.KeepSource),
             ],
             destinationFiles: [], destinationOps: []);
-        await viewModel.RunAsync(CancellationToken.None);
+        await RunPlans.PreviewAsync(viewModel, gateway);
         viewModel.Sources.ShowTree = true;
 
         DryRunTreeNode sub = Assert.Single(viewModel.Sources.Tree);
@@ -1030,7 +994,7 @@ public sealed class DryRunViewModelTests
     {
         var (viewModel, gateway) = NewViewModel();
         gateway.DryRunResult = NestedDestinationsReport(viewModel.ProfileId!.Value);
-        await viewModel.RunAsync(CancellationToken.None);
+        await RunPlans.PreviewAsync(viewModel, gateway);
 
         viewModel.Destinations.ShowTree = true;
 
@@ -1052,7 +1016,7 @@ public sealed class DryRunViewModelTests
         gateway.DryRunResult = WritesReport(viewModel.ProfileId!.Value,
             (@"\\srv1\share\a.txt", @"\\srv1\share", @"\\dst\out\a.txt", @"\\dst\out"),
             (@"\\srv2\other\b.txt", @"\\srv2\other", @"\\dst\out\b.txt", @"\\dst\out"));
-        await viewModel.RunAsync(CancellationToken.None);
+        await RunPlans.PreviewAsync(viewModel, gateway);
 
         Assert.Null(viewModel.Sources.CommonRoot);   // unrelated shares span no shared prefix
         viewModel.Sources.ShowTree = true;
@@ -1068,7 +1032,7 @@ public sealed class DryRunViewModelTests
     {
         var (viewModel, gateway) = NewViewModel();
         gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value);   // all under C:\s → C:\t/C:\t2
-        await viewModel.RunAsync(CancellationToken.None);
+        await RunPlans.PreviewAsync(viewModel, gateway);
 
         Assert.Equal(@"C:\s", viewModel.Sources.CommonRoot);
         Assert.Contains("Relative to", viewModel.Sources.CommonRootDisplay);
@@ -1082,7 +1046,7 @@ public sealed class DryRunViewModelTests
         gateway.DryRunResult = WritesReport(viewModel.ProfileId!.Value,
             (@"C:\a\one.txt", @"C:\a", @"E:\out\one.txt", @"E:\out"),
             (@"D:\b\two.txt", @"D:\b", @"E:\out\two.txt", @"E:\out"));
-        await viewModel.RunAsync(CancellationToken.None);
+        await RunPlans.PreviewAsync(viewModel, gateway);
 
         Assert.Null(viewModel.Sources.CommonRoot);
         Assert.Contains("Multiple drives", viewModel.Sources.CommonRootDisplay);
@@ -1096,7 +1060,7 @@ public sealed class DryRunViewModelTests
     {
         var (viewModel, gateway) = NewViewModel();
         gateway.DryRunResult = NestedSourcesReport(viewModel.ProfileId!.Value);
-        await viewModel.RunAsync(CancellationToken.None);
+        await RunPlans.PreviewAsync(viewModel, gateway);
 
         DryRunFileRow row = viewModel.Sources.VisibleRows.First();
         Assert.Equal(@"sub\", row.ParentDisplay);
@@ -1108,7 +1072,7 @@ public sealed class DryRunViewModelTests
     {
         var (viewModel, gateway) = NewViewModel();
         gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value);
-        await viewModel.RunAsync(CancellationToken.None);
+        await RunPlans.PreviewAsync(viewModel, gateway);
 
         Assert.False(viewModel.Sources.ShowTree);
         Assert.Empty(viewModel.Sources.Tree);
@@ -1125,7 +1089,7 @@ public sealed class DryRunViewModelTests
         // toggle — the exact retained memory the optimization work set out to eliminate.
         var (viewModel, gateway) = NewViewModel();
         gateway.DryRunResult = NestedSourcesReport(viewModel.ProfileId!.Value);
-        await viewModel.RunAsync(CancellationToken.None);
+        await RunPlans.PreviewAsync(viewModel, gateway);
 
         viewModel.Sources.ShowTree = true;
         Assert.NotEmpty(viewModel.Sources.Tree);
@@ -1133,7 +1097,7 @@ public sealed class DryRunViewModelTests
 
         // A second run applies a fresh report without the user toggling the tree off first.
         gateway.DryRunResult = NestedSourcesReport(viewModel.ProfileId!.Value);
-        await viewModel.RunAsync(CancellationToken.None);
+        await RunPlans.PreviewAsync(viewModel, gateway);
 
         Assert.False(viewModel.Sources.ShowTree);
         Assert.Empty(viewModel.Sources.Tree);
@@ -1147,14 +1111,15 @@ public sealed class DryRunViewModelTests
         // until the next report is built — otherwise consecutive runs peak at ~2x the row footprint.
         var (viewModel, gateway) = NewViewModel();
         gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value);
-        await viewModel.RunAsync(CancellationToken.None);
+        await RunPlans.PreviewAsync(viewModel, gateway);
         Assert.True(viewModel.HasReport);
         Assert.NotEmpty(viewModel.Sources.VisibleRows);
 
-        // Gate the second run so it stays parked in the scan, after RunAsync's synchronous prologue.
+        // Gate the second preview so it stays parked in the plan stream, after BeginPlanning's
+        // synchronous clear.
         gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value);
-        gateway.DryRunGate = new TaskCompletionSource();
-        Task running = viewModel.RunAsync(CancellationToken.None);
+        gateway.RunPlanGate = new TaskCompletionSource();
+        Task running = RunPlans.PreviewAsync(viewModel, gateway);
 
         // The previous preview is already gone — released synchronously before the gateway await, well
         // before the new report exists to replace it.
@@ -1162,22 +1127,22 @@ public sealed class DryRunViewModelTests
         Assert.Empty(viewModel.Sources.VisibleRows);
         Assert.Empty(viewModel.Destinations.VisibleRows);
 
-        gateway.DryRunGate.SetResult();
+        gateway.RunPlanGate.SetResult();
         await running;
         Assert.True(viewModel.HasReport);   // the new report applies normally
         Assert.NotEmpty(viewModel.Sources.VisibleRows);
     }
 
     [Fact]
-    public async Task RunAsync_does_not_trigger_the_memory_trim_when_a_report_is_already_loaded()
+    public async Task Starting_a_preview_does_not_trigger_the_memory_trim_when_a_report_is_already_loaded()
     {
-        // Regression for the UI-thread freeze: ClearReport() ran inside RunAsync used to inherit
+        // Regression for the UI-thread freeze: the clear at the start of a preview used to inherit
         // UiMemoryTrim's blocking two-pass GC.Collect whenever a report was already showing, so every
-        // re-run froze the window before the scan even started. RunAsync must never invoke it — only
-        // ReportClosed() (profile select/deselect) may.
+        // re-preview froze the window before the scan even started. BeginPlanning must never invoke it —
+        // only ReportClosed() (profile select/deselect) may.
         var (viewModel, gateway) = NewViewModel();
         gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value);
-        await viewModel.RunAsync(CancellationToken.None);
+        await RunPlans.PreviewAsync(viewModel, gateway);
         Assert.True(viewModel.HasReport);
 
         Action original = UiMemoryTrim.AfterPreviewClosedHook;
@@ -1186,7 +1151,7 @@ public sealed class DryRunViewModelTests
         try
         {
             gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value);
-            await viewModel.RunAsync(CancellationToken.None);
+            await RunPlans.PreviewAsync(viewModel, gateway);
         }
         finally
         {
@@ -1208,7 +1173,7 @@ public sealed class DryRunViewModelTests
         // from the dispose ordering, and the previous source is gone after the next run.
         var (viewModel, gateway) = NewViewModel();
         gateway.DryRunResult = NestedSourcesReport(viewModel.ProfileId!.Value);
-        await viewModel.RunAsync(CancellationToken.None);
+        await RunPlans.PreviewAsync(viewModel, gateway);
 
         viewModel.Sources.ShowTree = true;
         await viewModel.Sources.PendingRebuild;
@@ -1217,7 +1182,7 @@ public sealed class DryRunViewModelTests
         _ = previous.Rows.Count;   // realize the row cache the leak used to strand
 
         gateway.DryRunResult = NestedSourcesReport(viewModel.ProfileId!.Value);
-        await viewModel.RunAsync(CancellationToken.None);
+        await RunPlans.PreviewAsync(viewModel, gateway);
 
         Assert.Null(viewModel.Sources.TreeSource);   // list-view default; the prior source was released
     }
@@ -1228,14 +1193,14 @@ public sealed class DryRunViewModelTests
         var (viewModel, gateway) = NewViewModel();
         gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value) with { Truncated = true };
 
-        await viewModel.RunAsync(CancellationToken.None);
+        await RunPlans.PreviewAsync(viewModel, gateway);
 
         Assert.True(viewModel.WasTruncated);
         Assert.Contains("truncated", viewModel.TruncationNotice, StringComparison.OrdinalIgnoreCase);
         Assert.Contains("deletions", viewModel.TruncationNotice, StringComparison.OrdinalIgnoreCase);
 
         gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value);
-        await viewModel.RunAsync(CancellationToken.None);
+        await RunPlans.PreviewAsync(viewModel, gateway);
         Assert.False(viewModel.WasTruncated);
         Assert.Equal("", viewModel.TruncationNotice);
     }
@@ -1246,7 +1211,7 @@ public sealed class DryRunViewModelTests
         var (viewModel, gateway) = NewViewModel();
         gateway.DryRunResult = new IpcError("DRY_RUN_FAILED", "scan failed: boom");
 
-        await viewModel.RunAsync(CancellationToken.None);
+        await RunPlans.PreviewAsync(viewModel, gateway);
 
         Assert.False(viewModel.HasReport);
         Assert.Contains("boom", viewModel.ErrorMessage);
@@ -1258,7 +1223,7 @@ public sealed class DryRunViewModelTests
         var (viewModel, gateway) = NewViewModel();
         gateway.DryRunResult = new IpcError("IPC_TRANSPORT", "connection closed");
 
-        await viewModel.RunAsync(CancellationToken.None);
+        await RunPlans.PreviewAsync(viewModel, gateway);
 
         Assert.False(viewModel.HasReport);
         Assert.Contains("connection closed", viewModel.ErrorMessage);
@@ -1269,27 +1234,31 @@ public sealed class DryRunViewModelTests
     public async Task Unexpected_gateway_exception_surfaces_as_a_banner_not_a_fault()
     {
         var (viewModel, gateway) = NewViewModel();
-        gateway.DryRunException = new InvalidOperationException("wire format drifted");
+        gateway.RunPlanException = new InvalidOperationException("wire format drifted");
 
-        await viewModel.RunAsync(CancellationToken.None);
+        await RunPlans.PreviewAsync(viewModel, gateway);
 
         Assert.False(viewModel.HasReport);
         Assert.Contains("wire format drifted", viewModel.ErrorMessage);
+        // And no footer: a plan that could not be displayed must never be approvable.
+        Assert.Null(viewModel.PendingRunId);
     }
 
     [Fact]
-    public async Task Dry_run_forwards_the_profile_id()
+    public async Task A_preview_streams_the_plan_of_the_run_it_was_given()
     {
         var (viewModel, gateway) = NewViewModel();
         gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value);
 
-        await viewModel.RunAsync(CancellationToken.None);
+        Guid runId = await RunPlans.PreviewAsync(viewModel, gateway);
 
-        Assert.Equal(viewModel.ProfileId!.Value, Assert.Single(gateway.DryRunCalls));
+        // The rows come from the RUN's frozen snapshot, not from a fresh simulation — that is the whole
+        // point, and it is why the gateway has no dry-run method left to reach for.
+        Assert.Equal(runId, Assert.Single(gateway.RunPlanStreamCalls));
     }
 
     [Fact]
-    public async Task Run_status_shows_phases_and_clears_when_the_run_completes()
+    public async Task Run_status_shows_phases_and_clears_when_the_preview_completes()
     {
         var (viewModel, gateway) = NewViewModel();
         gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value);
@@ -1300,51 +1269,256 @@ public sealed class DryRunViewModelTests
                 observed.Add(viewModel.RunStatusText);
         };
 
-        await viewModel.RunAsync(CancellationToken.None);
+        await RunPlans.PreviewAsync(viewModel, gateway);
 
-        // The synchronous phase transitions: an immediate scanning caption, the building caption
-        // once the gateway resolves, and empty once the run is over.
-        Assert.Equal("Scanning sources…", observed.First());
+        // The phase transitions: the planning caption from the moment Preview is pressed, the building
+        // caption once the plan has streamed, and empty once the rows are up.
+        Assert.Equal("Working out what this will do…", observed.First());
         Assert.Contains("Building the lists…", observed);
         Assert.Equal("", viewModel.RunStatusText);
+        Assert.False(viewModel.IsPreviewing);
     }
 
     [Fact]
-    public async Task Run_status_formats_streamed_progress_counts()
+    public async Task IsPreviewing_spans_the_whole_wait_and_clears_at_the_end()
     {
         var (viewModel, gateway) = NewViewModel();
         gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value);
-        gateway.ScriptedProgress = [new DryRunProgress(DryRunProgressPhase.ScanningSources, 12345, 0)];
-        gateway.DryRunGate = new TaskCompletionSource();
+        gateway.RunPlanGate = new TaskCompletionSource();
 
-        Task running = viewModel.RunAsync(CancellationToken.None);
+        Task running = RunPlans.PreviewAsync(viewModel, gateway);
+        // Set before the plan stream is even awaited: the planning phase is a real wait the user must see
+        // a progress bar for, and it reports nothing to this view model.
+        Assert.True(viewModel.IsPreviewing);
 
-        // Progress<T> marshals its reports through the ambient context, so the caption update is
-        // asynchronous relative to the fake's Report call — wait for it (bounded) instead of racing.
-        string expected = $"Scanning sources… {12345:N0} files found";
-        for (int i = 0; i < 200 && viewModel.RunStatusText != expected; i++)
-            await Task.Delay(10);
-        Assert.Equal(expected, viewModel.RunStatusText);
-
-        gateway.DryRunGate.SetResult();
+        gateway.RunPlanGate.SetResult();
         await running;
 
-        Assert.Equal("", viewModel.RunStatusText);
+        Assert.False(viewModel.IsPreviewing);
+    }
+
+    // ── The shape a REAL plan replay has ────────────────────────────────────────────────────────
+
+    /// <summary>What <c>get-run-plan-stream</c> actually emits for an additive profile: one source row
+    /// per planned copy, each with its New destination, and — because nothing is being removed — not one
+    /// orphan.
+    /// <para>Distinct from <see cref="SampleReport"/> on purpose. Every other case here scripts a rich
+    /// dry-run report, which is the readable way to describe rows but is NOT what a plan replay looks
+    /// like; the empty-panel defect lived exactly in that gap.</para></summary>
+    private DryRunReport AdditivePlanReplay(int files = 2)
+    {
+        List<DryRunFile> sourceFiles = [];
+        List<DryRunOperation> sourceOps = [];
+        List<DryRunOperation> destinationOps = [];
+        for (int i = 0; i < files; i++)
+        {
+            sourceFiles.Add(Pf($@"C:\s\file-{i}.txt", @"C:\s"));
+            sourceOps.Add(SrcOp(i, $@"C:\s\file-{i}.txt", @"C:\s",
+                OperationKind.Processed, OnSuccessAction.KeepSource));
+            destinationOps.Add(DstOp(OperationKind.New, $@"D:\d\file-{i}.txt", @"D:\d", sourceIndex: i));
+        }
+        return Report(Guid.NewGuid(), sourceFiles, sourceOps, [], destinationOps);
+    }
+
+    [Fact]
+    public async Task An_additive_plan_fills_BOTH_panels()
+    {
+        // The reported symptom at view-model level: an additive profile removes nothing, so if a replay
+        // carries only orphans on the destination side this panel is empty and the user cannot tell that
+        // from "the preview found nothing".
+        var (viewModel, gateway) = NewViewModel();
+        gateway.DryRunResult = AdditivePlanReplay();
+
+        await RunPlans.PreviewAsync(viewModel, gateway, copies: 2);
+
+        Assert.True(viewModel.HasReport);
+        Assert.Equal(2, viewModel.Sources.VisibleRows.Count);
+        Assert.Equal(2, viewModel.Destinations.VisibleRows.Count);
+    }
+
+    [Fact]
+    public async Task Every_source_row_in_a_plan_replay_lists_where_its_content_goes()
+    {
+        // A source row whose Targets are empty renders as a file the run will read and no statement about
+        // what it does with it.
+        var (viewModel, gateway) = NewViewModel();
+        gateway.DryRunResult = AdditivePlanReplay(files: 1);
+
+        await RunPlans.PreviewAsync(viewModel, gateway, copies: 1);
+
+        DryRunFileRow row = Assert.Single(viewModel.Sources.VisibleRows);
+        Assert.Equal(@"D:\d\file-0.txt", Assert.Single(row.Targets).Path);
+    }
+
+    // ── The approval footer ─────────────────────────────────────────────────────────────────────
+
+    [Fact]
+    public async Task The_footer_appears_with_the_rows_and_states_the_plans_totals()
+    {
+        var (viewModel, gateway) = NewViewModel();
+        gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value);
+
+        Guid runId = await RunPlans.PreviewAsync(viewModel, gateway, copies: 7, deletes: 2);
+
+        Assert.Equal(runId, viewModel.PendingRunId);
+        Assert.Equal(7, viewModel.PlannedCopies);
+        Assert.Equal(2, viewModel.PlannedDeletes);
+        // Deletions lead: removing files from a target is the only part that feels irreversible.
+        Assert.StartsWith("2 file(s) to REMOVE", viewModel.PlanSummary);
+        Assert.Contains("7 file(s) to copy or update", viewModel.PlanSummary);
+    }
+
+    [Fact]
+    public async Task With_nothing_to_remove_the_summary_is_only_about_copies()
+    {
+        var (viewModel, gateway) = NewViewModel();
+        gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value);
+
+        await RunPlans.PreviewAsync(viewModel, gateway, copies: 3);
+
+        Assert.StartsWith("3 file(s) to copy or update", viewModel.PlanSummary);
+        Assert.DoesNotContain("REMOVE", viewModel.PlanSummary);
+    }
+
+    [Fact]
+    public async Task A_TRUNCATED_plan_says_nothing_will_be_removed()
+    {
+        var (viewModel, gateway) = NewViewModel();
+        gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value);
+
+        await RunPlans.PreviewAsync(viewModel, gateway, copies: 5, deletes: 4, truncated: true);
+
+        Assert.True(viewModel.PlanTruncated);
+        // Not a caveat on the numbers — the deletion pass refuses a truncated plan outright, so a footer
+        // that still promised removals would be lying.
+        Assert.Contains("No files will be removed", viewModel.PlanTruncationNotice);
+    }
+
+    [Fact]
+    public async Task Approving_starts_the_run_that_was_previewed_and_retires_the_footer()
+    {
+        var (viewModel, gateway) = NewViewModel();
+        gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value);
+        bool? answered = null;
+        viewModel.RunAnswered = approve => answered = approve;
+
+        Guid runId = await RunPlans.PreviewAsync(viewModel, gateway);
+        await viewModel.ApproveRunCommand.ExecuteAsync(null);
+
+        Assert.Equal((runId, true), Assert.Single(gateway.ApproveRunCalls));
+        Assert.True(answered);
+        Assert.Null(viewModel.PendingRunId);
+        // The rows stay: the user is now watching the run they just approved, against the list of what it
+        // will do.
+        Assert.True(viewModel.HasReport);
+    }
+
+    [Fact]
+    public async Task Discarding_declines_the_run_and_changes_nothing()
+    {
+        var (viewModel, gateway) = NewViewModel();
+        gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value);
+        bool? answered = null;
+        viewModel.RunAnswered = approve => answered = approve;
+
+        Guid runId = await RunPlans.PreviewAsync(viewModel, gateway);
+        await viewModel.DeclineRunCommand.ExecuteAsync(null);
+
+        Assert.Equal((runId, false), Assert.Single(gateway.ApproveRunCalls));
+        Assert.False(answered);
+        Assert.Null(viewModel.PendingRunId);
+    }
+
+    [Fact]
+    public async Task A_second_press_of_Approve_cannot_answer_the_same_run_twice()
+    {
+        // The engine refuses a second approve with RUN_NOT_APPROVABLE, so without clearing the pending id
+        // FIRST a double-click would put that refusal in the error banner for no reason.
+        var (viewModel, gateway) = NewViewModel();
+        gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value);
+        await RunPlans.PreviewAsync(viewModel, gateway);
+
+        await viewModel.ApproveRunCommand.ExecuteAsync(null);
+        await viewModel.ApproveRunCommand.ExecuteAsync(null);
+
+        Assert.Single(gateway.ApproveRunCalls);
+        Assert.Null(viewModel.ErrorMessage);
+    }
+
+    [Fact]
+    public async Task A_refused_approval_lands_in_the_error_banner()
+    {
+        var (viewModel, gateway) = NewViewModel();
+        gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value);
+        await RunPlans.PreviewAsync(viewModel, gateway);
+        gateway.ApproveRunResult = new IpcError("RUN_NOT_APPROVABLE", "run is Closed, not awaiting approval");
+
+        await viewModel.ApproveRunCommand.ExecuteAsync(null);
+
+        Assert.Contains("Could not start the run", viewModel.ErrorMessage);
+        Assert.Contains("not awaiting approval", viewModel.ErrorMessage);
+    }
+
+    [Fact]
+    public async Task A_superseding_preview_declines_the_run_the_previous_one_left_parked()
+    {
+        // A run in AwaitingApproval holds a snapshot directory and has no expiry, so an unanswered
+        // preview would leak one for the lifetime of the service.
+        var (viewModel, gateway) = NewViewModel();
+        gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value);
+        Guid first = await RunPlans.PreviewAsync(viewModel, gateway);
+
+        Guid second = await RunPlans.PreviewAsync(viewModel, gateway);
+
+        Assert.Equal((first, false), Assert.Single(gateway.ApproveRunCalls));
+        Assert.Equal(second, viewModel.PendingRunId);
+    }
+
+    [Fact]
+    public async Task Closing_the_profile_declines_the_run_the_preview_left_parked()
+    {
+        var (viewModel, gateway) = NewViewModel();
+        gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value);
+        Guid runId = await RunPlans.PreviewAsync(viewModel, gateway);
+
+        viewModel.ClearProfile();
+
+        Assert.Equal((runId, false), Assert.Single(gateway.ApproveRunCalls));
+        Assert.Null(viewModel.PendingRunId);
+    }
+
+    [Fact]
+    public async Task A_failed_plan_stream_leaves_no_footer_to_approve()
+    {
+        var (viewModel, gateway) = NewViewModel();
+        Guid runId = Guid.NewGuid();
+        gateway.RunPlanResults[runId] = new IpcError("RUN_NOT_FOUND", $"no run with id {runId}");
+
+        viewModel.BeginPlanning();
+        await viewModel.LoadPlanAsync(RunPlans.Planned(runId, viewModel.ProfileId!.Value));
+
+        Assert.Contains("Preview failed", viewModel.ErrorMessage);
+        Assert.Null(viewModel.PendingRunId);
+        Assert.False(viewModel.HasReport);
     }
 
     [Fact]
     public async Task Cancellation_resets_to_a_calm_state()
     {
         var (viewModel, gateway) = NewViewModel();
-        gateway.DryRunGate = new TaskCompletionSource();
+        gateway.RunPlanGate = new TaskCompletionSource();
         using CancellationTokenSource cts = new();
 
-        Task running = viewModel.RunAsync(cts.Token);
+        viewModel.BeginPlanning();
+        Task running = viewModel.LoadPlanAsync(
+            RunPlans.Planned(Guid.NewGuid(), viewModel.ProfileId!.Value), cts.Token);
         cts.Cancel();
         await running;
 
         Assert.False(viewModel.HasReport);
         Assert.Contains("cancelled", viewModel.ErrorMessage, StringComparison.OrdinalIgnoreCase);
+        // No footer: there is nothing to approve, and offering to would approve a plan never displayed.
+        Assert.Null(viewModel.PendingRunId);
     }
 
     [Fact]
@@ -1357,7 +1531,7 @@ public sealed class DryRunViewModelTests
             destinationFiles: [],
             destinationOps: [DstOp(OperationKind.New, @"D:\d\a.dat", @"D:\d", sourceIndex: 0)]);
 
-        await viewModel.RunAsync(CancellationToken.None);
+        await RunPlans.PreviewAsync(viewModel, gateway);
 
         Assert.Equal("1.5 KB", Assert.Single(viewModel.Sources.VisibleRows).SizeText);
         var entry = viewModel.Destinations.VisibleRows.SelectMany(r => r.Destinations).Single();
@@ -1393,7 +1567,7 @@ public sealed class DryRunViewModelTests
         };
         gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value) with { Space = space };
 
-        await viewModel.RunAsync(CancellationToken.None);
+        await RunPlans.PreviewAsync(viewModel, gateway);
 
         Assert.NotNull(viewModel.Space);
         Assert.StartsWith("+", viewModel.Space!.NetChangeText);
@@ -1444,7 +1618,7 @@ public sealed class DryRunViewModelTests
             },
         };
 
-        await viewModel.RunAsync(CancellationToken.None);
+        await RunPlans.PreviewAsync(viewModel, gateway);
 
         VolumeSpaceRow d = Assert.Single(viewModel.Space!.Volumes);
         Assert.True(d.HasDeferredReclaim);
@@ -1479,7 +1653,7 @@ public sealed class DryRunViewModelTests
             },
         };
 
-        await viewModel.RunAsync(CancellationToken.None);
+        await RunPlans.PreviewAsync(viewModel, gateway);
 
         VolumeSpaceRow d = Assert.Single(viewModel.Space!.Volumes);
         Assert.True(d.IsDanger);
@@ -1492,7 +1666,7 @@ public sealed class DryRunViewModelTests
     {
         var (viewModel, gateway) = NewViewModel();
         gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value);   // Space defaults null
-        await viewModel.RunAsync(CancellationToken.None);
+        await RunPlans.PreviewAsync(viewModel, gateway);
         Assert.Null(viewModel.Space);
     }
 
@@ -1565,7 +1739,7 @@ public sealed class DryRunViewModelTests
                 DstOp(OperationKind.New, @"C:\t\b.txt", @"C:\t", sourceIndex: 1),
             ]);
 
-        await viewModel.RunAsync(CancellationToken.None);
+        await RunPlans.PreviewAsync(viewModel, gateway);
 
         Assert.True(viewModel.HasReport);
         Assert.Null(viewModel.ErrorMessage);
@@ -1577,7 +1751,7 @@ public sealed class DryRunViewModelTests
     {
         var (viewModel, gateway) = NewViewModel();   // searchDebounce == Zero → rebuilds are synchronous
         gateway.DryRunResult = DeepSourcesReport(viewModel.ProfileId!.Value);
-        await viewModel.RunAsync(CancellationToken.None);
+        await RunPlans.PreviewAsync(viewModel, gateway);
 
         viewModel.Sources.ShowTree = true;
 
@@ -1674,7 +1848,7 @@ public sealed class DryRunViewModelTests
     {
         var (viewModel, gateway) = NewViewModel();
         gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value);
-        await viewModel.RunAsync(CancellationToken.None);
+        await RunPlans.PreviewAsync(viewModel, gateway);
 
         // Under the sync threshold the rebuild completes in the same dispatcher frame — the
         // loading overlay must never flicker for small reports.

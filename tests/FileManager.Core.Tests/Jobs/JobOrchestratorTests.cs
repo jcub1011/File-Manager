@@ -107,6 +107,87 @@ public sealed class JobOrchestratorTests : IDisposable
         Assert.Empty(executor.Executed);
     }
 
+    // ---- a run's payloads execute against the profile the RUN was planned from --------------------
+    // Not the live catalog. The user approved a frozen work list computed from that profile, and the
+    // Mirror deletion pass reads it back from the same snapshot — resolving the catalog here let one run
+    // copy with one profile's targets while deleting per another's. It is also the only way a run planned
+    // from an unsaved draft can copy at all: that profile is in no catalog.
+
+    [Fact]
+    public async Task A_RUN_tagged_payload_is_built_from_the_profile_that_run_was_planned_from()
+    {
+        Guid runId = Guid.NewGuid();
+        string frozenTarget = Path.Combine(_root, "frozen-target");
+        Profile frozen = _profile with { Targets = [new TargetConfig { Path = frozenTarget }] };
+        FakeJobExecutor executor = new();
+        using TriggerQueue queue = new(new FakePauseState(), NullLogger<TriggerQueue>.Instance);
+        // The catalog holds a DIFFERENT profile under the same id, so a lookup there is visible in the plan.
+        JobOrchestrator orchestrator = OrchestratorOver(
+            _profile, executor, queue, new FrozenProfileSink(runId, frozen));
+
+        Assert.True(orchestrator.Start().IsSuccess);
+        queue.Enqueue(new Payload(
+            _profile.Id, _sourceFile, _sourceDir, TriggerKind.ManualShell, DateTimeOffset.UnixEpoch,
+            RunId: runId));
+
+        // Wait for the job rather than relying on StopAsync to drain: StopAsync stops DEQUEUING first, so
+        // a payload the consumer has not reached yet is dropped, not run. The sibling drop tests can lean
+        // on it because they assert emptiness either way; this one asserts a job happened.
+        Assert.True(await WaitForAsync(() => executor.Executed.Count == 1, TimeSpan.FromSeconds(5)));
+        await orchestrator.StopAsync();
+        JobPlan plan = Assert.Single(executor.Executed);
+        Assert.Equal(frozenTarget, Assert.Single(plan.Targets).TargetRoot);
+    }
+
+    [Fact]
+    public async Task A_RUN_tagged_payload_whose_profile_is_in_NO_catalog_still_runs()
+    {
+        // A never-saved draft: the catalog knows nothing about it, and before the frozen-profile lookup
+        // every one of its payloads was silently dropped.
+        Guid runId = Guid.NewGuid();
+        Profile draft = _profile with { Id = Guid.NewGuid() };
+        FakeJobExecutor executor = new();
+        using TriggerQueue queue = new(new FakePauseState(), NullLogger<TriggerQueue>.Instance);
+        JobOrchestrator orchestrator = OrchestratorOver(
+            _profile, executor, queue, new FrozenProfileSink(runId, draft));
+
+        Assert.True(orchestrator.Start().IsSuccess);
+        queue.Enqueue(new Payload(
+            draft.Id, _sourceFile, _sourceDir, TriggerKind.ManualShell, DateTimeOffset.UnixEpoch,
+            RunId: runId));
+
+        Assert.True(await WaitForAsync(() => executor.Executed.Count == 1, TimeSpan.FromSeconds(5)));
+        await orchestrator.StopAsync();
+        Assert.Equal(draft.Id, Assert.Single(executor.Executed).ProfileId);
+    }
+
+    [Fact]
+    public async Task A_payload_with_NO_run_still_resolves_the_catalog_and_still_drops_on_inactive()
+    {
+        // The catalog gates cover every OTHER trigger (watcher, shell), including the window where a
+        // profile is deactivated between enqueue and dequeue. Widening the frozen-profile lookup to those
+        // would be how a deactivated profile keeps moving files.
+        Profile inactive = _profile with { Active = false };
+        FakeJobExecutor executor = new();
+        using TriggerQueue queue = new(new FakePauseState(), NullLogger<TriggerQueue>.Instance);
+        JobOrchestrator orchestrator = OrchestratorOver(
+            inactive, executor, queue, new FrozenProfileSink(Guid.NewGuid(), _profile));
+
+        Assert.True(orchestrator.Start().IsSuccess);
+        queue.Enqueue(PayloadFor(inactive.Id));   // no RunId
+
+        await orchestrator.StopAsync();
+        Assert.Empty(executor.Executed);
+    }
+
+    /// <summary>Answers with one run's frozen profile and nothing else, so a test can tell "read the
+    /// snapshot" from "read the catalog" by which profile came back.</summary>
+    private sealed class FrozenProfileSink(Guid runId, Profile profile) : IRunSettleSink
+    {
+        public void Settled(Guid id, JobCompletion? completion) { }
+        public Profile? PlannedProfile(Guid id) => id == runId ? profile : null;
+    }
+
     /// <summary>A consume loop that dies takes the whole pipeline with it — Start() refuses to restart
     /// and every later trigger is accepted and silently never runs. The status snapshot has to say so:
     /// this was the one failure path that logged Critical and left LastError null, so get-status kept
@@ -238,7 +319,8 @@ public sealed class JobOrchestratorTests : IDisposable
         await _orchestrator.StopAsync();
     }
 
-    private JobOrchestrator OrchestratorOver(Profile profile, FakeJobExecutor executor, ITriggerQueue queue)
+    private JobOrchestrator OrchestratorOver(
+        Profile profile, FakeJobExecutor executor, ITriggerQueue queue, IRunSettleSink? runs = null)
     {
         EnginePaths paths = new() { Root = Path.Combine(_root, "engine-" + Guid.NewGuid().ToString("N")) };
         Directory.CreateDirectory(paths.JobLogsDirectory);
@@ -247,7 +329,7 @@ public sealed class JobOrchestratorTests : IDisposable
             queue, new FakeProfileCatalog(profile), executor, new JobPlanFactory(paths, config), _bus,
             new JobLogStore(paths, TimeProvider.System, NullLogger<JobLogStore>.Instance),
             new FakePauseState(), config, TimeProvider.System, NullMemoryTrimCoordinator.Instance,
-            NullRunSettleSink.Instance, NullLogger<JobOrchestrator>.Instance);
+            runs ?? NullRunSettleSink.Instance, NullLogger<JobOrchestrator>.Instance);
     }
 
     [Fact]

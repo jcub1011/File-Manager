@@ -23,20 +23,10 @@ public interface IIpcGateway
     Task<Result<Profile, IpcError>> GetProfileAsync(Guid profileId, CancellationToken ct = default);
     Task<Result<SaveOutcome, IpcError>> SaveProfileAsync(Profile profile, bool acknowledgeWarnings, CancellationToken ct = default);
     Task<Result<bool, IpcError>> DeleteProfileAsync(Guid profileId, CancellationToken ct = default);
-    /// <summary>Runs a streamed dry run, folding each chunk frame into <paramref name="sink"/> as it
-    /// arrives and returning only the run-level facts from the terminator.
-    /// <para>It streams rather than returning a <c>DryRunReport</c> for a memory reason, not a
-    /// stylistic one: assembling the report meant the whole run was live in the client at the same
-    /// time as the rows being projected out of it, which is most of the UI's peak at the 500k cap.
-    /// The caller's sink (<c>DryRunRowStore</c>) folds each chunk into its columns and drops it.</para>
-    /// <para><paramref name="progress"/> (when supplied) receives throttled discovery updates as the
-    /// service reports them; construct the <see cref="Progress{T}"/> on the UI thread so reports
-    /// marshal there automatically. When <paramref name="draft"/> is supplied, the service previews
-    /// that in-memory profile (unsaved edits) directly instead of resolving
-    /// <paramref name="profileId"/> against the persisted catalog.</para></summary>
-    Task<Result<DryRunCompletion, IpcError>> DryRunAsync(
-        Guid profileId, IDryRunChunkSink sink, IProgress<DryRunProgress>? progress = null,
-        Profile? draft = null, CancellationToken ct = default);
+    // No standalone dry-run method: the window's preview IS a run's planning phase, streamed back with
+    // GetRunPlanStreamAsync below. A second way to produce the same rows — one whose result no run would
+    // ever execute — is the thing this design exists to remove. The dry-run-stream request itself remains
+    // a service capability for non-GUI clients.
     Task<Result<GlobalSettings, IpcError>> GetSettingsAsync(CancellationToken ct = default);
     Task<Result<GlobalSettings, IpcError>> SaveSettingsAsync(GlobalSettings settings, CancellationToken ct = default);
     /// <summary>Relocates the profiles storage directory, optionally moving the existing files.
@@ -65,9 +55,29 @@ public interface IIpcGateway
     /// PROFILE_NOT_FOUND / PROFILE_INACTIVE / PATH_NOT_FOUND surface as an <see cref="IpcError"/>.</summary>
     /// <summary>Starts a run. <paramref name="path"/> null means the whole profile, which is what the
     /// window sends and what Mirror requires. The run PLANS first and touches nothing until
-    /// <see cref="ApproveRunAsync"/>; the plan's counts arrive as a <c>run-planned</c> event.</summary>
+    /// <see cref="ApproveRunAsync"/>; the plan's counts arrive as a <c>run-planned</c> event.
+    /// <para>This planning phase IS the window's preview: when <paramref name="draft"/> is supplied the
+    /// run plans that in-memory profile (unsaved edits) instead of resolving <paramref name="profileId"/>
+    /// against the persisted catalog, so what the user sees and what they approve are one work list. The
+    /// draft is frozen into the run's snapshot and the copies execute against it, not the catalog.</para></summary>
     Task<Result<RunProfileResponse, IpcError>> RunProfileAsync(
-        Guid profileId, string? path = null, CancellationToken ct = default);
+        Guid profileId, string? path = null, Profile? draft = null, CancellationToken ct = default);
+
+    /// <summary>Streams a pending run's frozen plan — the rows it will execute if approved — folding each
+    /// chunk into <paramref name="sink"/> as it arrives and returning only the run-level facts from the
+    /// terminator.
+    /// <para>It streams rather than returning a <c>DryRunReport</c> for a memory reason, not a stylistic
+    /// one: assembling the report meant the whole plan was live in the client at the same time as the rows
+    /// being projected out of it, which is most of the UI's peak at the 500k cap. The caller's sink
+    /// (<c>DryRunRowStore</c>) folds each chunk into its columns and drops it.</para>
+    /// <para>The service answers with the same frames a preview streams, so the preview's sink
+    /// (<c>DryRunRowStore</c>) and renderer are reused unchanged. Rows are read back from the snapshot
+    /// rather than re-planned: a re-scan would produce a DIFFERENT list from the one the run will
+    /// execute, which would defeat the point of showing it.</para>
+    /// <para>RUN_NOT_FOUND means the run is gone (closed, declined, or superseded) — a normal race, not a
+    /// fault.</para></summary>
+    Task<Result<DryRunCompletion, IpcError>> GetRunPlanStreamAsync(
+        Guid runId, IDryRunChunkSink sink, CancellationToken ct = default);
 
     /// <summary>Approves a planned run (starts the work) or declines it (closes it, changing nothing).</summary>
     Task<Result<bool, IpcError>> ApproveRunAsync(Guid runId, bool approve, CancellationToken ct = default);

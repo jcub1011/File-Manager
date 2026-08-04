@@ -2656,11 +2656,17 @@ public sealed partial class DryRunViewModel : ViewModelBase
     [ObservableProperty] public partial bool WasTruncated { get; set; }
     [ObservableProperty] public partial string TruncationNotice { get; set; } = "";
 
-    /// <summary>Live phase/count caption shown beside the run buttons while a dry run works
-    /// ("Scanning sources… 12,345 files found" → destinations → "Building the lists…"). The view
-    /// gates its visibility on <c>RunCommand.IsRunning</c>, so a late progress post after the run
-    /// ends is harmless.</summary>
+    /// <summary>Live phase/count caption shown beside the run buttons while a preview works
+    /// ("Working out what this will do…" → "Building the lists…"). The view gates its visibility on
+    /// <see cref="IsPreviewing"/>, so a late post after the preview ends is harmless.</summary>
     [ObservableProperty] public partial string RunStatusText { get; set; } = "";
+
+    /// <summary>True from the moment a preview is requested until its rows are on screen (or it
+    /// failed). Spans BOTH engine phases — the run's planning scan, which happens service-side and
+    /// reports nothing to this view model, and the plan-stream ingest that follows — because to the
+    /// user they are one wait. Replaces the old <c>RunCommand.IsRunning</c> the view used to gate on;
+    /// that command no longer exists, and it could not have covered the planning half anyway.</summary>
+    [ObservableProperty] public partial bool IsPreviewing { get; set; }
 
     // Blast-radius banner numbers (spec §8: deletions and overwrites are the report's whole point).
     [ObservableProperty] public partial int TotalFiles { get; set; }
@@ -2676,44 +2682,80 @@ public sealed partial class DryRunViewModel : ViewModelBase
 
     public bool CanRun => HasEditableProfile;
 
-    // ── Destination-scan choice behind the split run button ───────────────────────────────────
-    /// <summary>The scan choice the primary run button will use. Defaults to the profile's
-    /// <c>ScanDestination</c> setting via <see cref="ApplySyncSettings"/>; the dropdown overrides it
-    /// for subsequent run(s) without touching the saved profile. Forced true in Mirror.</summary>
+    // ── The pending run this preview IS ───────────────────────────────────────────────────────
+    // A preview is a real run's planning phase, parked in AwaitingApproval with nothing touched. So
+    // these are not decorations on a simulation: PendingRunId identifies work the engine is holding on
+    // this window's behalf, and it must be answered (approved or declined) or explicitly abandoned.
+
+    /// <summary>The run whose frozen plan is on screen and waiting for an answer, or null when there is
+    /// nothing to approve. Drives the footer's visibility.</summary>
+    [ObservableProperty] public partial Guid? PendingRunId { get; set; }
+
+    /// <summary>The plan's totals, straight off the <c>run-planned</c> event. These are the numbers the
+    /// footer states and the numbers the run will act on — the plan is a ceiling the executor can only
+    /// come in under (it re-screens and re-checks-unchanged), never exceed.</summary>
     [ObservableProperty]
-    [NotifyPropertyChangedFor(nameof(RunButtonLabel))]
-    public partial bool RunWithDestinationScan { get; set; }
+    [NotifyPropertyChangedFor(nameof(PlanSummary))]
+    public partial int PlannedCopies { get; set; }
 
-    /// <summary>False in Mirror, where the destination sweep is mandatory (it is the only source of
-    /// Deleted-orphan previews) — so the "No Destination Scan" dropdown item is disabled.</summary>
-    [ObservableProperty] public partial bool CanChooseNoScan { get; set; } = true;
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(PlanSummary), nameof(PlanTruncationNotice))]
+    public partial int PlannedDeletes { get; set; }
 
-    /// <summary>The two run-button / dropdown captions, defined once so the split button and its menu
-    /// items can never drift apart.</summary>
-    public string WithScanLabel => "Dry Run (With Destination Scan)";
-    public string NoScanLabel => "Dry Run (No Destination Scan)";
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(PlanSummary))]
+    public partial long PlannedCopyBytes { get; set; }
 
-    /// <summary>Primary run-button caption reflecting the current scan choice.</summary>
-    public string RunButtonLabel => RunWithDestinationScan ? WithScanLabel : NoScanLabel;
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(PlanSummary))]
+    public partial long PlannedDeleteBytes { get; set; }
 
-    /// <summary>Resets the run button's scan choice to the profile's default whenever the editor's
-    /// sync mode or ScanDestination setting changes (and on profile load). Mirror forces the scan on
-    /// and locks out the "No scan" option; AdditiveArchive follows the profile setting.</summary>
-    public void ApplySyncSettings(SyncMode mode, bool profileScanDestination)
+    /// <summary>The footer's one-line summary of what approving will do. Deletions lead when there are
+    /// any: removing files from a target is the only part that feels irreversible, so it must not be
+    /// the second clause.</summary>
+    public string PlanSummary
     {
-        CanChooseNoScan = mode != SyncMode.Mirror;
-        RunWithDestinationScan = Profile.ComputeEffectiveScanDestination(mode, profileScanDestination);
+        get
+        {
+            string copies = $"{PlannedCopies:N0} file(s) to copy or update ({ByteSize.Format(PlannedCopyBytes)})";
+            return PlannedDeletes > 0
+                ? $"{PlannedDeletes:N0} file(s) to REMOVE from the target folder(s) "
+                  + $"({ByteSize.Format(PlannedDeleteBytes)}) — these go to the Recycle Bin  ·  {copies}"
+                : copies;
+        }
     }
 
-    [RelayCommand]
-    private void SelectWithScan() => RunWithDestinationScan = true;
+    /// <summary>The Mirror blast-radius warning, or empty for a non-Mirror profile. Shown in the footer
+    /// beside the counts rather than in a dialog before the run, which is the point of the Preview tab:
+    /// the warning now sits next to the actual rows it describes.
+    /// <para>The filter caveat is not padding. An excluded source file contributes no survivor, so
+    /// tightening a filter on a Mirror profile removes files the profile previously copied — correct,
+    /// faithful to what is listed above, and utterly surprising if unsaid.</para></summary>
+    [ObservableProperty] public partial string MirrorWarning { get; set; } = "";
 
-    [RelayCommand]
-    private void SelectNoScan()
-    {
-        if (CanChooseNoScan)
-            RunWithDestinationScan = false;
-    }
+    /// <summary>Set when the plan does not cover everything that was scanned. Distinct from
+    /// <see cref="WasTruncated"/>, which describes the rows on screen: this one is what the RUN will do
+    /// about it, and for Mirror the answer is "remove nothing" — <c>MirrorDeletionPass</c> refuses a
+    /// truncated plan outright, so a footer that still promised deletions would be lying.</summary>
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(PlanTruncationNotice))]
+    public partial bool PlanTruncated { get; set; }
+
+    /// <summary>The truncated-plan footer notice, kept beside <see cref="PlanTruncated"/> so the two
+    /// cannot drift.</summary>
+    public string PlanTruncationNotice =>
+        "This plan does not cover everything that was scanned, so it may be incomplete."
+        + (PlannedDeletes > 0 ? " No files will be removed from the target folder(s)." : "");
+
+    /// <summary>Keeps the footer's Mirror warning in step with the editor's live sync mode. Called on
+    /// profile load and whenever the mode changes, so the warning describes the profile currently on
+    /// screen even before a plan exists.</summary>
+    public void ApplySyncMode(SyncMode mode) =>
+        MirrorWarning = mode == SyncMode.Mirror
+            ? "This is a MIRROR profile: every file listed for removal goes to the Recycle Bin. That "
+              + "includes files excluded by this profile's filters, so tightening a filter removes copies "
+              + "this profile made earlier."
+            : "";
 
     /// <summary>Attach the editor's open profile (new or existing). Enables the run and clears any
     /// prior preview. A null id is valid for a never-saved draft — the run sends the draft inline.</summary>
@@ -2732,6 +2774,7 @@ public sealed partial class DryRunViewModel : ViewModelBase
         ProfileId = null;
         ProfileName = "";
         HasEditableProfile = false;
+        MirrorWarning = "";
         ReportClosed();
     }
 
@@ -2741,51 +2784,109 @@ public sealed partial class DryRunViewModel : ViewModelBase
     /// report (generated from the pre-edit settings) would resurrect over the cleared preview.</summary>
     private int _reportEpoch;
 
-    [RelayCommand(IncludeCancelCommand = true)]
-    public async Task RunAsync(CancellationToken ct)
+    /// <summary>Marks the start of a preview: the shell has asked the engine to plan a run and is waiting
+    /// for its <c>run-planned</c> event. Clears the previous preview now rather than when the rows
+    /// arrive, so the tab does not sit showing a stale report throughout the scan.
+    /// <para>The clear releases the previous preview's rows and forest — without it the old report stays
+    /// alive while the next one is built, so consecutive previews peak at ~2x the row footprint (the
+    /// Gen2 pressure that makes a re-preview feel worse). It is the state-only <see cref="ClearReport"/>,
+    /// never <see cref="ReportClosed"/>: a preview about to start is not a safe moment for
+    /// <c>UiMemoryTrim</c>'s blocking two-pass collect on the UI thread.</para></summary>
+    public void BeginPlanning()
     {
-        // Build the editor's current draft (unsaved edits) when a provider is attached, so the run
-        // previews exactly what is on screen. A parse error short-circuits before any work. Without a
-        // provider (unit tests), fall back to the persisted-profile path keyed on ProfileId.
-        Profile? draft = null;
-        if (DraftProvider is not null)
-        {
-            (Profile? built, string? buildError) = DraftProvider();
-            if (buildError is not null)
-            {
-                ErrorMessage = buildError;
-                return;
-            }
-            // Apply the split button's per-run scan choice to the ephemeral draft only. The draft is
-            // never saved, so this override does not change the profile's stored ScanDestination.
-            draft = built is not null
-                ? built with { ScanDestination = RunWithDestinationScan }
-                : null;
-        }
-        Guid? runId = draft?.Id ?? ProfileId;
-        if (runId is not Guid profileId)
-            return;
-        // Release the previous preview's rows and forest now — this is the intentional "fresh run"
-        // path, so ClearReport bumps the epoch and nulls both tabs' _all/_visible/VisibleRows/Tree/
-        // TreeSource. Without it the old report stays alive while PrepareReport builds the next one, so
-        // consecutive runs peak at ~2x the row footprint (the Gen2-GC pressure that makes a re-run feel
-        // worse). The epoch bump also supersedes any run still in flight; the guard below drops this
-        // run's result if a later clear/run supersedes it in turn. This calls the state-only
-        // ClearReport(), not ReportClosed() — a run is never a safe moment for UiMemoryTrim's blocking
-        // collect.
         ClearReport();
+        // A previous preview's run is superseded by this one, so decline it rather than leaving it parked
+        // in AwaitingApproval with a snapshot directory nothing will ever answer for.
+        AbandonPendingRun();
+        EmptyStateText = DefaultEmptyState;   // a previous "nothing to do" says nothing about this run
+        PlanningRunId = null;                 // set by PlanningStarted once the engine accepts the run
+        IsPreviewing = true;
+        RunStatusText = "Working out what this will do…";
+    }
+
+    /// <summary>The run whose PLANNING is in flight, once the engine has accepted it. Distinct from
+    /// <see cref="PendingRunId"/>, which is a plan already on screen: this one exists only during the
+    /// scan, and it exists so that scan can be cancelled. Without it a large profile's preview would be
+    /// an uninterruptible wait — the affordance the old dry run had and this must not lose.</summary>
+    [ObservableProperty] public partial Guid? PlanningRunId { get; set; }
+
+    /// <summary>Called by the shell once <c>run-profile</c> has been accepted, so the planning scan
+    /// becomes cancellable.</summary>
+    public void PlanningStarted(Guid runId) => PlanningRunId = runId;
+
+    /// <summary>Stops the planning scan. Nothing has been touched at this point, so this is free —
+    /// the run is dropped and its snapshot cleaned up by the coordinator.</summary>
+    [RelayCommand]
+    private async Task CancelPreviewAsync()
+    {
+        if (PlanningRunId is not Guid runId)
+            return;
+        PlanningRunId = null;
+        // Ends the wait immediately rather than waiting for the engine to answer: the user asked for this
+        // to stop, and the plan event for a cancelled run may never arrive at all.
+        EndPlanning("Preview cancelled.");
+        try
+        {
+            var cancelled = await _gateway.CancelRunAsync(runId);
+            if (cancelled.TryGetError(out IpcError? error))
+                Log.Debug("Cancelling the planning run {RunId} failed: {Message}", runId, error.Message);
+        }
+        catch (Exception ex)
+        {
+            // Last-resort catch-all (directive): a command has no exception boundary of its own. A failed
+            // cancel is not worth a banner — the user's intent is already reflected on screen.
+            Log.Error(ex, "Cancelling the planning run {RunId} failed", runId);
+        }
+    }
+
+    /// <summary>What the tab says when there are no rows. Normally the invitation to preview; replaced by
+    /// <see cref="EndPlanning"/> when a plan came back with nothing to do.
+    /// <para>It has to be said HERE and not only as an activity notice: a preview navigates to this tab,
+    /// and the activity panel is closed until a run is actually approved — so an "everything is already up
+    /// to date" that lives only there is a message the user never sees.</para></summary>
+    [ObservableProperty] public partial string EmptyStateText { get; set; } = DefaultEmptyState;
+
+    private const string DefaultEmptyState = "Preview this profile to see exactly what a run would do.";
+
+    /// <summary>Abandons a preview that never produced rows: a refused request, a plan the engine reported
+    /// as failed, or a plan with nothing in it. <paramref name="error"/> raises the danger banner;
+    /// <paramref name="emptyState"/> replaces the placeholder for the benign "nothing to do" case.</summary>
+    public void EndPlanning(string? error = null, string? emptyState = null)
+    {
+        IsPreviewing = false;
+        RunStatusText = "";
+        PlanningRunId = null;   // the scan is over either way, so there is nothing left to cancel
+        if (error is not null)
+            ErrorMessage = error;
+        if (emptyState is not null)
+            EmptyStateText = emptyState;
+    }
+
+    /// <summary>Streams a planned run's frozen work list into the view and raises the approval footer.
+    ///
+    /// <para>This is the whole point of the two-phase run: the rows below are read back from the run's
+    /// snapshot, not re-planned, so what is listed is exactly what <see cref="ApproveRunCommand"/> will
+    /// execute. The frames are the same ones a preview always streamed, which is why the ingest path
+    /// below — store, meter, off-thread prepare, epoch guard — is unchanged.</para>
+    ///
+    /// <para>The caller owns the decision to be here: a failed plan, or one with nothing to do, is
+    /// answered by the shell and never reaches this method.</para></summary>
+    public async Task LoadPlanAsync(RunPlannedEvent planned, CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(planned);
+
+        // The epoch this plan belongs to. BeginPlanning already bumped it; a later clear or a superseding
+        // preview bumps it again, and the guard before ApplyPrepared drops this plan's rows if so.
         int epoch = _reportEpoch;
-        // Baseline for the churn figure on the two samples below — taken after the clear so it measures
-        // this run only, not the previous preview's teardown.
+        IsPreviewing = true;
+        PlanningRunId = null;   // the scan is done; from here the wait is this method's own ingest
+        // Baseline for the churn figures on the two samples below — taken after BeginPlanning's clear so
+        // it measures this preview only, not the previous one's teardown.
         long allocatedBefore = UiMemoryLog.AllocatedSnapshot();
-        RunStatusText = "Scanning sources…";
-        // Constructed on the UI thread, so Progress<T> captures the UI SynchronizationContext and
-        // every report marshals there — the service's throttling (~10 frames/sec) bounds the load.
-        var progress = new Progress<DryRunProgress>(p => RunStatusText = FormatRunStatus(p));
 
         try
         {
-            // The run streams straight into its store: chunks fold into columns as they arrive and
+            // The plan streams straight into its store: chunks fold into columns as they arrive and
             // are dropped, so the assembled report — which used to be live alongside the rows being
             // projected out of it — never exists here at all.
             DryRunRowStore store = DryRunRowStore.CreateForIngest();
@@ -2795,30 +2896,29 @@ public sealed partial class DryRunViewModel : ViewModelBase
                 ? new DryRunIngestMeter(store)
                 : null;
             long streamAllocatedBefore = UiMemoryLog.AllocatedSnapshot();
-            var run = await _gateway.DryRunAsync(profileId, meter ?? (IDryRunChunkSink)store, progress, draft, ct);
+            var run = await _gateway.GetRunPlanStreamAsync(
+                planned.RunId, meter ?? (IDryRunChunkSink)store, ct);
             meter?.Log(UiMemoryLog.AllocatedSnapshot() - streamAllocatedBefore);
             if (run.IsCanceled)
             {
-                Log.Debug("Dry run for profile {ProfileId} cancelled by the user", profileId);
-                ErrorMessage = "Dry run cancelled.";
+                Log.Debug("Preview of run {RunId} cancelled by the user", planned.RunId);
+                ErrorMessage = "Preview cancelled.";
                 return;
             }
             if (run.TryGetError(out IpcError? error))
             {
                 ErrorMessage = error.Code == "IPC_TRANSPORT"
-                    ? $"Dry run failed: {error.Message}. The connection to the background service was lost unexpectedly — see the service log in %LOCALAPPDATA%\\FileManager\\logs."
-                    : $"Dry run failed: {error.Message}";
+                    ? $"Preview failed: {error.Message}. The connection to the background service was lost unexpectedly — see the service log in %LOCALAPPDATA%\\FileManager\\logs."
+                    : $"Preview failed: {error.Message}";
                 return;
             }
             run.TryGetValue(out DryRunCompletion? completion);
-            // Set unconditionally (not only via a progress frame): a fast run may finish before any
-            // frame arrives, and the preparation below is real seconds of work worth labelling.
             RunStatusText = "Building the lists…";
             // Completing the store and sorting both tabs is seconds of CPU at the streamed cap, so it
             // runs on the thread pool. No ConfigureAwait(false): the continuation must resume on the
             // UI context so ApplyPrepared raises its property changes on the UI thread.
-            // RunCommand.IsRunning spans the preparation, so the view's progress bar keeps
-            // animating instead of the window freezing.
+            // IsPreviewing spans the preparation, so the view's progress bar keeps animating instead of
+            // the window freezing.
             long prepareAllocatedBefore = UiMemoryLog.AllocatedSnapshot();
             PreparedReport prepared = await Task.Run(() =>
             {
@@ -2844,35 +2944,110 @@ public sealed partial class DryRunViewModel : ViewModelBase
             // cannot see it at all.
             UiMemoryLog.Sample("preview-prepared (near peak)", allocatedBefore);
             if (_reportEpoch != epoch)
-                return;   // the preview was cleared while running — a stale report must not apply
+                return;   // superseded while streaming — a stale plan must not apply
             ApplyPrepared(prepared);
+            // Only now: the footer must never offer to approve a run whose rows are not the ones on
+            // screen, so it appears with them and not a moment earlier.
+            PlannedCopies = planned.PlannedCopies;
+            PlannedDeletes = planned.PlannedDeletes;
+            PlannedCopyBytes = planned.PlannedCopyBytes;
+            PlannedDeleteBytes = planned.PlannedDeleteBytes;
+            PlanTruncated = planned.Truncated;
+            PendingRunId = planned.RunId;
             // What the app now sits at with a preview on screen — the number a user reports.
             UiMemoryLog.Sample("preview-applied", allocatedBefore);
         }
         catch (OperationCanceledException)
         {
-            Log.Debug("Dry run for profile {ProfileId} cancelled by the user", profileId);
-            ErrorMessage = "Dry run cancelled.";
+            Log.Debug("Preview of run {RunId} cancelled by the user", planned.RunId);
+            ErrorMessage = "Preview cancelled.";
         }
         catch (Exception ex)
         {
             // Last resort: an unexpected exception becomes a logged error banner instead of an
             // unobserved command fault.
-            Log.Error(ex, "Dry run for profile {ProfileId} failed unexpectedly", profileId);
-            ErrorMessage = $"Dry run failed unexpectedly: {ex.Message}";
+            Log.Error(ex, "Preview of run {RunId} failed unexpectedly", planned.RunId);
+            ErrorMessage = $"Preview failed unexpectedly: {ex.Message}";
         }
         finally
         {
             RunStatusText = "";
+            IsPreviewing = false;
         }
     }
 
-    private static string FormatRunStatus(DryRunProgress p) => p.Phase switch
+    // ── Answering the pending run ─────────────────────────────────────────────────────────────
+    /// <summary>Set by the shell, and called with the user's answer once the engine has accepted it.
+    /// Mirrors <see cref="DraftProvider"/>: this view model owns the gateway call, the shell owns what
+    /// happens around it (the activity notice, and opening the panel on an approval — the payoff is
+    /// watching the run land). A null callback is silent, so headless tests are not blocked.</summary>
+    public Action<bool>? RunAnswered { get; set; }
+
+    /// <summary>Starts the run whose plan is on screen. THIS is the moment files begin to move — every
+    /// preceding phase was read-only by construction.</summary>
+    [RelayCommand]
+    private Task ApproveRunAsync() => AnswerPendingRunAsync(approve: true);
+
+    /// <summary>Declines the run whose plan is on screen, closing it and changing nothing.</summary>
+    [RelayCommand]
+    private Task DeclineRunAsync() => AnswerPendingRunAsync(approve: false);
+
+    private async Task AnswerPendingRunAsync(bool approve)
     {
-        DryRunProgressPhase.ScanningSources => $"Scanning sources… {p.SourceFiles:N0} files found",
-        DryRunProgressPhase.SweepingDestinations => $"Scanning destinations… {p.DestinationFiles:N0} files found",
-        _ => "Building the lists…",
-    };
+        if (PendingRunId is not Guid runId)
+            return;
+        // Cleared FIRST, so a double-click cannot answer the same run twice — the second call would be
+        // refused with RUN_NOT_APPROVABLE and land in the error banner for no reason.
+        PendingRunId = null;
+        try
+        {
+            var answered = await _gateway.ApproveRunAsync(runId, approve);
+            if (answered.IsCanceled)
+                return;
+            if (answered.TryGetError(out IpcError? error))
+            {
+                ErrorMessage = $"Could not {(approve ? "start" : "cancel")} the run: {error.Message}";
+                return;
+            }
+            RunAnswered?.Invoke(approve);
+        }
+        catch (Exception ex)
+        {
+            // Last-resort catch-all (directive): a command has no exception boundary of its own.
+            Log.Error(ex, "Answering run {RunId} with approve={Approve} failed", runId, approve);
+            ErrorMessage = $"Could not {(approve ? "start" : "cancel")} the run: {ex.Message}";
+        }
+    }
+
+    /// <summary>Declines the pending run without narrating it, for the paths that abandon a preview
+    /// rather than answer it: a superseding preview, and the profile being closed or switched.
+    /// <para>Not optional housekeeping. A run parked in <c>AwaitingApproval</c> holds a snapshot
+    /// directory and has no expiry of its own, so a preview left unanswered leaks one for the lifetime
+    /// of the service. Fire-and-forget: the caller is mid-transition and the answer is not interesting,
+    /// and an already-closed run answering RUN_NOT_APPROVABLE is a normal race here.</para></summary>
+    public void AbandonPendingRun()
+    {
+        if (ForgetPendingPlan() is not Guid runId)
+            return;
+        _ = _gateway.ApproveRunAsync(runId, approve: false)
+            .ContinueWith(
+                t => Log.Debug(t.Exception, "Declining superseded run {RunId} failed", runId),
+                CancellationToken.None,
+                TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
+                TaskScheduler.Default);
+    }
+
+    /// <summary>Drops the footer's state and returns the run id it was holding, if any. State only — it
+    /// tells the engine nothing.</summary>
+    private Guid? ForgetPendingPlan()
+    {
+        Guid? runId = PendingRunId;
+        PendingRunId = null;
+        PlannedCopies = PlannedDeletes = 0;
+        PlannedCopyBytes = PlannedDeleteBytes = 0;
+        PlanTruncated = false;
+        return runId;
+    }
 
     /// <summary>Shared by every source row with no destination ops (skipped files, ~2/3 of a typical
     /// report) — a fresh empty list per row is ~10 MB at the streamed cap.</summary>
@@ -3013,6 +3188,9 @@ public sealed partial class DryRunViewModel : ViewModelBase
         // selection/deselection where there is nothing to report.
         bool hadReport = HasReport;
         ClearReport();
+        // The user is done with this preview, and its run is still parked in AwaitingApproval holding a
+        // snapshot directory with no expiry of its own. Closing the profile is abandonment, so decline it.
+        AbandonPendingRun();
         if (!hadReport)
             return;
         // The rows are unrooted but not yet collected, so this reads barely changed from

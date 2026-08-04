@@ -10,7 +10,7 @@ using FileManager.UI.Views;
 namespace FileManager.UI.Tests;
 
 /// <summary>Where Ctrl+Z is live, through the real window. The gesture is handled at window scope so it
-/// works with focus in the sidebar, which means the ONLY thing keeping it off the Dry Run tab is the gate
+/// works with focus in the sidebar, which means the ONLY thing keeping it off the Preview tab is the gate
 /// in <c>MainWindow.OnUndoRedoKeyDown</c> — so that gate gets a test rather than a comment.
 ///
 /// Deliberately never calls <c>Close()</c>: MainWindow's OnClosing is a two-pass async teardown that
@@ -107,7 +107,7 @@ public sealed class MainWindowUndoScopeTests(HeadlessSessionFixture headless)
     }
 
     [Fact]
-    public async Task Ctrl_Z_on_the_dry_run_tab_leaves_the_profile_draft_alone()
+    public async Task Ctrl_Z_on_the_preview_tab_leaves_the_profile_draft_alone()
     {
         // The reported worry, pinned: stepping the profile backwards from a tab that shows a run preview
         // would be an edit the user cannot see happening.
@@ -116,16 +116,16 @@ public sealed class MainWindowUndoScopeTests(HeadlessSessionFixture headless)
             var (window, shell) = Show();
             try
             {
-                shell.NewProfile();                       // also makes the Dry Run tab reachable
+                shell.NewProfile();                       // also makes the Preview tab reachable
                 shell.Editor.ProfileName = "renamed";
                 window.UpdateLayout();
 
-                TabItem dryRun = Assert.IsType<TabItem>(window.FindControl<TabItem>("DryRunTab"));
+                TabItem preview = Assert.IsType<TabItem>(window.FindControl<TabItem>("PreviewTab"));
                 TabItem profile = Assert.IsType<TabItem>(window.FindControl<TabItem>("ProfileTab"));
-                dryRun.IsSelected = true;
+                preview.IsSelected = true;
                 window.UpdateLayout();
                 // Assert the switch actually took, or the rest of this test proves nothing.
-                Assert.True(dryRun.IsSelected);
+                Assert.True(preview.IsSelected);
                 Assert.False(profile.IsSelected);
 
                 // And focus something, or no KeyDown is raised at all and the test passes vacuously.
@@ -166,9 +166,9 @@ public sealed class MainWindowUndoScopeTests(HeadlessSessionFixture headless)
                 shell.Editor.ProfileName = "renamed";
                 window.UpdateLayout();
 
-                TabItem dryRun = Assert.IsType<TabItem>(window.FindControl<TabItem>("DryRunTab"));
+                TabItem preview = Assert.IsType<TabItem>(window.FindControl<TabItem>("PreviewTab"));
                 TabItem profile = Assert.IsType<TabItem>(window.FindControl<TabItem>("ProfileTab"));
-                dryRun.IsSelected = true;
+                preview.IsSelected = true;
                 window.UpdateLayout();
                 profile.IsSelected = true;
                 window.UpdateLayout();

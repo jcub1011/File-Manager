@@ -7,13 +7,13 @@ using FileManager.UI.ViewModels;
 
 namespace FileManager.UI.Tests;
 
-/// <summary>The approval half of a run: what the user is shown once the plan is known, and what the
-/// window does with their answer.
+/// <summary>What the window does with a plan once the engine has one, and with the run's terminal report.
 ///
 /// <para>The window is the only thing that turns a planned run into a real one. A run that plans and is
-/// never approved does nothing at all, so an approval path that silently drops a plan is a feature that
-/// appears broken; and an approval prompt that fails to mention destination deletions is how a Mirror
-/// run's destructive half reaches the disk unannounced. Both are pinned here.</para></summary>
+/// never answered does nothing at all AND leaves a snapshot directory parked on disk with no expiry, so
+/// every path out of "planned" has to end in an answer or a displayed plan. The three that never reach
+/// the Preview tab are pinned here: a failed plan, a plan with nothing to do, and someone else's
+/// plan.</para></summary>
 public sealed class MainWindowViewModelRunPlanTests
 {
     private static readonly Guid ProfileId = Guid.Parse("cccccccc-0000-0000-0000-000000000003");
@@ -34,234 +34,164 @@ public sealed class MainWindowViewModelRunPlanTests
         FakeIpcGateway gateway = new() { GetResult = profile ?? MirrorProfile() };
         MainWindowViewModel shell = new(
             gateway, new FakeFolderPicker(), new FakeLogFolder(), new FakeDryRunItemActions(),
-            clientSettingsPath: Path.Combine(Path.GetTempPath(), "fm-client-" + Guid.NewGuid().ToString("N") + ".json"))
-        {
-            ConfirmRunProfile = _ => Task.FromResult(true),
-        };
+            clientSettingsPath: Path.Combine(Path.GetTempPath(), "fm-client-" + Guid.NewGuid().ToString("N") + ".json"));
         return (shell, gateway);
     }
 
     private static RunPlannedEvent Planned(
-        Guid runId, int copies = 3, int deletes = 2, bool truncated = false, string? error = null) => new()
-        {
-            AtUtc = DateTimeOffset.UnixEpoch,
-            RunId = runId,
-            ProfileId = ProfileId,
-            PlannedCopies = copies,
-            PlannedDeletes = deletes,
-            PlannedCopyBytes = 3_000,
-            PlannedDeleteBytes = 2_000,
-            Truncated = truncated,
-            Error = error,
-        };
+        Guid runId, int copies = 3, int deletes = 2, bool truncated = false, string? error = null) =>
+        RunPlans.Planned(runId, ProfileId, copies, deletes, 3_000, 2_000, truncated, error);
 
-    /// <summary>Starts a run so the window is tracking its id, and returns that id.</summary>
-    private static async Task<Guid> StartRunAsync(MainWindowViewModel shell, FakeIpcGateway gateway)
+    /// <summary>Starts a preview so the window is tracking the run's id, and returns that id. The editor
+    /// must be holding the profile first: a preview plans the draft.</summary>
+    private static async Task<Guid> StartPreviewAsync(MainWindowViewModel shell, FakeIpcGateway gateway)
     {
+        shell.Editor.Load(MirrorProfile());
         Guid runId = Guid.NewGuid();
         gateway.RunProfileResult = new RunProfileResponse { RunId = runId };
-        await shell.RunProfileNowAsync(Row());
+        await shell.PreviewProfileAsync(Row());
         return runId;
     }
 
-    // ---- the confirmation the user answers before the scan ----------------------------------------
+    // ---- the plan the user is shown ---------------------------------------------------------------
 
     [Fact]
-    public async Task The_pre_run_confirmation_warns_that_a_MIRROR_run_deletes_at_the_target()
-    {
-        string? shown = null;
-        (MainWindowViewModel shell, _) = NewShell();
-        shell.ConfirmRunProfile = message => { shown = message; return Task.FromResult(false); };
-
-        await shell.RunProfileNowAsync(Row());
-
-        // Mirror's destructive half acts on the DESTINATION. A dialog naming only the source
-        // disposition describes the safe half of the run and stays silent about the half that deletes.
-        Assert.Contains("MIRROR", shown);
-        Assert.Contains("RECYCLE BIN", shown);
-        // And the consequence that will otherwise be reported as data loss: an excluded source file
-        // contributes no survivor, so tightening a filter removes copies made earlier.
-        Assert.Contains("filters", shown);
-    }
-
-    [Fact]
-    public async Task An_ADDITIVE_profile_confirmation_does_not_mention_deleting_at_the_target()
-    {
-        string? shown = null;
-        (MainWindowViewModel shell, _) = NewShell(MirrorProfile() with { SyncMode = SyncMode.AdditiveArchive });
-        shell.ConfirmRunProfile = message => { shown = message; return Task.FromResult(false); };
-
-        await shell.RunProfileNowAsync(Row());
-
-        Assert.DoesNotContain("MIRROR", shown);
-    }
-
-    [Fact]
-    public async Task The_pre_run_confirmation_says_nothing_happens_yet()
-    {
-        string? shown = null;
-        (MainWindowViewModel shell, _) = NewShell();
-        shell.ConfirmRunProfile = message => { shown = message; return Task.FromResult(false); };
-
-        await shell.RunProfileNowAsync(Row());
-
-        // Saying so is what makes the first dialog answerable: the user is agreeing to find out, not to
-        // move files.
-        Assert.Contains("Nothing is copied or deleted yet", shown);
-    }
-
-    // ---- the approval the user answers after the scan ---------------------------------------------
-
-    [Fact]
-    public async Task A_planned_run_is_APPROVED_when_the_user_agrees()
+    public async Task A_planned_run_streams_its_frozen_work_list_into_the_Preview_tab()
     {
         (MainWindowViewModel shell, FakeIpcGateway gateway) = NewShell();
-        Guid runId = await StartRunAsync(shell, gateway);
-        shell.ConfirmRunPlan = _ => Task.FromResult(true);
+        Guid runId = await StartPreviewAsync(shell, gateway);
 
         shell.HandleEngineEvent(Planned(runId));
-        await WaitUntilAsync(() => gateway.ApproveRunCalls.Count == 1);
+        await WaitUntilAsync(() => shell.DryRun.PendingRunId is not null);
 
-        Assert.Equal((runId, true), gateway.ApproveRunCalls[0]);
+        // Read back from the RUN's snapshot, not re-planned: a fresh scan would produce a different list
+        // from the one approving executes, which would defeat the entire point of showing it.
+        Assert.Equal(runId, Assert.Single(gateway.RunPlanStreamCalls));
+        Assert.Equal(runId, shell.DryRun.PendingRunId);
+        Assert.Equal(3, shell.DryRun.PlannedCopies);
+        Assert.Equal(2, shell.DryRun.PlannedDeletes);
+        // Nothing has been answered — the footer is now the user's move.
+        Assert.Empty(gateway.ApproveRunCalls);
     }
 
     [Fact]
-    public async Task A_planned_run_is_DECLINED_when_the_user_says_no()
+    public async Task The_footer_states_the_DELETE_count_first_for_a_Mirror_plan()
     {
+        // The deletion count is the most consequential number in the plan, and the one no other part of
+        // the tab totals for the user.
         (MainWindowViewModel shell, FakeIpcGateway gateway) = NewShell();
-        Guid runId = await StartRunAsync(shell, gateway);
-        shell.ConfirmRunPlan = _ => Task.FromResult(false);
+        Guid runId = await StartPreviewAsync(shell, gateway);
+
+        shell.HandleEngineEvent(Planned(runId, copies: 3, deletes: 2));
+        await WaitUntilAsync(() => shell.DryRun.PendingRunId is not null);
+
+        Assert.StartsWith("2 file(s) to REMOVE", shell.DryRun.PlanSummary);
+        Assert.Contains("Recycle Bin", shell.DryRun.PlanSummary);
+    }
+
+    [Fact]
+    public async Task A_MIRROR_profile_warns_in_the_footer_that_the_run_deletes_at_the_target()
+    {
+        // Mirror's destructive half acts on the DESTINATION, so a footer naming only counts would describe
+        // the safe part of the run and stay silent about the part that deletes.
+        (MainWindowViewModel shell, FakeIpcGateway gateway) = NewShell();
+        Guid runId = await StartPreviewAsync(shell, gateway);
 
         shell.HandleEngineEvent(Planned(runId));
-        await WaitUntilAsync(() => gateway.ApproveRunCalls.Count == 1);
+        await WaitUntilAsync(() => shell.DryRun.PendingRunId is not null);
 
-        // Declining must be sent, not merely not-approved: the service is holding a planned run and a
-        // frozen work list on disk, and only an answer closes it.
-        Assert.Equal((runId, false), gateway.ApproveRunCalls[0]);
-    }
-
-    [Fact]
-    public async Task The_approval_prompt_names_the_copy_and_DELETE_counts()
-    {
-        string? shown = null;
-        (MainWindowViewModel shell, FakeIpcGateway gateway) = NewShell();
-        Guid runId = await StartRunAsync(shell, gateway);
-        shell.ConfirmRunPlan = message => { shown = message; return Task.FromResult(false); };
-
-        shell.HandleEngineEvent(Planned(runId, copies: 812, deletes: 14));
-        await WaitUntilAsync(() => shown is not null);
-
-        Assert.Contains("812", shown);
-        // The number that matters: this is the only place the user sees how many files leave the target.
-        Assert.Contains("14", shown);
-        Assert.Contains("REMOVE", shown);
-        Assert.Contains("Recycle Bin", shown);
-    }
-
-    [Fact]
-    public async Task An_approval_prompt_with_no_deletions_does_not_mention_removing_anything()
-    {
-        string? shown = null;
-        (MainWindowViewModel shell, FakeIpcGateway gateway) = NewShell();
-        Guid runId = await StartRunAsync(shell, gateway);
-        shell.ConfirmRunPlan = message => { shown = message; return Task.FromResult(false); };
-
-        shell.HandleEngineEvent(Planned(runId, copies: 5, deletes: 0));
-        await WaitUntilAsync(() => shown is not null);
-
-        Assert.DoesNotContain("REMOVE", shown);
+        Assert.Contains("MIRROR", shell.DryRun.MirrorWarning);
+        Assert.Contains("Recycle Bin", shell.DryRun.MirrorWarning);
+        Assert.Contains("filters", shell.DryRun.MirrorWarning);
     }
 
     [Fact]
     public async Task A_TRUNCATED_plan_says_so_and_says_nothing_will_be_removed()
     {
-        string? shown = null;
         (MainWindowViewModel shell, FakeIpcGateway gateway) = NewShell();
-        Guid runId = await StartRunAsync(shell, gateway);
-        shell.ConfirmRunPlan = message => { shown = message; return Task.FromResult(false); };
+        Guid runId = await StartPreviewAsync(shell, gateway);
 
-        shell.HandleEngineEvent(Planned(runId, copies: 5, deletes: 3, truncated: true));
-        await WaitUntilAsync(() => shown is not null);
+        shell.HandleEngineEvent(Planned(runId, truncated: true));
+        await WaitUntilAsync(() => shell.DryRun.PendingRunId is not null);
 
-        Assert.Contains("may be incomplete", shown);
-        // The engine refuses the deletion phase on a truncated plan, so promising otherwise here would
-        // be a lie the user would only discover afterwards.
-        Assert.Contains("No files will be removed", shown);
+        Assert.True(shell.DryRun.PlanTruncated);
+        Assert.Contains("may be incomplete", shell.DryRun.PlanTruncationNotice);
+        // The engine refuses the deletion phase on a truncated plan, so promising otherwise here would be
+        // a lie the user would only discover afterwards.
+        Assert.Contains("No files will be removed", shell.DryRun.PlanTruncationNotice);
     }
 
+    // ---- the plans that never reach the tab -------------------------------------------------------
+
     [Fact]
-    public async Task A_plan_with_NOTHING_to_do_is_closed_without_asking()
+    public async Task A_plan_with_NOTHING_to_do_is_closed_without_showing_a_footer()
     {
-        bool asked = false;
         (MainWindowViewModel shell, FakeIpcGateway gateway) = NewShell();
-        Guid runId = await StartRunAsync(shell, gateway);
-        shell.ConfirmRunPlan = _ => { asked = true; return Task.FromResult(true); };
+        Guid runId = await StartPreviewAsync(shell, gateway);
 
         shell.HandleEngineEvent(Planned(runId, copies: 0, deletes: 0));
         await WaitUntilAsync(() => gateway.ApproveRunCalls.Count == 1);
 
-        // Nothing to approve, so nothing to interrupt the user for — but the run still has to be closed
-        // or it sits pending with a snapshot on disk.
-        Assert.False(asked);
+        // Nothing worth approving — but the run still has to be closed or it sits pending with a snapshot
+        // on disk that nothing will ever answer for.
         Assert.Equal((runId, false), gateway.ApproveRunCalls[0]);
+        Assert.Null(shell.DryRun.PendingRunId);
+        Assert.Empty(gateway.RunPlanStreamCalls);
+        Assert.Contains("Nothing to do", shell.Activity.Notice);
+        // And on the tab the preview just navigated to: the activity panel is closed until a run is
+        // approved, so a notice that lives only there is one the user never sees.
+        Assert.Contains("Nothing to do", shell.DryRun.EmptyStateText);
+        Assert.False(shell.DryRun.IsPreviewing);
     }
 
     [Fact]
-    public async Task A_FAILED_plan_is_reported_and_never_asked_about()
+    public async Task A_FAILED_plan_is_reported_and_never_streamed()
     {
-        bool asked = false;
         (MainWindowViewModel shell, FakeIpcGateway gateway) = NewShell();
-        Guid runId = await StartRunAsync(shell, gateway);
-        shell.ConfirmRunPlan = _ => { asked = true; return Task.FromResult(true); };
+        Guid runId = await StartPreviewAsync(shell, gateway);
 
         shell.HandleEngineEvent(Planned(runId, error: "source \"C:\\in\" is unreadable"));
-        await WaitUntilAsync(() => shell.List.ErrorMessage is not null);
+        await WaitUntilAsync(() => shell.DryRun.ErrorMessage is not null);
 
-        Assert.False(asked);
+        // The coordinator already closed the run, so there is nothing to answer and nothing to show.
         Assert.Empty(gateway.ApproveRunCalls);
-        Assert.Contains("unreadable", shell.List.ErrorMessage);
+        Assert.Empty(gateway.RunPlanStreamCalls);
+        Assert.Contains("unreadable", shell.DryRun.ErrorMessage);
+        Assert.Null(shell.DryRun.PendingRunId);
+        Assert.False(shell.DryRun.IsPreviewing);
     }
 
     [Fact]
     public async Task A_plan_for_ANOTHER_clients_run_is_ignored()
     {
         (MainWindowViewModel shell, FakeIpcGateway gateway) = NewShell();
-        await StartRunAsync(shell, gateway);
-        shell.ConfirmRunPlan = _ => Task.FromResult(true);
+        await StartPreviewAsync(shell, gateway);
 
         shell.HandleEngineEvent(Planned(Guid.NewGuid()));   // not ours
         await Task.Delay(100);
 
-        // The bus is a broadcast. Approving a run this user never started would be this window
-        // authorising someone else's file deletions.
+        // The bus is a broadcast. Showing — let alone offering to approve — a run this user never started
+        // would be this window authorising someone else's file deletions.
         Assert.Empty(gateway.ApproveRunCalls);
+        Assert.Empty(gateway.RunPlanStreamCalls);
+        Assert.Null(shell.DryRun.PendingRunId);
     }
 
-    [Fact]
-    public async Task A_null_approval_callback_proceeds_so_headless_runs_are_not_blocked()
-    {
-        (MainWindowViewModel shell, FakeIpcGateway gateway) = NewShell();
-        Guid runId = await StartRunAsync(shell, gateway);
-        shell.ConfirmRunPlan = null;
-
-        shell.HandleEngineEvent(Planned(runId));
-        await WaitUntilAsync(() => gateway.ApproveRunCalls.Count == 1);
-
-        Assert.Equal((runId, true), gateway.ApproveRunCalls[0]);
-    }
+    // ---- abandonment -----------------------------------------------------------------------------
 
     [Fact]
-    public async Task A_failed_approve_request_lands_in_the_banner()
+    public async Task Closing_the_window_declines_a_plan_left_waiting()
     {
+        // A pending run holds a snapshot directory and has no expiry of its own, so a preview the user
+        // walked away from would leak one for the lifetime of the service.
         (MainWindowViewModel shell, FakeIpcGateway gateway) = NewShell();
-        Guid runId = await StartRunAsync(shell, gateway);
-        shell.ConfirmRunPlan = _ => Task.FromResult(true);
-        gateway.ApproveRunResult = new IpcError("RUN_NOT_APPROVABLE", "run is Closed");
-
+        Guid runId = await StartPreviewAsync(shell, gateway);
         shell.HandleEngineEvent(Planned(runId));
-        await WaitUntilAsync(() => shell.List.ErrorMessage is not null);
+        await WaitUntilAsync(() => shell.DryRun.PendingRunId is not null);
 
-        Assert.Contains("Closed", shell.List.ErrorMessage);
+        await shell.RequestCloseAsync();
+
+        Assert.Contains((runId, false), gateway.ApproveRunCalls);
     }
 
     // ---- the terminal report ----------------------------------------------------------------------
@@ -270,7 +200,7 @@ public sealed class MainWindowViewModelRunPlanTests
     public async Task The_completion_notice_reports_copies_and_removals()
     {
         (MainWindowViewModel shell, FakeIpcGateway gateway) = NewShell();
-        Guid runId = await StartRunAsync(shell, gateway);
+        Guid runId = await StartPreviewAsync(shell, gateway);
 
         shell.HandleEngineEvent(new RunCompletedEvent
         {
@@ -293,7 +223,7 @@ public sealed class MainWindowViewModelRunPlanTests
     public async Task A_run_whose_deletions_were_REFUSED_says_so_in_the_completion_notice()
     {
         (MainWindowViewModel shell, FakeIpcGateway gateway) = NewShell();
-        Guid runId = await StartRunAsync(shell, gateway);
+        Guid runId = await StartPreviewAsync(shell, gateway);
 
         shell.HandleEngineEvent(new RunCompletedEvent
         {

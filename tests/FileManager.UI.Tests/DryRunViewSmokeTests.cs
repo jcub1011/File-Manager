@@ -5,6 +5,7 @@ using System.Linq;
 using FileManager.Contracts.DryRun;
 using FileManager.Contracts.Profiles;
 using FileManager.UI.Tests.Fakes;
+using FileManager.UI.Tests.TestData;
 using FileManager.UI.ViewModels;
 using FileManager.UI.Views;
 
@@ -18,7 +19,7 @@ namespace FileManager.UI.Tests;
 [Collection(HeadlessCollection.Name)]
 public sealed class DryRunViewSmokeTests(HeadlessSessionFixture headless)
 {
-    private DryRunViewModel PopulatedViewModel()
+    private (DryRunViewModel ViewModel, FakeIpcGateway Gateway) PopulatedViewModel()
     {
         FakeIpcGateway gateway = new();
         // Zero debounce: no pending Task.Delay is scheduled on the headless dispatcher.
@@ -56,7 +57,7 @@ public sealed class DryRunViewSmokeTests(HeadlessSessionFixture headless)
         destinationOps.Add(DstOp(OperationKind.Deleted, @"D:\dst\orphan.dat", @"D:\dst", subjectIndex: orphanSubject));
 
         gateway.DryRunResult = Report(vm.ProfileId!.Value, sourceFiles, sourceOps, destinationFiles, destinationOps);
-        return vm;
+        return (vm, gateway);
     }
 
     // New-model fixture helpers (see DryRunViewModelTests for the model shape). Paths run through a
@@ -104,8 +105,8 @@ public sealed class DryRunViewSmokeTests(HeadlessSessionFixture headless)
     {
         await headless.Session.DispatchAsync(async () =>
         {
-            DryRunViewModel vm = PopulatedViewModel();
-            await vm.RunAsync(CancellationToken.None);
+            var (vm, gateway) = PopulatedViewModel();
+            await RunPlans.PreviewAsync(vm, gateway);
 
             var (window, _) = ShowView(vm);
             try
@@ -119,12 +120,44 @@ public sealed class DryRunViewSmokeTests(HeadlessSessionFixture headless)
     }
 
     [Fact]
+    public async Task The_approval_footer_lays_out_when_a_plan_is_pending()
+    {
+        // The footer is the one band that renders only in a state the other cases never reach, so without
+        // this its XAML — a docked bar with two buttons and two info bars — is compiled but never laid
+        // out, and a runtime-only failure in it would first appear in the app.
+        await headless.Session.DispatchAsync(async () =>
+        {
+            var (vm, gateway) = PopulatedViewModel();
+            vm.ApplySyncMode(SyncMode.Mirror);   // so the Mirror warning bar renders too
+            await RunPlans.PreviewAsync(vm, gateway, copies: 4, deletes: 2, truncated: true);
+            Assert.NotNull(vm.PendingRunId);
+
+            var (window, view) = ShowView(vm);
+            try
+            {
+                Button approve = view.GetVisualDescendants().OfType<Button>()
+                    .Single(b => b.Command == vm.ApproveRunCommand);
+                Button discard = view.GetVisualDescendants().OfType<Button>()
+                    .Single(b => b.Command == vm.DeclineRunCommand);
+                Assert.True(approve.IsEffectivelyVisible);
+                Assert.True(approve.Bounds.Width > 0, "the Approve Run button laid out to zero width");
+                Assert.True(discard.Bounds.Width > 0, "the Discard button laid out to zero width");
+                // The two info bars are part of the same band and only render in this state, so a broken
+                // binding or template in either would otherwise reach the app unseen.
+                Assert.NotEqual("", vm.MirrorWarning);
+                Assert.True(vm.PlanTruncated);
+            }
+            finally { window.Close(); }
+        }, CancellationToken.None);
+    }
+
+    [Fact]
     public async Task Destinations_tab_loads_and_lays_out()
     {
         await headless.Session.DispatchAsync(async () =>
         {
-            DryRunViewModel vm = PopulatedViewModel();
-            await vm.RunAsync(CancellationToken.None);
+            var (vm, gateway) = PopulatedViewModel();
+            await RunPlans.PreviewAsync(vm, gateway);
 
             var (window, _) = ShowView(vm);   // both panels realize at once — no tab to select
             try
@@ -155,7 +188,7 @@ public sealed class DryRunViewSmokeTests(HeadlessSessionFixture headless)
             };
             gateway.DryRunResult = Report(vm.ProfileId!.Value,
                 [Pf(@"C:\src\reports\annual-summary.docx", @"C:\src")], srcOps, [], dstOps);
-            await vm.RunAsync(CancellationToken.None);
+            await RunPlans.PreviewAsync(vm, gateway);
 
             var (window, _) = ShowView(vm);
             try
@@ -190,7 +223,7 @@ public sealed class DryRunViewSmokeTests(HeadlessSessionFixture headless)
                 destinationOps.Add(DstOp(OperationKind.New, $@"D:\dst\file-{i}.dat", @"D:\dst", sourceIndex: i));
             }
             gateway.DryRunResult = Report(vm.ProfileId!.Value, sourceFiles, sourceOps, [], destinationOps);
-            await vm.RunAsync(CancellationToken.None);
+            await RunPlans.PreviewAsync(vm, gateway);
 
             var (window, _) = ShowView(vm);
             try
@@ -211,10 +244,10 @@ public sealed class DryRunViewSmokeTests(HeadlessSessionFixture headless)
     {
         await headless.Session.DispatchAsync(async () =>
         {
-            DryRunViewModel vm = PopulatedViewModel();
+            var (vm, gateway) = PopulatedViewModel();
             // RunAsync hops to the thread pool for report preparation, so blocking the dispatcher
             // thread with GetResult() here would deadlock — await it instead.
-            await vm.RunAsync(CancellationToken.None);
+            await RunPlans.PreviewAsync(vm, gateway);
             vm.Sources.ShowTree = true;               // build the forest before showing so the TreeView realizes
 
             var (window, _) = ShowView(vm);           // no throw ⇒ TreeDataTemplate + pills + VSP + IsExpanded binding valid
@@ -234,10 +267,10 @@ public sealed class DryRunViewSmokeTests(HeadlessSessionFixture headless)
     {
         await headless.Session.DispatchAsync(async () =>
         {
-            DryRunViewModel vm = PopulatedViewModel();
+            var (vm, gateway) = PopulatedViewModel();
             // RunAsync hops to the thread pool for report preparation, so blocking the dispatcher
             // thread with GetResult() here would deadlock — await it instead.
-            await vm.RunAsync(CancellationToken.None);
+            await RunPlans.PreviewAsync(vm, gateway);
             vm.Destinations.ShowTree = true;
 
             var (window, _) = ShowView(vm);
@@ -257,8 +290,8 @@ public sealed class DryRunViewSmokeTests(HeadlessSessionFixture headless)
         // A narrow window exercises the toolbar/search-box shrink and the min-width columns without clipping.
         await headless.Session.DispatchAsync(async () =>
         {
-            DryRunViewModel vm = PopulatedViewModel();
-            await vm.RunAsync(CancellationToken.None);
+            var (vm, gateway) = PopulatedViewModel();
+            await RunPlans.PreviewAsync(vm, gateway);
 
             DryRunView view = new() { DataContext = vm };
             Window window = new() { Width = 760, Height = 700, Content = view };
@@ -310,7 +343,7 @@ public sealed class DryRunViewSmokeTests(HeadlessSessionFixture headless)
                 ],
             };
             gateway.DryRunResult = report with { Space = space };
-            await vm.RunAsync(CancellationToken.None);
+            await RunPlans.PreviewAsync(vm, gateway);
 
             var (window, _) = ShowView(vm);
             try
@@ -328,8 +361,8 @@ public sealed class DryRunViewSmokeTests(HeadlessSessionFixture headless)
     {
         await headless.Session.DispatchAsync(async () =>
         {
-            DryRunViewModel vm = PopulatedViewModel();
-            await vm.RunAsync(CancellationToken.None);
+            var (vm, gateway) = PopulatedViewModel();
+            await RunPlans.PreviewAsync(vm, gateway);
 
             var (window, _) = ShowView(vm);
             try

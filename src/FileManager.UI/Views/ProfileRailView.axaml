@@ -60,11 +60,11 @@
                 <Border Classes="avatar" ToolTip.Tip="{Binding Name}">
                     <Border.ContextMenu>
                         <ContextMenu x:DataType="vm:ProfileListItem">
-                            <MenuItem Header="Run now…" Command="{Binding RunCommand}" CommandParameter="{Binding}"
+                            <MenuItem Header="Preview…" Command="{Binding RunCommand}" CommandParameter="{Binding}"
                                       IsEnabled="{Binding Active}"
-                                      ToolTip.Tip="Performs a real run: moves files and applies the source disposition.">
+                                      ToolTip.Tip="Opens this profile and works out exactly what it will do. Nothing is copied or deleted until you approve it.">
                                 <MenuItem.Icon>
-                                    <PathIcon Data="{StaticResource IconPlay}" Width="12" Height="12" />
+                                    <PathIcon Data="{StaticResource IconSearch}" Width="12" Height="12" />
                                 </MenuItem.Icon>
                             </MenuItem>
                             <MenuItem Header="Export…" Command="{Binding ExportCommand}" CommandParameter="{Binding}">

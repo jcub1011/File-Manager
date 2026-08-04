@@ -62,14 +62,16 @@ public sealed partial class MainWindowViewModel : ViewModelBase
 
         List.CreateProfileCommand = NewProfileCommand;
         List.ExportProfileCommand = ExportProfileCommand;
-        List.RunProfileCommand = RunProfileNowCommand;
+        List.RunProfileCommand = PreviewProfileCommand;
         List.DeleteProfileCommand = DeleteProfileCommand;
         List.CanNavigate = () => !Editor.IsDirty;
         List.NavigationBlocked = () => Editor.ShowUnsavedWarning = true;
-        List.SelectionCommitted = item => _ = LoadSelectionSafeAsync(item);
+        // Kept rather than discarded so a caller that MOVES the selection can await the load it started
+        // — PreviewProfileAsync must not plan a draft the editor has not finished loading.
+        List.SelectionCommitted = item => _selectionLoad = LoadSelectionSafeAsync(item);
         Editor.Saved = profileId => _ = AfterSaveAsync(profileId);
 
-        // Dry run previews the editor's current draft (unsaved edits), so it can run without saving.
+        // A preview plans the editor's current draft (unsaved edits), so it runs without saving.
         // Discard can land on a still-open profile (revert/new) or a cleared editor — mirror that so
         // the run isn't left enabled against nothing.
         Editor.Discarded = () =>
@@ -77,13 +79,21 @@ public sealed partial class MainWindowViewModel : ViewModelBase
             if (Editor.HasProfile)
             {
                 DryRun.SetProfile(List.SelectedProfile?.ProfileId, Editor.ProfileName);
-                DryRun.ApplySyncSettings(Editor.SyncMode, Editor.ScanDestination);
+                DryRun.ApplySyncMode(Editor.SyncMode);
             }
             else
                 DryRun.ClearProfile();
         };
         DryRun.DraftProvider = () =>
             Editor.TryBuildDraft(out Profile? draft, out string? error) ? (draft, null) : ((Profile?)null, error);
+        DryRun.RunAnswered = approved =>
+        {
+            if (approved)
+                ActivityVisible = true;   // the payoff: the user watches the run land
+            Activity.ShowNotice(approved
+                ? "Run approved — starting now."
+                : "Run discarded — nothing was changed.");
+        };
         // Keep the sidebar's unsaved-changes marker and row-locking in step with the editor's dirty
         // state: while dirty, other rows become unselectable so the user can't appear to navigate away.
         Editor.PropertyChanged += (_, e) =>
@@ -93,12 +103,11 @@ public sealed partial class MainWindowViewModel : ViewModelBase
                 List.HasUnsavedChanges = Editor.IsDirty;
                 List.UnsavedProfileId = Editor.IsDirty ? List.SelectedProfile?.ProfileId : null;
             }
-            // Keep the dry-run split button's default scan choice in step with the editor's live
-            // sync mode / ScanDestination (a dropdown override is transient and reset on any change).
-            else if (e.PropertyName is nameof(ProfileEditorViewModel.SyncMode)
-                     or nameof(ProfileEditorViewModel.ScanDestination))
+            // Keep the Preview footer's Mirror warning in step with the editor's live sync mode, so it
+            // describes the profile on screen rather than the one the last plan was built from.
+            else if (e.PropertyName == nameof(ProfileEditorViewModel.SyncMode))
             {
-                DryRun.ApplySyncSettings(Editor.SyncMode, Editor.ScanDestination);
+                DryRun.ApplySyncMode(Editor.SyncMode);
             }
         };
 
@@ -114,6 +123,18 @@ public sealed partial class MainWindowViewModel : ViewModelBase
     public DryRunViewModel DryRun { get; }
     public StatusBarViewModel StatusBar { get; }
     public ActivityViewModel Activity { get; }
+
+    /// <summary>The Profile tab's index in the document TabControl.</summary>
+    public const int ProfileTabIndex = 0;
+
+    /// <summary>The Preview tab's index in the document TabControl.</summary>
+    public const int PreviewTabIndex = 1;
+
+    /// <summary>Which document tab is showing. Two-way bound, because a preview NAVIGATES: the user
+    /// presses Preview on the Profile tab and the rows they asked for appear on the Preview tab, which
+    /// only works if the view model can move the selection.</summary>
+    [ObservableProperty]
+    public partial int SelectedTabIndex { get; set; }
 
     /// <summary>Whether the activity panel is showing. It docks above the status bar, OUTSIDE the
     /// document area's profile gate, because engine activity is global state — not per-profile.</summary>
@@ -155,8 +176,8 @@ public sealed partial class MainWindowViewModel : ViewModelBase
         }
         List.SelectedProfile = null;
         Editor.LoadNew();
-        DryRun.SetProfile(null, Editor.ProfileName);   // new/unsaved profile is still dry-runnable
-        DryRun.ApplySyncSettings(Editor.SyncMode, Editor.ScanDestination);
+        DryRun.SetProfile(null, Editor.ProfileName);   // a never-saved profile is still previewable
+        DryRun.ApplySyncMode(Editor.SyncMode);
     }
 
     [RelayCommand]
@@ -170,14 +191,14 @@ public sealed partial class MainWindowViewModel : ViewModelBase
             _ = Activity.ReconcileAsync();   // the event stream is lossy; re-seed on open
     }
 
-    /// <summary>Set by the composition root to confirm a manual run before it is submitted. Mirrors
-    /// <see cref="ConfirmClose"/>; a null callback proceeds, so headless tests are not blocked.</summary>
-    public Func<string, Task<bool>>? ConfirmRunProfile { get; set; }
-
     // Run ids this window started, pending their run-queued event. Bounded: a run whose event never
     // arrives (service restart mid-scan) would otherwise leak an entry per run for the session.
     private const int MaxTrackedRuns = 32;
     private readonly HashSet<Guid> _ownRunIds = [];
+
+    // The in-flight editor load started by the last selection change, so a caller that moved the
+    // selection itself can await it. Never null: an un-awaited completed task is the no-op case.
+    private Task _selectionLoad = Task.CompletedTask;
 
     private void RememberOwnRun(Guid runId)
     {
@@ -186,76 +207,95 @@ public sealed partial class MainWindowViewModel : ViewModelBase
         _ownRunIds.Add(runId);
     }
 
-    /// <summary>Submits a real run of the selected profile (spec §3.2 manual invocation). This MOVES
-    /// FILES and applies the profile's source disposition, so it always confirms first, and the dialog
-    /// is the only place the user sees the blast radius (source roots + disposition) spelled out.</summary>
+    /// <summary>Previews what the selected profile will do, by starting the PLANNING phase of a real run
+    /// and showing its frozen work list on the Preview tab.
+    ///
+    /// <para>There is no confirmation dialog here and nothing to confirm: planning is read-only by
+    /// construction, and the run parks in <c>AwaitingApproval</c> until the Preview tab's footer answers
+    /// it. That footer — showing the actual rows — is what the old blast-radius dialog was standing in
+    /// for.</para>
+    ///
+    /// <para>The run plans the editor's DRAFT, so what is previewed is what is on screen, unsaved edits
+    /// included. The draft is frozen into the run's snapshot and the copies execute against it, so
+    /// approving cannot run a different profile than the one previewed.</para></summary>
     [RelayCommand]
-    public async Task RunProfileNowAsync(ProfileListItem? item)
+    public async Task PreviewProfileAsync(ProfileListItem? item)
     {
-        if (item is null)
-            return;
+        // Null covers two callers: the Profile tab's button before a row is selected, and the Preview
+        // tab's own button, which previews whatever the editor already holds.
+        string name = item?.Name ?? List.SelectedProfile?.Name ?? Editor.ProfileName;
         try
         {
-            // run-profile resolves against the PERSISTED catalog, so unsaved edits would be silently
-            // ignored. Refuse, reusing the editor's existing unsaved-changes affordance.
-            if (Editor.IsDirty && List.UnsavedProfileId == item.ProfileId)
+            // A row's menu can name a profile other than the one open in the editor, and the draft is
+            // the only thing a preview plans — so open it first, through the list's selection, which is
+            // what applies the unsaved-changes guard. A refused navigation leaves the editor's edits
+            // alone and previews nothing, exactly as the old command refused to run a dirty profile.
+            if (item is not null && item.ProfileId != List.SelectedProfile?.ProfileId)
             {
-                Editor.ShowUnsavedWarning = true;
+                List.SelectedProfile = item;
+                if (List.SelectedProfile?.ProfileId != item.ProfileId)
+                    return;
+                await _selectionLoad;   // the load that selection just started
+            }
+
+            // The draft IS the profile to plan. A parse error is the editor's to report, and it stops
+            // this before the tab switches — a Preview tab showing nothing is worse than staying put.
+            if (!Editor.TryBuildDraft(out Profile? draft, out string? buildError))
+            {
+                List.ErrorMessage = buildError;
+                return;
+            }
+            if (draft is null)
+                return;
+            if (draft.Sources.Count == 0)
+            {
+                List.ErrorMessage = $"\"{name}\" has no sources to run.";
                 return;
             }
 
-            var profileResult = await _gateway.GetProfileAsync(item.ProfileId);
-            if (profileResult.IsCanceled)
-                return;
-            if (profileResult.TryGetError(out IpcError? loadError))
-            {
-                List.ErrorMessage = $"Could not run \"{item.Name}\": {loadError.Message}";
-                return;
-            }
-            profileResult.TryGetValue(out Profile? profile);
-
-            if (profile!.Sources.Count == 0)
-            {
-                List.ErrorMessage = $"\"{item.Name}\" has no sources to run.";
-                return;
-            }
-
-            if (ConfirmRunProfile is not null && !await ConfirmRunProfile(BuildRunConfirmation(profile)))
-                return;
-
-            ActivityVisible = true;   // the payoff: the user watches the run land
             List.ErrorMessage = null;
+            SelectedTabIndex = PreviewTabIndex;
+            // Clears the previous preview and declines the run it was holding, BEFORE this one exists —
+            // so at most one run is ever parked awaiting this window's approval.
+            DryRun.BeginPlanning();
 
             // ONE request for the whole profile. This used to be one per source root, which is wrong
             // for Mirror: an orphan is "a destination file no source writes to", so the decision can
             // only be made over the complete source set — N independent runs would each see the other
             // sources' files as orphans.
-            var run = await _gateway.RunProfileAsync(profile.Id, path: null);
+            // draft.Id, not the list row's: for a never-saved profile they are the same value and there
+            // is no row, and for a saved one the draft carries the persisted id anyway.
+            var run = await _gateway.RunProfileAsync(draft.Id, path: null, draft: draft);
             if (run.IsCanceled)
+            {
+                DryRun.EndPlanning();
                 return;
+            }
             if (run.TryGetError(out IpcError? runError))
             {
-                List.ErrorMessage = $"Could not run \"{item.Name}\": {runError.Message}";
+                DryRun.EndPlanning($"Could not preview \"{name}\": {runError.Message}");
                 return;
             }
             run.TryGetValue(out RunProfileResponse? started);
             // Remembered so the broadcast run-planned/run-completed events can be recognized as OURS —
-            // and, for run-planned, so this window is the one that asks for approval.
+            // and, for run-planned, so this window is the one that shows the plan.
             RememberOwnRun(started!.RunId);
-            Activity.ShowNotice($"Working out what \"{item.Name}\" will do…");
+            // Makes the planning scan cancellable: a large profile's plan is minutes of walking, and the
+            // user must be able to stop it.
+            DryRun.PlanningStarted(started.RunId);
         }
         catch (Exception ex)
         {
             // Last-resort catch-all (directive): a command has no exception boundary of its own.
-            Log.Error(ex, "Running profile {ProfileId} failed", item.ProfileId);
-            List.ErrorMessage = $"Could not run \"{item.Name}\": {ex.Message}";
+            Log.Error(ex, "Previewing profile \"{Name}\" failed", name);
+            DryRun.EndPlanning($"Could not preview \"{name}\": {ex.Message}");
         }
     }
 
     /// <summary>Set by the composition root to confirm a delete before it is submitted. Mirrors
-    /// <see cref="ConfirmRunProfile"/>: a modal, so the same confirmation appears whether the delete
-    /// came from the Profile tab, a list row, or the collapsed rail. A null callback proceeds, so
-    /// headless tests are not blocked.</summary>
+    /// <see cref="ConfirmClose"/>: a modal, so the same confirmation appears whether the delete came
+    /// from the Profile tab, a list row, or the collapsed rail. A null callback proceeds, so headless
+    /// tests are not blocked.</summary>
     public Func<string, Task<bool>>? ConfirmDeleteProfile { get; set; }
 
     /// <summary>Deletes a profile after confirming. Falls back to the selected profile so the Profile
@@ -277,76 +317,41 @@ public sealed partial class MainWindowViewModel : ViewModelBase
         await List.DeleteAsync(item);
     }
 
-    /// <summary>Set by the composition root to approve a planned run once its itemized totals are known.
-    /// A null callback APPROVES, so a headless test is not blocked — matching how
-    /// <see cref="ConfirmRunProfile"/> treats a null.</summary>
-    public Func<string, Task<bool>>? ConfirmRunPlan { get; set; }
-
-    /// <summary>Shows the plan's totals and approves or declines the run.
+    /// <summary>Shows a finished plan on the Preview tab, where its footer asks for the approval.
+    ///
     /// <para>This is the moment the two-phase run exists for: the work list is frozen, nothing has been
-    /// touched, and the numbers shown are the numbers that will happen. A plan that failed outright is
-    /// reported instead of asked about — there is nothing to approve.</para></summary>
-    private async Task ApproveOrDeclineRunAsync(RunPlannedEvent planned)
+    /// touched, and what is displayed is what will happen. Two plans never reach the view — one that
+    /// failed outright (nothing to approve) and one with nothing to do (nothing worth approving); both
+    /// are answered here so no run is left parked holding a snapshot.</para></summary>
+    private async Task ShowRunPlanAsync(RunPlannedEvent planned)
     {
         try
         {
             if (planned.Error is { } planError)
             {
                 _ownRunIds.Remove(planned.RunId);
-                List.ErrorMessage = $"Could not work out what to run: {planError}";
+                DryRun.EndPlanning($"Could not work out what to run: {planError}");
                 return;
             }
             if (planned.PlannedCopies == 0 && planned.PlannedDeletes == 0)
             {
                 _ownRunIds.Remove(planned.RunId);
+                DryRun.EndPlanning(emptyState: "Nothing to do — everything is already up to date.");
                 await _gateway.ApproveRunAsync(planned.RunId, approve: false);
                 Activity.ShowNotice("Nothing to do — everything is already up to date.");
                 return;
             }
 
-            bool approve = ConfirmRunPlan is null || await ConfirmRunPlan(BuildPlanConfirmation(planned));
-            var answered = await _gateway.ApproveRunAsync(planned.RunId, approve);
-            if (answered.TryGetError(out IpcError? error))
-            {
-                _ownRunIds.Remove(planned.RunId);
-                List.ErrorMessage = $"Could not {(approve ? "start" : "cancel")} the run: {error.Message}";
-                return;
-            }
-            if (!approve)
-            {
-                _ownRunIds.Remove(planned.RunId);
-                Activity.ShowNotice("Run cancelled — nothing was changed.");
-            }
+            await DryRun.LoadPlanAsync(planned);
         }
         catch (Exception ex)
         {
             // Last-resort catch-all (directive): this is a fire-and-forget continuation off the event
             // pump, so it has no exception boundary of its own.
-            Log.Error(ex, "Approving run {RunId} failed", planned.RunId);
+            Log.Error(ex, "Showing the plan for run {RunId} failed", planned.RunId);
             _ownRunIds.Remove(planned.RunId);
-            List.ErrorMessage = $"Could not start the run: {ex.Message}";
+            DryRun.EndPlanning($"Could not show what the run will do: {ex.Message}");
         }
-    }
-
-    /// <summary>The approval text: what the frozen plan says will happen, in counts. The deletion line
-    /// leads when there is one, because it is the only irreversible-feeling part.</summary>
-    private static string BuildPlanConfirmation(RunPlannedEvent planned)
-    {
-        string text = "Ready to run." + Environment.NewLine + Environment.NewLine
-            + $"    {planned.PlannedCopies} file(s) to copy or update"
-            + $" ({ByteSize.Format(planned.PlannedCopyBytes)})";
-        if (planned.PlannedDeletes > 0)
-            text += Environment.NewLine
-                + $"    {planned.PlannedDeletes} file(s) to REMOVE from the target folder(s)"
-                + $" ({ByteSize.Format(planned.PlannedDeleteBytes)}) — these go to the Recycle Bin";
-        if (planned.Truncated)
-            text += Environment.NewLine + Environment.NewLine
-                + "NOTE: this plan does not cover everything that was scanned, so it may be incomplete."
-                + (planned.PlannedDeletes > 0
-                    ? " No files will be removed from the targets."
-                    : "");
-        text += Environment.NewLine + Environment.NewLine + "Go ahead?";
-        return text;
     }
 
     private static string DescribeRunOutcome(RunCompletedEvent completed)
@@ -359,44 +364,6 @@ public sealed partial class MainWindowViewModel : ViewModelBase
         string text = $"Run finished ({completed.Outcome}): {counts}.";
         if (completed.DeletionAbortReason is { } reason)
             text += $" No files were removed from the targets — {reason}";
-        return text;
-    }
-
-    /// <summary>The pre-flight confirmation: which roots will be walked, what happens to the sources,
-    /// and — for Mirror — that files will be removed from the TARGETS.
-    /// <para>The Mirror wording is not decoration. Mirror's destructive half acts on the destination, so
-    /// a dialog that names only the source disposition describes the safe half of the run and stays
-    /// silent about the half that deletes. The filter caveat is here for the same reason: an excluded
-    /// source file contributes no survivor, so tightening a filter on a Mirror profile removes files it
-    /// previously copied — correct, faithful to the preview, and utterly surprising if unsaid.</para></summary>
-    private static string BuildRunConfirmation(Profile profile)
-    {
-        string roots = string.Join(Environment.NewLine, profile.Sources.Select(s => "    " + s.Path));
-        string disposition = profile.Policies.OnSuccess switch
-        {
-            OnSuccessAction.KeepSource => "the source files will be left in place",
-            OnSuccessAction.MoveToArchive => "each source file will then be MOVED to the archive folder",
-            OnSuccessAction.MoveToTrash => "each source file will then be MOVED TO THE RECYCLE BIN",
-            OnSuccessAction.PermanentDelete => "each source file will then be PERMANENTLY DELETED",
-            _ => $"the source disposition is {profile.Policies.OnSuccess}",
-        };
-
-        string text = $"Run \"{profile.Name}\" now?" + Environment.NewLine + Environment.NewLine
-            + "Files under:" + Environment.NewLine
-            + roots + Environment.NewLine
-            + $"will be copied to {profile.Targets.Count} target(s), and {disposition}.";
-
-        if (profile.SyncMode == SyncMode.Mirror)
-        {
-            text += Environment.NewLine + Environment.NewLine
-                + "This is a MIRROR profile: any file in the target folder(s) that is not in the "
-                + "source set will be MOVED TO THE RECYCLE BIN. That includes files excluded by this "
-                + "profile's filters, so tightening a filter removes copies this profile made earlier.";
-        }
-
-        text += Environment.NewLine + Environment.NewLine
-            + "Nothing is copied or deleted yet — you will see exactly what the run intends to do, and "
-            + "can approve or cancel it then.";
         return text;
     }
 
@@ -447,11 +414,11 @@ public sealed partial class MainWindowViewModel : ViewModelBase
                 }
                 break;
             case RunPlannedEvent planned:
-                // Only OUR run: the bus is a broadcast, and a second window must not be asked to
-                // approve work this user did not start. The id stays remembered until the run closes,
-                // because run-completed needs it too.
+                // Only OUR run: the bus is a broadcast, and a second window must not show — let alone be
+                // asked to approve — work this user did not start. The id stays remembered until the run
+                // closes, because run-completed needs it too.
                 if (_ownRunIds.Contains(planned.RunId))
-                    _ = ApproveOrDeclineRunAsync(planned);
+                    _ = ShowRunPlanAsync(planned);
                 break;
             case RunProgressEvent runProgress:
                 if (_ownRunIds.Contains(runProgress.RunId))
@@ -501,6 +468,11 @@ public sealed partial class MainWindowViewModel : ViewModelBase
     {
         try
         {
+            // Whatever the mode, a preview left on screen is a run parked in AwaitingApproval holding a
+            // snapshot directory that nothing will answer for once this window is gone. Decline it first
+            // — before the branch below can return early and leave it stranded.
+            DryRun.AbandonPendingRun();
+
             var settingsResult = await _gateway.GetSettingsAsync();
             // If settings can't be read (e.g. service unreachable), fall back to the default mode so a
             // transient outage never traps the user in the window.
@@ -739,7 +711,7 @@ public sealed partial class MainWindowViewModel : ViewModelBase
             loaded.TryGetValue(out Profile? profile);
             Editor.Load(profile!);
             DryRun.SetProfile(profile!.Id, profile.Name);
-            DryRun.ApplySyncSettings(profile.SyncMode, profile.ScanDestination);
+            DryRun.ApplySyncMode(profile.SyncMode);
         }
         catch (Exception ex)
         {
@@ -757,7 +729,7 @@ public sealed partial class MainWindowViewModel : ViewModelBase
             SuppressNextProfilesEcho();
             await List.RefreshAndSelectAsync(profileId);
             DryRun.SetProfile(profileId, Editor.ProfileName);
-            DryRun.ApplySyncSettings(Editor.SyncMode, Editor.ScanDestination);
+            DryRun.ApplySyncMode(Editor.SyncMode);
         }
         catch (Exception ex)
         {

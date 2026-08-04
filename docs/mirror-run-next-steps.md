@@ -20,8 +20,8 @@ fixed (kept here for the diagnosis); everything else is additive.
 | --- | --- | --- | --- |
 | ~~1~~ | ~~[Placer leaves `.fmtmp-` temps when sibling cancellation races rollback](#1-fixed-jobexecutiontargets-was-built-by-a-torn-lazy-initializer)~~ | **DONE** — root cause was a torn lazy initializer in `JobExecution`, not the placer | — |
 | 2 | [Decide the ratio-guard override](#2-decision-the-ratio-guard-has-no-override) | Blocks confident use against real archives | S (after a decision) |
-| 3 | [Itemized approval view](#3-itemized-approval-view-in-the-dry-run-view) | The approval step currently shows counts, not rows; the IPC is already done | M |
-| 4 | [Cancel affordance in the activity panel](#4-cancel-affordance-in-the-activity-panel) | `cancel-run` works but has no button | S |
+| ~~3~~ | ~~[Itemized approval view](#3-done-itemized-approval-view-in-the-preview-tab)~~ | **DONE** — the dry-run tab became the Preview tab and its footer approves the run | — |
+| 4 | [Cancel affordance in the activity panel](#4-cancel-affordance-in-the-activity-panel) | `cancel-run` works but has no button *during execution* — the planning phase now has one | S |
 | 5 | [Reconcile history (`get-recent-reconciles`)](#5-reconcile-history-get-recent-reconciles) | A deletion pass is invisible in the activity list | S–M |
 | 6 | [Remove emptied directories at a Mirror destination](#6-remove-emptied-directories-at-a-mirror-destination) | Destination accumulates an empty skeleton | S |
 | 7 | [Whole-profile reconcile for automation](#7-whole-profile-reconcile-for-automation) | Scoped runs never reconcile; needs Set 5 or a new request | M, design first |
@@ -155,41 +155,75 @@ already pins the refusal; add the override case beside it.
 
 ---
 
-## 3. Itemized approval view in the dry-run view
+## 3. DONE: itemized approval view in the Preview tab
 
-**Already in place — the engine half is done and tested:**
+**Status:** shipped. The Dry Run tab became the **Preview** tab, and it is now the approval view — the
+counts dialog is gone, and so is the pre-flight blast-radius dialog.
 
-- `GetRunPlanStreamRequest` / `get-run-plan-stream` and
-  `src/FileManager.Core/IPC/Handlers/GetRunPlanStreamHandler.cs`, registered in the dispatch table.
-- It replays the snapshot as the **same `DryRunChunkResponse` frames a preview streams**, deliberately,
-  so no second renderer is needed: source rows as `Processed`, orphans as `Deleted`, terminated by a
-  `DryRunCompleteResponse` carrying the plan's `Truncated` flag and `SpaceProjection`.
-- `IRunCoordinator.SnapshotDirectory(runId)` resolves the run's frozen work list.
+The decision that made it small: rather than feeding a standalone preview into a run, **the preview IS
+the run's planning phase**. `RunCoordinator.Begin` already drove the same `IProfilePlanner` and froze the
+result, so nothing needed to be recomputed or persisted — `get-run-plan-stream` replays that snapshot as
+the identical `DryRunChunkResponse` frames, which is exactly what it was built for.
 
-**Not in place:** anything in the UI. `IIpcGateway` has `RunProfileAsync` / `ApproveRunAsync` /
-`CancelRunAsync` but **no plan-stream method**, and nothing calls the request. What ships today is
-`MainWindowViewModel.ApproveOrDeclineRunAsync` → `BuildPlanConfirmation`, a dialog with counts (and the
-deletion count called out).
+What that took:
 
-**Why finish it:** counts tell the user *how many* files leave the target; only rows tell them *which*.
-For Mirror that is the difference between "14 files will be removed" and seeing that one of them is
-something they care about.
+- **Protocol 10.** `RunProfileRequest.InlineProfile`, mirroring `DryRunStreamRequest.InlineProfile`, so a
+  run can be planned from the editor's unsaved draft. `RunProfileHandler` uses it in place of the catalog
+  lookup; every gate (`Active`, `Sources`, scope containment) still applies to whichever profile resolved.
+- **A frozen profile executes the run.** `IRunSettleSink` gained `PlannedProfile(runId)`, and
+  `JobOrchestrator.RunJobAsync` prefers it for a run-tagged payload. This was **a pre-existing defect**,
+  not a cost of the draft path: the copies read the live catalog while the Mirror deletion pass read the
+  snapshot, so a profile edited while a run awaited approval changed the copies and not the deletions.
+  A draft-planned run merely made it reachable on purpose (its profile is in no catalog at all, so every
+  payload would have been dropped). Consequence to know: a run-tagged payload no longer stops because its
+  profile was deactivated mid-run — the user approved *this* plan, and `cancel-run` is how it stops.
+- **UI.** `IIpcGateway.GetRunPlanStreamAsync` (the old `DryRunAsync` is gone — one path now);
+  `DryRunViewModel.LoadPlanAsync` reusing the whole ingest path unchanged (store, epoch guard, off-thread
+  prepare, allocation sample points); a footer with **Approve Run** / **Discard**;
+  `MainWindowViewModel.PreviewProfileAsync` replacing `RunProfileNowAsync`.
+- **Lifetime.** A run parked in `AwaitingApproval` holds a snapshot directory and has no expiry, so an
+  unanswered preview is declined on every abandonment path: a superseding preview, profile switch or
+  close, and window close.
 
-**To do:**
+### The trap in this design, found twice after the first pass
 
-1. `IIpcGateway` + `IpcGateway`: add a plan-stream method modelled on the existing dry-run stream
-   consumption (`src/FileManager.UI/Services/IpcGateway.cs:228` shows the shape —
-   `client.DryRunStreamAsync` with an `IDryRunChunkSink`). The frames are identical, so the same sink
-   works.
-2. `DryRunViewModel`: accept a plan stream as an alternative source to a preview. Note its existing
-   epoch guard (`_reportEpoch`) and the `I-POOL-RECYCLE` ownership contract on chunk entries — copy out
-   anything retained.
-3. A "pending run" banner with **Approve** / **Cancel**, routed to `ApproveRunAsync`.
-4. Have `RunPlannedEvent` open this view instead of (or before) the dialog.
+**A snapshot's executable halves are not its displayable ones, and the difference is invisible until a
+panel is empty.** `copies.ndjsonl` lists only files there is *work* for and records where each is READ
+from; `deletes.ndjsonl` lists only orphans. Both are exactly right for execution and neither can be shown
+to anyone. Rendering the tab from them produced, in two rounds of the same mistake:
 
-Careful: `DryRunViewModel` is ~3000 lines and is the most performance-sensitive view in the app
-(columnar row store, pooled carriers, allocation-gauge tests). Read `docs/dry-run-ui-memory-next-steps.md`
-before touching it. This is the main reason it was not attempted in the first pass.
+- source rows with an empty target fan-out, and no destination side at all for any profile that removes
+  nothing (every additive profile);
+- then no *source* side at all for a profile already up to date — a Mirror profile that is fully
+  synchronized has zero copy items, so the panel went blank exactly when the honest answer was "these
+  files, every one already up to date".
+
+Both read to the user as **"the preview found nothing"**, which is the one thing an approval view must
+never be ambiguous about.
+
+The fix is two display-only files beside the executable ones — `sources.ndjsonl` / `RunSourceItem` and
+`destinations.ndjsonl` / `RunDestinationItem`. Everything they hold was already flowing through
+`RunSnapshotWriter.Consume` and being dropped. `sources.ndjsonl` records **every source the plan looked
+at**, whatever it decided, in plan order — so an item's ordinal IS the source index the plan assigned it,
+and a destination row names its source by that ordinal directly. Nothing in execution reads either file;
+orphans stay in `deletes.ndjsonl` so the deletion pass still touches only the small half it needs.
+
+`GetRunPlanStreamHandler` therefore reads the **display** halves and never `copies.ndjsonl`. If a future
+change points it back at the executable ones, the panels go blank again in exactly these two ways.
+
+**Why no test caught it.** Every row-projection test scripted a rich `DryRunReport` through the fake's plan
+stream, so the handler was only ever asked to replay data the real writer never produced.
+`GetRunPlanStreamHandlerTests` now runs the **real** planner into the **real** writer for that reason, with
+the already-synchronized-Mirror and additive-profile cases as its first two. `DryRunRowStoreTests` pins the
+frame split a replay uses (all sources, then all destinations), which a preview's per-file bundles never
+exercise.
+
+One behaviour change survives all of this: the scan-choice split button is gone. A run plans with the
+profile's own `ScanDestination`, so there was no wire path for a per-run override and no reason to invent
+one.
+
+Still open, and cheap now that the plan is on screen: the ratio-guard override (§2) has an obvious home —
+an `AcknowledgeLargeDeletion` checkbox in this footer, beside the count it is about.
 
 ---
 
@@ -197,8 +231,11 @@ before touching it. This is the main reason it was not attempted in the first pa
 
 `cancel-run` works end to end (`CancelRunHandler`, `IRunCoordinator.Cancel`,
 `IIpcGateway.CancelRunAsync`, `ITriggerQueue.DropRun`) and is covered by
-`RunLifecycleTests.Cancelling_mid_execution_drops_the_queued_work_and_skips_the_deletion_phase`. There
-is simply no button: `ActivityViewModel` has no cancel command.
+`RunLifecycleTests.Cancelling_mid_execution_drops_the_queued_work_and_skips_the_deletion_phase`.
+
+The **planning** phase now has its button: `DryRunViewModel.CancelPreviewCommand`, shown on the Preview
+tab while `PlanningRunId` is set. What is still missing is a cancel for a run already **executing** —
+`ActivityViewModel` has no cancel command.
 
 **To do:** a run-level row in `ActivityViewModel` showing phase and progress against the known total
 (`RunProgressEvent` carries `Completed` / `Total` / `Deleted`), with a Cancel command wired to
@@ -437,7 +474,7 @@ dotnet build File-Manager.slnx
 dotnet test File-Manager.slnx
 ```
 
-Expect **1436 tests, 0 failures** and **19 warnings** (the pre-existing baseline: CA1416 in
+Expect **1465 tests, 0 failures** and **19 warnings** (the pre-existing baseline: CA1416 in
 Platform.Windows.Tests, xUnit1031/2031 in Core.Tests, and one CS9107 in
 `src/FileManager.Core/Files/FileSystemService.cs`). Note the "src is warning-free" claim in older docs
 is stale — that CS9107 predates this work.
@@ -448,12 +485,17 @@ Manual Mirror check against the checked-in scenario environment:
 powershell -ExecutionPolicy Bypass -File tests/FileManager.Scripts.Windows.Tests/New-MirrorEnv.ps1
 ```
 
-Point `EnginePaths.Root` at `tests/FileManager.Scripts.Windows.Tests/mirror`, run the profile from the
+Point `EnginePaths.Root` at `tests/FileManager.Scripts.Windows.Tests/mirror`, press **Preview** in the
 GUI, and confirm:
 
-1. The approval prompt names 2 files to remove, and **nothing has moved yet**.
-2. Approving recycles `stale-orphan.txt` and `old\deep-orphan.txt` — check the Recycle Bin, not just
+1. It lands on the Preview tab and the footer names 2 files to remove, with **nothing moved yet**. Both
+   panels have rows: sources with their targets listed, destinations with the orphans. Then check the two
+   empty-panel cases specifically — a non-Mirror profile (its Destinations tab must show where each copy
+   lands) and a Preview run twice in a row (the second must still list every source, as unchanged).
+2. Editing the draft without saving and pressing Preview again plans the NEW draft, and leaves no stray
+   directory under `EnginePaths.RunsDirectory` for the superseded run.
+3. **Approve Run** recycles `stale-orphan.txt` and `old\deep-orphan.txt` — check the Recycle Bin, not just
    their absence.
-3. `audit/mirror-YYYYMM.ndjsonl` has a row per deletion.
-4. Re-running deletes nothing further (idempotency).
-5. Repeat with `MirrorDeletion.Proactive` — the orphans should go *before* the copies land.
+4. `audit/mirror-YYYYMM.ndjsonl` has a row per deletion.
+5. Previewing again says "Nothing to do" with no footer, and leaves no pending run (idempotency).
+6. Repeat with `MirrorDeletion.Proactive` — the orphans should go *before* the copies land.

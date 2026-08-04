@@ -307,6 +307,8 @@ internal sealed class RunPlanHarness : IDisposable
             DeleteItemCount = writer.DeleteCount,
             CopyBytes = writer.CopyBytes,
             DeleteBytes = writer.DeleteBytes,
+            SourceItemCount = writer.SourceCount,
+            DestinationItemCount = writer.DestinationCount,
             Truncated = state.Truncated,
             SweepFaultDetail = state.SweepFaultDetail,
             Space = state.Space,
@@ -327,6 +329,12 @@ internal sealed class RunPlanHarness : IDisposable
 
     public static List<RunDeleteItem> Deletes(string runDirectory) =>
         [.. RunSnapshotReader.ReadDeletes(runDirectory, NullLogger.Instance)];
+
+    public static List<RunSourceItem> Sources(string runDirectory) =>
+        [.. RunSnapshotReader.ReadSources(runDirectory, NullLogger.Instance)];
+
+    public static List<RunDestinationItem> Destinations(string runDirectory) =>
+        [.. RunSnapshotReader.ReadDestinations(runDirectory, NullLogger.Instance)];
 
     public void Dispose()
     {

@@ -13,12 +13,12 @@ namespace FileManager.Core.Runs;
 /// this, a 5,000-file invocation was 5,000 independent jobs with no start, no end, no totals, and no
 /// way to stop it — and no point at which "every copy has landed, now remove the orphans" could be
 /// expressed at all.</para></summary>
-/// <summary>The one thing <c>JobOrchestrator</c> needs from a run: somewhere to report that a payload
-/// reached a terminal state.
+/// <summary>All <c>JobOrchestrator</c> needs from a run: somewhere to report that a payload reached a
+/// terminal state, and the profile that run was planned against.
 /// <para>Deliberately narrower than <see cref="IRunCoordinator"/>. The orchestrator is a hot loop that
-/// has no business being able to start, approve, or cancel runs, and keeping the dependency to this
-/// one method is also what lets a test drive the orchestrator with a no-op sink instead of standing up
-/// a coordinator.</para></summary>
+/// has no business being able to start, approve, or cancel runs, and keeping the dependency this small
+/// is also what lets a test drive the orchestrator with a no-op sink instead of standing up a
+/// coordinator.</para></summary>
 public interface IRunSettleSink
 {
     /// <summary>Reports that a payload of <paramref name="runId"/> reached a terminal state.
@@ -27,6 +27,15 @@ public interface IRunSettleSink
     /// settles the run's barrier, which is the entire reason this is reported at all.
     /// <para>An unknown run id is ignored, not an error: most payloads belong to no run.</para></summary>
     void Settled(Guid runId, JobCompletion? completion);
+
+    /// <summary>The profile <paramref name="runId"/> was PLANNED against — the same one frozen into its
+    /// snapshot header — or null when the id is unknown.
+    /// <para>This exists because a run's copies must not be built from the live catalog. The plan the
+    /// user approved was computed from this profile, and the Mirror deletion pass already reads it back
+    /// from the snapshot; resolving the catalog instead meant the two halves of one run could use
+    /// different targets, layouts and dispositions. It is also the only way a run planned from an
+    /// unsaved draft can copy anywhere at all — that profile is in no catalog.</para></summary>
+    Profile? PlannedProfile(Guid runId);
 }
 
 /// <summary>A run-settle sink that does nothing, for a host or test with no run coordinator.</summary>
@@ -34,6 +43,9 @@ public sealed class NullRunSettleSink : IRunSettleSink
 {
     public static NullRunSettleSink Instance { get; } = new();
     public void Settled(Guid runId, JobCompletion? completion) { }
+    /// <summary>Null: with no coordinator there is no run to have planned anything, so every caller
+    /// falls back to the catalog exactly as it did before runs existed.</summary>
+    public Profile? PlannedProfile(Guid runId) => null;
 }
 
 public interface IRunCoordinator : IRunSettleSink
