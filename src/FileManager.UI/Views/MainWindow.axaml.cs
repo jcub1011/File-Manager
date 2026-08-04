@@ -4,6 +4,7 @@ using Avalonia.Input;
 using Avalonia.Interactivity;
 using Avalonia.Media;
 using Avalonia.Reactive;
+using FileManager.UI.Undo;
 using FileManager.UI.ViewModels;
 using System;
 
@@ -39,6 +40,51 @@ namespace FileManager.UI.Views
 
             // Live-switch collapsed/expanded as the splitter drags the column across the threshold.
             ProfilePanelColumn.GetObservable(ColumnDefinition.WidthProperty).Subscribe(OnSidebarWidthChanged);
+
+            // Undo/redo for the profile draft is handled at window scope, not inside ProfileEditorView,
+            // for two reasons: the shortcut has to work while focus is in the sidebar (which is outside
+            // the editor's subtree), and the "am I in scope?" question is about which TAB is selected —
+            // something only this window can answer.
+            //
+            // Tunnel (preview) routing, so the window sees Ctrl+Z before the focused TextBox does. That
+            // is a deliberate trade, the same one the settings dialog makes: undo always means "undo the
+            // last profile change" no matter which field has focus, at the cost of a TextBox's own
+            // per-character undo. Coalescing makes a typing run one profile step, so reverting what was
+            // just typed — in the multi-line glob boxes too — still takes one press.
+            AddHandler(InputElement.KeyDownEvent, OnUndoRedoKeyDown, RoutingStrategies.Tunnel);
+
+            // A field losing focus ends its coalescing run, so returning to it later starts a fresh undo
+            // step instead of extending an edit the user has moved on from. It is also what makes a path
+            // chosen through Browse its own step: clicking the button moves focus off the box.
+            AddHandler(InputElement.LostFocusEvent, OnEditorLostFocus, RoutingStrategies.Tunnel);
+        }
+
+        /// <summary>Ctrl+Z / Ctrl+Y / Ctrl+Shift+Z, scoped to the profile draft on screen.
+        ///
+        /// The gate is the point of this method. The editor view model is reused for every profile and
+        /// its undo steps capture it directly, so undo must never be reachable from a context where the
+        /// user is not looking at that draft — the Dry Run tab shows a preview of a run, and stepping the
+        /// profile backwards from there would be an edit the user cannot see happening.</summary>
+        private void OnUndoRedoKeyDown(object? sender, KeyEventArgs e)
+        {
+            if (DataContext is not MainWindowViewModel vm)
+                return;
+            // The tab decides whether the draft is on screen at all. HasProfile is belt-and-braces for the
+            // case where it is the selected tab but nothing is loaded (the document area is hidden then,
+            // while ProfileTab.IsSelected stays true) — the history is already empty there.
+            if (!ProfileTab.IsSelected || !vm.Editor.HasProfile)
+                return;
+            UndoGestures.TryHandle(vm.Editor.History, e);
+        }
+
+        /// <summary>Ends the coalescing run on any focus change in the window. Deliberately NOT gated on
+        /// the active tab: breaking a run is always safe, whereas gating it would depend on whether the
+        /// tab-selection change or the focus change lands first when the user clicks straight from a text
+        /// box onto the Dry Run tab header.</summary>
+        private void OnEditorLostFocus(object? sender, RoutedEventArgs e)
+        {
+            if (DataContext is MainWindowViewModel vm)
+                vm.Editor.History.BreakMerge();
         }
 
         // Live preview during a drag: the current width decides the mode (below the min expanded width

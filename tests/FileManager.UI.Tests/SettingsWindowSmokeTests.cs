@@ -342,6 +342,41 @@ public sealed class SettingsWindowSmokeTests(HeadlessSessionFixture headless)
     }
 
     [Fact]
+    public async Task Ctrl_Z_in_a_text_box_does_not_toggle_forever()
+    {
+        // Once the history is empty Ctrl+Z must stay a no-op. Releasing the key back to the focused TextBox
+        // at that point hands it the control's OWN undo stack, which still holds the programmatic write the
+        // restore made — undoing that re-applies the edit and, arriving through the two-way binding,
+        // records it here as a fresh step. The window then flips between the two values forever.
+        await headless.Session.DispatchAsync(async () =>
+        {
+            SettingsViewModel vm = new(new FakeIpcGateway(), new FakeFolderPicker(), new FakeSystemDrives(), clientSettingsPath: TempFiles.ClientSettings());
+            await vm.LoadAsync();
+            string original = vm.ScratchDirectory.Value;
+
+            SettingsWindow window = new() { DataContext = vm };
+            window.Show();
+            window.UpdateLayout();
+
+            TextBox box = window.GetVisualDescendants().OfType<TextBox>()
+                .Single(t => ReferenceEquals(t.DataContext, vm.ScratchDirectory));
+            box.Focus();
+            box.Text = @"D:\spill";
+
+            window.KeyPressQwerty(PhysicalKey.Z, RawInputModifiers.Control);
+            Assert.Equal(original, vm.ScratchDirectory.Value);
+
+            for (int i = 0; i < 4; i++)
+            {
+                window.KeyPressQwerty(PhysicalKey.Z, RawInputModifiers.Control);
+                Assert.Equal(original, vm.ScratchDirectory.Value);
+                Assert.False(vm.IsDirty);
+                Assert.False(vm.History.CanUndo);
+            }
+        }, CancellationToken.None);
+    }
+
+    [Fact]
     public async Task The_footer_close_button_names_the_consequence_when_there_are_unsaved_edits()
     {
         await headless.Session.DispatchAsync(async () =>

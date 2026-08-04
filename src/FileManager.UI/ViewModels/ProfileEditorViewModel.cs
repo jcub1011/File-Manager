@@ -3,11 +3,11 @@ using CommunityToolkit.Mvvm.Input;
 using FileManager.Contracts.IPC;
 using FileManager.Contracts.Profiles;
 using FileManager.UI.Services;
+using FileManager.UI.Undo;
 using FileManager.UI.ViewModels.Editor;
 using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
-using System.Collections.Specialized;
 using System.ComponentModel;
 using System.Linq;
 using System.Threading.Tasks;
@@ -16,8 +16,13 @@ namespace FileManager.UI.ViewModels;
 
 /// <summary>Maps the immutable Profile record to a mutable draft and back. Fields the editor
 /// does not own (Transformers, Triggers of an existing profile, Id, SchemaVersion) round-trip
-/// through the stashed original untouched.</summary>
-public sealed partial class ProfileEditorViewModel : ViewModelBase
+/// through the stashed original untouched.
+///
+/// Edits are reversible: the draft declares its undoable properties (<see cref="UndoableProperties"/>)
+/// and its row collections (<see cref="TrackNested"/>), and <see cref="UndoHistory"/> records them from
+/// the change notifications they already raise. <see cref="IsDirty"/> falls out of the same history, so
+/// undoing back to the loaded state genuinely clears it.</summary>
+public sealed partial class ProfileEditorViewModel : ViewModelBase, IUndoTrackable
 {
     /// <summary>Spec §5.1: the schema version this build reads and writes.</summary>
     public const int CurrentSchemaVersion = 2;
@@ -31,12 +36,19 @@ public sealed partial class ProfileEditorViewModel : ViewModelBase
     /// so switching back to AdditiveArchive restores their choice instead of leaving it stuck checked.</summary>
     private bool _scanDestinationPreference;
 
+    /// <summary>Open only for the duration of a <see cref="SyncMode"/> assignment — see
+    /// <see cref="OnPropertyChanging"/> for why the bracket cannot live inside the change hook.</summary>
+    private IDisposable? _syncModeBatch;
+
     public ProfileEditorViewModel(IIpcGateway gateway, IFolderPicker folderPicker)
     {
         _gateway = gateway;
         _folderPicker = folderPicker;
-        Sources.CollectionChanged += OnRowsChanged;
-        Targets.CollectionChanged += OnRowsChanged;
+        // Registers this draft's properties and, through TrackNested, the two row collections. From here
+        // on the history is the only dirty-tracking mechanism: rows and collection edits need no
+        // per-call-site bookkeeping.
+        History.Track(this);
+        History.PropertyChanged += OnHistoryChanged;
     }
 
     /// <summary>Invoked after a successful save so the shell can refresh the list.</summary>
@@ -92,7 +104,6 @@ public sealed partial class ProfileEditorViewModel : ViewModelBase
     public ObservableCollection<TargetRowViewModel> Targets { get; } = [];
     public ObservableCollection<ValidationIssueItem> Issues { get; } = [];
 
-    [ObservableProperty] public partial bool IsDirty { get; set; }
     [ObservableProperty] public partial bool CanAcknowledgeAndSave { get; set; }
     [ObservableProperty] public partial string? LocalError { get; set; }
     [ObservableProperty] public partial string? StatusMessage { get; set; }
@@ -110,9 +121,14 @@ public sealed partial class ProfileEditorViewModel : ViewModelBase
     // bind to the property, not the enum, in this position (mirrors OnConcurrencyModeChanged).
     partial void OnSyncModeChanged(global::FileManager.Contracts.Profiles.SyncMode value)
     {
-        // Loads set SyncMode and ScanDestination explicitly; only respond to genuine user switches.
-        if (!_loading)
+        // Loads set SyncMode and ScanDestination explicitly; only respond to genuine user switches. An
+        // in-flight undo/redo is restoring both properties itself, so re-applying the rule here would
+        // fight the restore and overwrite the ScanDestination value being put back.
+        if (!_loading && !History.IsRestoring)
         {
+            // Everything recorded here joins the mode's own step, because the batch bracketing this
+            // property's notification is already open (see OnPropertyChanging below).
+            bool previousPreference = _scanDestinationPreference;
             if (value == SyncMode.Mirror)
             {
                 _scanDestinationPreference = ScanDestination;   // remember the AdditiveArchive choice
@@ -122,36 +138,152 @@ public sealed partial class ProfileEditorViewModel : ViewModelBase
             {
                 ScanDestination = _scanDestinationPreference;     // restore it when leaving Mirror
             }
+
+            // The preference is a plain field, invisible to the property recorder, so it needs its two
+            // halves spelled out. Without this, Mirror → undo → Mirror forgets the AdditiveArchive
+            // choice the first switch stashed.
+            bool newPreference = _scanDestinationPreference;
+            if (newPreference != previousPreference)
+            {
+                History.Record(
+                    undo: () => _scanDestinationPreference = previousPreference,
+                    redo: () => _scanDestinationPreference = newPreference);
+            }
         }
         OnPropertyChanged(nameof(CanEditScanDestination));
     }
 
-    /// <summary>Editor mutations mark the draft dirty; loads do not.</summary>
+    /// <summary>Opens an undo batch around a <see cref="SyncMode"/> switch, so the mode change and the
+    /// <see cref="ScanDestination"/> write it forces undo together.
+    ///
+    /// The bracket has to straddle the notification rather than sit inside
+    /// <see cref="OnSyncModeChanged"/>: the generated setter runs that hook BEFORE raising
+    /// PropertyChanged, so a batch opened and closed within it would capture the coupled write and leave
+    /// the mode's own step outside — one undo would then revert the mode while leaving the sweep flag
+    /// the mode had forced on. Unconditional because an empty batch records nothing, so a load or an
+    /// in-flight restore (both of which record nothing) costs only the scope.</summary>
+    protected override void OnPropertyChanging(PropertyChangingEventArgs e)
+    {
+        base.OnPropertyChanging(e);
+        if (e.PropertyName is nameof(SyncMode))
+            _syncModeBatch = History.Batch();
+    }
+
+    /// <inheritdoc cref="OnPropertyChanging"/>
     protected override void OnPropertyChanged(PropertyChangedEventArgs e)
     {
+        // Base first: raising the event is what pushes this property's own step, and it has to land
+        // inside the batch before the batch closes.
         base.OnPropertyChanged(e);
-        if (_loading)
-            return;
-        switch (e.PropertyName)
+        if (e.PropertyName is nameof(SyncMode))
         {
-            case nameof(IsDirty):
-            case nameof(CanAcknowledgeAndSave):
-            case nameof(LocalError):
-            case nameof(StatusMessage):
-            case nameof(ShowUnsavedWarning):
-            case nameof(HasProfile):
-            case nameof(IsNew):
-            case nameof(ShowArchiveFolder):
+            _syncModeBatch?.Dispose();
+            _syncModeBatch = null;
+        }
+    }
+
+    // ============================ Undo / redo and unsaved changes ============================
+
+    /// <summary>Undo/redo for this editing session, and the source of <see cref="IsDirty"/>. Bound
+    /// directly by the Undo/Redo buttons on the Profile tab header; the Ctrl+Z / Ctrl+Y shortcuts in
+    /// <c>ProfileEditorView</c> run the same commands. Lives as long as the editor and is reset by every
+    /// load, so it never spans two profiles.</summary>
+    public UndoHistory History { get; } = new();
+
+    /// <summary>The reversible draft fields, one line each. Coalesced for values a user builds up a
+    /// keystroke at a time (names, paths, the glob boxes, the numeric text fields); not coalesced for
+    /// the enums and booleans, where every pick is a decision that deserves its own step.
+    ///
+    /// The omissions are deliberate, and are the same set the old dirty-flag override excluded — now
+    /// inverted into an explicit opt-in. <see cref="HasProfile"/> and <see cref="IsNew"/> say which
+    /// profile is open, not what was edited. <see cref="CanAcknowledgeAndSave"/>,
+    /// <see cref="LocalError"/>, <see cref="StatusMessage"/> and <see cref="ShowUnsavedWarning"/> are
+    /// transient chrome. <see cref="ShowArchiveFolder"/> and <see cref="CanEditScanDestination"/> are
+    /// derived from properties that are already tracked, so recording them would double a step.</summary>
+    public IEnumerable<UndoableProperty> UndoableProperties =>
+    [
+        UndoableProperty.For(nameof(ProfileName), () => ProfileName, v => ProfileName = v, coalesce: true),
+        UndoableProperty.For(nameof(Active), () => Active, v => Active = v),
+        UndoableProperty.For(nameof(SyncMode), () => SyncMode, v => SyncMode = v),
+        UndoableProperty.For(nameof(ScanDestination), () => ScanDestination, v => ScanDestination = v),
+        UndoableProperty.For(nameof(TargetLayout), () => TargetLayout, v => TargetLayout = v),
+        UndoableProperty.For(nameof(ConflictResolution), () => ConflictResolution, v => ConflictResolution = v),
+        UndoableProperty.For(nameof(OverwriteHandling), () => OverwriteHandling, v => OverwriteHandling = v),
+        UndoableProperty.For(nameof(VerificationMethod), () => VerificationMethod, v => VerificationMethod = v),
+        UndoableProperty.For(nameof(OnSuccess), () => OnSuccess, v => OnSuccess = v),
+        UndoableProperty.For(nameof(ArchiveFolder), () => ArchiveFolder, v => ArchiveFolder = v, coalesce: true),
+        UndoableProperty.For(nameof(MetadataOnConflict), () => MetadataOnConflict, v => MetadataOnConflict = v),
+        UndoableProperty.For(nameof(Verbosity), () => Verbosity, v => Verbosity = v),
+        UndoableProperty.For(nameof(NotifyOnFailure), () => NotifyOnFailure, v => NotifyOnFailure = v),
+        UndoableProperty.For(nameof(IncludeGlobsText), () => IncludeGlobsText, v => IncludeGlobsText = v, coalesce: true),
+        UndoableProperty.For(nameof(ExcludeGlobsText), () => ExcludeGlobsText, v => ExcludeGlobsText = v, coalesce: true),
+        UndoableProperty.For(nameof(MinSizeText), () => MinSizeText, v => MinSizeText = v, coalesce: true),
+        UndoableProperty.For(nameof(MaxSizeText), () => MaxSizeText, v => MaxSizeText = v, coalesce: true),
+        UndoableProperty.For(nameof(MaxDepthText), () => MaxDepthText, v => MaxDepthText = v, coalesce: true),
+    ];
+
+    /// <summary>Adding, removing and editing source/target rows all become undo steps; the row view
+    /// models declare their own properties and the history picks them up as rows enter the lists.
+    ///
+    /// <see cref="Issues"/> is deliberately absent: it is validation output from the service, not user
+    /// state, and a save that returns warnings must not land on the undo stack.</summary>
+    public void TrackNested(UndoHistory history)
+    {
+        history.TrackCollection(Sources);
+        history.TrackCollection(Targets);
+    }
+
+    private void OnHistoryChanged(object? sender, PropertyChangedEventArgs e)
+    {
+        // The shell drives the sidebar's unsaved marker and its row locking off this notification, and
+        // the Discard button's visibility binds to it, so it has to be re-raised from here.
+        if (e.PropertyName is nameof(UndoHistory.IsDirty))
+            OnPropertyChanged(nameof(IsDirty));
+    }
+
+    /// <summary>True when there are edits Save has not persisted. Position-based, from the undo history:
+    /// undoing back to the last saved position clears it, which the old latching flag could not do.</summary>
+    public bool IsDirty => History.IsDirty;
+
+    /// <summary>Opens a load: recording off and the coupled-property hooks disarmed for the duration,
+    /// and on close the validation issues and banners cleared and the undo history dropped.
+    ///
+    /// EVERY path that changes which profile the draft holds must go through this. The history's steps
+    /// capture this view model — and there is exactly one of it, reused for every profile — so a step that
+    /// outlived a load would apply the previous profile's values to the new one's draft on the next undo.
+    /// Dropping the history here is the whole reason undo cannot escape the profile on screen, so it is a
+    /// scope rather than three call sites that each have to remember it.
+    ///
+    /// <see cref="_loading"/> is held alongside <see cref="UndoHistory.Suppress"/> because the two do
+    /// different jobs: Suppress stops the history recording, while <c>_loading</c> stops the SyncMode hook
+    /// from applying the Mirror rule to values being loaded.</summary>
+    private IDisposable BeginLoad()
+    {
+        IDisposable suppressed = History.Suppress();
+        _loading = true;
+        return new LoadScope(this, suppressed);
+    }
+
+    private sealed class LoadScope(ProfileEditorViewModel editor, IDisposable suppressed) : IDisposable
+    {
+        private bool _disposed;
+
+        public void Dispose()
+        {
+            if (_disposed)
                 return;
-            default:
-                IsDirty = true;
-                return;
+            _disposed = true;
+            editor.Issues.Clear();
+            editor.ResetTransientState();
+            editor._loading = false;
+            suppressed.Dispose();
+            editor.History.Reset();   // the loaded draft is the baseline: nothing to undo, nothing unsaved
         }
     }
 
     public void LoadNew()
     {
-        _loading = true;
+        using IDisposable load = BeginLoad();
         _original = null;
         IsNew = true;
         HasProfile = true;
@@ -178,14 +310,11 @@ public sealed partial class ProfileEditorViewModel : ViewModelBase
         Sources.Add(NewSourceRow());
         Targets.Clear();
         Targets.Add(NewTargetRow());
-        Issues.Clear();
-        ResetTransientState();
-        _loading = false;
     }
 
     public void Load(Profile profile)
     {
-        _loading = true;
+        using IDisposable load = BeginLoad();
         _original = profile;
         IsNew = false;
         HasProfile = true;
@@ -226,22 +355,16 @@ public sealed partial class ProfileEditorViewModel : ViewModelBase
             row.Path = target.Path;
             Targets.Add(row);
         }
-        Issues.Clear();
-        ResetTransientState();
-        _loading = false;
     }
 
     public void Clear()
     {
-        _loading = true;
+        using IDisposable load = BeginLoad();
         _original = null;
         HasProfile = false;
         IsNew = false;
         Sources.Clear();
         Targets.Clear();
-        Issues.Clear();
-        ResetTransientState();
-        _loading = false;
     }
 
     /// <summary>Rebuilds the immutable record. Unowned fields round-trip from the original:
@@ -368,7 +491,9 @@ public sealed partial class ProfileEditorViewModel : ViewModelBase
             {
                 _original = draft;
                 IsNew = false;
-                IsDirty = false;
+                // Clears the unsaved-changes flag without dropping the history, so the user can still
+                // step back through what they just saved.
+                History.MarkSaved();
                 ShowUnsavedWarning = false;
                 CanAcknowledgeAndSave = false;
                 StatusMessage = Issues.Count > 0 ? "Saved (with warnings)." : "Saved.";
@@ -480,11 +605,12 @@ public sealed partial class ProfileEditorViewModel : ViewModelBase
     private static bool PathsEqual(string a, string b) =>
         string.Equals(a?.Trim(), b?.Trim(), StringComparison.OrdinalIgnoreCase);
 
+    // Rows need no undo wiring here: the history tracks them as they enter Sources/Targets and untracks
+    // them as they leave, so a row is recorded from the moment it is added.
     private SourceRowViewModel NewSourceRow()
     {
         SourceRowViewModel row = new(_folderPicker);
         row.PreviousRowPath = () => PathAbove(Sources, row, r => r.Path);
-        row.PropertyChanged += OnRowPropertyChanged;
         return row;
     }
 
@@ -492,7 +618,6 @@ public sealed partial class ProfileEditorViewModel : ViewModelBase
     {
         TargetRowViewModel row = new(_folderPicker);
         row.PreviousRowPath = () => PathAbove(Targets, row, r => r.Path);
-        row.PropertyChanged += OnRowPropertyChanged;
         return row;
     }
 
@@ -510,21 +635,10 @@ public sealed partial class ProfileEditorViewModel : ViewModelBase
         return null;
     }
 
-    private void OnRowPropertyChanged(object? sender, PropertyChangedEventArgs e)
-    {
-        if (!_loading)
-            IsDirty = true;
-    }
-
-    private void OnRowsChanged(object? sender, NotifyCollectionChangedEventArgs e)
-    {
-        if (!_loading)
-            IsDirty = true;
-    }
-
+    /// <summary>Clears the banners and acknowledgement state. The unsaved-changes flag is not among them
+    /// any more — it comes from the history, which every caller resets right after this.</summary>
     private void ResetTransientState()
     {
-        IsDirty = false;
         CanAcknowledgeAndSave = false;
         LocalError = null;
         StatusMessage = null;

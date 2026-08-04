@@ -3,22 +3,16 @@ using Avalonia.Controls;
 using Avalonia.Input;
 using Avalonia.Interactivity;
 using Avalonia.VisualTree;
+using FileManager.UI.Undo;
 using FileManager.UI.ViewModels;
 using FileManager.UI.ViewModels.Settings;
 using System;
 using System.Linq;
-using System.Windows.Input;
 
 namespace FileManager.UI.Views
 {
     public partial class SettingsWindow : Window
     {
-        // Parsed from the same strings the footer buttons show as tooltips, so the display and the
-        // handling cannot drift apart (same recipe as DryRunView's row shortcuts).
-        private static readonly KeyGesture UndoGesture = KeyGesture.Parse("Ctrl+Z");
-        private static readonly KeyGesture RedoGesture = KeyGesture.Parse("Ctrl+Y");
-        private static readonly KeyGesture RedoAltGesture = KeyGesture.Parse("Ctrl+Shift+Z");
-
         public SettingsWindow()
         {
             InitializeComponent();
@@ -38,20 +32,10 @@ namespace FileManager.UI.Views
 
         private void OnUndoRedoKeyDown(object? sender, KeyEventArgs e)
         {
-            if (DataContext is not SettingsViewModel vm)
-                return;
-
-            ICommand? command =
-                UndoGesture.Matches(e) ? vm.History.UndoCommand
-                : RedoGesture.Matches(e) || RedoAltGesture.Matches(e) ? vm.History.RedoCommand
-                : null;
-
-            // Only claim the key when there is actually something to undo — otherwise Ctrl+Z on an
-            // untouched window should behave as it always did rather than being swallowed here.
-            if (command is null || !command.CanExecute(null))
-                return;
-            command.Execute(null);
-            e.Handled = true;
+            // The whole window is in scope: this dialog edits nothing but settings, and it is modal, so
+            // there is no neighbouring document a stray Ctrl+Z could reach.
+            if (DataContext is SettingsViewModel vm)
+                UndoGestures.TryHandle(vm.History, e);
         }
 
         private void OnEditorLostFocus(object? sender, RoutedEventArgs e)
