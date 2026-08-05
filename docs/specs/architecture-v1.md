@@ -2628,7 +2628,9 @@ Mirror is built. It is no longer reserved, and this section records the shape ra
 - **Validation.** Saving a Mirror profile raises the blocking warning `PROFILE_MIRROR_DELETES`, which the
   client must acknowledge — the same mechanism as `PROFILE_UNVERIFIED_DELETE`.
 - **Not done:** emptied directories are not removed; a scoped (path-narrowed) run copies but never
-  deletes; source selection is a seam (`ISourceSelector`) with no strategy behind it yet — the intended one is throughput-driven dispatch, not a media-type ranking (see `docs/mirror-run-next-steps.md` §8–§9).
+  deletes; when two Sources offer the same destination path the earliest Source wins (§3.4) with no
+  throughput-driven alternative — the intended one dispatches on least outstanding read work per volume,
+  which is a dispatch-time decision rather than a plan-time one (see `docs/mirror-run-next-steps.md` §8–§9).
 
 ### 10.2 `ArgumentMode.Shell` [Post-v1]
 

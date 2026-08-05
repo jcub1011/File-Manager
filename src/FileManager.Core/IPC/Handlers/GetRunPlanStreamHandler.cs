@@ -66,7 +66,13 @@ public sealed class GetRunPlanStreamHandler(
         // One converter for the whole stream, exactly as the preview handler does: it owns the
         // directory-index space across every frame, so each index stays a valid position into the
         // client's concatenated Directories list.
-        DryRunStreamHandler.WireChunkConverter converter = new(recycleWireRecords: false);
+        //
+        // Recycling ON, as on the preview path. The condition it needs is that the consumer has finished
+        // with a frame before asking for the next, and this handler's production consumer —
+        // IpcServer.ServeStreamAsync — serializes each frame before advancing the enumerator, which is the
+        // same guarantee the preview stream relies on. Constructing with `false` here spent one full set of
+        // column buffers per chunk on the one path that runs on EVERY preview, for no gain.
+        DryRunStreamHandler.WireChunkConverter converter = new();
 
         // Source side: one file + one operation per source the plan LOOKED at — sources.ndjsonl, not
         // copies.ndjsonl. The copy list holds only files there is work for, so reading it would drop every
@@ -101,8 +107,12 @@ public sealed class GetRunPlanStreamHandler(
             if (sourceFiles.Count >= RowsPerChunk)
             {
                 yield return converter.Convert(sourceFiles, [], sourceOps, []);
-                sourceFiles = [];
-                sourceOps = [];
+                // Cleared, not replaced. Convert has copied everything it needs into the frame's columns by
+                // the time it returns, and the frame is serialized before the enumerator advances — so the
+                // lists are ours again, with their capacity, instead of two fresh RowsPerChunk-sized arrays
+                // per chunk for the length of the stream.
+                sourceFiles.Clear();
+                sourceOps.Clear();
             }
         }
         if (sourceFiles.Count > 0)
@@ -150,15 +160,15 @@ public sealed class GetRunPlanStreamHandler(
             if (destOps.Count >= RowsPerChunk)
             {
                 yield return converter.Convert([], destFiles, [], destOps);
-                destFiles = [];
-                destOps = [];
+                destFiles.Clear();
+                destOps.Clear();
             }
         }
         if (destOps.Count > 0)
         {
             yield return converter.Convert([], destFiles, [], destOps);
-            destFiles = [];
-            destOps = [];
+            destFiles.Clear();
+            destOps.Clear();
         }
 
         // Pass 2: one file + one Deleted operation per planned orphan. These are the rows that matter
@@ -184,8 +194,8 @@ public sealed class GetRunPlanStreamHandler(
             if (destFiles.Count >= RowsPerChunk)
             {
                 yield return converter.Convert([], destFiles, [], destOps);
-                destFiles = [];
-                destOps = [];
+                destFiles.Clear();
+                destOps.Clear();
             }
         }
         if (destFiles.Count > 0)

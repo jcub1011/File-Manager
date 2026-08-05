@@ -117,9 +117,11 @@ public sealed record RunCopyItem
     public required OperationKind PlannedKind { get; init; }
 
     /// <summary>Which Source of the profile this file is being taken from, or -1 when its root matched
-    /// none. Recorded rather than re-derived so a future source-selection strategy (preferring a
-    /// faster volume when two Sources offer byte-identical copies) changes PLANNING only and never
-    /// execution — see <c>ISourceSelector</c>.</summary>
+    /// none. Recorded rather than re-derived, which is what keeps the snapshot and the audit trail in
+    /// agreement with reality once a source-selection strategy exists — the intended one (dispatching
+    /// contested files by least outstanding read work per volume) decides at dispatch time, so this field
+    /// reports what actually happened rather than what was predicted. Design in
+    /// <c>docs/mirror-run-next-steps.md</c> §8–§9.</summary>
     public required int SourceIndex { get; init; }
 }
 

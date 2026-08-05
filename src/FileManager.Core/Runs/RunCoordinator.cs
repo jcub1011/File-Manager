@@ -859,17 +859,30 @@ public sealed class RunCoordinator(
             ScannedDestinations = counters.Destinations,
         });
 
+    /// <summary>An execution progress sample.
+    /// <para>Reads the counters directly rather than through <c>run.Snapshot()</c>, which allocates a whole
+    /// <see cref="RunStatus"/> including a COPY of the deletion-failure list to hand back six integers. The
+    /// drain loop polls five times a second, so a run that reaches the 30-minute deadline did that 9,000
+    /// times — copying, late in a troubled run, thousands of strings per sample to publish a count.</para></summary>
     private void PublishProgress(RunState run)
     {
-        RunStatus status = run.Snapshot();
+        RunPhase phase;
+        int completed, total, deleted;
+        lock (run.Gate)
+        {
+            phase = run.Phase;
+            completed = run.Succeeded + run.SkippedJobs + run.Failed;
+            total = run.PlannedCopies;
+            deleted = run.Deleted;
+        }
         Publish(new RunProgressEvent
         {
             AtUtc = time.GetUtcNow(),
             RunId = run.RunId,
-            Phase = status.Phase.ToString(),
-            Completed = status.Succeeded + status.Skipped + status.Failed,
-            Total = status.PlannedCopies,
-            Deleted = status.Deleted,
+            Phase = phase.ToString(),
+            Completed = completed,
+            Total = total,
+            Deleted = deleted,
         });
     }
 

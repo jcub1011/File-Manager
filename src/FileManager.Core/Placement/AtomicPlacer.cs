@@ -38,10 +38,14 @@ public sealed class AtomicPlacer(
 
         try
         {
-            if (!File.Exists(finalPath))
+            // ONE FileInfo for all three reads. It caches the directory entry on first access, so
+            // Exists/Length/LastWriteTimeUtc below cost a single metadata round trip between them —
+            // File.Exists + new FileInfo().Length + File.GetLastWriteTimeUtc() was three, per target per
+            // job. On the UNC/NAS targets this identity feature exists for, each one is a network op, so a
+            // 100k-file run was paying ~200k avoidable remote stats.
+            FileInfo existing = new(finalPath);
+            if (!existing.Exists)
                 return UnchangedCheckResult.NoExistingFile;
-
-            var existing = new FileInfo(finalPath);
             if (existing.Length != reference.SizeBytes)
                 return UnchangedCheckResult.ExistsDifferent;
 
@@ -49,8 +53,7 @@ public sealed class AtomicPlacer(
             // policies (and under VerificationMethod None/SizeTimestamp, where no content hash exists to
             // compare). Zero content bytes read.
             bool settledByMetadata = reference.Plan.AcceptMetadataMatch
-                && IdentityStrategy.TimestampsMatch(
-                    File.GetLastWriteTimeUtc(finalPath), reference.LastWriteUtc);
+                && IdentityStrategy.TimestampsMatch(existing.LastWriteTimeUtc, reference.LastWriteUtc);
 
             if (!settledByMetadata)
             {

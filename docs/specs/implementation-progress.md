@@ -183,8 +183,8 @@ placer temp-cleanup bug and the open ratio-guard decision.*
 - Volume-aware dispatch: spread in-flight reads across source volumes instead of letting the FIFO
   concentrate them. Self-calibrating on least-outstanding-work per volume, so it needs no hardware
   probing and helps every multi-source run.
-- Duplicate source election on the same signal (the `ISourceSelector` seam, which moves to dispatch
-  time). Gated on deciding "dispose all replicas" — see the doc.
+- Duplicate source election on the same signal, decided at dispatch time. Gated on deciding "dispose all
+  replicas" — see the doc.
 - Remove emptied directories at a Mirror destination.
 - `get-recent-reconciles`, so a deletion pass appears in the activity history.
 

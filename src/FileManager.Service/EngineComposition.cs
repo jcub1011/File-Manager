@@ -118,10 +118,6 @@ internal static class EngineComposition
         // dependency that only goes one way, so there is no cycle: the coordinator never knows about
         // the orchestrator.
         services.AddSingleton<IMirrorDeletionPass, MirrorDeletionPass>();
-        // A seam, not a feature: this reproduces today's §3.4 priority rule exactly. It exists so a
-        // future speed/byte-balancing strategy for contested destination paths is a planning-only
-        // change — see ISourceSelector's doc for the recorded intent and its platform prerequisite.
-        services.AddSingleton<ISourceSelector, PrioritySourceSelector>();
         // Concrete + interface, the MemoryTrimCoordinator pattern: RunProfileHandler and
         // JobOrchestrator both write to run state, so both must resolve THE SAME instance — and
         // EngineHost resolves the concrete type to drain it at shutdown.

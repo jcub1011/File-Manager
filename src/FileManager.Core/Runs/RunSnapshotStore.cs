@@ -395,20 +395,20 @@ internal static class RunSnapshotReader
         if (!File.Exists(path))
             yield break;
 
-        using FileStream stream = new(path, FileMode.Open, FileAccess.Read, FileShare.Read, bufferSize: 64 * 1024);
-        using StreamReader reader = new(stream, Encoding.UTF8);
+        // Bytes, not text. This used to decode each line to a string with StreamReader.ReadLine and then
+        // immediately re-encode it with Encoding.UTF8.GetBytes, because NdjsonFrame and the deserializer
+        // both want bytes — two full transcodes and two allocations per row to undo work the file already
+        // had in the right form. This path runs on EVERY plan replay over sources and destinations alike,
+        // so at the 500,000-file cap that was millions of throwaway objects per preview.
         int lineNumber = 0;
-        while (reader.ReadLine() is { } line)
+        foreach (byte[] line in NdjsonLines.ReadAllLines(path))
         {
             lineNumber++;
-            if (line.Length == 0)
-                continue;
             T? item = null;
             string? problem = null;
             try
             {
-                byte[] bytes = Encoding.UTF8.GetBytes(line);
-                if (!NdjsonFrame.TryDecode(bytes, out ReadOnlySpan<byte> json, out string? reason))
+                if (!NdjsonFrame.TryDecode(line, out ReadOnlySpan<byte> json, out string? reason))
                     problem = reason ?? "malformed frame";
                 else
                     item = JsonSerializer.Deserialize(json, typeInfo);

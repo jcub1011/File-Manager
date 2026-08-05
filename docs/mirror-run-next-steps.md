@@ -450,11 +450,23 @@ reassigns.
 
 ### The seam needs to move
 
-`src/FileManager.Core/Runs/ISourceSelector.cs` currently chooses from static inputs at **plan** time, and
-its doc records the superseded media-type intent. Under this design the decision happens at **dispatch**
-time and must see live per-volume load, so the interface moves. The important property survives:
-`RunCopyItem.SourceIndex` still records what actually happened, so the snapshot and the audit trail agree
-with reality even though the choice was not made in advance.
+There was a plan-time seam for this — `ISourceSelector`, with a `PrioritySourceSelector` that reproduced
+the existing §3.4 rule and a DI registration — and it has been **deleted**: nothing ever injected it, no
+test exercised `Select`, and its own doc conceded the interface would be re-shaped rather than
+implemented. A seam in the wrong place is worse than none, because `PrioritySourceSelector.Rank` could
+drift out of step with the `JobPlan.PriorityIndex` rule it mirrored and no test would notice.
+
+Two conclusions from that design worth keeping:
+
+- **Rank by live load, not by media type.** Ordering volumes NVMe > SATA SSD > HDD was considered and
+  abandoned: media type is a poor proxy for throughput, and no static probe sees queue depth, competing
+  processes, NAS congestion, or a drive that is degrading. Dispatch instead on *least outstanding read
+  work per volume* (keyed by `IVolumeInfoProvider.GetVolumeKey`) — a faster volume drains its in-flight
+  work sooner, so it looks more available, so it receives more. That self-calibrates with nothing to
+  measure and no hardware probing.
+- **So the decision cannot be made at plan time at all**, which is why the seam belonged at dispatch. The
+  load-bearing property survives either way: `RunCopyItem.SourceIndex` records what actually happened, so
+  the snapshot and the audit trail agree with reality even though the choice was not made in advance.
 
 ### Scope reality check
 

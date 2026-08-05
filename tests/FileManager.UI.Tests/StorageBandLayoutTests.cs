@@ -57,11 +57,14 @@ public sealed class StorageBandLayoutTests
             usedNow: 1000, settled: 900, realisticPeak: 950, safeCeiling: 980);
 
         AssertTiles(bands);
+        // The 0 → 900 band is the AT-REST total, not the current one: the volume holds 1000 right now, and
+        // 900 is where it settles. Labelling it CurrentUsed (which this used to assert) made the bar report
+        // "Current Storage Used = 900" on a drive holding 1000, and left no SUAR reading anywhere.
         Assert.Equal(
-            [StorageBandKind.Freed, StorageBandKind.AbsolutePeak, StorageBandKind.RealisticPeak, StorageBandKind.CurrentUsed],
+            [StorageBandKind.Freed, StorageBandKind.AbsolutePeak, StorageBandKind.RealisticPeak, StorageBandKind.UsedAtRest],
             bands.Select(b => b.Kind));
 
-        Assert.Equal(900, Span(bands, StorageBandKind.CurrentUsed));      // 0 → 900, what stays put
+        Assert.Equal(900, Span(bands, StorageBandKind.UsedAtRest));       // 0 → 900, where it settles
         Assert.Equal(50, Span(bands, StorageBandKind.RealisticPeak));     // 900 → 950
         Assert.Equal(30, Span(bands, StorageBandKind.AbsolutePeak));      // 950 → 980
         Assert.Equal(20, Span(bands, StorageBandKind.Freed));             // 980 → 1000, genuinely released
@@ -74,7 +77,7 @@ public sealed class StorageBandLayoutTests
             usedNow: 1000, settled: 500, realisticPeak: 600, safeCeiling: 650);
 
         AssertTiles(bands);
-        Assert.Equal(500, Span(bands, StorageBandKind.CurrentUsed));
+        Assert.Equal(500, Span(bands, StorageBandKind.UsedAtRest));       // where it settles, not "current"
         Assert.Equal(100, Span(bands, StorageBandKind.RealisticPeak));
         Assert.Equal(50, Span(bands, StorageBandKind.AbsolutePeak));
         Assert.Equal(350, Span(bands, StorageBandKind.Freed));            // 650 → 1000

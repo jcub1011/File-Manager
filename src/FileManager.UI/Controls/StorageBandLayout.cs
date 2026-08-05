@@ -62,7 +62,13 @@ public static class StorageBandLayout
             (StorageBandKind.AbsolutePeak, ceiling),
             (StorageBandKind.RealisticPeak, peak),
             grows ? (StorageBandKind.UsedAtRest, settled) : (StorageBandKind.Freed, usedNow),
-            (StorageBandKind.CurrentUsed, grows ? usedNow : settled),
+            // The smaller threshold is the untouched baseline, and WHICH figure that is flips with the
+            // direction: growing, the volume's current total is the baseline and settled is above it;
+            // freeing, the at-rest total is the baseline and the current total is above it. Tagging this
+            // band CurrentUsed unconditionally mislabelled the at-rest total "CSU / Current Storage Used"
+            // on any volume the run frees — reporting 900 GB as current when the drive holds 1000 GB right
+            // now — and left the bar with no SUAR reading at all.
+            (grows ? StorageBandKind.CurrentUsed : StorageBandKind.UsedAtRest, grows ? usedNow : settled),
         ];
         Array.Sort(layers, static (a, b) => b.Threshold.CompareTo(a.Threshold));
 
