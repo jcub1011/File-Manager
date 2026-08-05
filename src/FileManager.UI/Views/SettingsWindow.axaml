@@ -253,27 +253,42 @@
                              so the two windows do not disagree about where Discard sits.
                              Save and Discard both leave the window open: this is a settings document,
                              not a wizard, so committing or abandoning a change should not also decide
-                             that the user is finished. Only Close and the title-bar X close it. Icon-only
-                             now, matching the main window's strips — so the tooltips carry the wording the
-                             labels used to, and Close keeps its bound text there rather than dropping the
-                             distinction between "Close" and "Close without saving". -->
+                             that the user is finished. Only Close and the title-bar X close it. Labelled
+                             and flat, matching the main window's strips: three actions that resolve the
+                             dialog in three different ways is too much to hang on three glyphs, and Close
+                             needs its label on screen to keep the distinction between "Close" and "Close
+                             without saving" visible. The tooltips stay on for the detail.
+                             Filled, so unlike Undo/Redo above they need no onChrome: that class only makes
+                             a transparent button's hover visible on this bar, and a fill brings its own. -->
                         <!-- One size down, as everywhere else: a bare cross fills its box corner to corner
                              and overshoots the outline glyphs beside it at a matched size. -->
                         <Button x:Name="FooterDiscardButton"
-                                Classes="iconButton onChrome" Command="{Binding DiscardChangesCommand}"
+                                Classes="iconButton hasLabel" Command="{Binding DiscardChangesCommand}"
                                 ToolTip.Tip="Discard changes — put every setting back the way it was last saved">
-                            <PathIcon Data="{StaticResource IconClose}" Width="14" Height="14" />
+                            <StackPanel Orientation="Horizontal" Spacing="6">
+                                <PathIcon Data="{StaticResource IconClose}" Width="12" Height="12"
+                                          VerticalAlignment="Center" />
+                                <TextBlock Text="Discard changes" VerticalAlignment="Center" />
+                            </StackPanel>
                         </Button>
-                        <Button Classes="iconButton onChrome tintAccent" Command="{Binding SaveCommand}"
+                        <Button Classes="iconButton hasLabel tintAccent" Command="{Binding SaveCommand}"
                                 IsEnabled="{Binding !IsBusy}" ToolTip.Tip="Save">
-                            <PathIcon Data="{StaticResource IconSave}" Width="16" Height="16" />
+                            <StackPanel Orientation="Horizontal" Spacing="6">
+                                <PathIcon Data="{StaticResource IconSave}" Width="14" Height="14"
+                                          VerticalAlignment="Center" />
+                                <TextBlock Text="Save" VerticalAlignment="Center" />
+                            </StackPanel>
                         </Button>
-                        <!-- Named for the smoke test: with the label gone, CloseButtonText is only visible
-                             in the tooltip, so the test can no longer find this button by its content. -->
+                        <!-- Named for the smoke test: the label lives in a TextBlock inside a StackPanel, so
+                             the button's own Content is not its text and the test cannot match on it. -->
                         <Button x:Name="FooterCloseButton"
-                                Classes="iconButton onChrome tintDanger" Click="OnCloseClick"
+                                Classes="iconButton hasLabel tintDanger" Click="OnCloseClick"
                                 ToolTip.Tip="{Binding CloseButtonText}">
-                            <PathIcon Data="{StaticResource IconTrash}" Width="16" Height="16" />
+                            <StackPanel Orientation="Horizontal" Spacing="6">
+                                <PathIcon Data="{StaticResource IconTrash}" Width="14" Height="14"
+                                          VerticalAlignment="Center" />
+                                <TextBlock Text="{Binding CloseButtonText}" VerticalAlignment="Center" />
+                            </StackPanel>
                         </Button>
                     </StackPanel>
                 </Grid>

@@ -75,19 +75,30 @@
                     </Grid>
                 </Border>
                 <Grid ColumnDefinitions="Auto,*">
-                    <!-- onChrome, like the settings footer: the default iconButton hover is a lift off
-                         Brush.Panel.Background and is invisible on this bar's chrome fill. -->
-                    <Button Grid.Column="0" Classes="iconButton onChrome" Command="{Binding RefreshCommand}"
+                    <!-- Labelled and filled, like the settings footer: these two resolve the window (or
+                         re-read everything in it) and are worth naming. No onChrome — that class exists
+                         only to make a transparent button's hover visible on this bar's chrome fill, and
+                         a filled button brings its own. The Dismiss cross inside the error bar above is
+                         still transparent, so it still needs it. -->
+                    <Button Grid.Column="0" Classes="iconButton hasLabel" Command="{Binding RefreshCommand}"
                             ToolTip.Tip="Refresh — re-read the queue from the service">
-                        <PathIcon Data="{StaticResource IconRefresh}" Width="16" Height="16" />
+                        <StackPanel Orientation="Horizontal" Spacing="6">
+                            <PathIcon Data="{StaticResource IconRefresh}" Width="14" Height="14"
+                                      VerticalAlignment="Center" />
+                            <TextBlock Text="Refresh" VerticalAlignment="Center" />
+                        </StackPanel>
                     </Button>
                     <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="8" HorizontalAlignment="Right">
                         <!-- One size down, as everywhere else: a bare cross fills its box corner to corner
                              and overshoots the outline glyphs beside it at a matched size. -->
                         <Button x:Name="FooterCloseButton"
-                                Classes="iconButton onChrome tintDanger" Click="OnCloseClick"
+                                Classes="iconButton hasLabel tintDanger" Click="OnCloseClick"
                                 ToolTip.Tip="Close the job queue. Runs keep going — this window only stops watching them.">
-                            <PathIcon Data="{StaticResource IconClose}" Width="14" Height="14" />
+                            <StackPanel Orientation="Horizontal" Spacing="6">
+                                <PathIcon Data="{StaticResource IconClose}" Width="12" Height="12"
+                                          VerticalAlignment="Center" />
+                                <TextBlock Text="Close" VerticalAlignment="Center" />
+                            </StackPanel>
                         </Button>
                     </StackPanel>
                 </Grid>
@@ -161,26 +172,47 @@
                                          run — a finished one is otherwise kept until auto-delete reaps it,
                                          or forever when that setting is off. Discarding a live run confirms
                                          first (see JobQueueViewModel.ConfirmDiscard). -->
+                                    <!-- Labelled and filled, like every other action in the app. Full-size
+                                         rather than the dense 12px glyphs these were: the approval strip
+                                         below the progress bar already puts full-size buttons inside this
+                                         card, so a compact variant here would only make the two disagree.
+                                         The profile name to the left already trims on overflow, which is
+                                         what gives at the window's 520px minimum. -->
                                     <StackPanel Grid.Row="0" Grid.Column="2" Orientation="Horizontal"
-                                                Spacing="4" VerticalAlignment="Top">
-                                        <Button Classes="iconButton" IsVisible="{Binding IsPausable}"
+                                                Spacing="8" VerticalAlignment="Top">
+                                        <!-- Glyph AND label come from the row: this one button is both Pause
+                                             and Resume, and PauseLabel already returns the word for the
+                                             current state with notification wired to Paused. No tooltip —
+                                             it used to hold this same word, and the header paragraph is
+                                             where what pausing actually does is explained. -->
+                                        <Button Classes="iconButton hasLabel" IsVisible="{Binding IsPausable}"
                                                 Command="{Binding $parent[ItemsControl].((vm:JobQueueViewModel)DataContext).TogglePauseCommand}"
-                                                CommandParameter="{Binding}"
-                                                ToolTip.Tip="{Binding PauseLabel}">
-                                            <PathIcon Width="12" Height="12"
-                                                      Data="{Binding PauseIconKey, Converter={x:Static conv:IconConverters.Geometry}}" />
+                                                CommandParameter="{Binding}">
+                                            <StackPanel Orientation="Horizontal" Spacing="6">
+                                                <PathIcon Width="14" Height="14" VerticalAlignment="Center"
+                                                          Data="{Binding PauseIconKey, Converter={x:Static conv:IconConverters.Geometry}}" />
+                                                <TextBlock Text="{Binding PauseLabel}" VerticalAlignment="Center" />
+                                            </StackPanel>
                                         </Button>
-                                        <Button Classes="iconButton" IsVisible="{Binding IsCancellable}"
+                                        <Button Classes="iconButton hasLabel" IsVisible="{Binding IsCancellable}"
                                                 Command="{Binding $parent[ItemsControl].((vm:JobQueueViewModel)DataContext).CancelRunCommand}"
                                                 CommandParameter="{Binding}"
                                                 ToolTip.Tip="Cancel this run but keep it in the queue. Work that has not started is dropped; files already being copied finish. A Mirror run removes nothing.">
-                                            <PathIcon Data="{StaticResource IconSkip}" Width="12" Height="12" />
+                                            <StackPanel Orientation="Horizontal" Spacing="6">
+                                                <PathIcon Data="{StaticResource IconSkip}" Width="14" Height="14"
+                                                          VerticalAlignment="Center" />
+                                                <TextBlock Text="Cancel" VerticalAlignment="Center" />
+                                            </StackPanel>
                                         </Button>
-                                        <Button Classes="iconButton tintDanger"
+                                        <Button Classes="iconButton hasLabel tintDanger"
                                                 Command="{Binding $parent[ItemsControl].((vm:JobQueueViewModel)DataContext).DiscardCommand}"
                                                 CommandParameter="{Binding}"
                                                 ToolTip.Tip="Discard — remove this run from the queue. A run still going is cancelled first.">
-                                            <PathIcon Data="{StaticResource IconTrash}" Width="12" Height="12" />
+                                            <StackPanel Orientation="Horizontal" Spacing="6">
+                                                <PathIcon Data="{StaticResource IconTrash}" Width="14" Height="14"
+                                                          VerticalAlignment="Center" />
+                                                <TextBlock Text="Discard" VerticalAlignment="Center" />
+                                            </StackPanel>
                                         </Button>
                                     </StackPanel>
 
@@ -193,22 +225,47 @@
                                     <StackPanel Grid.Row="2" Grid.Column="1" Grid.ColumnSpan="2"
                                                 Orientation="Horizontal" Spacing="8" Margin="0,8,0,0"
                                                 IsVisible="{Binding IsAwaitingApproval}">
-                                        <Button Content="Approve run" Classes="success"
+                                        <!-- A checkmark, not the Preview tab's play triangle: from here the
+                                             plan is a summary rather than a report on screen, so this button
+                                             reads as "yes, this one" rather than "watch it start". -->
+                                        <Button Classes="iconButton hasLabel tintSuccess"
                                                 IsVisible="{Binding CanApproveHere}"
                                                 Command="{Binding $parent[ItemsControl].((vm:JobQueueViewModel)DataContext).ApproveCommand}"
-                                                CommandParameter="{Binding}" />
-                                        <Button Content="View plan…"
+                                                CommandParameter="{Binding}"
+                                                ToolTip.Tip="Approve run — starts this run. It copies the files the plan listed and, for a Mirror profile, removes the ones marked for removal.">
+                                            <StackPanel Orientation="Horizontal" Spacing="6">
+                                                <PathIcon Data="{StaticResource IconCheckmark}" Width="14" Height="14"
+                                                          VerticalAlignment="Center" />
+                                                <TextBlock Text="Approve run" VerticalAlignment="Center" />
+                                            </StackPanel>
+                                        </Button>
+                                        <!-- The spyglass the Profile tab's Preview uses: this goes and looks,
+                                             it does not commit. -->
+                                        <Button Classes="iconButton hasLabel"
                                                 IsVisible="{Binding !CanApproveHere}"
                                                 Command="{Binding $parent[ItemsControl].((vm:JobQueueViewModel)DataContext).ViewPlanCommand}"
                                                 CommandParameter="{Binding}"
-                                                ToolTip.Tip="Show what this run will do on the Preview tab, where it can be approved." />
+                                                ToolTip.Tip="Show what this run will do on the Preview tab, where it can be approved.">
+                                            <StackPanel Orientation="Horizontal" Spacing="6">
+                                                <PathIcon Data="{StaticResource IconSearch}" Width="14" Height="14"
+                                                          VerticalAlignment="Center" />
+                                                <TextBlock Text="View plan…" VerticalAlignment="Center" />
+                                            </StackPanel>
+                                        </Button>
                                         <!-- Declining a plan IS discarding it: the run closes AND leaves the
                                              queue, rather than lingering as a row for a plan the user said
-                                             no to. Same command as the row's trash button. -->
-                                        <Button Content="Discard"
+                                             no to. Same command, and now the same trash can, as the row's
+                                             discard button above. -->
+                                        <Button Classes="iconButton hasLabel tintDanger"
                                                 Command="{Binding $parent[ItemsControl].((vm:JobQueueViewModel)DataContext).DiscardCommand}"
                                                 CommandParameter="{Binding}"
-                                                ToolTip.Tip="Discard this plan. Nothing has been changed and nothing will be." />
+                                                ToolTip.Tip="Discard this plan. Nothing has been changed and nothing will be.">
+                                            <StackPanel Orientation="Horizontal" Spacing="6">
+                                                <PathIcon Data="{StaticResource IconTrash}" Width="14" Height="14"
+                                                          VerticalAlignment="Center" />
+                                                <TextBlock Text="Discard" VerticalAlignment="Center" />
+                                            </StackPanel>
+                                        </Button>
                                     </StackPanel>
                                 </Grid>
                             </Border>

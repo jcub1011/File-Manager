@@ -127,28 +127,47 @@
         <Setter Property="Background" Value="#38808080" />
     </Style>
     <!-- Idle glyphs sit at the secondary weight and brighten on hover — softer and more
-         cohesive than stark full-contrast icons. -->
+         cohesive than stark full-contrast icons. Every rule below is stated twice, once for the glyph
+         and once for a .hasLabel button's label, so the pair colours as one token rather than a bright
+         word beside a dim icon. The two cannot share one comma-separated selector: Avalonia resolves
+         the setter against the selectors' common base type, and Foreground is not declared on Control.
+         Within a pair the order is free — they target different element types and never collide. -->
     <Style Selector="Button.iconButton PathIcon">
+        <Setter Property="Foreground" Value="{DynamicResource Brush.Text.Secondary}" />
+    </Style>
+    <Style Selector="Button.iconButton TextBlock">
         <Setter Property="Foreground" Value="{DynamicResource Brush.Text.Secondary}" />
     </Style>
     <Style Selector="Button.iconButton:pointerover PathIcon">
         <Setter Property="Foreground" Value="{DynamicResource Brush.Text.Primary}" />
     </Style>
+    <Style Selector="Button.iconButton:pointerover TextBlock">
+        <Setter Property="Foreground" Value="{DynamicResource Brush.Text.Primary}" />
+    </Style>
 
-    <!-- Tint variants for icon-only buttons whose glyph is their whole label: the colour carries the
-         meaning the solid-fill text buttons used to (accent = commit, red = destructive, green =
-         inspect). One constant tint across idle and hover — the hover fill behind the glyph is the
-         feedback. These must stay AFTER the two rules above: equal-priority style setters are resolved
-         by document order, so an earlier tint would lose the hover state back to Brush.Text.Primary.
-         Tinting via a class rather than a Foreground on the PathIcon itself is deliberate — a local
-         value on the element outranks every one of these styles at once, hover rule included. -->
+    <!-- Tint variants: the colour carries the meaning the solid-fill buttons used to (accent = commit,
+         red = destructive, green = inspect). One constant tint across idle and hover — the hover fill
+         behind the content is the feedback. These must stay AFTER the four rules above: equal-priority
+         style setters are resolved by document order, so an earlier tint would lose the hover state
+         back to Brush.Text.Primary. Tinting via a class rather than a Foreground on the PathIcon or
+         TextBlock itself is deliberate — a local value on the element outranks every one of these
+         styles at once, hover rule included. -->
     <Style Selector="Button.iconButton.tintAccent PathIcon">
+        <Setter Property="Foreground" Value="{DynamicResource Brush.Accent}" />
+    </Style>
+    <Style Selector="Button.iconButton.tintAccent TextBlock">
         <Setter Property="Foreground" Value="{DynamicResource Brush.Accent}" />
     </Style>
     <Style Selector="Button.iconButton.tintDanger PathIcon">
         <Setter Property="Foreground" Value="{DynamicResource Brush.Danger}" />
     </Style>
+    <Style Selector="Button.iconButton.tintDanger TextBlock">
+        <Setter Property="Foreground" Value="{DynamicResource Brush.Danger}" />
+    </Style>
     <Style Selector="Button.iconButton.tintSuccess PathIcon">
+        <Setter Property="Foreground" Value="{DynamicResource Brush.Success}" />
+    </Style>
+    <Style Selector="Button.iconButton.tintSuccess TextBlock">
         <Setter Property="Foreground" Value="{DynamicResource Brush.Success}" />
     </Style>
     <!-- Amber: go, but look before you do. For Approve Run, which is irreversible without being an
@@ -156,9 +175,112 @@
     <Style Selector="Button.iconButton.tintWarning PathIcon">
         <Setter Property="Foreground" Value="{DynamicResource Brush.Warning}" />
     </Style>
+    <Style Selector="Button.iconButton.tintWarning TextBlock">
+        <Setter Property="Foreground" Value="{DynamicResource Brush.Warning}" />
+    </Style>
+    <!-- ================= Labelled variant: a button, not a tinted glyph =================
+         The actions that resolve a decision (Save, Delete, Preview, Approve, Discard, Close) carry a
+         visible label, and a label wants a button under it. Tinted text on a transparent strip reads
+         as a link rather than a control, and at these brush values it is the harder thing to read of
+         the two — Brush.Warning on the chrome fill is the worst of them. So .hasLabel takes the tint
+         as a solid FILL and puts white on top: the recipe Button.danger/.success already use, reached
+         through the tint class the icon-only buttons carry so gaining a label costs no restyling.
+         Untinted is the neutral secondary. Brush.Muted is the one grey in the set dark enough to hold
+         white text at 4.5:1, and being variant-independent it behaves the same in both themes.
+         The hover/press shades are literal darker steps of each token rather than tokens of their own,
+         exactly as Button.danger/.success do — nothing else needs them. Accent is the exception: it
+         has real hover/pressed tokens because the accent is user-facing and theme-varied.
+         All of this must follow the icon-only rules above to win: equal-priority setters resolve by
+         document order. It must also PRECEDE the :disabled rules below, which stay last. -->
+    <Style Selector="Button.iconButton.hasLabel">
+        <Setter Property="Padding" Value="12,5" />
+        <Setter Property="Background" Value="{DynamicResource Brush.Muted}" />
+    </Style>
+    <Style Selector="Button.iconButton.hasLabel PathIcon">
+        <Setter Property="Foreground" Value="{DynamicResource Brush.OnColor.Light}" />
+    </Style>
+    <Style Selector="Button.iconButton.hasLabel TextBlock">
+        <Setter Property="Foreground" Value="{DynamicResource Brush.OnColor.Light}" />
+    </Style>
+    <!-- The fill lives on the ContentPresenter for the hover/press states, so these have to restate it
+         there: the iconButton and onChrome states above set that same property and would otherwise
+         wipe the fill out from under the label on hover. -->
+    <Style Selector="Button.iconButton.hasLabel:pointerover /template/ ContentPresenter">
+        <Setter Property="Background" Value="#626871" />
+    </Style>
+    <Style Selector="Button.iconButton.hasLabel:pressed /template/ ContentPresenter">
+        <Setter Property="Background" Value="#545A62" />
+    </Style>
+
+    <Style Selector="Button.iconButton.hasLabel.tintAccent">
+        <Setter Property="Background" Value="{DynamicResource Brush.Accent}" />
+    </Style>
+    <Style Selector="Button.iconButton.hasLabel.tintAccent:pointerover /template/ ContentPresenter">
+        <Setter Property="Background" Value="{DynamicResource Brush.Accent.Hover}" />
+    </Style>
+    <Style Selector="Button.iconButton.hasLabel.tintAccent:pressed /template/ ContentPresenter">
+        <Setter Property="Background" Value="{DynamicResource Brush.Accent.Pressed}" />
+    </Style>
+
+    <Style Selector="Button.iconButton.hasLabel.tintDanger">
+        <Setter Property="Background" Value="{DynamicResource Brush.Danger}" />
+    </Style>
+    <Style Selector="Button.iconButton.hasLabel.tintDanger:pointerover /template/ ContentPresenter">
+        <Setter Property="Background" Value="#A94E49" />
+    </Style>
+    <Style Selector="Button.iconButton.hasLabel.tintDanger:pressed /template/ ContentPresenter">
+        <Setter Property="Background" Value="#94443F" />
+    </Style>
+
+    <Style Selector="Button.iconButton.hasLabel.tintSuccess">
+        <Setter Property="Background" Value="{DynamicResource Brush.Success}" />
+    </Style>
+    <Style Selector="Button.iconButton.hasLabel.tintSuccess:pointerover /template/ ContentPresenter">
+        <Setter Property="Background" Value="#47825D" />
+    </Style>
+    <Style Selector="Button.iconButton.hasLabel.tintSuccess:pressed /template/ ContentPresenter">
+        <Setter Property="Background" Value="#3B6E4E" />
+    </Style>
+
+    <!-- Amber is the one fill here that will not carry white: #C39A3C against #FFFFFF is 2.6:1, well
+         under the 4.5:1 a 13px label needs, and this is the most consequential button in the app to
+         leave hard to read. Dark ink on amber gets 6.5:1 and is what caution colouring does everywhere
+         else, so tintWarning overrides the white above — hence its position after those rules. The
+         hover/press steps are shallower than the other tints for the same reason: they have to stay
+         light enough to hold the dark ink (5.5:1 and 4.6:1). -->
+    <Style Selector="Button.iconButton.hasLabel.tintWarning">
+        <Setter Property="Background" Value="{DynamicResource Brush.Warning}" />
+    </Style>
+    <Style Selector="Button.iconButton.hasLabel.tintWarning PathIcon">
+        <Setter Property="Foreground" Value="{DynamicResource Brush.OnColor.Dark}" />
+    </Style>
+    <Style Selector="Button.iconButton.hasLabel.tintWarning TextBlock">
+        <Setter Property="Foreground" Value="{DynamicResource Brush.OnColor.Dark}" />
+    </Style>
+    <Style Selector="Button.iconButton.hasLabel.tintWarning:pointerover /template/ ContentPresenter">
+        <Setter Property="Background" Value="#B58C33" />
+    </Style>
+    <Style Selector="Button.iconButton.hasLabel.tintWarning:pressed /template/ ContentPresenter">
+        <Setter Property="Background" Value="#A67D2B" />
+    </Style>
+
+    <!-- Disabled drops the fill along with the colour. A greyed label on a live accent fill still reads
+         as a live button, which is the one thing a disabled control must not do. Delete, both Previews
+         and the Settings Save all reach this state, so it is not a corner.
+         Translucent mid-grey rather than a token: this has to stay legible as a FILLED-but-dead plate on
+         a panel and on a chrome bar in both variants, and Brush.Control.Background is #FFFFFF in the
+         light theme — on the light chrome bar that disabled Save would vanish into a blank gap. Same
+         trick, and the same value, as the onChrome pressed state above. -->
+    <Style Selector="Button.iconButton.hasLabel:disabled /template/ ContentPresenter">
+        <Setter Property="Background" Value="#38808080" />
+    </Style>
+
     <!-- Fluent greys a disabled button through its template's ContentPresenter foreground, which every
-         explicit PathIcon foreground above defeats — so say it outright. Last, so it beats the tints. -->
+         explicit foreground above defeats — so say it outright. Last, so it beats the tints. -->
     <Style Selector="Button.iconButton:disabled PathIcon">
+        <Setter Property="Foreground" Value="{DynamicResource Brush.Text.Disabled}" />
+    </Style>
+    <Style Selector="Button.iconButton:disabled TextBlock">
         <Setter Property="Foreground" Value="{DynamicResource Brush.Text.Disabled}" />
     </Style>
 
@@ -234,26 +356,12 @@
         <Setter Property="Foreground" Value="White" />
     </Style>
 
-    <!-- "Go" action button (green): the manual Run. Same shape as Button.danger, and like it the
-         hover/press shades are literal darker steps of Brush.Success rather than tokens of their
-         own — nothing else needs them. -->
-    <Style Selector="Button.success">
-        <Setter Property="Background" Value="{DynamicResource Brush.Success}" />
-        <Setter Property="Foreground" Value="White" />
-        <Setter Property="BorderThickness" Value="0" />
-    </Style>
-    <Style Selector="Button.success:pointerover /template/ ContentPresenter">
-        <Setter Property="Background" Value="#47825D" />
-        <Setter Property="Foreground" Value="White" />
-    </Style>
-    <Style Selector="Button.success:pressed /template/ ContentPresenter">
-        <Setter Property="Background" Value="#3B6E4E" />
-        <Setter Property="Foreground" Value="White" />
-    </Style>
-    <!-- The Run glyph must follow the button's white foreground, not the theme's icon brush. -->
-    <Style Selector="Button.success PathIcon">
-        <Setter Property="Foreground" Value="White" />
-    </Style>
+    <!-- Button.success lived here: a solid green "go" button whose only caller was the job queue's
+         "Approve run". That button is now iconButton.hasLabel.tintSuccess like every other action in
+         the app, which leaves nothing selecting Button.success — the .infoBar.success that remains is
+         a Border. Its hover/press steps (#47825D / #3B6E4E) carried over to the .hasLabel green above,
+         so nothing was lost with it. Button.danger stays: ConfirmWindow and ProfileEditorView still
+         use it for their inline confirmations. -->
 
     <!-- ============================ Inputs ============================ -->
     <Style Selector="TextBox">
