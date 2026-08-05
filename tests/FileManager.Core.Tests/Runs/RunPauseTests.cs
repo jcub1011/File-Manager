@@ -1,5 +1,6 @@
 using FileManager.Contracts.IPC;
 using FileManager.Contracts.Primitives;
+using FileManager.Contracts.Profiles;
 using FileManager.Core.Jobs;
 using FileManager.Core.Runs;
 using FileManager.Core.Runs.Reconcile;
@@ -65,6 +66,35 @@ public sealed class RunPauseTests
         }
 
         Assert.Equal(4, runs.ListRuns().Count(r => r.Phase == nameof(RunPhase.AwaitingApproval)));
+    }
+
+    /// <summary>A run announces itself the moment it begins, before it has walked anything.
+    ///
+    /// <para>Until this existed a run published nothing until it either blocked on a plan slot or its walk
+    /// crossed a 100 ms progress boundary — and a walk that has not yielded its first chunk crosses no
+    /// boundary at all. A run over a slow share therefore existed for seconds with every client's job queue
+    /// showing nothing, which is exactly when a user opens the queue to see what is happening.</para>
+    ///
+    /// <para>The sample carries the profile because a client cannot look it up: a run planned from an
+    /// unsaved draft is in no catalog, and this sample is what a queue builds its row from.</para></summary>
+    [Fact]
+    public void A_run_announces_itself_as_soon_as_it_begins()
+    {
+        using RunPlanHarness h = new("run-announce");
+        h.WriteSource("a.txt", "aaa");
+        RunCoordinator runs = h.Coordinator();
+        Profile profile = h.AdditiveProfile();
+
+        runs.Begin(profile, null).TryGetValue(out RunHandle? handle);
+
+        // Deliberately NOT awaiting a phase: the point is that the announcement precedes any walking, so
+        // waiting for the plan would prove nothing about when it was published.
+        RunProgressEvent announced = h.Bus.Events.OfType<RunProgressEvent>().First();
+        Assert.Equal(handle!.RunId, announced.RunId);
+        Assert.Equal(profile.Id, announced.ProfileId);
+        Assert.Equal(profile.Name, announced.ProfileName);
+        Assert.Equal(nameof(RunPhase.Planning), announced.Phase);
+        Assert.Equal(0, announced.ScannedSources);   // nothing has been looked at yet, and it says so
     }
 
     // ---- get-runs ---------------------------------------------------------------------------------

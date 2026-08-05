@@ -20,11 +20,13 @@ public sealed class JobQueueViewModelTests
 
     private static RunProgressEvent Progress(
         Guid runId, string phase = "Executing", int completed = 1, int total = 10,
-        bool paused = false, long scannedSources = 0) =>
+        bool paused = false, long scannedSources = 0, string name = "Photos") =>
         new()
         {
             AtUtc = DateTimeOffset.UnixEpoch,
             RunId = runId,
+            ProfileId = Guid.NewGuid(),
+            ProfileName = name,
             Phase = phase,
             Completed = completed,
             Total = total,
@@ -101,6 +103,116 @@ public sealed class JobQueueViewModelTests
         Assert.Equal(7, row.Completed);
     }
 
+    // ── The reconcile diffs rather than rebuilds ────────────────────────────────────────────────
+    // An open queue window re-reads the list every couple of seconds. The old reconcile cleared the
+    // collection and refilled it, which was fine on window-open and on reconnect and is not fine twice a
+    // second: it resets the scroll position and makes a virtualized list rebuild every realized row.
+
+    /// <summary>The common case, and the one that matters for an open window: nothing changed, so the
+    /// collection must raise NO events at all.</summary>
+    [Fact]
+    public async Task An_unchanged_reconcile_does_not_touch_the_collection()
+    {
+        Guid a = Guid.NewGuid(), b = Guid.NewGuid();
+        FakeIpcGateway gateway = new()
+        {
+            RunsResult = new List<RunSummaryDto> { Summary(a), Summary(b) },
+        };
+        JobQueueViewModel queue = new(gateway);
+        await queue.ReconcileAsync();
+
+        int changes = 0;
+        queue.Runs.CollectionChanged += (_, _) => changes++;
+        await queue.ReconcileAsync();
+        await queue.ReconcileAsync();
+
+        Assert.Equal(0, changes);
+        Assert.Equal(2, queue.Runs.Count);
+    }
+
+    /// <summary>A new run appears without the rest of the list being rebuilt around it — one insert, and the
+    /// rows already there keep their instances.</summary>
+    [Fact]
+    public async Task A_new_run_is_inserted_without_disturbing_the_existing_rows()
+    {
+        Guid a = Guid.NewGuid(), b = Guid.NewGuid();
+        FakeIpcGateway gateway = new() { RunsResult = new List<RunSummaryDto> { Summary(a) } };
+        JobQueueViewModel queue = new(gateway);
+        await queue.ReconcileAsync();
+        JobQueueRow existing = queue.Runs[0];
+
+        // get-runs is newest-first, so the new run leads.
+        gateway.RunsResult = new List<RunSummaryDto> { Summary(b), Summary(a) };
+        await queue.ReconcileAsync();
+
+        Assert.Equal(2, queue.Runs.Count);
+        Assert.Equal(b, queue.Runs[0].RunId);
+        Assert.Same(existing, queue.Runs[1]);   // the row that was already there was not rebuilt
+    }
+
+    /// <summary>A run the response no longer names has gone from the engine, so its row goes too.</summary>
+    [Fact]
+    public async Task A_run_the_response_omits_is_removed()
+    {
+        Guid a = Guid.NewGuid(), b = Guid.NewGuid();
+        FakeIpcGateway gateway = new()
+        {
+            RunsResult = new List<RunSummaryDto> { Summary(a), Summary(b) },
+        };
+        JobQueueViewModel queue = new(gateway);
+        await queue.ReconcileAsync();
+
+        gateway.RunsResult = new List<RunSummaryDto> { Summary(a) };
+        await queue.ReconcileAsync();
+
+        Assert.Equal(a, Assert.Single(queue.Runs).RunId);
+    }
+
+    /// <summary>Order follows the response (newest first), so a run that moved position is moved rather
+    /// than rebuilt — and the selection, which is an instance, survives it.</summary>
+    [Fact]
+    public async Task A_reordered_response_moves_rows_and_keeps_the_selection()
+    {
+        Guid a = Guid.NewGuid(), b = Guid.NewGuid(), c = Guid.NewGuid();
+        FakeIpcGateway gateway = new()
+        {
+            RunsResult = new List<RunSummaryDto> { Summary(a), Summary(b), Summary(c) },
+        };
+        JobQueueViewModel queue = new(gateway);
+        await queue.ReconcileAsync();
+        JobQueueRow selected = queue.Runs[2];
+        queue.SelectedRun = selected;
+
+        gateway.RunsResult = new List<RunSummaryDto> { Summary(c), Summary(a), Summary(b) };
+        await queue.ReconcileAsync();
+
+        Assert.Equal([c, a, b], queue.Runs.Select(r => r.RunId));
+        Assert.Same(selected, queue.SelectedRun);
+        Assert.Same(selected, queue.Runs[0]);
+    }
+
+    /// <summary>The watch loop is what makes an open window keep up when the event stream drops a frame —
+    /// for this view a dropped announcement means the run is simply absent.</summary>
+    [Fact]
+    public async Task The_watch_loop_reconciles_until_it_is_cancelled()
+    {
+        FakeIpcGateway gateway = new();
+        JobQueueViewModel queue = new(gateway);
+        using CancellationTokenSource cts = new();
+
+        Task watching = queue.WatchAsync(cts.Token);
+        // Long enough for several intervals, so this is not asserting on a single lucky tick.
+        await Task.Delay(JobQueueViewModel.WatchInterval * 3);
+        int polled = gateway.GetRunsCalls;
+        Assert.True(polled >= 1, $"the loop should have polled by now; it polled {polled} time(s)");
+
+        await cts.CancelAsync();
+        await watching;   // must return rather than throw
+        await Task.Delay(JobQueueViewModel.WatchInterval * 2);
+
+        Assert.Equal(polled, gateway.GetRunsCalls);   // and stop polling once cancelled
+    }
+
     /// <summary>A transient outage must not blank the queue — the rows on screen are still the best
     /// picture available.</summary>
     [Fact]
@@ -155,7 +267,7 @@ public sealed class JobQueueViewModelTests
     }
 
     /// <summary>Unlike the per-file activity feed, a run gets a synthesized row from a progress sample
-    /// alone: a queue silently missing an executing run is far worse than one row with a blank name.</summary>
+    /// alone: a queue silently missing an executing run is far worse than one extra row.</summary>
     [Fact]
     public void Progress_for_an_unseen_run_still_produces_a_row()
     {
@@ -167,6 +279,36 @@ public sealed class JobQueueViewModelTests
         Assert.Equal(5, row.Completed);
         Assert.Equal(0.25, row.ProgressFraction);
         Assert.Contains("5 of 20", row.ProgressText);
+    }
+
+    /// <summary>A run is ANNOUNCED by its first progress sample, before it has a plan — so that sample has
+    /// to carry the profile, or the row it creates is nameless for the whole of planning (minutes, on a
+    /// slow source). A client cannot look the name up: a draft-planned run is in no catalog.</summary>
+    [Fact]
+    public void The_row_a_progress_sample_creates_knows_its_profile()
+    {
+        JobQueueViewModel queue = new(new FakeIpcGateway());
+
+        queue.OnRunProgress(Progress(
+            Guid.NewGuid(), phase: "Planning", completed: 0, total: 0, name: "Backup"));
+
+        JobQueueRow row = Assert.Single(queue.Runs);
+        Assert.Equal("Backup", row.ProfileName);
+        Assert.NotEqual(Guid.Empty, row.ProfileId);
+    }
+
+    /// <summary>A sample from an older service carries no name, and must not blank one a run-planned already
+    /// supplied.</summary>
+    [Fact]
+    public void A_nameless_progress_sample_does_not_blank_a_name_already_known()
+    {
+        JobQueueViewModel queue = new(new FakeIpcGateway());
+        Guid runId = Guid.NewGuid();
+        queue.OnRunPlanned(Planned(runId, name: "Backup"));
+
+        queue.OnRunProgress(Progress(runId, name: ""));
+
+        Assert.Equal("Backup", queue.Runs[0].ProfileName);
     }
 
     /// <summary>run-completed is authoritative. A late progress sample — the stream is lossy AND unordered

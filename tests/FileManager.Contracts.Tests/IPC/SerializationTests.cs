@@ -115,7 +115,7 @@ public sealed class SerializationTests
     [Fact]
     public void Current_protocol_version_is_pinned()
     {
-        Assert.Equal(13, IpcRequest.CurrentProtocolVersion);
+        Assert.Equal(14, IpcRequest.CurrentProtocolVersion);
     }
 
     /// <summary>JobPhase must stay a string on the wire (the context sets UseStringEnumConverter), so

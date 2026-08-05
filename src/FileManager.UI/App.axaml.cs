@@ -100,7 +100,22 @@ namespace FileManager.UI
                     // engine events while this window is closed, so reopening shows current state instead of
                     // starting empty.
                     queue = new JobQueueWindow { DataContext = viewModel.Queue };
-                    queue.Closed += (_, _) => queue = null;
+
+                    // A watch loop for as long as the window is up. The event stream it otherwise follows is
+                    // drop-oldest lossy, and for this view a dropped frame means a run is simply MISSING —
+                    // there is nothing to correct it until the user presses Refresh. Linked to _shutdown so
+                    // app exit stops it even if the window never raises Closed.
+                    CancellationTokenSource watching =
+                        CancellationTokenSource.CreateLinkedTokenSource(_shutdown.Token);
+                    _ = viewModel.Queue.WatchAsync(watching.Token);
+                    queue.Closed += (_, _) =>
+                    {
+                        queue = null;
+                        // Stop polling for a list nobody is looking at. The view model lives on and keeps
+                        // consuming events, so reopening still shows current state.
+                        watching.Cancel();
+                        watching.Dispose();
+                    };
                     queue.Show(window);
                 };
                 window.DataContext = viewModel;

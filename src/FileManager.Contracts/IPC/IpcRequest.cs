@@ -93,8 +93,14 @@ public abstract record IpcRequest
     /// the terminal event. Version-gated because the retention contract itself changed: an old client
     /// assumes a finished run disappears within ten minutes and offers no way to remove one, so against a
     /// new service its queue would fill with rows it cannot clear — and a new client against an old
-    /// service would show a Discard button that answers NOT_IMPLEMENTED.</summary>
-    public const int CurrentProtocolVersion = 13;
+    /// service would show a Discard button that answers NOT_IMPLEMENTED.
+    /// 14 — a run is ANNOUNCED the moment it begins (an initial run-progress sample, counters at zero)
+    /// rather than only once its walk crosses a progress boundary, so a job queue shows a new run
+    /// immediately instead of after an unbounded silence on a slow source. run-progress gained ProfileId
+    /// and ProfileName to make that announcement nameable — without them the row a client builds from the
+    /// first sample stays blank for the whole of planning, and a run whose run-planned frame was dropped
+    /// stays blank for good.</summary>
+    public const int CurrentProtocolVersion = 14;
 
     public int ProtocolVersion { get; init; } = CurrentProtocolVersion;
 }

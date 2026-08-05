@@ -109,6 +109,21 @@ public sealed class RunCoordinator(
         PruneClosedRuns();
         ArmPruneTimer();
 
+        // ANNOUNCE THE RUN NOW — synchronously, before the planning task is even scheduled.
+        //
+        // A run used to publish nothing until it either blocked on a plan slot or its walk crossed a 100 ms
+        // progress boundary, and a walk that has not yielded its first chunk crosses no boundary at all. So
+        // a run over a slow share existed for seconds with every client's job queue showing nothing —
+        // precisely when a user opens the queue to see what is happening.
+        //
+        // Here rather than at the top of PlanAsync because that body runs on the thread pool: the
+        // announcement would then be subject to scheduling delay, which is worst exactly when the machine is
+        // busy. Publishing before the Task.Run also means the event cannot lose a race with the run-profile
+        // reply — a client learns the run exists no later than it learns its id.
+        //
+        // The counters are zero, which is the honest picture: the run exists and has looked at nothing.
+        PublishPlanningProgress(run, new DryRunProgressCounters());
+
         // Planning runs detached so the IPC caller is not held behind a scan (§8 rule 5). The token here is
         // None deliberately — cancelling a Task.Run's token only prevents the delegate from being
         // SCHEDULED, which would leave the run parked in Planning with nothing to close it. Stopping a walk
@@ -1140,6 +1155,8 @@ public sealed class RunCoordinator(
         {
             AtUtc = time.GetUtcNow(),
             RunId = run.RunId,
+            ProfileId = run.Profile.Id,
+            ProfileName = run.Profile.Name,
             // WaitingPhase, not Planning, while queued behind the concurrent-plan limit. Both are
             // RunPhase.Planning to the engine; the distinction exists only because "scanning, 0 files
             // found" and "not started yet" look identical to a user and mean very different things.
@@ -1182,6 +1199,8 @@ public sealed class RunCoordinator(
         {
             AtUtc = time.GetUtcNow(),
             RunId = run.RunId,
+            ProfileId = run.Profile.Id,
+            ProfileName = run.Profile.Name,
             Phase = waiting && phase == RunPhase.Planning ? WaitingPhase : phase.ToString(),
             Completed = completed,
             Total = total,

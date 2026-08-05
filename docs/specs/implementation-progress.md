@@ -167,7 +167,7 @@ triggers and transformers are the next sets.
 | Handlers: `get-runs`, `set-run-paused` | ✅ | The job queue's re-seed (the event stream is drop-oldest lossy) and its pause toggle. |
 | Handler: `discard-run` | ✅ | Removes a run, cancelling it first if live. The ONLY user-driven deletion, and the only thing besides auto-delete that takes an entry out of the coordinator. 23 entries in the dispatch table. |
 | `subscribe` + `IIpcServer.Broadcast` | ✅ | Handled by the server directly: ack + open-ended one-way `EngineEvent` stream over a bounded, drop-oldest per-subscriber channel. |
-| Protocol version | ✅ | **13** — `discard-run`, and `RunSummaryDto.ClosedAtUtc` so a queue can age a finished run it learned about from a reconcile rather than from the terminal event. The retention CONTRACT changed, which is what makes it a bump: an old client assumes a finished run vanishes within ten minutes and offers no way to remove one. Prior: **12** — `get-runs` / `set-run-paused`; `run-planned` gained `ProfileName` (a draft-planned run is in no catalog, so a client-side lookup leaves exactly the GUI's own runs nameless), `run-progress` gained `Paused`. UI and Service must ship together. Prior: **7** — drops `ThemeMode` from `GlobalSettings` (settings.json schema v5); it moved to the UI-owned `client-settings.json`. Prior: 6 added `job-progress` / `run-queued` events and gave `run-profile` a `run-profile-result` reply. UI and Service must ship together. |
+| Protocol version | ✅ | **14** — a run is ANNOUNCED the moment it begins (an initial `run-progress` sample, counters at zero, published synchronously by `Begin` so it cannot be delayed by thread-pool scheduling or lose a race with the `run-profile` reply), and `run-progress` gained `ProfileId`/`ProfileName` so the row a client builds from that first sample is nameable. Prior: **13** — `discard-run`, and `RunSummaryDto.ClosedAtUtc` so a queue can age a finished run it learned about from a reconcile rather than from the terminal event. The retention CONTRACT changed, which is what makes it a bump: an old client assumes a finished run vanishes within ten minutes and offers no way to remove one. Prior: **12** — `get-runs` / `set-run-paused`; `run-planned` gained `ProfileName` (a draft-planned run is in no catalog, so a client-side lookup leaves exactly the GUI's own runs nameless), `run-progress` gained `Paused`. UI and Service must ship together. Prior: **7** — drops `ThemeMode` from `GlobalSettings` (settings.json schema v5); it moved to the UI-owned `client-settings.json`. Prior: 6 added `job-progress` / `run-queued` events and gave `run-profile` a `run-profile-result` reply. UI and Service must ship together. |
 
 ### §4.10 Dry-run & observability
 | Component | Status | Note |
@@ -274,6 +274,31 @@ placer temp-cleanup bug and the open ratio-guard decision.*
   `ItemsControl` rather than switching to `ListBox`: the row buttons bind through `$parent[ItemsControl]`.
 - **Another client's queue lags a discard** until its next reconcile — `get-runs` is a full replace, so it
   self-corrects, but there is no `run-discarded` event. Single-user desktop; not worth a broadcast.
+
+#### Keeping an open queue up to date
+
+- **A run is announced when it BEGINS, not when it first has something to report.** It used to publish
+  nothing until it either blocked on a plan slot or its walk crossed a 100 ms progress boundary — and a
+  walk that has not yielded its first chunk crosses no boundary at all, so a run over a slow share existed
+  for seconds with every client's queue showing nothing. Published synchronously from `Begin`, before the
+  planning task is scheduled: putting it at the top of `PlanAsync` would subject it to thread-pool
+  scheduling delay, which is worst exactly when the machine is busy, and could lose a race with the
+  `run-profile` reply.
+- **`run-progress` carries the profile now.** A run is announced before it has a plan, so the row a client
+  builds from that first sample had no name — and a client cannot look one up, because a draft-planned run
+  is in no catalog. That was already true of any row synthesized from progress (a run whose `run-planned`
+  frame was dropped stayed nameless for good); announcing every run from a progress sample made it the
+  normal case rather than an edge one.
+- **An open queue window polls; a closed one does not.** The event stream is drop-oldest lossy, and for
+  this view a dropped frame is not a cosmetic lag — the run is simply absent, with nothing to correct it
+  until the user presses Refresh. Every other view reconciles on open and on reconnect and leaves it there,
+  which suits a feed you glance at; the queue is meant to be left open and watched. The loop is started on
+  `Show` and cancelled on `Closed`, so a closed queue keeps consuming events (its view model outlives the
+  window) without polling for a list nobody is looking at.
+- **The reconcile diffs rather than rebuilds.** It used to `Clear()` and refill, which is fine twice a
+  session and not fine twice a second: it resets the scroll position and makes a virtualized list rebuild
+  every realized row. It now walks the response against the collection, moving what is out of place and
+  raising no collection events at all when nothing changed — which is the common case for a poll.
 
 #### Two defects found on the first real use of Discard
 

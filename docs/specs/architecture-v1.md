@@ -270,8 +270,11 @@ frame = one serialized `IpcRequest`, `IpcResponse`, or `EngineEvent` (§5.2), se
   (`get-runs` / `runs`, `set-run-paused`; `run-planned` gained `ProfileName`, `run-progress` gained
   `Paused`) — the job-queue set; **13 made runs retained until DISCARDED rather than forgotten on a
   timer** (`discard-run`, and `RunSummaryDto.ClosedAtUtc` so a queue can age a finished run it learned
-  about from a reconcile). The authoritative value is the constant in `IpcRequest.cs` — see its
-  history comment. The server rejects mismatches with `ErrorResponse("IPC_VERSION_MISMATCH", …)`.
+  about from a reconcile); **14 announces a run the moment it begins** (an initial `run-progress` sample
+  with the counters at zero, published synchronously by `Begin`) and adds `ProfileId`/`ProfileName` to
+  `run-progress` so the row a client builds from it is nameable. The authoritative value is the constant
+  in `IpcRequest.cs` — see its history comment. The server rejects mismatches with
+  `ErrorResponse("IPC_VERSION_MISMATCH", …)`.
 
 ### 3.3 Start-if-not-running handshake
 

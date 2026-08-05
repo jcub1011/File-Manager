@@ -134,6 +134,19 @@ public sealed record RunProgressEvent : EngineEvent
 {
     public required Guid RunId { get; init; }
 
+    /// <summary>Which profile this run is for. Zero only for a sample published by a build that predates
+    /// this member.</summary>
+    public Guid ProfileId { get; init; }
+
+    /// <summary>The name of the profile this run was planned against, for the same reason
+    /// <see cref="RunPlannedEvent.ProfileName"/> carries it: a run planned from an unsaved draft has a
+    /// profile that exists in no catalog, so a client cannot look it up.
+    /// <para>On the PROGRESS event and not just the planned one because a run is announced the moment it
+    /// begins, long before it has a plan — and a client that builds a row from that sample (or from any
+    /// sample for a run whose <c>run-planned</c> it never saw) would otherwise show a nameless row for the
+    /// whole of planning, which on a slow source is minutes.</para></summary>
+    public string ProfileName { get; init; } = "";
+
     /// <summary>The <c>RunPhase</c> this sample was taken in, as a string. <c>Planning</c> means the copy
     /// counters below are all zero and the scan counts are the live figures.</summary>
     public required string Phase { get; init; }

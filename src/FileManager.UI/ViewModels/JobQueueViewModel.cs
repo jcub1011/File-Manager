@@ -353,6 +353,45 @@ public sealed partial class JobQueueViewModel(IIpcGateway gateway, TimeProvider?
     [RelayCommand]
     public async Task RefreshAsync() => await ReconcileAsync();
 
+    /// <summary>How often an OPEN queue window re-reads the run list. Two seconds, matching the status
+    /// bar's poll — fast enough that a run which slipped past the event stream appears while the user is
+    /// still looking, slow enough to be invisible against everything else the service answers.</summary>
+    internal static readonly TimeSpan WatchInterval = TimeSpan.FromSeconds(2);
+
+    /// <summary>Keeps an open queue window in step with the engine.
+    ///
+    /// <para>The live feed is the engine event stream, which is bounded and DROP-OLDEST — and for this view
+    /// a dropped frame is not a cosmetic lag: a run whose announcement was dropped is simply absent, with
+    /// nothing to correct it until the user presses Refresh or reopens the window. Every other view
+    /// reconciles on open and on reconnect and leaves it there, which is fine for a feed you glance at; the
+    /// queue is meant to be left open and watched, so it re-reads while it is.</para>
+    ///
+    /// <para>Runs only while the window is open — the composition root starts this on Show and cancels it on
+    /// Closed. A closed queue keeps consuming events (its view model outlives the window) but must not keep
+    /// polling for a list nobody is looking at.</para></summary>
+    public async Task WatchAsync(CancellationToken ct)
+    {
+        while (!ct.IsCancellationRequested)
+        {
+            try
+            {
+                await Task.Delay(WatchInterval, ct);
+                await ReconcileAsync(ct);
+            }
+            catch (OperationCanceledException)
+            {
+                return;   // the window closed, or the app is shutting down
+            }
+            catch (Exception ex)
+            {
+                // Last-resort catch-all: this is a detached loop with no caller to observe a throw, and a
+                // failed poll must never take the window down. ReconcileAsync already turns an IPC failure
+                // into a banner without throwing, so reaching here means something unexpected.
+                Log.Error(ex, "The job queue's refresh loop failed");
+            }
+        }
+    }
+
     /// <summary>Re-seeds from <c>get-runs</c>. Called on window open and on every (re)connect, because the
     /// event stream drops frames under back-pressure.</summary>
     public async Task ReconcileAsync(CancellationToken ct = default)
@@ -370,15 +409,18 @@ public sealed partial class JobQueueViewModel(IIpcGateway gateway, TimeProvider?
         ErrorMessage = null;
 
         // Unlike the activity feed's ring, get-runs IS the complete picture — the coordinator holds every
-        // run, closed ones included, until it prunes them. So a row the response omits has been pruned and
-        // should go, which makes this a full replace rather than a merge. Rows are still MUTATED where the
-        // ids match, so selection and scroll position survive a reconcile.
+        // run, closed ones included, until it is discarded or auto-deleted. So a row the response omits has
+        // gone and should go here too.
+        //
+        // DIFFED, not rebuilt. This used to Clear() and re-Add the whole collection, which was acceptable
+        // when a reconcile only happened on window open and on reconnect. It runs every couple of seconds
+        // now that an open window watches, and a clear-and-refill that often resets the scroll position and
+        // makes a virtualized list rebuild every realized row — so a user scrolled down the queue would be
+        // yanked back to the top twice a second. In the overwhelmingly common case (nothing changed) the
+        // loop below raises no collection events at all.
         Guid selectedId = SelectedRun?.RunId ?? Guid.Empty;
-        Dictionary<Guid, JobQueueRow> existing = [];
-        foreach (JobQueueRow row in Runs)
-            existing[row.RunId] = row;
 
-        Runs.Clear();
+        int index = 0;
         foreach (RunSummaryDto run in runs!)
         {
             // A get-runs that was already in flight when the user pressed Discard can still name the run.
@@ -386,14 +428,40 @@ public sealed partial class JobQueueViewModel(IIpcGateway gateway, TimeProvider?
             // handlers guard against, arriving by a different route.
             if (_discarded.Contains(run.RunId))
                 continue;
-            if (existing.TryGetValue(run.RunId, out JobQueueRow? row))
-                Apply(row, run);
+
+            int found = IndexOfRun(run.RunId, from: index);
+            if (found < 0)
+            {
+                Runs.Insert(index, RowFrom(run));
+            }
             else
-                row = RowFrom(run);
-            Runs.Add(row);
+            {
+                // Move only when it is genuinely out of place: a Move on an ObservableCollection is a
+                // structural change the list has to handle, so raising one per row per poll would defeat
+                // the point of diffing at all.
+                if (found != index)
+                    Runs.Move(found, index);
+                Apply(Runs[index], run);
+            }
+            index++;
         }
+
+        // Whatever is left past the response's own length is gone from the engine.
+        while (Runs.Count > index)
+            Runs.RemoveAt(Runs.Count - 1);
+
         TrimAndFlag();
+        // Re-resolved rather than left alone: the selected row survives as an INSTANCE (rows are mutated in
+        // place), but it may have been one of the rows just removed.
         SelectedRun = FindRow(selectedId);
+    }
+
+    private int IndexOfRun(Guid runId, int from)
+    {
+        for (int i = from; i < Runs.Count; i++)
+            if (Runs[i].RunId == runId)
+                return i;
+        return -1;
     }
 
     /// <summary>A run finished planning: its work list is frozen and it is waiting to be approved.</summary>
@@ -443,16 +511,20 @@ public sealed partial class JobQueueViewModel(IIpcGateway gateway, TimeProvider?
         JobQueueRow row = FindRow(evt.RunId) ?? Insert(new JobQueueRow
         {
             RunId = evt.RunId,
-            ProfileId = Guid.Empty,
+            ProfileId = evt.ProfileId,
             StartedAtUtc = evt.AtUtc,
             Time = time,
-            ProfileName = "",
+            ProfileName = evt.ProfileName,
             PlanWasShown = IsOwnRun?.Invoke(evt.RunId) ?? false,
         });
         // Never over a terminal phase: run-completed is authoritative, and a late progress sample must not
         // resurrect a finished run as running.
         if (row.IsFinished)
             return;
+        // A run is announced by its first progress sample, so this is where most rows learn their name.
+        // Guarded so a sample from an older service cannot blank a name a run-planned already supplied.
+        if (evt.ProfileName.Length > 0)
+            row.ProfileName = evt.ProfileName;
         row.Phase = evt.Phase;
         row.Paused = evt.Paused;
         row.Completed = evt.Completed;
