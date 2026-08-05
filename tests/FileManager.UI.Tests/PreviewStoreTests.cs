@@ -10,8 +10,12 @@ namespace FileManager.UI.Tests;
 /// <para>A run parked in <c>AwaitingApproval</c> holds a snapshot directory and has no expiry of its own,
 /// so before previews were retained, <c>DryRunViewModel</c> declined one on every profile switch. Retaining
 /// results deliberately keeps those runs parked — which means the ONLY thing standing between this feature
-/// and a directory leak for the lifetime of the service is that this type declines every entry it drops.
-/// Most of what follows tests that, not the dictionary.</para></summary>
+/// and a directory leak for the lifetime of the service is that this type gets rid of every entry it drops.
+/// Most of what follows tests that, not the dictionary.</para>
+///
+/// <para><b>DISCARD, not decline.</b> Declining merely CLOSES a run, and a closed run is now retained until
+/// something removes it — so a window that declined every superseded preview would fill the job queue with
+/// rows for previews the user replaced and never asked to keep. These assertions pin the discard.</para></summary>
 public sealed class PreviewStoreTests
 {
     private static StoredPreview Preview(Guid runId, Guid profileId, DateTimeOffset? at = null)
@@ -34,7 +38,7 @@ public sealed class PreviewStoreTests
     }
 
     /// <summary>The whole point of keying by profile: previewing B must not destroy A's result. Before
-    /// this, every new preview declined whatever the previous one left parked, regardless of profile.</summary>
+    /// this, every new preview answered whatever the previous one left parked, regardless of profile.</summary>
     [Fact]
     public void Remembering_one_profile_leaves_another_profiles_result_alone()
     {
@@ -48,14 +52,15 @@ public sealed class PreviewStoreTests
 
         Assert.Equal(runA, store.For(profileA)?.RunId);
         Assert.Equal(runB, store.For(profileB)?.RunId);
-        Assert.Empty(gateway.ApproveRunCalls);   // neither superseded the other
+        Assert.Empty(gateway.DiscardRunCalls);   // neither superseded the other
         Assert.Equal(2, store.Count);
     }
 
     /// <summary>THE leak guard. Re-previewing a profile replaces its entry, and the run the old entry held
-    /// must be declined — nothing else will ever answer for it.</summary>
+    /// must be discarded — nothing else will ever answer for it, and merely closing it would leave a row in
+    /// the queue for a preview the user superseded.</summary>
     [Fact]
-    public void Re_previewing_a_profile_declines_the_run_its_previous_result_was_holding()
+    public void Re_previewing_a_profile_discards_the_run_its_previous_result_was_holding()
     {
         FakeIpcGateway gateway = new();
         PreviewStore store = new(gateway);
@@ -65,15 +70,15 @@ public sealed class PreviewStoreTests
         store.Remember(profileId, Preview(first, profileId));
         store.Remember(profileId, Preview(second, profileId));
 
-        Assert.Equal((first, false), Assert.Single(gateway.ApproveRunCalls));
+        Assert.Equal(first, Assert.Single(gateway.DiscardRunCalls));
         Assert.Equal(second, store.For(profileId)?.RunId);
         Assert.Equal(1, store.Count);
     }
 
     /// <summary>Re-remembering the SAME run (a restore that re-registers what is already held) must not
-    /// decline it — that would close the very run being restored.</summary>
+    /// discard it — that would destroy the very run being restored.</summary>
     [Fact]
-    public void Remembering_the_same_run_again_declines_nothing()
+    public void Remembering_the_same_run_again_discards_nothing()
     {
         FakeIpcGateway gateway = new();
         PreviewStore store = new(gateway);
@@ -82,12 +87,12 @@ public sealed class PreviewStoreTests
         store.Remember(profileId, Preview(runId, profileId));
         store.Remember(profileId, Preview(runId, profileId));
 
-        Assert.Empty(gateway.ApproveRunCalls);
+        Assert.Empty(gateway.DiscardRunCalls);
         Assert.Equal(runId, store.For(profileId)?.RunId);
     }
 
     [Fact]
-    public void Forgetting_a_profile_declines_the_run_it_was_holding()
+    public void Forgetting_a_profile_discards_the_run_it_was_holding()
     {
         FakeIpcGateway gateway = new();
         PreviewStore store = new(gateway);
@@ -97,15 +102,15 @@ public sealed class PreviewStoreTests
         Guid? forgotten = store.Forget(profileId);
 
         Assert.Equal(runId, forgotten);
-        Assert.Equal((runId, false), Assert.Single(gateway.ApproveRunCalls));
+        Assert.Equal(runId, Assert.Single(gateway.DiscardRunCalls));
         Assert.Null(store.For(profileId));
     }
 
     /// <summary>Drop is for a run that is ALREADY gone — a RUN_NOT_FOUND restore, or one whose
-    /// run-completed arrived. It must not decline, or the most ordinary path in the feature (reopening a
+    /// run-completed arrived. It must not discard, or the most ordinary path in the feature (reopening a
     /// preview after the service restarted) logs a failure every time.</summary>
     [Fact]
-    public void Dropping_a_run_that_is_already_gone_does_not_try_to_decline_it()
+    public void Dropping_a_run_that_is_already_gone_does_not_try_to_discard_it()
     {
         FakeIpcGateway gateway = new();
         PreviewStore store = new(gateway);
@@ -114,7 +119,7 @@ public sealed class PreviewStoreTests
 
         store.Drop(runId);
 
-        Assert.Empty(gateway.ApproveRunCalls);
+        Assert.Empty(gateway.DiscardRunCalls);
         Assert.Null(store.For(profileId));
         Assert.Equal(0, store.Count);
     }
@@ -132,10 +137,10 @@ public sealed class PreviewStoreTests
         Assert.Equal(1, store.Count);
     }
 
-    /// <summary>Window close. Every retained run must be declined — this is the last moment anything can
+    /// <summary>Window close. Every retained run must be discarded — this is the last moment anything can
     /// release those snapshot directories, and the process may exit immediately afterwards.</summary>
     [Fact]
-    public async Task Closing_declines_every_retained_run()
+    public async Task Closing_discards_every_retained_run()
     {
         FakeIpcGateway gateway = new();
         PreviewStore store = new(gateway);
@@ -146,21 +151,21 @@ public sealed class PreviewStoreTests
 
         await store.DeclineAllAsync();
 
-        Assert.Equal(3, gateway.ApproveRunCalls.Count);
-        Assert.Contains((a, false), gateway.ApproveRunCalls);
-        Assert.Contains((b, false), gateway.ApproveRunCalls);
-        Assert.Contains((c, false), gateway.ApproveRunCalls);
+        Assert.Equal(3, gateway.DiscardRunCalls.Count);
+        Assert.Contains(a, gateway.DiscardRunCalls);
+        Assert.Contains(b, gateway.DiscardRunCalls);
+        Assert.Contains(c, gateway.DiscardRunCalls);
         Assert.Equal(0, store.Count);
     }
 
     /// <summary>A service that has already gone away needs no telling, and must not trap the user in the
-    /// window. The declines are best-effort by contract.</summary>
+    /// window. The discards are best-effort by contract.</summary>
     [Fact]
-    public async Task Closing_survives_a_service_that_refuses_every_decline()
+    public async Task Closing_survives_a_service_that_refuses_every_discard()
     {
         FakeIpcGateway gateway = new()
         {
-            ApproveRunResult = new IpcError("IPC_TRANSPORT", "the pipe is gone"),
+            DiscardRunResult = new IpcError("IPC_TRANSPORT", "the pipe is gone"),
         };
         PreviewStore store = new(gateway);
         store.Remember(Guid.NewGuid(), Preview(Guid.NewGuid(), Guid.NewGuid()));

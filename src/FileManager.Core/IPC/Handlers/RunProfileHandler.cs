@@ -186,3 +186,26 @@ public sealed class SetRunPausedHandler(IRunCoordinator runs) : IIpcRequestHandl
         return Task.FromResult(response);
     }
 }
+
+/// <summary>Handles discard-run: forgets a run entirely, cancelling it first if it is still live.
+///
+/// <para>This is the only request that removes a run. Finished runs are otherwise retained until the
+/// auto-delete setting reaps them — or indefinitely, when that setting is off — so without this a queue
+/// would only ever grow.</para>
+///
+/// <para>RUN_NOT_FOUND, the same code cancel-run uses, for an unknown or already-discarded id: for a
+/// client whose rows come from a lossy stream, "that run is gone" is one situation, not two.</para></summary>
+public sealed class DiscardRunHandler(IRunCoordinator runs) : IIpcRequestHandler
+{
+    public string RequestType => IpcRequestTypes.DiscardRun;
+
+    public Task<IpcResponse> HandleAsync(IpcRequest request, CancellationToken ct = default)
+    {
+        var typed = (DiscardRunRequest)request;
+        Result result = runs.Discard(typed.RunId);
+        IpcResponse response = result.TryGetError(out string? error)
+            ? new ErrorResponse { Code = "RUN_NOT_FOUND", Message = error }
+            : new OkResponse();
+        return Task.FromResult(response);
+    }
+}

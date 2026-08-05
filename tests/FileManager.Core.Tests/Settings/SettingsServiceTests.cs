@@ -306,4 +306,82 @@ public sealed class SettingsServiceTests : IDisposable
         string kept = Assert.Single(Directory.GetFiles(_root, "settings.json.corrupt-*"));
         Assert.Equal("{ garbage", File.ReadAllText(kept));               // ...and the original survives
     }
+
+    // ── Finished-run auto-delete ────────────────────────────────────────────────────────────────
+
+    /// <summary>The upgrade case, and the reason both members use nullable backing fields. A settings.json
+    /// predating them must read back as ON at 24 hours — a plain <c>bool</c>/<c>int</c> would read back as
+    /// <c>false</c>/0, which would silently switch auto-delete off for every upgrading user, and then, if
+    /// they ever turned it on, delete every run the instant it finished.</summary>
+    [Fact]
+    public void A_settings_file_predating_run_retention_keeps_auto_delete_on_at_the_shipped_interval()
+    {
+        File.WriteAllText(_paths.SettingsFilePath, """{"SchemaVersion":7}""");
+
+        GlobalSettings loaded = NewService().Current;
+
+        Assert.True(loaded.AutoDeleteFinishedRuns);
+        Assert.Equal(GlobalSettings.DefaultFinishedRunRetentionHours, loaded.FinishedRunRetentionHours);
+        Assert.Equal(TimeSpan.FromHours(24), loaded.FinishedRunRetention);
+    }
+
+    [Fact]
+    public void Run_retention_settings_round_trip()
+    {
+        SettingsService service = NewService();
+        Assert.True(service.Update(new GlobalSettings
+        {
+            AutoDeleteFinishedRuns = false,
+            FinishedRunRetentionHours = 72,
+        }).TryGetValue(out GlobalSettings? saved));
+
+        Assert.False(saved!.AutoDeleteFinishedRuns);
+        Assert.Equal(72, saved.FinishedRunRetentionHours);
+        Assert.False(NewService().Current.AutoDeleteFinishedRuns);
+        Assert.Equal(72, NewService().Current.FinishedRunRetentionHours);
+    }
+
+    /// <summary>A hand-edited 0 is the value that turns a retention setting into data loss — it would delete
+    /// every run the moment it finished — so the clamp matters here more than for most settings.</summary>
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-1)]
+    [InlineData(int.MaxValue)]
+    public void Update_clamps_a_retention_interval_the_coordinator_would_not_honor(int configured)
+    {
+        SettingsService service = NewService();
+        service.Update(new GlobalSettings { FinishedRunRetentionHours = configured });
+
+        Assert.InRange(
+            service.Current.FinishedRunRetentionHours,
+            GlobalSettings.MinFinishedRunRetentionHours,
+            GlobalSettings.MaxFinishedRunRetentionHours);
+        Assert.NotEqual(configured, service.Current.FinishedRunRetentionHours);
+    }
+
+    /// <summary>Both defaults collapse to the absent representation, so an omitted field and an explicit
+    /// default stay value-equal — which is what the settings window's dirty flag is built on.</summary>
+    [Fact]
+    public void The_shipped_run_retention_defaults_stay_absent_in_the_file()
+    {
+        NewService().Update(new GlobalSettings
+        {
+            AutoDeleteFinishedRuns = true,
+            FinishedRunRetentionHours = GlobalSettings.DefaultFinishedRunRetentionHours,
+        });
+
+        using var doc = System.Text.Json.JsonDocument.Parse(File.ReadAllText(_paths.SettingsFilePath));
+        foreach (string member in new[] { "AutoDeleteFinishedRuns", "FinishedRunRetentionHours" })
+        {
+            Assert.True(
+                !doc.RootElement.TryGetProperty(member, out var el)
+                    || el.ValueKind == System.Text.Json.JsonValueKind.Null,
+                $"the default for {member} must stay absent in settings.json");
+        }
+        Assert.Equal(GlobalSettings.Default, new GlobalSettings
+        {
+            AutoDeleteFinishedRuns = true,
+            FinishedRunRetentionHours = GlobalSettings.DefaultFinishedRunRetentionHours,
+        });
+    }
 }

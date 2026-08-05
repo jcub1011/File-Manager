@@ -27,6 +27,20 @@ public sealed record EngineConfig
     /// once.</para></summary>
     public int MaxConcurrentPlans { get; init; } = 3;
 
+    /// <summary>Hard cap on how many FINISHED runs the coordinator retains, evicting the oldest-closed
+    /// first. Live runs are never candidates.
+    ///
+    /// <para>A backstop, not a knob — which is why it lives here and not in <c>GlobalSettings</c>. The
+    /// user-facing controls are "auto-delete finished runs" and "after how long", and the first of those
+    /// can be switched OFF; without this cap that setting would be an unbounded allocation on a service
+    /// that runs for months. It is set far above any hand-driven session, so in practice a run leaves the
+    /// queue because the user discarded it or because auto-delete reaped it.</para>
+    ///
+    /// <para>500 matches <c>IJobLogStore</c>'s recent-jobs ring, and is affordable only because
+    /// <c>RunState.ReleaseAfterClose</c> reduces a finished run to a handful of scalars — before that, a
+    /// retained run held its whole profile plus one string per file it copied.</para></summary>
+    public int MaxRetainedClosedRuns { get; init; } = 500;
+
     // ---- Mirror deletion pass (§10.1) -----------------------------------------------------------
     // Every one of these has a fail-closed default: when a bound is hit, NOTHING is deleted. None is
     // user-editable yet (EngineConfig is registered with defaults only, like the rest of this type).

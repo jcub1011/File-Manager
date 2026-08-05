@@ -68,8 +68,14 @@ public sealed record JobSummaryDto(
 /// timestamp and would otherwise have no position.</param>
 /// <param name="PlannedAtUtc">When planning finished and the work list was frozen — the age a client
 /// measures staleness against. Null while still planning.</param>
+/// <param name="ClosedAtUtc">When the run reached its terminal state; null while it is still live.
+/// <para>A finished run is now retained until it is discarded or auto-deleted, so a queue has to be able
+/// to say HOW finished — a run that ended a minute ago and one that ended yesterday are both
+/// <c>Closed</c>. The terminal event carries the same instant, but only to a client that was listening at
+/// the time; this is what lets a reconcile age a row it is seeing for the first time.</para></param>
 public sealed record RunSummaryDto(
     Guid RunId, Guid ProfileId, string ProfileName, string Phase, string Outcome,
     bool Paused, bool Waiting, DateTimeOffset StartedAtUtc, DateTimeOffset? PlannedAtUtc,
+    DateTimeOffset? ClosedAtUtc,
     int PlannedCopies, int PlannedDeletes, long PlannedCopyBytes, long PlannedDeleteBytes,
     int Succeeded, int Skipped, int Failed, int Deleted, bool PlanTruncated, string? PlanError);

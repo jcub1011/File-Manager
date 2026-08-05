@@ -301,6 +301,7 @@ public sealed class GetRunPlanStreamHandlerTests
         public Result<RunHandle, string> Begin(Profile profile, string? scopePath) => "not used";
         public Result Approve(Guid id, bool approve, bool acknowledgeWarnings = false) => Result.Success();
         public Result Cancel(Guid id) => Result.Success();
+        public Result Discard(Guid id) => Result.Success();
         public RunStatus? GetStatus(Guid id) => null;
         public void Settled(Guid id, JobCompletion? completion) { }
         public Profile? PlannedProfile(Guid id) => null;

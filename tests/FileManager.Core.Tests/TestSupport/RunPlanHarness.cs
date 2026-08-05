@@ -43,6 +43,9 @@ internal sealed class RunPlanHarness : IDisposable
             ScanThreading = new ScanThreadingSettings { MaxScanThreads = budget, PerDriveDefault = budget },
         };
         FakeSettingsProvider settingsProvider = new(settings);
+        // Kept so a retention test can rewrite the auto-delete settings the coordinator reads on every
+        // sweep, which is how it picks up a change without a restart.
+        SettingsProvider = settingsProvider;
         FileSystemService fileSystem = new(NullLogger<FileSystemService>.Instance);
         ScanScheduler scheduler = new(NullLogger<ScanScheduler>.Instance, fileSystem, settingsProvider);
         DestinationProjector projector = new(
@@ -130,6 +133,10 @@ internal sealed class RunPlanHarness : IDisposable
     /// pause set through the coordinator would be invisible to the queue that has to honour it.</summary>
     public RunPauseRegistry RunPause { get; } = new(NullLogger<RunPauseRegistry>.Instance);
 
+    /// <summary>The settings the coordinator reads for its retention rules. Mutable so a test can turn
+    /// auto-delete off, or shorten the interval, mid-run.</summary>
+    public FakeSettingsProvider SettingsProvider { get; }
+
     /// <summary>The coordinator's clock. Assign a <c>FakeTimeProvider</c> before <see cref="Coordinator"/>
     /// to drive the drain barrier's deadline deterministically — the only way to assert that a long pause
     /// does not time it out without waiting out a real one.</summary>
@@ -145,7 +152,7 @@ internal sealed class RunPlanHarness : IDisposable
             UseConfig(config);
         _coordinator = new RunCoordinator(
             Planner, Queue, Pass, Bus, Validator, Catalog, Paths, effective, Time,
-            RunPause, NullLogger<RunCoordinator>.Instance);
+            RunPause, SettingsProvider, NullLogger<RunCoordinator>.Instance);
         return _coordinator;
     }
 

@@ -83,6 +83,12 @@ namespace FileManager.UI
                 // stacking duplicates — there is no existing precedent for this because every other window
                 // here is modal and cannot be opened twice.
                 JobQueueWindow? queue = null;
+                // Discarding a run that is still live cancels real work, so it confirms first — the same
+                // friction "Run now" and Delete profile use. Owned by the QUEUE window when one is open, so
+                // the prompt appears over what the user was looking at.
+                viewModel.Queue.ConfirmDiscard = async message =>
+                    await new ConfirmWindow(message, "Discard", "Keep", confirmIsDanger: true)
+                        .ShowDialog<bool>((Avalonia.Controls.Window?)queue ?? window);
                 viewModel.ShowJobQueue = () =>
                 {
                     if (queue is not null)

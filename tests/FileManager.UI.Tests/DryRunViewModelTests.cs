@@ -1630,6 +1630,59 @@ public sealed class DryRunViewModelTests
         Assert.Equal(planned.AtUtc, viewModel.PreviewTakenAtUtc);
     }
 
+    /// <summary>REGRESSION. Discarding a run that was still PLANNING left the tab's progress bar spinning
+    /// forever: the discard handler checked only <c>PendingRunId</c>, which is null during a scan, and the
+    /// late <c>run-planned</c> that would otherwise have ended the wait was no longer recognized as this
+    /// window's — the shell drops the id at the same moment. Nothing was left to stop it.</summary>
+    [Fact]
+    public void Discarding_a_run_that_is_still_PLANNING_stops_the_preview_spinner()
+    {
+        var (viewModel, _) = NewViewModel();
+        Guid runId = Guid.NewGuid();
+        viewModel.BeginPlanning();
+        viewModel.PlanningStarted(runId);
+        Assert.True(viewModel.IsPreviewing);
+
+        viewModel.ForgetDiscardedRun(runId);
+
+        Assert.False(viewModel.IsPreviewing);
+        Assert.Null(viewModel.PlanningRunId);
+        Assert.Equal("", viewModel.RunStatusText);
+        Assert.Contains("discarded", viewModel.EmptyStateText);
+        Assert.Null(viewModel.ErrorMessage);   // the user did this; it is not a failure
+    }
+
+    /// <summary>Discarding a run whose plan is already on screen drops the footer — leaving it would offer
+    /// to approve a run the engine has forgotten.</summary>
+    [Fact]
+    public async Task Discarding_a_run_whose_plan_is_on_screen_drops_the_footer()
+    {
+        var (viewModel, gateway) = NewViewModel();
+        gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value);
+        Guid runId = await RunPlans.PreviewAsync(viewModel, gateway);
+        Assert.Equal(runId, viewModel.PendingRunId);
+
+        viewModel.ForgetDiscardedRun(runId);
+
+        Assert.Null(viewModel.PendingRunId);
+        Assert.Contains("discarded", viewModel.EmptyStateText);
+    }
+
+    /// <summary>A discard for some OTHER run must not disturb the preview on screen — the queue lists every
+    /// run, so discarding one is not a statement about the one this tab is showing.</summary>
+    [Fact]
+    public async Task Discarding_an_unrelated_run_leaves_the_preview_alone()
+    {
+        var (viewModel, gateway) = NewViewModel();
+        gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value);
+        Guid runId = await RunPlans.PreviewAsync(viewModel, gateway);
+
+        viewModel.ForgetDiscardedRun(Guid.NewGuid());
+
+        Assert.Equal(runId, viewModel.PendingRunId);
+        Assert.True(viewModel.HasReport);
+    }
+
     [Fact]
     public async Task A_failed_plan_stream_leaves_no_footer_to_approve()
     {

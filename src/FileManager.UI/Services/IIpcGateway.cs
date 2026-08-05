@@ -87,8 +87,19 @@ public interface IIpcGateway
     Task<Result<bool, IpcError>> ApproveRunAsync(
         Guid runId, bool approve, bool acknowledgeWarnings = false, CancellationToken ct = default);
 
-    /// <summary>Cancels a run. Work not yet started is dropped; work in flight finishes.</summary>
+    /// <summary>Cancels a run. Work not yet started is dropped; work in flight finishes.
+    /// <para>Cancel STOPS the work and KEEPS the record. To remove the record too, see
+    /// <see cref="DiscardRunAsync"/>.</para></summary>
     Task<Result<bool, IpcError>> CancelRunAsync(Guid runId, CancellationToken ct = default);
+
+    /// <summary>Removes a run from the engine, cancelling it first if it is still live. The only
+    /// user-driven deletion — a finished run is otherwise retained until auto-delete reaps it, or
+    /// indefinitely when that setting is off.
+    /// <para>Discarding a run that is still EXECUTING cancels it, so the row goes at once but work already
+    /// in flight still finishes (I-ATOMIC-JOB). The UI must confirm before doing that.</para>
+    /// <para>RUN_NOT_FOUND covers an unknown or already-discarded id — a normal race for a view fed by a
+    /// lossy stream, not a fault worth a banner.</para></summary>
+    Task<Result<bool, IpcError>> DiscardRunAsync(Guid runId, CancellationToken ct = default);
 
     /// <summary>Every run the service still holds, newest first — the job queue's authoritative re-seed.
     /// <para>Needed for the same reason <see cref="GetRecentJobsAsync"/> is: the event stream is bounded

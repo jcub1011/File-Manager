@@ -22,6 +22,7 @@ public sealed class JobQueueWindowSmokeTests(HeadlessSessionFixture headless)
         string name = "Photos", int planned = 12, int succeeded = 5, string? planError = null) =>
         new(Guid.NewGuid(), Guid.NewGuid(), name, phase, outcome, paused, waiting,
             DateTimeOffset.UnixEpoch, DateTimeOffset.UnixEpoch,
+            phase == "Closed" ? DateTimeOffset.UnixEpoch : null,
             planned, 2, 4096, 512, succeeded, 0, 0, 0, false, planError);
 
     [Fact]

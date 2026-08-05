@@ -316,6 +316,18 @@
         <Setter Property="Padding" Value="{StaticResource Pad.Card}" />
     </Style>
 
+    <!-- A card that is history rather than news — the job queue's finished runs, once they are past the
+         ten-minute mark. Opacity rather than a muted foreground so the whole card recedes together,
+         status glyph included; a row whose icon stayed at full strength would still pull the eye.
+         Deliberately gentle: these rows are still readable and still actionable (Discard lives on them),
+         so this says "older", not "disabled". -->
+    <Style Selector="Border.card.old">
+        <Setter Property="Opacity" Value="0.55" />
+    </Style>
+    <Style Selector="Border.card.old:pointerover">
+        <Setter Property="Opacity" Value="1" />
+    </Style>
+
     <!-- Info bar (VS-style inline message): 1px semantic border over a soft tint. Base is neutral;
          add .danger/.warning/.success/.info to colour it. -->
     <Style Selector="Border.infoBar">

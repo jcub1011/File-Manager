@@ -205,9 +205,24 @@ public sealed class SettingsService : ISettingsProvider
         {
             ScanThreading = NormalizeThreading(settings.ScanThreading),
             MaxScanDepth = NormalizeScanDepth(settings.MaxScanDepth),
+            FinishedRunRetentionHours = NormalizeRetentionHours(settings.FinishedRunRetentionHours),
             ScratchDirectory = NormalizeDirectory(settings.ScratchDirectory, GlobalSettings.DefaultScratchDirectory, "ScratchDirectory"),
             ProfilesDirectory = NormalizeDirectory(settings.ProfilesDirectory, GlobalSettings.DefaultProfilesDirectory, "ProfilesDirectory"),
         };
+
+    /// <summary>Clamps the auto-delete interval to a range the coordinator will honour. A hand-edited 0
+    /// would otherwise delete every run the instant it finished — the one value that turns a retention
+    /// setting into data loss — and a negative one would delete them before they finished.</summary>
+    private int NormalizeRetentionHours(int value)
+    {
+        int clamped = Math.Clamp(
+            value, GlobalSettings.MinFinishedRunRetentionHours, GlobalSettings.MaxFinishedRunRetentionHours);
+        if (clamped != value)
+            _logger.LogWarning(
+                "Settings FinishedRunRetentionHours value {Value} is outside the supported range; using {Clamped}",
+                value, clamped);
+        return clamped;
+    }
 
     private int NormalizeScanDepth(int value)
     {

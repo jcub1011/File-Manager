@@ -93,8 +93,8 @@ public sealed class PreviewStore(IIpcGateway gateway)
         }
     }
 
-    /// <summary>Declines every retained run and empties the store. For window close.
-    /// <para>Awaited, unlike the individual declines: this is the last chance to release the snapshot
+    /// <summary>Discards every retained run and empties the store. For window close.
+    /// <para>Awaited, unlike the individual discards: this is the last chance to release the snapshot
     /// directories, and a fire-and-forget here would race the process exit. Failures are logged and
     /// swallowed — a service that has already gone away needs no telling.</para></summary>
     public async Task DeclineAllAsync()
@@ -110,26 +110,33 @@ public sealed class PreviewStore(IIpcGateway gateway)
         {
             try
             {
-                var declined = await gateway.ApproveRunAsync(runId, approve: false);
-                if (declined.TryGetError(out IpcError? error))
-                    Log.Debug("Declining retained run {RunId} on close failed: {Message}", runId, error.Message);
+                var discarded = await gateway.DiscardRunAsync(runId);
+                if (discarded.TryGetError(out IpcError? error))
+                    Log.Debug("Discarding retained run {RunId} on close failed: {Message}", runId, error.Message);
             }
             catch (Exception ex)
             {
                 // Last resort: closing the window must never be blocked by cleanup of a run the service
                 // may already have forgotten.
-                Log.Debug(ex, "Declining retained run {RunId} on close failed", runId);
+                Log.Debug(ex, "Discarding retained run {RunId} on close failed", runId);
             }
         }
     }
 
-    /// <summary>Fire-and-forget decline for a superseded or abandoned entry. The caller is mid-transition
-    /// and an already-closed run answering RUN_NOT_APPROVABLE is a normal race, not a fault — the same
-    /// contract <c>DryRunViewModel.AbandonPendingRun</c> documents.</summary>
+    /// <summary>Fire-and-forget DISCARD for a superseded or abandoned entry.
+    ///
+    /// <para><b>Discard, not decline.</b> Declining merely closes a run, and a closed run is now retained
+    /// until the user gets rid of it — so a window that declined every superseded preview would fill the
+    /// job queue with rows for previews the user replaced by pressing Preview again and never asked to
+    /// keep a record of. Discard both closes it and removes it, which is what abandoning a preview
+    /// actually means.</para>
+    ///
+    /// <para>The caller is mid-transition and an already-gone run answering RUN_NOT_FOUND is a normal race,
+    /// not a fault — the same contract <c>DryRunViewModel.AbandonPendingRun</c> documents.</para></summary>
     private void Decline(Guid runId) =>
-        _ = gateway.ApproveRunAsync(runId, approve: false)
+        _ = gateway.DiscardRunAsync(runId)
             .ContinueWith(
-                t => Log.Debug(t.Exception, "Declining superseded retained run {RunId} failed", runId),
+                t => Log.Debug(t.Exception, "Discarding superseded retained run {RunId} failed", runId),
                 System.Threading.CancellationToken.None,
                 TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
                 TaskScheduler.Default);

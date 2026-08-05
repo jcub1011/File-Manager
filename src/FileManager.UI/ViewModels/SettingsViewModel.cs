@@ -84,6 +84,30 @@ public sealed partial class SettingsViewModel : ViewModelBase
             + $"so an old preview risks being incomplete, never wrong. Auto uses {ClientSettings.DefaultPreviewStaleAfterMinutes} minutes.",
             ["preview", "dry run", "stale", "out of date", "age", "expiry", "refresh", "minutes", "cache"]);
 
+        // TWO rows rather than one "never or N" control, because no such editor kind exists: AutoNumber's
+        // Auto flag means "the engine picks the number", never "off". A checkbox beside a number says the
+        // same thing with editor kinds that already have templates.
+        AutoDeleteFinishedRuns = Setting.Bool(
+            "runs.autoDelete", "Auto-Delete Finished Runs",
+            "Whether finished runs leave the job queue on their own. Turn this off to keep every run until "
+            + "you discard it — the engine still caps how many finished runs it holds, so nothing grows "
+            + "without bound. A run is the record of what actually happened, so nothing else ever deletes "
+            + "one: cancelling a run stops the work but keeps the row.",
+            ["runs", "queue", "job", "history", "delete", "remove", "clean", "cleanup", "retain",
+             "retention", "auto", "expire", "purge", "keep"],
+            checkBoxLabel: "Delete finished runs automatically");
+
+        FinishedRunRetentionHours = Setting.AutoNumber(
+            "runs.retentionHours", "Delete Finished Runs After (hours)",
+            "How long a finished run stays in the job queue before it is deleted. Ignored while "
+            + $"auto-delete is off. Auto uses {GlobalSettings.DefaultFinishedRunRetentionHours} hours; the "
+            + $"range is {GlobalSettings.MinFinishedRunRetentionHours} hour to "
+            + $"{GlobalSettings.MaxFinishedRunRetentionHours} (a year). If you want them kept longer than "
+            + "that, turn auto-delete off instead.",
+            ["runs", "queue", "job", "history", "delete", "remove", "retain", "retention", "hours",
+             "days", "age", "expire", "how long", "keep"],
+            minimum: GlobalSettings.MinFinishedRunRetentionHours);
+
         StartupMode = Setting.Choice(
             "startup.serviceMode", "Startup Mode",
             "When the background service runs. Run on Startup launches it at Windows login. Start on Program Open starts it when this app opens and leaves it running. Start and Stop with Program starts it on open and stops it when the app closes (warning first if jobs are running).",
@@ -149,6 +173,8 @@ public sealed partial class SettingsViewModel : ViewModelBase
             undoable: false);
 
         ReleaseMemoryAfterLargeOperations.Value = GlobalSettings.Default.ReleaseMemoryAfterLargeOperations;
+        AutoDeleteFinishedRuns.Value = GlobalSettings.Default.AutoDeleteFinishedRuns;
+        FinishedRunRetentionHours.Value = GlobalSettings.DefaultFinishedRunRetentionHours;
         ScratchDirectory.Value = GlobalSettings.DefaultScratchDirectory;
         ProfilesDirectory.Value = GlobalSettings.DefaultProfilesDirectory;
         MaxScanThreads.Value = ScanAutoDefault;
@@ -193,6 +219,13 @@ public sealed partial class SettingsViewModel : ViewModelBase
     public AutoNumberSettingViewModel MaxScanDepth { get; }
     public DriveOverridesSettingViewModel DriveOverrides { get; }
     public BoolSettingViewModel ReleaseMemoryAfterLargeOperations { get; }
+
+    /// <summary>Whether finished runs leave the job queue on their own. Off means they stay until
+    /// discarded — the engine's own count backstop is what keeps "never" bounded.</summary>
+    public BoolSettingViewModel AutoDeleteFinishedRuns { get; }
+
+    /// <summary>How long a finished run is kept, when <see cref="AutoDeleteFinishedRuns"/> is on.</summary>
+    public AutoNumberSettingViewModel FinishedRunRetentionHours { get; }
     public TextSettingViewModel ScratchDirectory { get; }
     public TextSettingViewModel ProfilesDirectory { get; }
 
@@ -222,6 +255,10 @@ public sealed partial class SettingsViewModel : ViewModelBase
             .With(Theme, PreviewStaleAfter, ServiceExePath));
         Categories.Add(new SettingsCategoryViewModel("startup", "Service Startup") { RequiresService = true }
             .With(StartupMode));
+        Categories.Add(new SettingsCategoryViewModel(
+            "runs", "Job Queue", "How long finished runs are kept before the engine deletes them.")
+            { RequiresService = true }
+            .With(AutoDeleteFinishedRuns, FinishedRunRetentionHours));
         Categories.Add(performance.With(
             MaxScanThreads, PerDriveDefault, MaxHashThreads, MaxScanDepth, ReleaseMemoryAfterLargeOperations));
         Categories.Add(new SettingsCategoryViewModel("performance.advanced", "Per-Drive Overrides", parent: performance)
@@ -582,6 +619,12 @@ public sealed partial class SettingsViewModel : ViewModelBase
             StartupMode.Value = settings!.ServiceStartupMode;
             ScratchDirectory.Value = settings.ScratchDirectory;
             ReleaseMemoryAfterLargeOperations.Value = settings.ReleaseMemoryAfterLargeOperations;
+            AutoDeleteFinishedRuns.Value = settings.AutoDeleteFinishedRuns;
+            // Auto here means "the shipped interval", so a stored value equal to it reads back as Auto —
+            // the same absent-means-default round-trip GlobalSettings performs.
+            (FinishedRunRetentionHours.Auto, FinishedRunRetentionHours.Value) =
+                (settings.FinishedRunRetentionHours == GlobalSettings.DefaultFinishedRunRetentionHours,
+                 settings.FinishedRunRetentionHours);
             ProfilesDirectory.Value = settings.ProfilesDirectory;
 
             // Auto here means "the shipped ceiling", so a stored value equal to it reads back as Auto —
@@ -721,6 +764,10 @@ public sealed partial class SettingsViewModel : ViewModelBase
                 // the current value through so a generic Save never resets it to the default.
                 ProfilesDirectory = ProfilesDirectory.Value,
                 MaxScanDepth = MaxScanDepth.Auto ? GlobalSettings.DefaultMaxScanDepth : MaxScanDepth.Value,
+                AutoDeleteFinishedRuns = AutoDeleteFinishedRuns.Value,
+                FinishedRunRetentionHours = FinishedRunRetentionHours.Auto
+                    ? GlobalSettings.DefaultFinishedRunRetentionHours
+                    : FinishedRunRetentionHours.Value,
                 ScanThreading = new ScanThreadingSettings
                 {
                     MaxScanThreads = ToBudget(MaxScanThreads.Auto, MaxScanThreads.Value),

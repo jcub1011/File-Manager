@@ -133,9 +133,16 @@ internal sealed class FakeJobExecutor : IJobExecutor
 /// <see cref="Update"/> echoes the input.</summary>
 internal sealed class FakeSettingsProvider(GlobalSettings? current = null) : ISettingsProvider
 {
-    public GlobalSettings Current { get; } = current ?? GlobalSettings.Default;
-    public Result<GlobalSettings, string> Update(GlobalSettings settings) =>
-        Result<GlobalSettings, string>.Success(settings);
+    /// <summary>Settable, and swapped by <see cref="Update"/>, because the real service's is too: consumers
+    /// that re-read <c>Current</c> to pick up a change without a restart (the run coordinator's retention
+    /// sweep) cannot be tested against a provider whose value is fixed at construction.</summary>
+    public GlobalSettings Current { get; set; } = current ?? GlobalSettings.Default;
+
+    public Result<GlobalSettings, string> Update(GlobalSettings settings)
+    {
+        Current = settings;
+        return Result<GlobalSettings, string>.Success(settings);
+    }
 }
 
 /// <summary>Reports abundant free space and a per-drive-root volume key; lets a test force a

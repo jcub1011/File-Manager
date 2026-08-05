@@ -32,6 +32,17 @@ public sealed partial class JobQueueRow : ObservableObject
     public required Guid ProfileId { get; init; }
     public required DateTimeOffset StartedAtUtc { get; init; }
 
+    /// <summary>Clock behind <see cref="IsOld"/>. Injected so a test can advance it rather than waiting
+    /// out the real threshold.</summary>
+    public TimeProvider Time { get; init; } = TimeProvider.System;
+
+    /// <summary>When the run reached its terminal state; null while it is still live.
+    /// <para>A finished run is now retained until it is discarded, so the queue has to be able to say HOW
+    /// finished: a run that ended a minute ago and one that ended yesterday are both <c>Closed</c>.</para></summary>
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(IsOld), nameof(FinishedAgeText), nameof(HasFinishedAge))]
+    public partial DateTimeOffset? ClosedAtUtc { get; set; }
+
     /// <summary>From the wire, never resolved locally: a run planned from an unsaved draft has a profile
     /// that exists in no catalog, so a client-side lookup returns null for exactly the runs the GUI starts.</summary>
     [ObservableProperty] public partial string ProfileName { get; set; } = "";
@@ -102,6 +113,49 @@ public sealed partial class JobQueueRow : ObservableObject
 
     public bool IsAwaitingApproval => Phase == nameof(RunPhaseNames.AwaitingApproval);
     public bool IsFinished => Phase == nameof(RunPhaseNames.Closed);
+
+    /// <summary>How long a finished run stays "recent" before the row is dimmed as history.
+    ///
+    /// <para>Ten minutes, which is exactly how long a finished run used to SURVIVE — the engine forgot it
+    /// at this mark. The number kept its meaning ("this run is no longer what is going on right now") and
+    /// lost its teeth: it dims the row instead of deleting the record. Deliberately not a setting; the
+    /// setting is how long a finished run is KEPT, which is a different question.</para></summary>
+    public static readonly TimeSpan OldAfter = TimeSpan.FromMinutes(10);
+
+    /// <summary>Whether this row is history rather than news. Drives the muted styling.</summary>
+    public bool IsOld =>
+        ClosedAtUtc is { } closed && Time.GetUtcNow() - closed >= OldAfter;
+
+    public bool HasFinishedAge => ClosedAtUtc is not null;
+
+    /// <summary>How long ago the run finished, in prose. Shown for every finished row, not just old ones —
+    /// now that runs are kept, "when" is as much a part of the row as "what".</summary>
+    public string FinishedAgeText
+    {
+        get
+        {
+            if (ClosedAtUtc is not { } closed)
+                return "";
+            TimeSpan age = Time.GetUtcNow() - closed;
+            return age < TimeSpan.FromMinutes(1)
+                ? "finished just now"
+                : age < TimeSpan.FromHours(1)
+                    ? $"finished {(int)age.TotalMinutes} min ago"
+                    : age < TimeSpan.FromDays(1)
+                        ? $"finished {(int)age.TotalHours} hr ago"
+                        : $"finished {closed.ToLocalTime():yyyy-MM-dd HH:mm}";
+        }
+    }
+
+    /// <summary>Recomputes the age-derived members. Called on a timer by the shell, because nothing else
+    /// changes when time passes.</summary>
+    public void RefreshAge()
+    {
+        if (ClosedAtUtc is null)
+            return;
+        OnPropertyChanged(nameof(IsOld));
+        OnPropertyChanged(nameof(FinishedAgeText));
+    }
 
     /// <summary>Approve/Discard are offered inline only for a plan this window showed.</summary>
     public bool CanApproveHere => IsAwaitingApproval && PlanWasShown;
@@ -255,11 +309,19 @@ internal static class RunPhaseNames
 /// <para>Live rows come from the engine event stream, which is bounded and drop-oldest, so
 /// <see cref="ReconcileAsync"/> re-seeds from <c>get-runs</c> on window open and on every (re)connect —
 /// the same contract <see cref="ActivityViewModel"/> follows against <c>get-recent-jobs</c>.</para></summary>
-public sealed partial class JobQueueViewModel(IIpcGateway gateway) : ViewModelBase
+public sealed partial class JobQueueViewModel(IIpcGateway gateway, TimeProvider? time = null) : ViewModelBase
 {
-    /// <summary>Rows kept. The engine retains closed runs for ~10 minutes, so this bound is only reached by
-    /// a session that started hundreds of runs inside that window.</summary>
-    internal const int MaxRows = 100;
+    /// <summary>Clock handed to every row, for the finished-age captions. Injected so a test can advance it
+    /// instead of waiting out the ten-minute threshold.</summary>
+    private readonly TimeProvider time = time ?? TimeProvider.System;
+
+    /// <summary>Rows kept.
+    ///
+    /// <para>Matches the engine's own <c>MaxRetainedClosedRuns</c> backstop. It used to be 100 against a
+    /// ten-minute engine-side window, which no bound could realistically reach; now that finished runs are
+    /// retained until discarded, a lower cap here would mean the user could not SEE — let alone discard —
+    /// the runs the engine is still holding, which is the one thing the queue is for.</para></summary>
+    internal const int MaxRows = 500;
 
     public ObservableCollection<JobQueueRow> Runs { get; } = [];
 
@@ -319,6 +381,11 @@ public sealed partial class JobQueueViewModel(IIpcGateway gateway) : ViewModelBa
         Runs.Clear();
         foreach (RunSummaryDto run in runs!)
         {
+            // A get-runs that was already in flight when the user pressed Discard can still name the run.
+            // Without this the reconcile puts the row back, which is the same resurrection the event
+            // handlers guard against, arriving by a different route.
+            if (_discarded.Contains(run.RunId))
+                continue;
             if (existing.TryGetValue(run.RunId, out JobQueueRow? row))
                 Apply(row, run);
             else
@@ -333,11 +400,15 @@ public sealed partial class JobQueueViewModel(IIpcGateway gateway) : ViewModelBa
     public void OnRunPlanned(RunPlannedEvent evt)
     {
         ArgumentNullException.ThrowIfNull(evt);
+        // A discarded run's own closing events must not put its row back — see _discarded.
+        if (_discarded.Contains(evt.RunId))
+            return;
         JobQueueRow row = FindRow(evt.RunId) ?? Insert(new JobQueueRow
         {
             RunId = evt.RunId,
             ProfileId = evt.ProfileId,
             StartedAtUtc = evt.AtUtc,
+            Time = time,
             ProfileName = evt.ProfileName,
             PlanWasShown = IsOwnRun?.Invoke(evt.RunId) ?? false,
         });
@@ -351,7 +422,10 @@ public sealed partial class JobQueueViewModel(IIpcGateway gateway) : ViewModelBa
         // something that no longer exists.
         row.Phase = evt.Error is null ? RunPhaseNames.AwaitingApproval : RunPhaseNames.Closed;
         if (evt.Error is not null)
+        {
             row.Outcome = "PlanFailed";
+            row.ClosedAtUtc = evt.AtUtc;   // a failed plan is already closed engine-side
+        }
         // Re-asked here rather than trusted from insert time: planning is detached service-side, so this
         // event can beat the shell's own run-profile reply and the ownership answer changes a moment later.
         row.PlanWasShown = IsOwnRun?.Invoke(evt.RunId) ?? false;
@@ -364,11 +438,14 @@ public sealed partial class JobQueueViewModel(IIpcGateway gateway) : ViewModelBa
     public void OnRunProgress(RunProgressEvent evt)
     {
         ArgumentNullException.ThrowIfNull(evt);
+        if (_discarded.Contains(evt.RunId))
+            return;
         JobQueueRow row = FindRow(evt.RunId) ?? Insert(new JobQueueRow
         {
             RunId = evt.RunId,
             ProfileId = Guid.Empty,
             StartedAtUtc = evt.AtUtc,
+            Time = time,
             ProfileName = "",
             PlanWasShown = IsOwnRun?.Invoke(evt.RunId) ?? false,
         });
@@ -390,15 +467,23 @@ public sealed partial class JobQueueViewModel(IIpcGateway gateway) : ViewModelBa
     public void OnRunCompleted(RunCompletedEvent evt)
     {
         ArgumentNullException.ThrowIfNull(evt);
+        // The one that lingers longest: a discarded EXECUTING run keeps unwinding and closes only once its
+        // in-flight jobs finish, so this can arrive well after the row went.
+        if (_discarded.Contains(evt.RunId))
+            return;
         JobQueueRow row = FindRow(evt.RunId) ?? Insert(new JobQueueRow
         {
             RunId = evt.RunId,
             ProfileId = evt.ProfileId,
             StartedAtUtc = evt.AtUtc,
+            Time = time,
             ProfileName = "",
         });
         row.Phase = RunPhaseNames.Closed;
         row.Outcome = evt.Outcome;
+        // The terminal event's own stamp, which is when the run actually closed — so a row ages from the
+        // moment the work ended rather than from whenever this window happened to hear about it.
+        row.ClosedAtUtc = evt.AtUtc;
         row.Completed = evt.Succeeded + evt.Skipped + evt.Failed;
         row.Deleted = evt.Deleted;
         // A finished run cannot be paused, so the flag must not outlive it — a cancelled-while-paused run
@@ -477,12 +562,115 @@ public sealed partial class JobQueueViewModel(IIpcGateway gateway) : ViewModelBa
         await AnswerRun(row.RunId, true);
     }
 
+    /// <summary>Removes the row's run from the engine — the only user-driven deletion.
+    ///
+    /// <para>Offered on EVERY row, including a parked plan (declining a plan is discarding it) and a
+    /// finished one (which is otherwise kept until auto-delete reaps it, or forever when that is off).</para>
+    ///
+    /// <para>A run that is still LIVE is confirmed first: discarding it cancels real work. The row goes at
+    /// once, but jobs already in flight still finish (I-ATOMIC-JOB), which is what the confirmation text
+    /// has to say.</para></summary>
     [RelayCommand]
     private async Task DiscardAsync(JobQueueRow? row)
     {
-        if (row is null || !row.IsAwaitingApproval || AnswerRun is null)
+        if (row is null)
             return;
-        await AnswerRun(row.RunId, false);
+        try
+        {
+            if (!row.IsFinished && ConfirmDiscard is not null
+                && !await ConfirmDiscard(DiscardPrompt(row)))
+                return;
+
+            // BEFORE the call, not after: the engine removes the run synchronously and its closing events
+            // are published from the run's own detached task, so they can reach this window while the await
+            // below is still suspended. Remembering the id first is what makes the filter airtight.
+            RememberDiscard(row.RunId);
+            var result = await gateway.DiscardRunAsync(row.RunId);
+            if (result.IsCanceled)
+            {
+                Forget(row.RunId);
+                return;
+            }
+            if (result.TryGetError(out IpcError? error))
+            {
+                // RUN_NOT_FOUND means it was already gone — which is the outcome the user wanted, so the
+                // row still goes. Anything else is a real failure, and the run is still there: stop
+                // filtering its events, or its row would sit frozen at whatever it last said.
+                if (error.Code != "RUN_NOT_FOUND")
+                {
+                    Forget(row.RunId);
+                    ErrorMessage = $"Could not discard the run: {error.Message}";
+                    return;
+                }
+            }
+            // Removed locally rather than waiting for a reconcile: there is no run-discarded event, and a
+            // row that lingers after the user pressed Discard reads as a failure.
+            Runs.Remove(row);
+            if (ReferenceEquals(SelectedRun, row))
+                SelectedRun = null;
+            DiscardedRun?.Invoke(row.RunId);
+            TrimAndFlag();
+        }
+        catch (Exception ex)
+        {
+            // Last-resort catch-all (directive): a command has no exception boundary of its own.
+            Log.Error(ex, "Discarding run {RunId} failed", row.RunId);
+            Forget(row.RunId);
+            ErrorMessage = $"Could not discard the run: {ex.Message}";
+        }
+    }
+
+    private static string DiscardPrompt(JobQueueRow row) => row.IsAwaitingApproval
+        ? $"Discard the plan for \"{row.ProfileName}\"? Nothing has been changed and nothing will be."
+        : $"Discard the run for \"{row.ProfileName}\"? It will be cancelled and removed from the queue. "
+          + "Files already being copied will finish, and a Mirror run will remove nothing.";
+
+    /// <summary>Set by the composition root to confirm discarding a run that is still live. Null proceeds,
+    /// so headless tests are not blocked — mirrors <c>MainWindowViewModel.ConfirmDeleteProfile</c>.</summary>
+    public Func<string, Task<bool>>? ConfirmDiscard { get; set; }
+
+    /// <summary>Set by the shell, and called with the id of a run the user discarded, so anything else
+    /// holding it (the retained-preview store, the Preview tab) can let go.</summary>
+    public Action<Guid>? DiscardedRun { get; set; }
+
+    /// <summary>How many discarded run ids are remembered. Bounded only so the set cannot grow for the
+    /// session; the events it filters all arrive within moments of the discard, except a discarded
+    /// EXECUTING run's terminal event, which waits for its in-flight jobs. Sixty-four is far more than a
+    /// user discards while one run drains.</summary>
+    private const int MaxRememberedDiscards = 64;
+
+    // Runs the user discarded, so their own terminal events cannot resurrect them.
+    //
+    // THE BUG THIS FIXES: every event handler below synthesizes a row for a run it does not know, which is
+    // right for a lossy stream — a queue silently missing an executing run is far worse than one extra row.
+    // But a discarded run publishes its OWN closing events after the removal: cancelling a planning run
+    // makes PlanAsync publish run-planned (with the cancellation as its error) and run-completed, and both
+    // arrived at a queue that had just dropped the row and duly put it back. From the user's side the
+    // Discard button cancelled the job and left the entry sitting there.
+    private readonly HashSet<Guid> _discarded = [];
+    private readonly Queue<Guid> _discardOrder = new();
+
+    private void RememberDiscard(Guid runId)
+    {
+        if (!_discarded.Add(runId))
+            return;
+        _discardOrder.Enqueue(runId);
+        while (_discardOrder.Count > MaxRememberedDiscards)
+            _discarded.Remove(_discardOrder.Dequeue());
+    }
+
+    /// <summary>Stops filtering a run's events, for a discard that did not take. The run is still there, so
+    /// its row must go back to updating rather than sitting frozen at whatever it last said. The id stays in
+    /// <see cref="_discardOrder"/>, which only bounds the set — a stale entry there evicts something
+    /// harmlessly early and nothing more.</summary>
+    private void Forget(Guid runId) => _discarded.Remove(runId);
+
+    /// <summary>Re-evaluates every finished row's age. Called on the shell's minute tick, so a row dims
+    /// and its caption advances without the user touching anything.</summary>
+    public void RefreshAges()
+    {
+        foreach (JobQueueRow row in Runs)
+            row.RefreshAge();
     }
 
     /// <summary>Shows a parked run's plan on the Preview tab. The route by which a run this window did not
@@ -520,6 +708,7 @@ public sealed partial class JobQueueViewModel(IIpcGateway gateway) : ViewModelBa
             RunId = run.RunId,
             ProfileId = run.ProfileId,
             StartedAtUtc = run.StartedAtUtc,
+            Time = time,
             ProfileName = run.ProfileName,
         };
         Apply(row, run);
@@ -532,6 +721,7 @@ public sealed partial class JobQueueViewModel(IIpcGateway gateway) : ViewModelBa
             row.ProfileName = run.ProfileName;
         row.Phase = run.Phase;
         row.Outcome = run.Outcome;
+        row.ClosedAtUtc = run.ClosedAtUtc;
         row.Paused = run.Paused;
         row.PlannedCopies = run.PlannedCopies;
         row.PlannedDeletes = run.PlannedDeletes;

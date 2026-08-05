@@ -2,12 +2,14 @@ using FileManager.Contracts;
 using FileManager.Contracts.IPC;
 using FileManager.Contracts.Primitives;
 using FileManager.Contracts.Profiles;
+using FileManager.Contracts.Settings;
 using FileManager.Core.DryRun;
 using FileManager.Core.Files;
 using FileManager.Core.Jobs;
 using FileManager.Core.Observability;
 using FileManager.Core.Profiles;
 using FileManager.Core.Runs.Reconcile;
+using FileManager.Core.Settings;
 using FileManager.Core.Watching;
 using Microsoft.Extensions.Logging;
 using System;
@@ -49,6 +51,7 @@ public sealed class RunCoordinator(
     EngineConfig config,
     TimeProvider time,
     RunPauseRegistry runPause,
+    ISettingsProvider settings,
     ILogger<RunCoordinator> logger) : IRunCoordinator
 {
     /// <summary>How often a paused run re-checks whether it may proceed. Only ever waited on by a run the
@@ -56,13 +59,23 @@ public sealed class RunCoordinator(
     /// than a per-run wait handle — the same trade <see cref="DrainPollInterval"/> makes.</summary>
     private static readonly TimeSpan PausePollInterval = TimeSpan.FromMilliseconds(200);
 
+    /// <summary>How many of a run's deletion failures survive its close. The list is bounded only by the
+    /// orphan count, and a retained run now lives until it is discarded — so a pass that failed on tens of
+    /// thousands of orphans would otherwise hold a string per orphan indefinitely. A hundred is far more
+    /// than anyone reads and enough to characterize what went wrong.</summary>
+    private const int MaxReportedDeletionFailures = 100;
+
     /// <summary>How often the drain loop re-checks the barrier. A run takes seconds to minutes, so this
     /// costs nothing and keeps the barrier logic a readable loop rather than a web of callbacks.</summary>
     private static readonly TimeSpan DrainPollInterval = TimeSpan.FromMilliseconds(200);
 
-    /// <summary>How long a closed run stays queryable, so a client that asks just after the terminal
-    /// event still gets an answer instead of a null.</summary>
-    private static readonly TimeSpan ClosedRunRetention = TimeSpan.FromMinutes(10);
+    /// <summary>How often the idle sweep runs.
+    ///
+    /// <para>A fixed interval, NOT a fraction of the retention window. It used to be half the window,
+    /// which was reasonable at ten minutes and absurd at a day — a 12-hour sweep would leave an
+    /// auto-delete setting looking broken for half a day, and would let the count backstop go
+    /// unenforced for just as long.</para></summary>
+    private static readonly TimeSpan PruneSweepInterval = TimeSpan.FromMinutes(5);
 
     /// <summary>Minimum spacing between planning-progress samples. Matches the ~10 frames/sec the dry-run
     /// stream used, which was measured to be enough for a caption to look live without the publish itself
@@ -239,8 +252,13 @@ public sealed class RunCoordinator(
             run.Phase = RunPhase.Closed;
             run.Outcome = RunOutcome.Cancelled;
             run.ClosedAt = time.GetUtcNow();
+            run.ReleaseAfterClose();
         }
         PublishCompleted(run);
+        // Decline and cancel-while-parked come through here, and both used to close a run WITHOUT ever
+        // sweeping. Those are the paths the GUI takes on every superseded preview, so with a day-scale
+        // retention window they were the ones most likely to accumulate.
+        PruneClosedRuns();
         error = null;
         return true;
     }
@@ -249,7 +267,10 @@ public sealed class RunCoordinator(
     {
         if (!_runs.TryGetValue(runId, out RunState? run))
             return $"no run with id {runId}";
-        run.Cancel.Cancel();
+        // Null once the run has closed — ReleaseAfterClose disposes it. Cancelling an already-closed run is
+        // a normal race (the queue's Cancel button against a run that just finished), not an error, so the
+        // rest of this method still runs harmlessly and reports success.
+        run.Cancel?.Cancel();
         // CANCEL SUPERSEDES PAUSE, and this line is load-bearing rather than tidy-up. A paused run's
         // remaining work is dropped below and its deletion phase is skipped, so the pause has nothing left
         // to withhold — but the drain loop treats a paused run as never quiescent (deliberately, so the
@@ -279,6 +300,42 @@ public sealed class RunCoordinator(
         // The phase is re-checked inside CloseUnstarted under the gate, so losing the race with an
         // approval that got there first is a no-op rather than a double close.
         CloseUnstarted(run, RunPhase.AwaitingApproval, out _);
+        return Result.Success();
+    }
+
+    public Result Discard(Guid runId)
+    {
+        if (!_runs.TryGetValue(runId, out RunState? run))
+            return $"no run with id {runId}";
+
+        bool live;
+        lock (run.Gate)
+            live = run.Phase != RunPhase.Closed;
+
+        // A live run is CANCELLED first — discard means "I am done with this", and abandoning a run
+        // mid-flight without stopping it would leave work running that nothing is tracking. Cancel's own
+        // semantics still hold: pending work is dropped, jobs already in flight finish (I-ATOMIC-JOB), and
+        // a Mirror run's deletion phase is skipped. So the ROW disappears immediately; the last in-flight
+        // file does not.
+        if (live)
+            Cancel(runId);
+
+        // Belt and braces after the cancel: an Executing run's Close is still unwinding on its own task and
+        // will run these again harmlessly, while a run cancelled from Planning may not have reached them
+        // yet. Both are idempotent — CleanUpSnapshot no-ops on a null Directory, Forget on a missing key.
+        CleanUpSnapshot(run);
+        runPause.Forget(runId);
+
+        // THE removal. Until this existed, the age-based sweep was the only thing that ever took an entry
+        // out of _runs — so a user looking at a finished run had no way to be rid of it, and turning
+        // auto-delete off would have meant the queue only ever grew.
+        _runs.TryRemove(runId, out _);
+
+        // Note what is deliberately NOT done: a discarded Executing run's ExecuteAsync keeps unwinding
+        // against a RunState no longer in _runs. Its eventual Close publishes a run-completed for a run no
+        // client is listing, and Settled early-returns on the unknown id. Harmless, and cheaper than
+        // teaching every path to check whether it has been forgotten mid-flight.
+        logger.LogInformation("Run {RunId} discarded{State}", runId, live ? " (cancelled first)" : "");
         return Result.Success();
     }
 
@@ -375,7 +432,12 @@ public sealed class RunCoordinator(
                 // approved list that did not happen, which is why the deletion gate reads it too.
                 default: run.Dropped++; break;
             }
-            if (completion is not null)
+            // MIRROR ONLY. This set exists solely as the deletion pass's self-write guard, and nothing
+            // else ever reads it — so an additive profile was paying one retained string per copied file
+            // (megabytes on a large run) to build a set no code path would ever look at. Now that a
+            // finished run is retained until discarded rather than for ten minutes, that stopped being
+            // merely wasteful.
+            if (completion is not null && run.Profile.SyncMode == SyncMode.Mirror)
                 foreach (string written in completion.ResolvedFinalPaths)
                     run.PathsWritten.Add(written);
         }
@@ -406,7 +468,9 @@ public sealed class RunCoordinator(
         List<Task> pending = [];
         foreach (RunState run in _runs.Values)
         {
-            run.Cancel.Cancel();
+            // Both null for a run that has already closed — ReleaseAfterClose disposes the source and drops
+            // the task. Nothing to cancel and nothing to await; only live runs need either.
+            run.Cancel?.Cancel();
             if (run.Work is { } work)
                 pending.Add(work);
         }
@@ -430,8 +494,10 @@ public sealed class RunCoordinator(
 
     private async Task PlanAsync(RunState run)
     {
+        // Non-null here by construction: PlanAsync is started by Begin, and only a close releases the
+        // source — which cannot have happened to a run that has not planned yet.
         using CancellationTokenSource linked =
-            CancellationTokenSource.CreateLinkedTokenSource(_shutdown.Token, run.Cancel.Token);
+            CancellationTokenSource.CreateLinkedTokenSource(_shutdown.Token, run.Cancel!.Token);
         string directory = RunSnapshotPaths.DirectoryFor(paths, run.RunId);
         run.Directory = directory;
         PlanState state = new();
@@ -538,7 +604,10 @@ public sealed class RunCoordinator(
         }
         catch (OperationCanceledException)
         {
-            failure = run.Cancel.IsCancellationRequested
+            // Cancel is non-null here — only a close releases it, and this run has not closed yet — but
+            // read defensively rather than asserting: getting it wrong turns a cancellation into an
+            // unobserved NRE on a detached task.
+            failure = run.Cancel?.IsCancellationRequested == true
                 ? "the run was cancelled while planning"
                 : "the service shut down while planning";
         }
@@ -566,6 +635,11 @@ public sealed class RunCoordinator(
 
         if (failure is not null || run.Cancelled)
         {
+            // Dispose the LINKED source before the close below disposes the one it was derived from.
+            // ReleaseAfterClose disposes run.Cancel, and a child outliving its parent is the one ordering
+            // that has ever been fragile here. Double disposal is a documented no-op, so the `using` at
+            // the top of this method is free to run again.
+            linked.Dispose();
             CleanUpSnapshot(run);   // before Closed is observable — see Close()
             runPause.Forget(run.RunId);
             lock (run.Gate)
@@ -574,6 +648,7 @@ public sealed class RunCoordinator(
                 run.Outcome = run.Cancelled ? RunOutcome.Cancelled : RunOutcome.PlanFailed;
                 run.PlanError = failure;
                 run.ClosedAt = time.GetUtcNow();
+                run.ReleaseAfterClose();
             }
             PublishPlanned(run, failure);
             PublishCompleted(run);
@@ -899,6 +974,7 @@ public sealed class RunCoordinator(
             run.Outcome = outcome;
             run.PlanError ??= planError;
             run.ClosedAt = time.GetUtcNow();
+            run.ReleaseAfterClose();
         }
         PublishCompleted(run);
         logger.LogInformation(
@@ -931,24 +1007,63 @@ public sealed class RunCoordinator(
         run.Directory = null;
     }
 
-    /// <summary>Forgets long-closed runs so a long-lived service does not accumulate one per
-    /// invocation, while keeping recent ones queryable.
-    /// <para>Driven from three places, because the only one it had — <see cref="Begin"/> — meant a service
-    /// that ran 500 profiles overnight and then went idle kept all 500 <c>RunState</c>s for the rest of the
-    /// process: each holding a whole <see cref="Profile"/>, a <c>PathsWritten</c> set of every destination
-    /// path the run wrote, and a failure list. GetStatus also kept answering for runs long past the
-    /// retention window it documents.</para></summary>
+    /// <summary>Auto-deletes finished runs, and enforces the count backstop. Two independent rules.
+    ///
+    /// <para><b>1. Age, only when the user asked for it.</b> A finished run is the record of what the
+    /// engine did; deleting one is a decision. So a run is removed on age ONLY while
+    /// <see cref="GlobalSettings.AutoDeleteFinishedRuns"/> is on, and everything else that leaves the
+    /// queue leaves because <see cref="Discard"/> was called. This replaces a hard-coded ten-minute
+    /// window that deleted a run's history out from under whoever was reading it.</para>
+    ///
+    /// <para><b>2. Count, always.</b> Auto-delete can be switched off entirely, which without a second
+    /// rule would make "never delete" an unbounded allocation. <c>MaxRetainedClosedRuns</c> caps the
+    /// retained set regardless, evicting the oldest-closed first — a backstop rather than a knob, and set
+    /// far above any hand-driven session. What makes it affordable to sit near that cap is
+    /// <c>RunState.ReleaseAfterClose</c>: a closed run is a handful of scalars, not a profile plus a
+    /// string per copied file.</para>
+    ///
+    /// <para>Settings are read on every sweep, not captured, so changing either takes effect on the next
+    /// tick rather than at the next restart.</para></summary>
     private void PruneClosedRuns()
     {
-        DateTimeOffset cutoff = time.GetUtcNow() - ClosedRunRetention;
+        GlobalSettings current = settings.Current;
+
+        if (current.AutoDeleteFinishedRuns)
+        {
+            DateTimeOffset cutoff = time.GetUtcNow() - current.FinishedRunRetention;
+            foreach ((Guid id, RunState run) in _runs)
+                if (run.ClosedAt is { } closedAt && closedAt < cutoff)
+                    _runs.TryRemove(id, out _);
+        }
+
+        // The backstop. Counted first so the ordinary case — comfortably under the cap — costs one pass
+        // and no allocation at all.
+        int closedCount = 0;
+        foreach (RunState run in _runs.Values)
+            if (run.ClosedAt is not null)
+                closedCount++;
+        if (closedCount <= config.MaxRetainedClosedRuns)
+            return;
+
+        // Oldest-closed first, so what survives is what the user is most likely to still care about. A
+        // LIVE run is never a candidate however long it has been going: it is not history yet, and
+        // removing it would strand work nothing is tracking.
+        List<(DateTimeOffset ClosedAt, Guid Id)> closed = new(closedCount);
         foreach ((Guid id, RunState run) in _runs)
-            if (run.ClosedAt is { } closed && closed < cutoff)
-                _runs.TryRemove(id, out _);
+            if (run.ClosedAt is { } at)
+                closed.Add((at, id));
+        closed.Sort(static (a, b) => a.ClosedAt.CompareTo(b.ClosedAt));
+
+        int excess = closed.Count - config.MaxRetainedClosedRuns;
+        for (int i = 0; i < excess; i++)
+            _runs.TryRemove(closed[i].Id, out _);
+        logger.LogInformation(
+            "Retained-run cap reached: forgot the {Excess} oldest finished run(s), keeping {Kept}",
+            excess, config.MaxRetainedClosedRuns);
     }
 
-    /// <summary>Starts the idle sweep once, on the first run. At half the retention window, so a closed run
-    /// is forgotten within one window of becoming eligible without the timer being the thing that decides
-    /// the window.</summary>
+    /// <summary>Starts the idle sweep once, on the first run, at a FIXED interval — see
+    /// <see cref="PruneSweepInterval"/> for why it is no longer derived from the retention window.</summary>
     private void ArmPruneTimer()
     {
         if (_pruneTimer is not null)
@@ -957,9 +1072,9 @@ public sealed class RunCoordinator(
         {
             if (_pruneTimer is not null || _shutdown.IsCancellationRequested)
                 return;
-            TimeSpan period = ClosedRunRetention / 2;
             _pruneTimer = time.CreateTimer(
-                static state => ((RunCoordinator)state!).PruneOnTimer(), this, period, period);
+                static state => ((RunCoordinator)state!).PruneOnTimer(), this,
+                PruneSweepInterval, PruneSweepInterval);
         }
     }
 
@@ -1122,7 +1237,11 @@ public sealed class RunCoordinator(
         public Profile Profile { get; } = profile;
         public string? ScopePath { get; } = scopePath;
         public object Gate { get; } = new();
-        public CancellationTokenSource Cancel { get; } = new();
+
+        /// <summary>The run's own cancellation source. <b>Null once the run has closed</b> — released and
+        /// disposed by <see cref="ReleaseAfterClose"/>, so every reader must null-check. Before that
+        /// change it was never disposed at all, anywhere.</summary>
+        public CancellationTokenSource? Cancel { get; set; } = new();
 
         /// <summary>When the run was created. Immutable, and the queue's sort key — a run that has not
         /// finished planning has no <see cref="PlannedAt"/> and would otherwise have no position.</summary>
@@ -1247,10 +1366,56 @@ public sealed class RunCoordinator(
                     // RunCoordinator.WaitingPhase.
                     WaitingToPlan && Phase == RunPhase.Planning ? WaitingPhase : Phase.ToString(),
                     Outcome.ToString(),
-                    paused, WaitingToPlan, StartedAt, PlannedAt,
+                    paused, WaitingToPlan, StartedAt, PlannedAt, ClosedAt,
                     PlannedCopies, PlannedDeletes, PlannedCopyBytes, PlannedDeleteBytes,
                     Succeeded, SkippedJobs, Failed, Deleted, PlanTruncated, PlanError);
             }
+        }
+
+        /// <summary>Frees what a CLOSED run has no further use for. Called under <see cref="Gate"/> from
+        /// every close path, immediately after the phase flips.
+        ///
+        /// <para><b>This is what makes long retention affordable.</b> A run used to be forgotten ten
+        /// minutes after it closed, and that window was the only thing bounding what it held. Now a
+        /// finished run stays until the user discards it — possibly forever, since auto-delete can be
+        /// switched off — so it has to stop being expensive at the moment it stops being live. The heavy
+        /// members below are each provably dead by close; what remains is the handful of scalars
+        /// <see cref="Summarize"/> and <see cref="Snapshot"/> read.</para>
+        ///
+        /// <para>Deliberately NOT released: <see cref="Profile"/>. <c>PlannedProfile</c> can still be
+        /// asked for it by a payload that outlived the run (a quiescence or deadline close leaves work
+        /// queued), and <see cref="Summarize"/> needs its id and name. A profile record is bounded by its
+        /// own configuration, unlike everything above it.</para></summary>
+        public void ReleaseAfterClose()
+        {
+            // The unbounded one: one string per file this run copied, ~8-10 MB for a 33k-file run. Its
+            // only consumer is DeleteOrphansAsync, which copies it into its own set before the deletion
+            // pass runs — and the deletion pass finishes before Close is reached.
+            PathsWritten.Clear();
+            PathsWritten.TrimExcess();
+
+            // Read only by Refusal and BlockingIssuesOf, both reachable only from AwaitingApproval. A
+            // closed run cannot be approved, so nothing can ask again.
+            ValidationIssues = null;
+
+            // Roots the completed PlanAsync/ExecuteAsync state machine, and through it every local those
+            // methods captured — the snapshot writer, the plan state, the counters. StopAsync only awaits
+            // runs that are still unwinding, and this one has closed.
+            Work = null;
+
+            // Disposed here because there is nowhere else it ever was: before this, every run in the
+            // process leaked its CTS. Nulled rather than left disposed so the two callers that may race a
+            // close (StopAsync and Cancel) can null-check instead of catching ObjectDisposedException.
+            CancellationTokenSource? cts = Cancel;
+            Cancel = null;
+            cts?.Dispose();
+
+            // Bounded only by the orphan count, and Snapshot copies the whole list on every GetStatus. The
+            // total is kept so a truncated list still reports honestly rather than looking complete.
+            if (DeletionFailures.Count > MaxReportedDeletionFailures)
+                DeletionFailures.RemoveRange(
+                    MaxReportedDeletionFailures, DeletionFailures.Count - MaxReportedDeletionFailures);
+            DeletionFailures.TrimExcess();
         }
     }
 }

@@ -159,6 +159,7 @@ public sealed class EngineHostStartupTests : IDisposable
         public Result<RunHandle, string> Begin(Profile profile, string? scopePath) => "not used";
         public Result Approve(Guid runId, bool approve, bool acknowledgeWarnings = false) => Result.Success();
         public Result Cancel(Guid runId) => Result.Success();
+        public Result Discard(Guid runId) => Result.Success();
         public RunStatus? GetStatus(Guid runId) => null;
         public void Coalesced(Guid runId) { }
         public string? SnapshotDirectory(Guid runId) => null;

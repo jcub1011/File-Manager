@@ -1056,4 +1056,98 @@ public sealed class SettingsViewModelTests
         }
         finally { Directory.Delete(dir, recursive: true); }
     }
+
+    // ── Finished-run auto-delete ────────────────────────────────────────────────────────────────
+
+    [Fact]
+    public async Task Load_reflects_the_backend_run_retention_settings()
+    {
+        FakeIpcGateway gateway = new()
+        {
+            GetSettingsResult = new GlobalSettings
+            {
+                AutoDeleteFinishedRuns = false,
+                FinishedRunRetentionHours = 72,
+            },
+        };
+        SettingsViewModel vm = new(gateway, new FakeFolderPicker(), clientSettingsPath: TempFiles.ClientSettings());
+
+        await vm.LoadAsync();
+
+        Assert.False(vm.AutoDeleteFinishedRuns.Value);
+        Assert.False(vm.FinishedRunRetentionHours.Auto);
+        Assert.Equal(72, vm.FinishedRunRetentionHours.Value);
+    }
+
+    /// <summary>Auto here means "the shipped interval", so the stored default must not present as a user
+    /// pin — otherwise every load would look like an explicit choice the user never made.</summary>
+    [Fact]
+    public async Task Load_reads_the_shipped_retention_interval_back_as_auto()
+    {
+        FakeIpcGateway gateway = new() { GetSettingsResult = GlobalSettings.Default };
+        SettingsViewModel vm = new(gateway, new FakeFolderPicker(), clientSettingsPath: TempFiles.ClientSettings());
+
+        await vm.LoadAsync();
+
+        Assert.True(vm.AutoDeleteFinishedRuns.Value);
+        Assert.True(vm.FinishedRunRetentionHours.Auto);
+        Assert.Equal(GlobalSettings.DefaultFinishedRunRetentionHours, vm.FinishedRunRetentionHours.Value);
+    }
+
+    [Fact]
+    public async Task Save_sends_the_run_retention_settings()
+    {
+        FakeIpcGateway gateway = new();
+        SettingsViewModel vm = new(gateway, new FakeFolderPicker(), clientSettingsPath: TempFiles.ClientSettings());
+        vm.AutoDeleteFinishedRuns.Value = false;
+        vm.FinishedRunRetentionHours.Auto = false;
+        vm.FinishedRunRetentionHours.Value = 168;
+
+        await vm.SaveCommand.ExecuteAsync(null);
+
+        GlobalSettings saved = Assert.Single(gateway.SaveSettingsCalls);
+        Assert.False(saved.AutoDeleteFinishedRuns);
+        Assert.Equal(168, saved.FinishedRunRetentionHours);
+    }
+
+    [Fact]
+    public async Task Save_sends_the_default_retention_interval_when_auto_is_checked()
+    {
+        FakeIpcGateway gateway = new();
+        SettingsViewModel vm = new(gateway, new FakeFolderPicker(), clientSettingsPath: TempFiles.ClientSettings());
+        vm.FinishedRunRetentionHours.Auto = true;
+        vm.FinishedRunRetentionHours.Value = 168;   // the shadow value must be ignored while Auto is on
+
+        await vm.SaveCommand.ExecuteAsync(null);
+
+        Assert.Equal(
+            GlobalSettings.DefaultFinishedRunRetentionHours,
+            Assert.Single(gateway.SaveSettingsCalls).FinishedRunRetentionHours);
+    }
+
+    /// <summary>SaveAsync rebuilds GlobalSettings from scratch rather than `_stored with { … }`, so a member
+    /// omitted from that initializer is silently reset on every save. This pins that these two survive a
+    /// save the user made for an entirely unrelated reason.</summary>
+    [Fact]
+    public async Task An_unrelated_save_does_not_reset_the_run_retention_settings()
+    {
+        FakeIpcGateway gateway = new()
+        {
+            GetSettingsResult = new GlobalSettings
+            {
+                AutoDeleteFinishedRuns = false,
+                FinishedRunRetentionHours = 72,
+            },
+        };
+        SettingsViewModel vm = new(gateway, new FakeFolderPicker(), clientSettingsPath: TempFiles.ClientSettings());
+        await vm.LoadAsync();
+
+        vm.MaxScanDepth.Auto = false;
+        vm.MaxScanDepth.Value = 64;          // the user came here to change something else entirely
+        await vm.SaveCommand.ExecuteAsync(null);
+
+        GlobalSettings saved = Assert.Single(gateway.SaveSettingsCalls);
+        Assert.False(saved.AutoDeleteFinishedRuns);
+        Assert.Equal(72, saved.FinishedRunRetentionHours);
+    }
 }

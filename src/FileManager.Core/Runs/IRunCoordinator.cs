@@ -72,8 +72,21 @@ public interface IRunCoordinator : IRunSettleSink
 
     /// <summary>Cancels a run at any phase. Planning stops; pending payloads are dropped; the deletion
     /// phase is skipped. Jobs already in flight are NEVER interrupted (I-ATOMIC-JOB) — the run closes
-    /// once they drain.</summary>
+    /// once they drain.
+    /// <para>Cancel STOPS the work and KEEPS the record, so the user can still see what happened. To be
+    /// rid of the record too, see <see cref="Discard"/>.</para></summary>
     Result Cancel(Guid runId);
+
+    /// <summary>Forgets a run entirely, cancelling it first if it is still live. <b>The only user-driven
+    /// deletion, and the only way anything can make the coordinator forget a run.</b>
+    ///
+    /// <para>Everything else about a finished run's lifetime is either this or the auto-delete setting: a
+    /// run is no longer aged out of existence on a fixed timer, because a finished run is the record of
+    /// what the engine did and removing one is a decision.</para>
+    ///
+    /// <para>Discarding an EXECUTING run cancels it, so the row goes at once but work already in flight
+    /// still finishes.</para></summary>
+    Result Discard(Guid runId);
 
     /// <summary>The run's current state, or null when the id is unknown (an unknown id is a normal
     /// case: runs are forgotten a while after they close).</summary>

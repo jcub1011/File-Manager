@@ -73,6 +73,8 @@ public sealed class SettingsSearchTests
     [InlineData("volume key", "performance.driveOverrides")]
     [InlineData("service executable", "application.serviceExePath")]
     [InlineData("not found", "application.serviceExePath")]   // what a stuck user would actually type
+    [InlineData("purge", "runs.autoDelete")]                  // a keyword, absent from the prose
+    [InlineData("how long", "runs.retentionHours")]           // what a user would actually type
     public void A_query_matches_the_setting_it_should(string query, string expectedId)
     {
         SettingsViewModel vm = New();

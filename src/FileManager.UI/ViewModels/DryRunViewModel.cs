@@ -3082,6 +3082,9 @@ public sealed partial class DryRunViewModel : ViewModelBase
         int epoch = _reportEpoch;
         IsPreviewing = true;
         PlanningRunId = null;   // the scan is done; from here the wait is this method's own ingest
+        // Claims the stage between "planning" and "on screen", so a discard arriving mid-stream has
+        // something to match against — see ForgetDiscardedRun.
+        _loadingRunId = planned.RunId;
         // Baseline for the churn figures on the two samples below — taken after BeginPlanning's clear so
         // it measures this preview only, not the previous one's teardown.
         long allocatedBefore = UiMemoryLog.AllocatedSnapshot();
@@ -3107,6 +3110,11 @@ public sealed partial class DryRunViewModel : ViewModelBase
                 ErrorMessage = "Preview cancelled.";
                 return;
             }
+            // Discarded from the job queue while this was streaming. The failure below would be real —
+            // the run genuinely is gone — but reporting it as one blames the user for their own action,
+            // so ForgetDiscardedRun has already said what happened.
+            if (_loadingRunId != planned.RunId)
+                return;
             if (run.TryGetError(out IpcError? error))
             {
                 ErrorMessage = error.Code == "IPC_TRANSPORT"
@@ -3183,6 +3191,10 @@ public sealed partial class DryRunViewModel : ViewModelBase
         {
             RunStatusText = "";
             IsPreviewing = false;
+            // Only if still ours: a discard (or a superseding preview) may have claimed the stage already,
+            // and clearing it blindly would let a later discard fall through every branch.
+            if (_loadingRunId == planned.RunId)
+                _loadingRunId = null;
         }
     }
 
@@ -3296,6 +3308,48 @@ public sealed partial class DryRunViewModel : ViewModelBase
                 CancellationToken.None,
                 TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
                 TaskScheduler.Default);
+    }
+
+    /// <summary>The run whose plan this tab is currently streaming, or null. Distinct from both
+    /// <see cref="PlanningRunId"/> (the engine is still walking) and <see cref="PendingRunId"/> (the rows
+    /// are on screen): this is the window in between, and it is the one a discard used to fall through.</summary>
+    private Guid? _loadingRunId;
+
+    private const string DiscardedEmptyState =
+        "That preview was discarded — preview again to see what a run would do.";
+
+    /// <summary>Lets go of a run the user discarded from the job queue, whatever stage it had reached here.
+    ///
+    /// <para><b>All three stages matter, and only one used to be handled.</b> A preview passes through
+    /// PLANNING (the engine is walking, <see cref="PlanningRunId"/> set), then LOADING (the plan is
+    /// streaming into the store), then PENDING (rows on screen, footer up). The original version checked
+    /// only the last, so discarding a run that was still planning left <see cref="IsPreviewing"/> true and
+    /// the tab's progress bar spinning forever — and it could not recover, because the shell drops the run
+    /// from its own id set at the same moment, so the late <c>run-planned</c> that would otherwise have
+    /// ended the wait was no longer recognized as ours.</para></summary>
+    public void ForgetDiscardedRun(Guid runId)
+    {
+        if (PlanningRunId == runId)
+        {
+            // EndPlanning clears PlanningRunId, IsPreviewing and the caption — the whole spinning state.
+            EndPlanning(emptyState: DiscardedEmptyState);
+            return;
+        }
+        if (_loadingRunId == runId)
+        {
+            // Nulled so the in-flight LoadPlanAsync recognizes itself as superseded and returns quietly
+            // instead of raising "Preview failed: no run with id …" — which is technically true and
+            // entirely unhelpful, since the user is the one who discarded it.
+            _loadingRunId = null;
+            ForgetPendingPlan();
+            EmptyStateText = DiscardedEmptyState;
+            return;
+        }
+        if (PendingRunId == runId)
+        {
+            ForgetPendingPlan();
+            EmptyStateText = DiscardedEmptyState;
+        }
     }
 
     /// <summary>Drops the footer's state and returns the run id it was holding, if any. State only — it

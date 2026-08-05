@@ -62,7 +62,15 @@ Three coherent increments are complete:
    configurable staleness banner says when a result may be out of date. Several previews can plan at once,
    bounded by `EngineConfig.MaxConcurrentPlans`.
 
-**Test status:** 1658 tests passing across the solution (Core 825, UI 634, Contracts 153,
+6. **Runs are kept until discarded.** A finished run used to be forgotten ten minutes after it ended, on a
+   hard-coded timer. It is now **retained** — the ten-minute mark only dims the row as *old* — and leaves
+   the queue in one of two ways: the user **discards** it (the new `discard-run`, which cancels a live run
+   first), or **auto-delete** reaps it after a configurable interval (default 24 h, and switchable off
+   entirely). What makes that affordable is `RunState.ReleaseAfterClose`: a closed run drops its
+   `PathsWritten` set, validation issues and completed task, and finally disposes its
+   `CancellationTokenSource`, so it costs scalars rather than megabytes.
+
+**Test status:** 1696 tests passing across the solution (Core 847, UI 650, Contracts 153,
 Platform.Windows 14, Service 32). 0 errors. One pre-existing flaky test is documented below. A clean
 Release build emits 19 analyzer warnings: 18 in test projects (xUnit1031/xUnit2031 in Core.Tests, CA1416
 platform-guard notices in Platform.Windows.Tests) plus one pre-existing CS9107 in
@@ -156,9 +164,10 @@ triggers and transformers are the next sets.
 | `IIpcServer` + framing/client/launcher | ✅ | |
 | Handlers: status, list/get/save/delete/validate profile, dry-run(+stream), settings, shutdown | ✅ | `get-status` now sources the real snapshot from `IJobOrchestrator`. |
 | Handlers: `run-profile`, `set-paused`, `get-matching`, `get-recent-jobs`, `get-job-log` | ✅ | Registered in the dispatch table. |
-| Handlers: `get-runs`, `set-run-paused` | ✅ | The job queue's re-seed (the event stream is drop-oldest lossy) and its pause toggle. 22 entries in the dispatch table. |
+| Handlers: `get-runs`, `set-run-paused` | ✅ | The job queue's re-seed (the event stream is drop-oldest lossy) and its pause toggle. |
+| Handler: `discard-run` | ✅ | Removes a run, cancelling it first if live. The ONLY user-driven deletion, and the only thing besides auto-delete that takes an entry out of the coordinator. 23 entries in the dispatch table. |
 | `subscribe` + `IIpcServer.Broadcast` | ✅ | Handled by the server directly: ack + open-ended one-way `EngineEvent` stream over a bounded, drop-oldest per-subscriber channel. |
-| Protocol version | ✅ | **12** — `get-runs` / `set-run-paused`; `run-planned` gained `ProfileName` (a draft-planned run is in no catalog, so a client-side lookup leaves exactly the GUI's own runs nameless), `run-progress` gained `Paused`. UI and Service must ship together. Prior: **7** — drops `ThemeMode` from `GlobalSettings` (settings.json schema v5); it moved to the UI-owned `client-settings.json`. Prior: 6 added `job-progress` / `run-queued` events and gave `run-profile` a `run-profile-result` reply. UI and Service must ship together. |
+| Protocol version | ✅ | **13** — `discard-run`, and `RunSummaryDto.ClosedAtUtc` so a queue can age a finished run it learned about from a reconcile rather than from the terminal event. The retention CONTRACT changed, which is what makes it a bump: an old client assumes a finished run vanishes within ten minutes and offers no way to remove one. Prior: **12** — `get-runs` / `set-run-paused`; `run-planned` gained `ProfileName` (a draft-planned run is in no catalog, so a client-side lookup leaves exactly the GUI's own runs nameless), `run-progress` gained `Paused`. UI and Service must ship together. Prior: **7** — drops `ThemeMode` from `GlobalSettings` (settings.json schema v5); it moved to the UI-owned `client-settings.json`. Prior: 6 added `job-progress` / `run-queued` events and gave `run-profile` a `run-profile-result` reply. UI and Service must ship together. |
 
 ### §4.10 Dry-run & observability
 | Component | Status | Note |
@@ -220,6 +229,77 @@ placer temp-cleanup bug and the open ratio-guard decision.*
 
 ## Notable decisions & documented limitations
 
+### Run retention (Set 5b)
+
+- **Retention no longer deletes; it ages.** The ten-minute constant kept its number and lost its teeth: it
+  is now the line at which a finished run reads as *old* in the queue (dimmed, with its age), not the line
+  at which the engine forgets it. A run is history worth keeping, and deleting one is a decision.
+- **Two ways out, and only two.** `discard-run` (the user) and auto-delete (`AutoDeleteFinishedRuns` +
+  `FinishedRunRetentionHours`, default on at 24 h, both read on every sweep so a change needs no restart).
+  Before this, `_runs.TryRemove` appeared exactly once in the whole coordinator — inside the age sweep —
+  so there was no way for a client to make the engine forget a run at all.
+- **Closed runs are released, not kept whole.** `RunState.ReleaseAfterClose` drops `PathsWritten`,
+  `ValidationIssues` and the completed `Work` task, caps `DeletionFailures` at 100, and **finally disposes
+  the `CancellationTokenSource` — which nothing anywhere had ever done.** This is not tidying: the old
+  ten-minute window was the only thing bounding what a run held, and without this "never auto-delete"
+  would be an out-of-memory button. `PathsWritten` alone is ~8–10 MB for a 33k-file run.
+- **`PathsWritten` is now Mirror-only.** It was populated on every settle for every profile and read only by
+  the Mirror deletion pass's self-write guard, so additive profiles (most of them) were paying one retained
+  string per copied file to build a set no code path would ever look at.
+- **The clear happens strictly after its one consumer**, which is the only real hazard in releasing a closed
+  run: clearing the self-write set early would let the deletion pass recycle a file the run had just
+  written. Pinned by
+  `RunRetentionTests.A_path_this_run_wrote_is_never_deleted_even_when_the_plan_called_it_an_orphan`, which
+  settles the copy onto the orphan's own path — exactly the plan-drift the guard exists for.
+- **The count cap is not a user setting.** `EngineConfig.MaxRetainedClosedRuns` (500, matching the
+  recent-jobs ring) applies even with auto-delete off, evicting the oldest-closed first and never a live
+  run. It is the backstop that makes "off" a safe choice rather than an unbounded one.
+- **The sweep interval is fixed at 5 minutes**, no longer `retention / 2` — which was sensible at ten
+  minutes and would have been a 12-hour sweep at a day, leaving both the setting and the cap unenforced for
+  half a day at a time. `CloseUnstarted` also sweeps now; it never did, and it is the path the GUI takes on
+  every superseded preview.
+- **Discarding an executing run does not stop it instantly.** It cancels — so work already in flight
+  finishes (I-ATOMIC-JOB) — and the row leaves at once. Its `ExecuteAsync` keeps unwinding against a
+  `RunState` no longer in `_runs` and publishes a terminal event for a run no client lists: harmless,
+  and cheaper than teaching every path to check whether it has been forgotten mid-flight.
+- **Superseded previews are discarded, not declined.** Declining only *closes* a run, and closed runs are
+  now kept — so the old behaviour would have filled the queue with rows for previews the user replaced by
+  pressing Preview again and never asked to keep.
+- **Two settings rows rather than one "never or N" control.** No such editor kind exists, and
+  `AutoNumberSettingViewModel.Auto` means "the engine picks the number", never "off" — a single control
+  would have meant a new view-model type and a new `DataTemplate`. A `Setting.Bool` beside a
+  `Setting.AutoNumber` says the same thing with templates that already exist.
+- **The queue list is virtualized now.** An `ItemsControl` in a `ScrollViewer` realizes every item, which
+  was fine against a ten-minute engine-side window and is not against hundreds of retained rows. Kept an
+  `ItemsControl` rather than switching to `ListBox`: the row buttons bind through `$parent[ItemsControl]`.
+- **Another client's queue lags a discard** until its next reconcile — `get-runs` is a full replace, so it
+  self-corrects, but there is no `run-discarded` event. Single-user desktop; not worth a broadcast.
+
+#### Two defects found on the first real use of Discard
+
+- **A discarded run resurrected its own row.** Every queue event handler synthesizes a row for a run it does
+  not know — correct for a lossy stream, since a queue silently missing an executing run is far worse than
+  one extra row. But a discarded run publishes its *own* closing events: cancelling a planning run makes
+  `PlanAsync` publish `run-planned` (carrying the cancellation as its error) and then `run-completed`, and
+  both arrived at a queue that had just dropped the row and dutifully put it back. What the user saw was
+  Discard cancelling the job and leaving the entry sitting there. Fixed with a bounded set of discarded ids
+  consulted by all three handlers *and* by `ReconcileAsync` (an in-flight `get-runs` is the same
+  resurrection by another route). The id is remembered **before** the IPC call, since the events can arrive
+  while it is still awaiting, and forgotten again if the discard genuinely failed — otherwise that run's row
+  would sit frozen at whatever it last said.
+- **Discarding a still-PLANNING run left the Preview tab spinning forever.** The shell's discard hook
+  checked only `PendingRunId`, which is null during a scan — it is `PlanningRunId` that holds the id then.
+  Nothing cleared `IsPreviewing`, and nothing else could: the hook drops the run from `_ownRunIds` at the
+  same moment, so the late `run-planned` that would otherwise have ended the wait was no longer recognized
+  as this window's. `ForgetDiscardedRun` now covers all three stages a preview passes through — PLANNING,
+  LOADING (the plan streaming into the store, which had no state to match against at all and would have
+  surfaced the discard as "Preview failed: no run with id …"), and PENDING.
+- **A test-side race the fix exposed.** `ShowRunPlanAsync` raises the footer inside `LoadPlanAsync` and
+  remembers the result only after it returns, so a test waiting on `PendingRunId` could proceed while the
+  preview store was still empty — and the next preview then found nothing to supersede. Waits now observe
+  the thing being asserted. Only a test concern: these continuations resume on the UI thread in the app
+  (the event pump deliberately omits `ConfigureAwait(false)`) and on the pool under xUnit.
+
 ### Job queue, retained previews & per-run pause (Set 5)
 
 - **A per-run pause withholds; it never aborts.** The global pause is a safety brake on the whole engine,
@@ -251,8 +331,8 @@ placer temp-cleanup bug and the open ratio-guard decision.*
   restore is therefore the ORDINARY case, not an error: the entry is dropped and the tab shows "the saved
   preview has expired" with no banner.
 - **A parked run still has no expiry.** One per profile bounds it, but previewing 50 profiles holds 50
-  snapshot directories until the window closes. `PruneClosedRuns` only touches *closed* runs. Worth a cap
-  later; not built here.
+  snapshot directories until the window closes. The retention sweep only ever touches *closed* runs — the
+  count cap added in Set 5b likewise. Worth a cap later; not built here.
 - **Approve is gated on having SEEN the plan.** The queue shows every run, including another client's, but
   a row offers Approve only when this window planned it; otherwise it offers "View plan", which loads it
   into the Preview tab and *then* makes it approvable. That is the invariant the two-phase run exists to

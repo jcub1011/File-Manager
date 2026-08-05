@@ -266,9 +266,11 @@ frame = one serialized `IpcRequest`, `IpcResponse`, or `EngineEvent` (§5.2), se
   `DryRunChunkResponse` columnar; 9 made manual runs snapshot-driven and two-phase (`approve-run`,
   `cancel-run`, `get-run-plan-stream`, and the three run events); 10 added
   `RunProfileRequest.InlineProfile`; 11 enforced blocking warnings at approval and published
-  planning-phase `run-progress`; **12 made runs individually enumerable and individually pausable**
+  planning-phase `run-progress`; 12 made runs individually enumerable and individually pausable
   (`get-runs` / `runs`, `set-run-paused`; `run-planned` gained `ProfileName`, `run-progress` gained
-  `Paused`) — the job-queue set. The authoritative value is the constant in `IpcRequest.cs` — see its
+  `Paused`) — the job-queue set; **13 made runs retained until DISCARDED rather than forgotten on a
+  timer** (`discard-run`, and `RunSummaryDto.ClosedAtUtc` so a queue can age a finished run it learned
+  about from a reconcile). The authoritative value is the constant in `IpcRequest.cs` — see its
   history comment. The server rejects mismatches with `ErrorResponse("IPC_VERSION_MISMATCH", …)`.
 
 ### 3.3 Start-if-not-running handshake
@@ -1480,6 +1482,7 @@ engine error, 2 on unreachable service):
 | `filemanager pause` / `resume` | `SetPausedRequest` | Global pause (spec §3.2.4). |
 | `filemanager runs` | `GetRunsRequest` | Every run still held, newest first. |
 | `filemanager hold <run>` / `release` | `SetRunPausedRequest` | Pauses ONE run — withholds work that has not started, never aborts (§4.2). |
+| `filemanager discard <run>` | `DiscardRunRequest` | Removes a run, cancelling it first if live. The only user-driven deletion (§4.3). |
 
 ### 4.10 Dry-run & observability subsystem
 
@@ -2644,8 +2647,24 @@ public sealed record EngineConfig
     /// the service. The slot is released when the work list freezes, NOT when the run closes — a run
     /// parked awaiting approval must hold nothing, or a queue of retained previews deadlocks.
     public int MaxConcurrentPlans { get; init; }               // default: 3
+
+    /// Hard cap on retained FINISHED runs, evicting the oldest-closed first; live runs are never
+    /// candidates. A backstop, not a knob — which is why it is here and not in GlobalSettings. The
+    /// user-facing controls are "auto-delete finished runs" and "after how long", and the first can be
+    /// switched OFF; without this cap that setting would be an unbounded allocation on a long-lived
+    /// service. Affordable at 500 only because RunState.ReleaseAfterClose reduces a finished run to a
+    /// handful of scalars.
+    public int MaxRetainedClosedRuns { get; init; }            // default: 500
 }
 ```
+
+**Run retention** (§4.3). A finished run is **not** aged out of existence on a timer. It is retained until
+the user discards it (`discard-run`), or until auto-delete removes it —
+`GlobalSettings.AutoDeleteFinishedRuns` (default on) and `FinishedRunRetentionHours` (default 24, clamped
+to 1…8760), both read on every sweep so a change takes effect without a restart. `MaxRetainedClosedRuns`
+above applies regardless, including when auto-delete is off. A run's snapshot directory is still deleted
+the moment it closes; what is retained is the in-memory summary, which `RunState.ReleaseAfterClose`
+strips down to scalars at close.
 
 **fsync points, complete list:** journal appends (every record), audit appends, target temp
 files before verification (`Flush(flushToDisk: true)`), profile saves (flush before the

@@ -109,9 +109,24 @@
 
             <ScrollViewer IsVisible="{Binding HasRuns}">
                 <ItemsControl ItemsSource="{Binding Runs}">
+                    <!-- VIRTUALIZED. An ItemsControl's default panel realizes every item, which was fine
+                         when the engine forgot a finished run after ten minutes and the list was a handful
+                         of rows. Runs are now retained until discarded (up to MaxRetainedClosedRuns), so
+                         this list can be hundreds of cards deep and every one of them would otherwise be
+                         built up front. Kept an ItemsControl rather than switched to a ListBox: the row
+                         buttons bind through $parent[ItemsControl], and changing the container type would
+                         break every one of them. -->
+                    <ItemsControl.ItemsPanel>
+                        <ItemsPanelTemplate>
+                            <VirtualizingStackPanel />
+                        </ItemsPanelTemplate>
+                    </ItemsControl.ItemsPanel>
                     <ItemsControl.ItemTemplate>
                         <DataTemplate x:DataType="vm:JobQueueRow">
-                            <Border Classes="card" Margin="0,0,0,6" Padding="10,8">
+                            <!-- .old dims a run that finished a while ago: history rather than news. The
+                                 class is what the ten-minute mark does now that it no longer deletes. -->
+                            <Border Classes="card" Classes.old="{Binding IsOld}"
+                                    Margin="0,0,0,6" Padding="10,8">
                                 <Grid ColumnDefinitions="Auto,*,Auto" RowDefinitions="Auto,Auto,Auto">
 
                                     <!-- Glyph + colour arrive as resource-key strings from the view model,
@@ -134,12 +149,18 @@
                                         <TextBlock Classes="caption" Text="{Binding ProgressText}"
                                                    Foreground="{DynamicResource Brush.Info}"
                                                    TextTrimming="CharacterEllipsis" />
+                                        <!-- Shown for every finished row, not just old ones. Runs are kept
+                                             now, so "when" is as much a part of the row as "what". -->
+                                        <TextBlock Classes="caption" Text="{Binding FinishedAgeText}"
+                                                   IsVisible="{Binding HasFinishedAge}"
+                                                   TextTrimming="CharacterEllipsis" />
                                     </StackPanel>
 
-                                    <!-- Row actions. Pause/Cancel apply to any live run; Approve/Discard only
-                                         to a plan THIS window showed, which is what CanApproveHere encodes.
-                                         A parked run planned elsewhere gets View plan instead — nobody
-                                         approves work they have not looked at. -->
+                                    <!-- Row actions. Pause and Cancel apply to a live run only; DISCARD
+                                         applies to every row, because it is the only thing that removes a
+                                         run — a finished one is otherwise kept until auto-delete reaps it,
+                                         or forever when that setting is off. Discarding a live run confirms
+                                         first (see JobQueueViewModel.ConfirmDiscard). -->
                                     <StackPanel Grid.Row="0" Grid.Column="2" Orientation="Horizontal"
                                                 Spacing="4" VerticalAlignment="Top">
                                         <Button Classes="iconButton" IsVisible="{Binding IsPausable}"
@@ -149,11 +170,17 @@
                                             <PathIcon Width="12" Height="12"
                                                       Data="{Binding PauseIconKey, Converter={x:Static conv:IconConverters.Geometry}}" />
                                         </Button>
-                                        <Button Classes="iconButton tintDanger" IsVisible="{Binding IsCancellable}"
+                                        <Button Classes="iconButton" IsVisible="{Binding IsCancellable}"
                                                 Command="{Binding $parent[ItemsControl].((vm:JobQueueViewModel)DataContext).CancelRunCommand}"
                                                 CommandParameter="{Binding}"
-                                                ToolTip.Tip="Cancel this run. Work that has not started is dropped; files already being copied finish. A Mirror run removes nothing.">
-                                            <PathIcon Data="{StaticResource IconClose}" Width="11" Height="11" />
+                                                ToolTip.Tip="Cancel this run but keep it in the queue. Work that has not started is dropped; files already being copied finish. A Mirror run removes nothing.">
+                                            <PathIcon Data="{StaticResource IconSkip}" Width="12" Height="12" />
+                                        </Button>
+                                        <Button Classes="iconButton tintDanger"
+                                                Command="{Binding $parent[ItemsControl].((vm:JobQueueViewModel)DataContext).DiscardCommand}"
+                                                CommandParameter="{Binding}"
+                                                ToolTip.Tip="Discard — remove this run from the queue. A run still going is cancelled first.">
+                                            <PathIcon Data="{StaticResource IconTrash}" Width="12" Height="12" />
                                         </Button>
                                     </StackPanel>
 
@@ -175,10 +202,13 @@
                                                 Command="{Binding $parent[ItemsControl].((vm:JobQueueViewModel)DataContext).ViewPlanCommand}"
                                                 CommandParameter="{Binding}"
                                                 ToolTip.Tip="Show what this run will do on the Preview tab, where it can be approved." />
+                                        <!-- Declining a plan IS discarding it: the run closes AND leaves the
+                                             queue, rather than lingering as a row for a plan the user said
+                                             no to. Same command as the row's trash button. -->
                                         <Button Content="Discard"
                                                 Command="{Binding $parent[ItemsControl].((vm:JobQueueViewModel)DataContext).DiscardCommand}"
                                                 CommandParameter="{Binding}"
-                                                ToolTip.Tip="Close this run without changing anything." />
+                                                ToolTip.Tip="Discard this plan. Nothing has been changed and nothing will be." />
                                     </StackPanel>
                                 </Grid>
                             </Border>

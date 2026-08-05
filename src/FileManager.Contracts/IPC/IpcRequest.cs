@@ -29,6 +29,7 @@ namespace FileManager.Contracts.IPC;
 [JsonDerivedType(typeof(GetRunPlanStreamRequest), "get-run-plan-stream")]
 [JsonDerivedType(typeof(GetRunsRequest), "get-runs")]
 [JsonDerivedType(typeof(SetRunPausedRequest), "set-run-paused")]
+[JsonDerivedType(typeof(DiscardRunRequest), "discard-run")]
 public abstract record IpcRequest
 {
     /// <summary>The protocol this build speaks. History: 1 — original wire format; 2 — dry-run
@@ -85,8 +86,15 @@ public abstract record IpcRequest
     /// profile that is in no catalog, so an old service's omission would leave the row permanently
     /// nameless rather than briefly so. Second, per-run pause changes what the GLOBAL pause means to a
     /// client — an old client offering only the global toggle would show "not paused" for an engine with
-    /// several individually paused runs, and its user would conclude the queue was wedged.</summary>
-    public const int CurrentProtocolVersion = 12;
+    /// several individually paused runs, and its user would conclude the queue was wedged.
+    /// 13 — runs are retained until DISCARDED rather than forgotten on a timer. New discard-run request
+    /// (the first and only way a client can make the engine forget a run), and RunSummaryDto gained
+    /// ClosedAtUtc so a queue can age a finished run it learned about from a reconcile rather than from
+    /// the terminal event. Version-gated because the retention contract itself changed: an old client
+    /// assumes a finished run disappears within ten minutes and offers no way to remove one, so against a
+    /// new service its queue would fill with rows it cannot clear — and a new client against an old
+    /// service would show a Discard button that answers NOT_IMPLEMENTED.</summary>
+    public const int CurrentProtocolVersion = 13;
 
     public int ProtocolVersion { get; init; } = CurrentProtocolVersion;
 }
@@ -179,6 +187,25 @@ public sealed record SetRunPausedRequest : IpcRequest
 {
     public required Guid RunId { get; init; }
     public required bool Paused { get; init; }
+}
+
+/// <summary>Removes a run from the engine entirely — the ONLY user-driven deletion, and the only way a
+/// client can make the coordinator forget a run at all.
+///
+/// <para><b>Discard is not Cancel.</b> Cancel stops the work and keeps the record, so the user can still
+/// see what happened. Discard says "I am done with this": a run still live is cancelled first, and then
+/// the run leaves the queue. Everything else about a finished run's lifetime is either this request or the
+/// auto-delete setting.</para>
+///
+/// <para>Note what discarding an EXECUTING run does and does not do: it cancels, so work not yet started
+/// is dropped and jobs already in flight still finish (I-ATOMIC-JOB). The row disappears immediately; the
+/// last in-flight file does not.</para>
+///
+/// <para>RUN_NOT_FOUND for an unknown or already-discarded id — a normal race for a queue fed by a lossy
+/// event stream, not a fault.</para></summary>
+public sealed record DiscardRunRequest : IpcRequest
+{
+    public required Guid RunId { get; init; }
 }
 public sealed record SetPausedRequest : IpcRequest { public required bool Paused { get; init; } }
 public sealed record DryRunRequest : IpcRequest

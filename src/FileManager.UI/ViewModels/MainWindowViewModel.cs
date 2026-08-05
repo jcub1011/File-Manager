@@ -62,7 +62,7 @@ public sealed partial class MainWindowViewModel : ViewModelBase
         StatusBar = new StatusBarViewModel(gateway);
         Activity = new ActivityViewModel(gateway);
         Previews = new PreviewStore(gateway);
-        Queue = new JobQueueViewModel(gateway);
+        Queue = new JobQueueViewModel(gateway, timeProvider);
         // A degraded engine startup, learned from the status poll rather than from the engine-warning
         // event — the event is published before any client can have subscribed. Same sink as the event
         // so the two are indistinguishable to the user, and the poll's own de-duplication keeps it from
@@ -136,6 +136,18 @@ public sealed partial class MainWindowViewModel : ViewModelBase
         Queue.IsOwnRun = runId => _ownRunIds.Contains(runId);
         Queue.AnswerRun = AnswerRunFromQueueAsync;
         Queue.ViewPlan = ShowQueuedPlanAsync;
+        // A discarded run is gone from the engine, so anything still holding it has to let go: the
+        // retained-preview store would otherwise try to restore a run that no longer exists, and this
+        // window would keep recognizing its (never-arriving) events as its own.
+        Queue.DiscardedRun = runId =>
+        {
+            Previews.Drop(runId);
+            // The tab FIRST, then the ownership set. Dropping the id here is what stops the discarded run's
+            // late run-planned from being recognized as ours — which is fine, but it also means that event
+            // can no longer end a wait the tab is sitting in, so the tab has to be told outright.
+            DryRun.ForgetDiscardedRun(runId);
+            _ownRunIds.Remove(runId);
+        };
 
         // Restore the persisted sidebar layout (collapsed state + expanded width). The view applies
         // the column geometry from these once its template is loaded.
@@ -149,7 +161,14 @@ public sealed partial class MainWindowViewModel : ViewModelBase
     /// seed. Returns a disposable the composition root keeps for the process lifetime.</summary>
     public IDisposable StartPreviewAgeTicker() =>
         _time.CreateTimer(
-            static state => ((MainWindowViewModel)state!).DryRun.RefreshPreviewAge(),
+            static state =>
+            {
+                var shell = (MainWindowViewModel)state!;
+                shell.DryRun.RefreshPreviewAge();
+                // The queue ages too now that finished runs are kept: a row dims and its caption advances
+                // on the same tick rather than only when something else happens to refresh it.
+                shell.Queue.RefreshAges();
+            },
             this, PreviewAgeTick, PreviewAgeTick);
 
     /// <summary>Re-reads the client-side settings this shell caches. Called after the settings window

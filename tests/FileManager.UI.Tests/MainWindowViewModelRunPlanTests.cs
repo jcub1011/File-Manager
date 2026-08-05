@@ -389,7 +389,7 @@ public sealed class MainWindowViewModelRunPlanTests
 
         shell.DryRun.ClearProfile();     // what selecting a different profile does to the tab
 
-        Assert.Empty(gateway.ApproveRunCalls);              // the run was NOT declined
+        Assert.Empty(gateway.DiscardRunCalls);              // the run was NOT discarded
         Assert.Equal(runId, shell.Previews.For(ProfileId)?.RunId);
         Assert.Null(shell.DryRun.PendingRunId);             // nothing on screen to approve
     }
@@ -420,35 +420,41 @@ public sealed class MainWindowViewModelRunPlanTests
         Assert.Equal(runId, shell.DryRun.PendingRunId);
         Assert.Equal(2, gateway.RunPlanStreamCalls.Count(id => id == runId));
         Assert.True(shell.DryRun.HasReport);
-        Assert.Empty(gateway.ApproveRunCalls);
+        Assert.Empty(gateway.DiscardRunCalls);
     }
 
     /// <summary>Re-previewing the SAME profile supersedes its own retained result, and the run that result
-    /// held must be declined — nothing else will ever answer for it, and it is holding a snapshot
-    /// directory with no expiry.</summary>
+    /// held must be DISCARDED — not merely declined. Declining closes a run, and a closed run is now kept
+    /// until something removes it, so declining would leave the queue holding a row for a preview the user
+    /// superseded and never asked to keep.</summary>
     [Fact]
-    public async Task Re_previewing_a_profile_declines_the_run_its_retained_result_was_holding()
+    public async Task Re_previewing_a_profile_discards_the_run_its_retained_result_was_holding()
     {
         (MainWindowViewModel shell, FakeIpcGateway gateway) = NewShell();
         Guid first = await StartPreviewAsync(shell, gateway);
         shell.HandleEngineEvent(Planned(first));
-        await WaitUntilAsync(() => shell.DryRun.PendingRunId == first);
+        // Waits on the STORE, not on PendingRunId. ShowRunPlanAsync sets the footer inside LoadPlanAsync and
+        // only remembers the result after it returns, so a wait on the footer can proceed while the store is
+        // still empty — and then the second preview finds nothing to supersede and discards nothing.
+        await WaitUntilAsync(() => shell.Previews.For(ProfileId)?.RunId == first);
 
         Guid second = Guid.NewGuid();
         gateway.RunProfileResult = new RunProfileResponse { RunId = second };
         await shell.PreviewProfileAsync(Row());
         shell.HandleEngineEvent(Planned(second));
-        // Waits on the STORE, not on PendingRunId: the plan is remembered a step after the footer is
-        // raised, so waiting on the footer can observe the gap between them.
-        await WaitUntilAsync(() => shell.Previews.For(ProfileId)?.RunId == second);
+        // And waits on the DISCARD, which is what this asserts. Remember discards before it stores, but
+        // these run on a pool thread here (the app resumes them on the UI thread), so waiting on the store
+        // and asserting the call reads two unsynchronized writes in the wrong order.
+        await WaitUntilAsync(() => gateway.DiscardRunCalls.Count > 0);
 
-        Assert.Equal((first, false), Assert.Single(gateway.ApproveRunCalls));
+        Assert.Equal(first, Assert.Single(gateway.DiscardRunCalls));
+        Assert.Equal(second, shell.Previews.For(ProfileId)?.RunId);
     }
 
     /// <summary>Window close is the last chance to release every retained run's snapshot directory, and
-    /// there may now be several rather than one.</summary>
+    /// there may now be several rather than one. Discarded, not declined, so they leave the queue too.</summary>
     [Fact]
-    public async Task Closing_the_window_declines_every_retained_preview()
+    public async Task Closing_the_window_discards_every_retained_preview()
     {
         (MainWindowViewModel shell, FakeIpcGateway gateway) = NewShell();
         Guid runId = await StartPreviewAsync(shell, gateway);
@@ -461,14 +467,14 @@ public sealed class MainWindowViewModelRunPlanTests
 
         await shell.RequestCloseAsync();
 
-        Assert.Contains((runId, false), gateway.ApproveRunCalls);
-        Assert.Contains((otherRun, false), gateway.ApproveRunCalls);
+        Assert.Contains(runId, gateway.DiscardRunCalls);
+        Assert.Contains(otherRun, gateway.DiscardRunCalls);
         Assert.Equal(0, shell.Previews.Count);
     }
 
-    /// <summary>A run that has ENDED is no longer restorable, and must be dropped WITHOUT declining —
-    /// declining a closed run answers RUN_NOT_APPROVABLE, which would put a failure in the log on the most
-    /// ordinary path there is: the user approved the run and it finished.</summary>
+    /// <summary>A run that has ENDED is no longer restorable, and must be dropped WITHOUT discarding it —
+    /// the user may still want its row in the queue, which is the whole point of keeping finished runs.
+    /// Forgetting the retained PREVIEW is not the same as deleting the RUN.</summary>
     [Fact]
     public async Task A_retained_preview_whose_run_finished_is_forgotten_silently()
     {
@@ -491,7 +497,7 @@ public sealed class MainWindowViewModelRunPlanTests
         });
 
         Assert.Null(shell.Previews.For(ProfileId));
-        Assert.Empty(gateway.ApproveRunCalls);
+        Assert.Empty(gateway.DiscardRunCalls);
     }
 
     // ---- the job queue ----------------------------------------------------------------------------

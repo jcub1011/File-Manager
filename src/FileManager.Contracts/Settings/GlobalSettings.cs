@@ -17,8 +17,13 @@ public sealed record GlobalSettings
     /// <see cref="ScratchDirectory"/>. v4 added <see cref="ProfilesDirectory"/>. v5 removed ThemeMode,
     /// which moved to the UI's client-settings.json (the engine never read it); a v4 file's orphaned
     /// member is ignored here and migrated by the UI on first run. v6 added
-    /// <see cref="ReleaseMemoryAfterLargeOperations"/>. v7 added <see cref="MaxScanDepth"/>.</summary>
-    public int SchemaVersion { get; init; } = 7;
+    /// <see cref="ReleaseMemoryAfterLargeOperations"/>. v7 added <see cref="MaxScanDepth"/>. v8 added
+    /// <see cref="AutoDeleteFinishedRuns"/> and <see cref="FinishedRunRetentionHours"/>.
+    /// <para>Nothing reads this number. It is a record of what changed, not a gate: every member uses the
+    /// nullable-backing pattern, so an older file's absent members read back as today's defaults and no
+    /// migration is needed. <c>SettingsService.MigrateLegacy</c> sniffs the raw JSON shape when a real
+    /// migration IS needed, never this value.</para></summary>
+    public int SchemaVersion { get; init; } = 8;
 
     /// <summary>When the worker service is started and stopped relative to the UI. Defaults to
     /// <see cref="Settings.ServiceStartupMode.StartAndStopWithProgram"/> so the service does not
@@ -180,6 +185,82 @@ public sealed record GlobalSettings
     /// shapes), shallow enough that a looping share is caught in seconds rather than after thousands of
     /// levels of re-expanding breadth.</summary>
     public const int DefaultMaxScanDepth = 512;
+
+    private readonly bool? _autoDeleteFinishedRuns;
+
+    /// <summary>Whether finished runs leave the job queue on their own after
+    /// <see cref="FinishedRunRetentionHours"/>. Off means a finished run stays until the user discards it.
+    ///
+    /// <para>A run is the record of what the engine actually did, so deleting one is a decision, not
+    /// housekeeping. Off is a legitimate choice — the engine still enforces its own count backstop
+    /// (<c>EngineConfig.MaxRetainedClosedRuns</c>) so "never" cannot grow without bound.</para>
+    ///
+    /// <para>Nullable backing field for the same reason as the members above: a settings.json predating
+    /// this field deserializes with no value, and the source generator does not run property
+    /// initializers for absent members — so a plain <c>bool</c> would read back as <c>false</c> and
+    /// silently switch auto-delete OFF for every upgrading user, which is the opposite of the shipped
+    /// default. The setter collapses the default (true) to the absent representation so an omitted field
+    /// and an explicit <c>true</c> compare equal under the record's value-equality.</para></summary>
+    [JsonIgnore]
+    public bool AutoDeleteFinishedRuns
+    {
+        get => _autoDeleteFinishedRuns ?? true;
+        init => _autoDeleteFinishedRuns = value ? null : false;
+    }
+
+    /// <summary>Serialization surface for <see cref="AutoDeleteFinishedRuns"/>: carries the nullable
+    /// backing representation so the default stays ABSENT in settings.json and on the wire.</summary>
+    [JsonInclude, JsonPropertyName("AutoDeleteFinishedRuns")]
+    public bool? AutoDeleteFinishedRunsSerialized
+    {
+        get => _autoDeleteFinishedRuns;
+        init => _autoDeleteFinishedRuns = value is true ? null : value;
+    }
+
+    private readonly int? _finishedRunRetentionHours;
+
+    /// <summary>How long a finished run stays in the job queue before auto-delete removes it. Ignored
+    /// entirely while <see cref="AutoDeleteFinishedRuns"/> is off.
+    ///
+    /// <para>Hours rather than a <see cref="TimeSpan"/> because nothing in this record is a duration and
+    /// there is no precedent for serializing one; an integer count with a computed span is the same shape
+    /// the UI's own <c>ClientSettings.PreviewStaleAfter</c> uses. Clamped by <c>SettingsService</c> to
+    /// [1, 8760] — an hour is the shortest interval that cannot delete a run the user is still reading,
+    /// and a year is where "keep it" is better expressed by turning auto-delete off.</para>
+    ///
+    /// <para>Nullable backing field for the same reason as the members above: absent must read back as 24,
+    /// not 0 — which would delete every run the moment it finished.</para></summary>
+    [JsonIgnore]
+    public int FinishedRunRetentionHours
+    {
+        get => _finishedRunRetentionHours ?? DefaultFinishedRunRetentionHours;
+        init => _finishedRunRetentionHours = value == DefaultFinishedRunRetentionHours ? null : value;
+    }
+
+    /// <summary>Serialization surface for <see cref="FinishedRunRetentionHours"/>: carries the nullable
+    /// backing representation so the default stays ABSENT in settings.json and on the wire.</summary>
+    [JsonInclude, JsonPropertyName("FinishedRunRetentionHours")]
+    public int? FinishedRunRetentionHoursSerialized
+    {
+        get => _finishedRunRetentionHours;
+        init => _finishedRunRetentionHours = value == DefaultFinishedRunRetentionHours ? null : value;
+    }
+
+    /// <summary><see cref="FinishedRunRetentionHours"/> as a span, for the coordinator's sweep.</summary>
+    [JsonIgnore]
+    public TimeSpan FinishedRunRetention => TimeSpan.FromHours(FinishedRunRetentionHours);
+
+    /// <summary>Long enough that a run you started yesterday is still there this morning, short enough
+    /// that an unattended service does not accumulate a week of rows nobody will read.</summary>
+    public const int DefaultFinishedRunRetentionHours = 24;
+
+    /// <summary>Shortest auto-delete interval. An hour, because anything less can remove a run while the
+    /// user is still looking at it — and "keep it briefly" is not a use case worth the footgun.</summary>
+    public const int MinFinishedRunRetentionHours = 1;
+
+    /// <summary>Longest auto-delete interval (a year). Past this, "keep them" is better said by turning
+    /// <see cref="AutoDeleteFinishedRuns"/> off, which is exactly what the setting is for.</summary>
+    public const int MaxFinishedRunRetentionHours = 8760;
 
     public static GlobalSettings Default { get; } = new();
 }

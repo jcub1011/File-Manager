@@ -301,7 +301,7 @@ public sealed class RunHandlersTests : IDisposable
     {
         RunSummaryDto run = new(
             Guid.NewGuid(), Guid.NewGuid(), "Photos", "Executing", "None",
-            Paused: false, Waiting: false, DateTimeOffset.UnixEpoch, DateTimeOffset.UnixEpoch,
+            Paused: false, Waiting: false, DateTimeOffset.UnixEpoch, DateTimeOffset.UnixEpoch, null,
             10, 0, 1024, 0, 3, 0, 0, 0, false, null);
         FakeRunCoordinator runs = new() { Runs = [run] };
         GetRunsHandler handler = new(runs);
@@ -352,6 +352,31 @@ public sealed class RunHandlersTests : IDisposable
         Assert.Equal("RUN_NOT_FOUND", Assert.IsType<ErrorResponse>(response).Code);
     }
 
+    [Fact]
+    public async Task Discard_run_passes_the_id_through()
+    {
+        FakeRunCoordinator runs = new();
+        DiscardRunHandler handler = new(runs);
+        Guid runId = Guid.NewGuid();
+
+        Assert.IsType<OkResponse>(await handler.HandleAsync(new DiscardRunRequest { RunId = runId }));
+
+        Assert.Equal(runId, Assert.Single(runs.Discards));
+    }
+
+    /// <summary>RUN_NOT_FOUND, the same code cancel-run and set-run-paused use: for a client whose rows come
+    /// from a lossy stream, "that run is gone" is one situation, not three to learn.</summary>
+    [Fact]
+    public async Task Discarding_a_run_the_coordinator_refuses_is_RUN_NOT_FOUND()
+    {
+        FakeRunCoordinator runs = new() { DiscardError = "no run with id" };
+        DiscardRunHandler handler = new(runs);
+
+        IpcResponse response = await handler.HandleAsync(new DiscardRunRequest { RunId = Guid.NewGuid() });
+
+        Assert.Equal("RUN_NOT_FOUND", Assert.IsType<ErrorResponse>(response).Code);
+    }
+
     /// <summary>Records what the handlers asked for, and can be scripted to refuse. Hand-written like
     /// every other double in this suite.</summary>
     private sealed class FakeRunCoordinator : IRunCoordinator
@@ -393,6 +418,17 @@ public sealed class RunHandlersTests : IDisposable
             if (CancelError is not null)
                 return CancelError;
             Cancellations.Add(runId);
+            return Result.Success();
+        }
+
+        public List<Guid> Discards { get; } = [];
+        public string? DiscardError { get; init; }
+
+        public Result Discard(Guid runId)
+        {
+            if (DiscardError is not null)
+                return DiscardError;
+            Discards.Add(runId);
             return Result.Success();
         }
 
