@@ -178,8 +178,12 @@ public sealed record GetRunPlanStreamRequest : IpcRequest
 /// drop-oldest frame channel), so a client that has just connected, or that dropped frames under
 /// back-pressure, cannot reconstruct the queue from <c>run-planned</c>/<c>run-progress</c> alone. Same
 /// role as <c>get-recent-jobs</c> plays for the per-file activity feed.</para>
-/// <para>The answer includes CLOSED runs for as long as the coordinator retains them (~10 minutes), so a
-/// client that asks moments after a run finished sees its outcome rather than a hole.</para></summary>
+/// <para>The answer includes CLOSED runs for as long as the coordinator retains them — until
+/// <see cref="DiscardRunRequest"/> removes one, or until auto-delete reaps it
+/// (<c>GlobalSettings.AutoDeleteFinishedRuns</c> and <c>FinishedRunRetentionHours</c>, 24 hours by
+/// default), with <c>EngineConfig.MaxRetainedClosedRuns</c> as the backstop when auto-delete is off. So a
+/// client that asks moments after a run finished sees its outcome rather than a hole, and one that asks a
+/// day later may still see it.</para></summary>
 public sealed record GetRunsRequest : IpcRequest;
 
 /// <summary>Pauses or resumes ONE run, independently of the global engine pause

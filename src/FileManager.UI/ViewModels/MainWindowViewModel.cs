@@ -721,13 +721,13 @@ public sealed partial class MainWindowViewModel : ViewModelBase
         try
         {
             // Whatever the mode, every RETAINED preview is a run parked in AwaitingApproval holding a
-            // snapshot directory that nothing will answer for once this window is gone. Decline them all
+            // snapshot directory that nothing will answer for once this window is gone. Discard them all
             // first — before the branch below can return early and leave them stranded.
             //
             // Awaited, unlike the old fire-and-forget single decline: this is the last chance, and the
-            // process may exit immediately after. DeclineAllAsync swallows its own failures, so a service
+            // process may exit immediately after. DiscardAllAsync swallows its own failures, so a service
             // that has already gone away cannot trap the user in the window.
-            await Previews.DeclineAllAsync();
+            await Previews.DiscardAllAsync();
             DryRun.AbandonPendingRun();   // a plan on screen that the store never took ownership of
 
             var settingsResult = await _gateway.GetSettingsAsync();

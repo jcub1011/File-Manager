@@ -201,16 +201,30 @@ public sealed class JobQueueViewModelTests
         using CancellationTokenSource cts = new();
 
         Task watching = queue.WatchAsync(cts.Token);
-        // Long enough for several intervals, so this is not asserting on a single lucky tick.
-        await Task.Delay(JobQueueViewModel.WatchInterval * 3);
+        // POLLED for the first tick rather than sleeping three intervals and hoping. Sleeping a fixed span
+        // and then asserting a poll HAS happened is the racy direction, and at three 2-second intervals it
+        // also spent six seconds of suite time to learn something true after two.
+        await WaitUntilAsync(() => gateway.GetRunsCalls >= 1);
         int polled = gateway.GetRunsCalls;
-        Assert.True(polled >= 1, $"the loop should have polled by now; it polled {polled} time(s)");
 
         await cts.CancelAsync();
         await watching;   // must return rather than throw
-        await Task.Delay(JobQueueViewModel.WatchInterval * 2);
+
+        // The one wait that must stay a sleep: this asserts polling has STOPPED, and there is no state
+        // transition to poll for — only the absence of one. Load only makes that direction safer, so a
+        // single interval is enough to catch a loop that ignored its token.
+        await Task.Delay(JobQueueViewModel.WatchInterval);
 
         Assert.Equal(polled, gateway.GetRunsCalls);   // and stop polling once cancelled
+    }
+
+    /// <summary>The watch loop is fire-and-forget, so tests poll for its effects rather than await them —
+    /// the same convention <c>ActivityViewModelTests</c> follows.</summary>
+    private static async Task WaitUntilAsync(Func<bool> condition)
+    {
+        for (int i = 0; i < 500 && !condition(); i++)
+            await Task.Delay(10);
+        Assert.True(condition(), "the awaited condition never became true");
     }
 
     /// <summary>A transient outage must not blank the queue — the rows on screen are still the best
@@ -384,6 +398,44 @@ public sealed class JobQueueViewModelTests
 
         Assert.Contains("12,345 source file(s)", queue.Runs[0].ProgressText);
         Assert.True(queue.Runs[0].IsIndeterminate);
+        Assert.True(queue.Runs[0].ShowProgress);
+    }
+
+    /// <summary>A run parked for approval shows NO bar.
+    ///
+    /// <para>It used to show one on the grounds that it was not finished, which implies progress that is not
+    /// happening — nothing runs behind those buttons until the user presses Approve. Worse, a parked plan
+    /// with nothing to copy has no denominator either, so the bar sat spinning indefinitely on a run that
+    /// was waiting on the user rather than working.</para></summary>
+    [Theory]
+    [InlineData(4)]    // a parked plan with work to do
+    [InlineData(0)]    // and one with none, which is where the spinner used to appear
+    public void A_run_parked_for_approval_shows_no_progress_bar(int plannedCopies)
+    {
+        JobQueueViewModel queue = new(new FakeIpcGateway());
+        Guid runId = Guid.NewGuid();
+
+        queue.OnRunPlanned(Planned(runId) with { PlannedCopies = plannedCopies });
+
+        JobQueueRow row = queue.Runs[0];
+        Assert.True(row.IsAwaitingApproval);
+        Assert.False(row.ShowProgress);
+        Assert.False(row.IsIndeterminate);
+    }
+
+    /// <summary>And a finished run shows none either — it is a record, not work.</summary>
+    [Fact]
+    public void A_finished_run_shows_no_progress_bar()
+    {
+        JobQueueViewModel queue = new(new FakeIpcGateway());
+        Guid runId = Guid.NewGuid();
+        queue.OnRunProgress(Progress(runId));
+        Assert.True(queue.Runs[0].ShowProgress);   // executing
+
+        queue.OnRunCompleted(Completed(runId));
+
+        Assert.False(queue.Runs[0].ShowProgress);
+        Assert.False(queue.Runs[0].IsIndeterminate);
     }
 
     /// <summary>The invariant the two-phase run exists to protect: nobody approves work they have not

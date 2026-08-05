@@ -32,8 +32,8 @@ public sealed record StoredPreview(RunPlannedEvent Planned, DateTimeOffset Taken
 /// user looked away — <c>DryRunViewModel</c> called <c>AbandonPendingRun()</c> on every profile switch —
 /// because a run parked in <c>AwaitingApproval</c> holds a snapshot directory with no expiry of its own.
 /// Retaining results means deliberately keeping those runs parked, so this type owns the obligation that
-/// came with it: <b>every entry it drops must decline the run it was holding</b>, and
-/// <see cref="DeclineAllAsync"/> must run before the window closes. One entry per profile is what bounds
+/// came with it: <b>every entry it drops must discard the run it was holding</b>, and
+/// <see cref="DiscardAllAsync"/> must run before the window closes. One entry per profile is what bounds
 /// the total — a re-preview of the same profile replaces (and declines) its own previous entry.</para>
 ///
 /// <para><b>Results do not survive a service restart.</b> <c>EngineHost</c> sweeps the runs directory at
@@ -53,34 +53,38 @@ public sealed class PreviewStore(IIpcGateway gateway)
     public StoredPreview? For(Guid? profileId) =>
         _byProfile.TryGetValue(profileId ?? Guid.Empty, out StoredPreview? stored) ? stored : null;
 
-    /// <summary>Remembers a finished plan for its profile, declining whatever that profile was holding.
-    /// <para>The displaced run is declined rather than merely forgotten: it is parked in
+    /// <summary>Remembers a finished plan for its profile, discarding whatever that profile was holding.
+    /// <para>The displaced run is discarded rather than merely forgotten: it is parked in
     /// <c>AwaitingApproval</c> holding a snapshot directory, and nothing else will ever answer for it.</para></summary>
     public void Remember(Guid? profileId, StoredPreview preview)
     {
         ArgumentNullException.ThrowIfNull(preview);
         Guid key = profileId ?? Guid.Empty;
         if (_byProfile.TryGetValue(key, out StoredPreview? previous) && previous.RunId != preview.RunId)
-            Decline(previous.RunId);
+            Discard(previous.RunId);
         _byProfile[key] = preview;
     }
 
-    /// <summary>Forgets this profile's result and declines its run. Returns the run id that was dropped,
-    /// so a caller can stop recognizing its events as its own.</summary>
-    public Guid? Forget(Guid? profileId)
+    /// <summary>Forgets this profile's result AND discards its run. Returns the run id that was dropped, so
+    /// a caller can stop recognizing its events as its own.
+    /// <para>Named for the discard because that is the half that matters: <see cref="Drop"/> is the variant
+    /// that forgets an entry and leaves the run alone. No production caller today — the live paths are
+    /// <see cref="Remember"/> superseding an entry and <see cref="DiscardAllAsync"/> on close — so this is
+    /// exercised by <c>PreviewStoreTests</c> only.</para></summary>
+    public Guid? DiscardFor(Guid? profileId)
     {
         Guid key = profileId ?? Guid.Empty;
         if (!_byProfile.Remove(key, out StoredPreview? stored))
             return null;
-        Decline(stored.RunId);
+        Discard(stored.RunId);
         return stored.RunId;
     }
 
-    /// <summary>Forgets an entry WITHOUT declining its run — for a run that is already gone (a
+    /// <summary>Forgets an entry WITHOUT touching its run — for a run that is already gone (a
     /// <c>RUN_NOT_FOUND</c> restore, or one whose <c>run-completed</c> has arrived).
-    /// <para>Separate from <see cref="Forget"/> on purpose: declining a closed run answers
-    /// RUN_NOT_APPROVABLE, and while that is harmless it would put a failure in the log for the most
-    /// ordinary path there is — reopening a preview after the service restarted.</para></summary>
+    /// <para>Separate from <see cref="DiscardFor"/> on purpose: answering a closed run gets
+    /// RUN_NOT_APPROVABLE / RUN_NOT_FOUND back, and while that is harmless it would put a failure in the log
+    /// for the most ordinary path there is — reopening a preview after the service restarted.</para></summary>
     public void Drop(Guid runId)
     {
         foreach ((Guid profileId, StoredPreview stored) in _byProfile)
@@ -97,7 +101,7 @@ public sealed class PreviewStore(IIpcGateway gateway)
     /// <para>Awaited, unlike the individual discards: this is the last chance to release the snapshot
     /// directories, and a fire-and-forget here would race the process exit. Failures are logged and
     /// swallowed — a service that has already gone away needs no telling.</para></summary>
-    public async Task DeclineAllAsync()
+    public async Task DiscardAllAsync()
     {
         if (_byProfile.Count == 0)
             return;
@@ -133,7 +137,7 @@ public sealed class PreviewStore(IIpcGateway gateway)
     ///
     /// <para>The caller is mid-transition and an already-gone run answering RUN_NOT_FOUND is a normal race,
     /// not a fault — the same contract <c>DryRunViewModel.AbandonPendingRun</c> documents.</para></summary>
-    private void Decline(Guid runId) =>
+    private void Discard(Guid runId) =>
         _ = gateway.DiscardRunAsync(runId)
             .ContinueWith(
                 t => Log.Debug(t.Exception, "Discarding superseded retained run {RunId} failed", runId),

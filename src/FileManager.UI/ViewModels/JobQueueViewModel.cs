@@ -64,13 +64,13 @@ public sealed partial class JobQueueRow : ObservableObject
         nameof(PauseLabel), nameof(PauseIconKey))]
     public partial bool Paused { get; set; }
 
+    // Not IsIndeterminate: that reads Phase and Total, never how far along the run is.
     [ObservableProperty]
-    [NotifyPropertyChangedFor(nameof(ProgressText), nameof(ProgressFraction), nameof(IsIndeterminate))]
+    [NotifyPropertyChangedFor(nameof(ProgressText), nameof(ProgressFraction))]
     public partial int Completed { get; set; }
 
     [ObservableProperty]
-    [NotifyPropertyChangedFor(nameof(ProgressText), nameof(ProgressFraction), nameof(IsIndeterminate),
-        nameof(ShowProgress))]
+    [NotifyPropertyChangedFor(nameof(ProgressText), nameof(ProgressFraction), nameof(IsIndeterminate))]
     public partial int Total { get; set; }
 
     [ObservableProperty]
@@ -166,10 +166,16 @@ public sealed partial class JobQueueRow : ObservableObject
 
     public bool IsCancellable => !IsFinished;
 
-    /// <summary>Show a determinate bar only while executing against a known denominator. Planning has no
-    /// total by construction — computing one is what it is doing.</summary>
-    public bool ShowProgress => !IsFinished;
-    public bool IsIndeterminate => !IsFinished && Total == 0;
+    /// <summary>A bar only while there is work in motion.
+    /// <para>Deliberately NOT every unfinished row, which is what it used to be: a run parked for approval
+    /// has nothing running behind its buttons, so a bar there implies progress that is not happening — and
+    /// a parked plan with nothing to copy has no denominator either, so it sat spinning indefinitely.</para></summary>
+    public bool ShowProgress => Phase is nameof(RunPhaseNames.Planning)
+        or nameof(RunPhaseNames.Waiting) or nameof(RunPhaseNames.Executing);
+
+    /// <summary>Indeterminate until there is a denominator. Planning has none by construction — computing
+    /// one is what it is doing.</summary>
+    public bool IsIndeterminate => ShowProgress && Total == 0;
 
     public double ProgressFraction => Total > 0 ? Math.Min(1.0, (double)Completed / Total) : 0;
 
@@ -317,11 +323,18 @@ public sealed partial class JobQueueViewModel(IIpcGateway gateway, TimeProvider?
 
     /// <summary>Rows kept.
     ///
-    /// <para>Matches the engine's own <c>MaxRetainedClosedRuns</c> backstop. It used to be 100 against a
-    /// ten-minute engine-side window, which no bound could realistically reach; now that finished runs are
-    /// retained until discarded, a lower cap here would mean the user could not SEE — let alone discard —
-    /// the runs the engine is still holding, which is the one thing the queue is for.</para></summary>
-    internal const int MaxRows = 500;
+    /// <para>The engine's own <c>MaxRetainedClosedRuns</c> backstop (500) plus headroom for live runs. It
+    /// used to be 100 against a ten-minute engine-side window, which no bound could realistically reach;
+    /// now that finished runs are retained until discarded, a lower cap here would mean the user could not
+    /// SEE — let alone discard — the runs the engine is still holding, which is the one thing the queue is
+    /// for.</para>
+    ///
+    /// <para><b>Above the engine's cap, not equal to it.</b> <c>get-runs</c> answers with 500 closed runs
+    /// PLUS every live one, so a cap of exactly 500 could not hold a full response: the reconcile inserted
+    /// the overflow, <see cref="TrimAndFlag"/> dropped it, and the next two-second poll re-inserted it —
+    /// re-adding and re-trimming rows twice a second, which is precisely the scroll-position churn the
+    /// diffing reconcile exists to avoid.</para></summary>
+    internal const int MaxRows = 600;
 
     public ObservableCollection<JobQueueRow> Runs { get; } = [];
 
@@ -732,10 +745,24 @@ public sealed partial class JobQueueViewModel(IIpcGateway gateway, TimeProvider?
     }
 
     /// <summary>Stops filtering a run's events, for a discard that did not take. The run is still there, so
-    /// its row must go back to updating rather than sitting frozen at whatever it last said. The id stays in
-    /// <see cref="_discardOrder"/>, which only bounds the set — a stale entry there evicts something
-    /// harmlessly early and nothing more.</summary>
-    private void Forget(Guid runId) => _discarded.Remove(runId);
+    /// its row must go back to updating rather than sitting frozen at whatever it last said.
+    ///
+    /// <para>Removed from BOTH collections. Leaving the id in <see cref="_discardOrder"/> would let a later
+    /// discard of the same run enqueue a second copy, and evicting the stale first copy would then drop the
+    /// id from <see cref="_discarded"/> while that second discard was still current — un-filtering a run
+    /// whose own closing events would put its row back, which is the resurrection the set exists to
+    /// stop.</para></summary>
+    private void Forget(Guid runId)
+    {
+        if (!_discarded.Remove(runId))
+            return;
+        // O(n) over at most MaxRememberedDiscards ids, on a path a user reaches only when a discard failed.
+        Guid[] remaining = [.. _discardOrder];
+        _discardOrder.Clear();
+        foreach (Guid queued in remaining)
+            if (queued != runId)
+                _discardOrder.Enqueue(queued);
+    }
 
     /// <summary>Re-evaluates every finished row's age. Called on the shell's minute tick, so a row dims
     /// and its caption advances without the user touching anything.</summary>

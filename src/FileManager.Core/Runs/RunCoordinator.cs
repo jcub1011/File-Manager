@@ -934,6 +934,9 @@ public sealed class RunCoordinator(
             run.DeletionAbortReason = result.AbortReason;
             foreach (MirrorDeletionFailure failure in result.Failures)
                 run.DeletionFailures.Add($"{failure.Path}: {failure.Reason}");
+            // Counted separately from the list's length, which the close truncates — see
+            // DeletionFailuresTotal.
+            run.DeletionFailuresTotal += result.Failures.Count;
         }
 
         if (result.AbortReason is { } reason)
@@ -1338,6 +1341,14 @@ public sealed class RunCoordinator(
         public string? DeletionAbortReason { get; set; }
         public List<string> DeletionFailures { get; } = [];
 
+        /// <summary>How many deletion failures there were, which <see cref="DeletionFailures"/> may
+        /// under-report once the run has closed.
+        /// <para>A plain counter rather than the list's length because <see cref="ReleaseAfterClose"/>
+        /// truncates the list to <see cref="MaxReportedDeletionFailures"/> — without this, a pass that
+        /// failed on thousands of orphans reported exactly a hundred and looked indistinguishable from one
+        /// that had a hundred.</para></summary>
+        public int DeletionFailuresTotal { get; set; }
+
         /// <summary>Every destination path this run's jobs actually resolved — the deletion pass's
         /// self-write guard.</summary>
         public HashSet<string> PathsWritten { get; } = new(StringComparer.OrdinalIgnoreCase);
@@ -1365,6 +1376,7 @@ public sealed class RunCoordinator(
                     DeletionAbortReason = DeletionAbortReason,
                     PlanError = PlanError,
                     DeletionFailures = [.. DeletionFailures],
+                    DeletionFailuresTotal = DeletionFailuresTotal,
                 };
             }
         }
@@ -1429,8 +1441,9 @@ public sealed class RunCoordinator(
             Cancel = null;
             cts?.Dispose();
 
-            // Bounded only by the orphan count, and Snapshot copies the whole list on every GetStatus. The
-            // total is kept so a truncated list still reports honestly rather than looking complete.
+            // Bounded only by the orphan count, and Snapshot copies the whole list on every GetStatus.
+            // DeletionFailuresTotal is deliberately NOT touched: it is what keeps a truncated list reporting
+            // honestly rather than looking complete.
             if (DeletionFailures.Count > MaxReportedDeletionFailures)
                 DeletionFailures.RemoveRange(
                     MaxReportedDeletionFailures, DeletionFailures.Count - MaxReportedDeletionFailures);

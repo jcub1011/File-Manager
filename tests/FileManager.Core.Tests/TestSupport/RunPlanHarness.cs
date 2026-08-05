@@ -201,6 +201,24 @@ internal sealed class RunPlanHarness : IDisposable
         return taken;
     }
 
+    /// <summary>Polls until a condition holds, or fails the test naming what it was waiting for.
+    ///
+    /// <para>For anything a run does on its DETACHED background task — the enqueue above all, which
+    /// <c>Approve</c> does not wait for. A fixed <c>Task.Delay</c> before asserting that work HAS happened
+    /// is a race the machine wins under load, and it fails as a puzzling value mismatch rather than as a
+    /// timeout. (Sleeping to assert something has NOT happened is fine and stays: load only makes that
+    /// direction safer.)</para></summary>
+    public static async Task WaitUntilAsync(Func<bool> condition, string what, int timeoutMs = 15_000)
+    {
+        for (int waited = 0; waited < timeoutMs; waited += 25)
+        {
+            if (condition())
+                return;
+            await Task.Delay(25);
+        }
+        Assert.Fail($"timed out after {timeoutMs} ms waiting for {what}");
+    }
+
     /// <summary>Polls until a run reaches a phase, or fails the test.</summary>
     public static async Task<RunStatus> WaitForPhaseAsync(
         RunCoordinator coordinator, Guid runId, RunPhase phase, int timeoutMs = 15_000)

@@ -238,7 +238,11 @@ public sealed class RunRetentionTests
         runs.Begin(h.AdditiveProfile(), null).TryGetValue(out RunHandle? handle);
         await RunPlanHarness.WaitForPhaseAsync(runs, handle!.RunId, RunPhase.AwaitingApproval);
         runs.Approve(handle.RunId, true);
-        await Task.Delay(200);   // let the copies queue
+        // Polled: the final assertion is that discarding DROPPED the pending copies, which passes trivially
+        // if a slept 200 ms lost the race and none were ever queued. Establishing the premise is what makes
+        // the assertion mean anything.
+        await RunPlanHarness.WaitUntilAsync(
+            () => h.Queue.PendingCountForRun(handle.RunId) == 8, "all 8 copies to be queued");
 
         Assert.False(runs.Discard(handle.RunId).TryGetError(out _));
 
@@ -327,5 +331,42 @@ public sealed class RunRetentionTests
         Assert.Equal(0, status.Deleted);
         Assert.True(File.Exists(orphan), "the pass must never delete a path this run wrote");
         Assert.Empty(h.Bin());
+    }
+
+    /// <summary>A closed run caps the deletion-failure list it retains, and reports how many there really
+    /// were.
+    ///
+    /// <para><c>ReleaseAfterClose</c> keeps only the first hundred entries: the list is bounded by the
+    /// orphan count, and a finished run now lives until it is discarded, so a pass that failed on tens of
+    /// thousands of orphans would otherwise hold a string per orphan indefinitely. The count has to survive
+    /// the truncation — without it a run that failed on thousands reported exactly a hundred and looked
+    /// indistinguishable from one that had a hundred, which is a safety-relevant figure quietly rounded
+    /// down.</para></summary>
+    [Fact]
+    public async Task A_closed_run_caps_its_deletion_failure_list_but_still_reports_the_true_total()
+    {
+        const int orphanCount = 101;   // one over the cap, so truncation is exercised at its boundary
+
+        using RunPlanHarness h = new("retain-failtrunc");
+        h.WriteSource("kept.txt", "kept");
+        for (int i = 0; i < orphanCount; i++)
+            h.Trash.FailOnPaths.Add(h.WriteTarget($"orphan-{i:D3}.txt", "orphaned"));
+
+        // Every orphan in this target root IS an orphan, so the ratio guard would refuse the pass outright
+        // and there would be no failures to count. Raised rather than padded with 200 decoy files: the gate
+        // is not what this test is about, and MirrorDeletionGateTests already owns it.
+        RunCoordinator runs = h.Coordinator(new EngineConfig { MirrorMaxDeleteFraction = 1.0 });
+        runs.Begin(h.MirrorProfile(), null).TryGetValue(out RunHandle? handle);
+        await RunPlanHarness.WaitForPhaseAsync(runs, handle!.RunId, RunPhase.AwaitingApproval);
+        Assert.Equal(orphanCount, runs.GetStatus(handle.RunId)!.PlannedDeletes);
+
+        runs.Approve(handle.RunId, true);
+        await h.DrainAndSettleAsync(runs, handle.RunId);
+        RunStatus status = await RunPlanHarness.WaitForPhaseAsync(runs, handle.RunId, RunPhase.Closed);
+
+        Assert.Equal(0, status.Deleted);                        // every move was injected to fail
+        Assert.Equal(100, status.DeletionFailures.Count);       // MaxReportedDeletionFailures
+        Assert.Equal(orphanCount, status.DeletionFailuresTotal);
+        Assert.Equal(RunOutcome.CompletedWithProblems, status.Outcome);
     }
 }

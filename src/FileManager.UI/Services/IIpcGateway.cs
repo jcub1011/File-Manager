@@ -105,8 +105,10 @@ public interface IIpcGateway
     /// <para>Needed for the same reason <see cref="GetRecentJobsAsync"/> is: the event stream is bounded
     /// and drop-oldest, so a queue view built only from <c>run-planned</c>/<c>run-progress</c> silently
     /// drifts. Re-seed on window open and on every (re)connect. An empty list is a legitimate answer.</para>
-    /// <para>Closed runs are included for as long as the service retains them (~10 minutes), so a row does
-    /// not vanish the instant its run finishes.</para></summary>
+    /// <para>Closed runs are included for as long as the service retains them — until
+    /// <see cref="DiscardRunAsync"/> removes one, or until auto-delete reaps it (24 hours by default, and
+    /// switchable off entirely). So a row does not vanish the instant its run finishes, and a queue has to
+    /// offer a way to clear one.</para></summary>
     Task<Result<IReadOnlyList<RunSummaryDto>, IpcError>> GetRunsAsync(CancellationToken ct = default);
 
     /// <summary>Pauses or resumes ONE run, independently of the global <see cref="SetPausedAsync"/>.

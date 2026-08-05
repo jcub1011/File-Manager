@@ -212,11 +212,19 @@ public sealed class RunPauseTests
 
         runs.SetPaused(handle.RunId, true);
         runs.Approve(handle.RunId, true);
-        await Task.Delay(200);   // let the enqueue finish
+        // POLLED, not slept. Approve returns before the enqueue, which happens on the run's own detached
+        // task, so a fixed 200 ms was a race the machine won under load — this assertion failed exactly
+        // that way, as "Values differ", in a parallel solution-wide run.
+        await RunPlanHarness.WaitUntilAsync(
+            () => h.Queue.PendingCountForRun(handle.RunId) == 8, "all 8 copies to be queued");
 
         Assert.Equal(8, h.Queue.PendingCountForRun(handle.RunId));
         // Nothing is servable while it is held — the consumer would walk straight past every entry.
-        using CancellationTokenSource cts = new(TimeSpan.FromMilliseconds(300));
+        //
+        // Ten seconds, not 300 ms: this token is a runaway guard, not part of the timing being asserted.
+        // At 300 ms it also had to cover the resume round-trip below, so a loaded machine cancelled the
+        // move instead of serving it — and the test failed on the resume rather than on the pause.
+        using CancellationTokenSource cts = new(TimeSpan.FromSeconds(10));
         await using IAsyncEnumerator<Payload> e =
             h.Queue.DequeueAsync(cts.Token).GetAsyncEnumerator(cts.Token);
         ValueTask<bool> move = e.MoveNextAsync();
@@ -311,7 +319,10 @@ public sealed class RunPauseTests
         await RunPlanHarness.WaitForPhaseAsync(runs, handle!.RunId, RunPhase.AwaitingApproval);
         runs.SetPaused(handle.RunId, true);
         runs.Approve(handle.RunId, true);
-        await Task.Delay(200);   // the enqueue happens; the drain loop starts polling
+        // Polled: advancing the clock before the enqueue has happened would move the deadline this test is
+        // about past a barrier that had not started measuring yet.
+        await RunPlanHarness.WaitUntilAsync(
+            () => h.Queue.PendingCountForRun(handle.RunId) > 0, "the copy to be queued");
 
         // Ten minutes of pause — twenty times the deadline. The clock moves; the deadline must not.
         clock.Advance(TimeSpan.FromMinutes(10));
@@ -350,11 +361,14 @@ public sealed class RunPauseTests
         runs.Begin(h.MirrorProfile(), null).TryGetValue(out RunHandle? handle);
         await RunPlanHarness.WaitForPhaseAsync(runs, handle!.RunId, RunPhase.AwaitingApproval);
         runs.Approve(handle.RunId, true);
-        await Task.Delay(200);
+        // Polled: on a slept 200 ms that lost the race there was nothing to drop below, and the test then
+        // asserted its way to a PASS against a premise it had never established.
+        await RunPlanHarness.WaitUntilAsync(
+            () => h.Queue.PendingCountForRun(handle.RunId) > 0, "the copy to be queued");
 
         // Take the payload OUT of the queue but never settle it, then pause: nothing pending, nothing
-        // settling — the exact shape quiescence looks for.
-        h.Queue.DropRun(handle.RunId);
+        // settling — the exact shape quiescence looks for. Asserted, because it IS the premise.
+        Assert.Equal(1, h.Queue.DropRun(handle.RunId));
         runs.SetPaused(handle.RunId, true);
         clock.Advance(TimeSpan.FromMinutes(5));
         await Task.Delay(400);   // several poll intervals
@@ -395,7 +409,11 @@ public sealed class RunPauseTests
         await RunPlanHarness.WaitForPhaseAsync(runs, handle!.RunId, RunPhase.AwaitingApproval);
         runs.SetPaused(handle.RunId, true);
         runs.Approve(handle.RunId, true);
-        await Task.Delay(200);   // the copies are queued, and held
+        // Polled: cancelling before the enqueue makes EnqueueCopies break on run.Cancelled, so there would
+        // be nothing held — and this test would pass without ever exercising cancel-supersedes-pause, the
+        // one thing it exists to pin.
+        await RunPlanHarness.WaitUntilAsync(
+            () => h.Queue.PendingCountForRun(handle.RunId) == 4, "all 4 copies to be queued and held");
 
         runs.Cancel(handle.RunId);
 

@@ -1530,7 +1530,7 @@ public sealed class DryRunViewModelTests
 
     /// <summary>Closing the profile drops the FOOTER's state but keeps the run alive, so re-selecting the
     /// profile can re-stream its rows. This is the change that makes a preview survive navigation; the
-    /// snapshot it holds is released by <c>PreviewStore.DeclineAllAsync</c> on window close.</summary>
+    /// snapshot it holds is released by <c>PreviewStore.DiscardAllAsync</c> on window close.</summary>
     [Fact]
     public async Task Closing_the_profile_keeps_the_run_parked_so_the_preview_can_be_reopened()
     {

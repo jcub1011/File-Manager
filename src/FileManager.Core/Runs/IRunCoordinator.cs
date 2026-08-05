@@ -187,6 +187,13 @@ public sealed record RunStatus
     /// <summary>Why planning failed, when it did.</summary>
     public string? PlanError { get; init; }
 
-    /// <summary>Paths a deletion attempt could not remove, if any.</summary>
+    /// <summary>Paths a deletion attempt could not remove, if any. <b>Capped once the run has closed</b> —
+    /// see <see cref="DeletionFailuresTotal"/> for how many there really were.</summary>
     public IReadOnlyList<string> DeletionFailures { get; init; } = [];
+
+    /// <summary>How many paths a deletion attempt could not remove — which is not always
+    /// <see cref="DeletionFailures"/>'s length. A closed run keeps only the first hundred entries, because
+    /// the list is bounded by the orphan count and a finished run is now retained until it is discarded, so
+    /// this is what says whether the list is the whole story.</summary>
+    public int DeletionFailuresTotal { get; init; }
 }

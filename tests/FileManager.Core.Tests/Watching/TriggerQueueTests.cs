@@ -208,4 +208,68 @@ public sealed class TriggerQueueTests
         Assert.Equal(2, queue.DropRun(held));
         Assert.Equal(0, queue.PendingCount);
     }
+
+    /// <summary>Coalescing can make an entry SERVABLE, and the wake has to follow.
+    ///
+    /// <para>Enqueue's coalesce branch keeps the FIFO position and swaps in the newer payload, and it used to
+    /// return without waking on the grounds that availability was unchanged. Per-run pause broke that: when
+    /// the entry being replaced belongs to a paused run and the incoming payload does not, the entry goes
+    /// from withheld to servable — and a consumer parked on the wakeup has nothing else to tell it, because
+    /// the paused run is still paused so no pause transition fires. The payload then waited for an unrelated
+    /// enqueue that may never come.</para></summary>
+    [Fact]
+    public async Task Coalescing_onto_a_paused_runs_entry_wakes_a_parked_consumer()
+    {
+        Guid profile = Guid.NewGuid(), held = Guid.NewGuid();
+        RunPauseRegistry runPause = new(NullLogger<RunPauseRegistry>.Instance);
+        TriggerQueue queue = new(new FakePauseState(), NullLogger<TriggerQueue>.Instance, runPause);
+        queue.Enqueue(Run(profile, @"C:\src\a", held));
+        runPause.Set(held, true);
+
+        using CancellationTokenSource cts = new(TimeSpan.FromSeconds(5));
+        await using IAsyncEnumerator<Payload> e = queue.DequeueAsync(cts.Token).GetAsyncEnumerator(cts.Token);
+        ValueTask<bool> move = e.MoveNextAsync();
+        await Task.Delay(100);
+        Assert.False(move.IsCompleted, "the only entry belongs to a paused run");
+
+        // Same (profile, source) with NO run — a watcher trigger, which no per-run pause can withhold. This
+        // coalesces onto the held entry and must wake the consumer without the run being resumed.
+        queue.Enqueue(P(profile, @"C:\src\a"));
+
+        Assert.True(await move);
+        Assert.Equal(@"C:\src\a", e.Current.SourcePath);
+        Assert.Null(e.Current.RunId);
+        Assert.True(runPause.IsRunPaused(held), "the run was never resumed — the wake came from the coalesce");
+    }
+
+    /// <summary>The converse: coalescing must NOT wake when the entry stays withheld. A spurious wake is
+    /// cheap but it is still a consumer spin, and the paused-prefix case is the one a user creates on
+    /// purpose.</summary>
+    [Fact]
+    public async Task Coalescing_onto_a_paused_entry_that_stays_paused_serves_nothing()
+    {
+        Guid profile = Guid.NewGuid(), held = Guid.NewGuid();
+        RunPauseRegistry runPause = new(NullLogger<RunPauseRegistry>.Instance);
+        TriggerQueue queue = new(new FakePauseState(), NullLogger<TriggerQueue>.Instance, runPause);
+        queue.Enqueue(Run(profile, @"C:\src\a", held));
+        runPause.Set(held, true);
+
+        using CancellationTokenSource cts = new(TimeSpan.FromSeconds(5));
+        await using IAsyncEnumerator<Payload> e = queue.DequeueAsync(cts.Token).GetAsyncEnumerator(cts.Token);
+        ValueTask<bool> move = e.MoveNextAsync();
+        await Task.Delay(100);
+
+        queue.Enqueue(Run(profile, @"C:\src\a", held));   // same paused run — still withheld
+        await Task.Delay(100);
+
+        Assert.False(move.IsCompleted);
+        Assert.Equal(1, queue.PendingCount);
+
+        // Settle the outstanding MoveNextAsync before the enumerator is disposed. Disposing one with a
+        // pending move throws NotSupportedException, and the consumer task would otherwise stay parked on
+        // the wakeup for the life of the test run — this is the only test here that deliberately ends with
+        // the consumer still waiting, so it is the only one that has to unwind it.
+        cts.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(async () => await move);
+    }
 }

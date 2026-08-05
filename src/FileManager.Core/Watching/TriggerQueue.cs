@@ -62,24 +62,37 @@ public sealed class TriggerQueue : ITriggerQueue, IDisposable
     {
         ArgumentNullException.ThrowIfNull(payload);
         string key = KeyOf(payload);
+        Payload? displaced = null;
+        bool becameEligible = false;
         lock (_gate)
         {
             if (_index.TryGetValue(key, out LinkedListNode<Payload>? existing))
             {
                 // Coalesce: one entry per (profile, source) while pending. Keep the FIFO position;
-                // refresh to the newest payload (freshest metadata/trigger/timestamp). Availability
-                // is unchanged, so no wakeup is needed.
+                // refresh to the newest payload (freshest metadata/trigger/timestamp).
                 // The displaced payload is REPORTED, not just dropped: if it belonged to a run that is
                 // counting jobs, that run has to stop expecting one for it.
-                Payload displaced = existing.Value;
+                displaced = existing.Value;
                 existing.Value = payload;
-                return new EnqueueOutcome(Queued: false, Displaced: displaced);
+                // AVAILABILITY IS NOT NECESSARILY UNCHANGED, which is what this branch used to assume when
+                // it returned without waking. Once a per-run pause can filter the queue, coalescing an
+                // ELIGIBLE payload onto a PAUSED run's entry makes that entry servable — and a consumer
+                // parked on _wakeup has nothing else to tell it so, because the paused run is still paused
+                // and OnRunPauseChanged never fires. The payload then waited for an unrelated Enqueue.
+                becameEligible = !IsEligible(displaced) && IsEligible(payload);
             }
-            LinkedListNode<Payload> node = _queue.AddLast(payload);
-            _index[key] = node;
+            else
+            {
+                LinkedListNode<Payload> node = _queue.AddLast(payload);
+                _index[key] = node;
+            }
         }
-        Wake();
-        return new EnqueueOutcome(Queued: true, Displaced: null);
+        // Outside the lock, like the queued path: a wake completes a TCS whose continuations run elsewhere.
+        if (displaced is null || becameEligible)
+            Wake();
+        return displaced is null
+            ? new EnqueueOutcome(Queued: true, Displaced: null)
+            : new EnqueueOutcome(Queued: false, Displaced: displaced);
     }
 
     public int PendingCountForRun(Guid runId)
@@ -153,14 +166,26 @@ public sealed class TriggerQueue : ITriggerQueue, IDisposable
         }
     }
 
-    /// <summary>The first pending payload the consumer may serve: the earliest one whose run is not
-    /// individually paused. Must be called under <see cref="_gate"/>.
+    /// <summary>Whether the consumer may serve this payload — that is, whether its run is not individually
+    /// paused. Must be called under <see cref="_gate"/>.
+    ///
+    /// <para>A null <c>RunId</c> is a payload belonging to no run (a watcher or scheduler trigger), which no
+    /// per-run pause can withhold, so it is eligible without consulting the gate at all. That check is what
+    /// keeps an unpaused engine's queue walk free of gate calls; there is deliberately no
+    /// <see cref="Guid.Empty"/> special case inside <see cref="IRunPauseGate.IsRunPaused"/> to lean on.</para>
+    ///
+    /// <para>Shared by <see cref="FirstEligible"/> and <see cref="Enqueue"/> so the dequeue filter and the
+    /// coalesce wake cannot disagree about what "servable" means.</para></summary>
+    private bool IsEligible(Payload payload) =>
+        payload.RunId is not Guid runId || !_runPause.IsRunPaused(runId);
+
+    /// <summary>The first pending payload the consumer may serve. Must be called under <see cref="_gate"/>.
     ///
     /// <para>Walks rather than peeking, which is the cost of per-run pause and is bounded by the number of
-    /// PAUSED entries ahead of the first eligible one — zero in the ordinary case, since
-    /// <see cref="IRunPauseGate.IsRunPaused"/> short-circuits on <see cref="Guid.Empty"/> and nothing is
-    /// paused. It is a linear scan only while a paused run has a long pending prefix, which is exactly the
-    /// situation the user created on purpose.</para>
+    /// PAUSED entries ahead of the first eligible one — zero in the ordinary case, since nothing is paused
+    /// and <see cref="IsEligible"/> answers a run-less payload without a lookup. It is a linear scan only
+    /// while a paused run has a long pending prefix, which is exactly the situation the user created on
+    /// purpose.</para>
     ///
     /// <para>The gate is read here rather than cached per payload deliberately: a run's pause state can
     /// change between two dequeues, and the coordinator is the only authority on it.</para></summary>
@@ -168,9 +193,7 @@ public sealed class TriggerQueue : ITriggerQueue, IDisposable
     {
         for (LinkedListNode<Payload>? node = _queue.First; node is not null; node = node.Next)
         {
-            // A null RunId is a payload belonging to no run (a watcher or scheduler trigger), which no
-            // per-run pause can withhold — so it is eligible without consulting the gate at all.
-            if (node.Value.RunId is not Guid runId || !_runPause.IsRunPaused(runId))
+            if (IsEligible(node.Value))
                 return node;
         }
         return null;

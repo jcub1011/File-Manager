@@ -99,7 +99,7 @@ public sealed class PreviewStoreTests
         Guid profileId = Guid.NewGuid(), runId = Guid.NewGuid();
         store.Remember(profileId, Preview(runId, profileId));
 
-        Guid? forgotten = store.Forget(profileId);
+        Guid? forgotten = store.DiscardFor(profileId);
 
         Assert.Equal(runId, forgotten);
         Assert.Equal(runId, Assert.Single(gateway.DiscardRunCalls));
@@ -149,7 +149,7 @@ public sealed class PreviewStoreTests
         store.Remember(Guid.NewGuid(), Preview(b, Guid.NewGuid()));
         store.Remember(Guid.NewGuid(), Preview(c, Guid.NewGuid()));
 
-        await store.DeclineAllAsync();
+        await store.DiscardAllAsync();
 
         Assert.Equal(3, gateway.DiscardRunCalls.Count);
         Assert.Contains(a, gateway.DiscardRunCalls);
@@ -170,7 +170,7 @@ public sealed class PreviewStoreTests
         PreviewStore store = new(gateway);
         store.Remember(Guid.NewGuid(), Preview(Guid.NewGuid(), Guid.NewGuid()));
 
-        await store.DeclineAllAsync();   // must not throw
+        await store.DiscardAllAsync();   // must not throw
 
         Assert.Equal(0, store.Count);
     }
