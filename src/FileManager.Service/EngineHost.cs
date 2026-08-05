@@ -31,6 +31,13 @@ internal sealed class EngineHost(
     IAutostartRegistrar autostart,
     ICrashRecovery crashRecovery,
     IJobOrchestrator orchestrator,
+    // Nothing called IRunCoordinator.StopAsync before, though the interface declared it as the teardown
+    // entry point: the run-profile handler this replaced owned a shutdown token and a Dispose that
+    // cancelled it, and moving that work into the coordinator left the teardown unwired. So a detached plan
+    // walked on past shutdown — the exact hung-shutdown bug that Dispose was written to fix — and worse,
+    // the deletion pass observes that never-cancelled token and kept recycling destination files while the
+    // process exited.
+    Core.Runs.IRunCoordinator runs,
     IEngineEventBus eventBus,
     IPauseStateService pauseState,
     Core.EngineStartupState startupState,
@@ -102,6 +109,13 @@ internal sealed class EngineHost(
         //     backstop. Non-fatal — a scratch issue must not stop the service; the spool degrades to
         //     its in-memory fast path if it cannot write.
         PurgeScratchDirectory();
+
+        // 2b. Run snapshots: sweep any directory a previous process left behind. A run drops its own when
+        //     it closes, so anything here belongs to a run that died or to a cleanup that failed on a
+        //     locked file — and nothing else ever enumerates this directory, so without this a leaked
+        //     snapshot stays in %LOCALAPPDATA% permanently. Before anything can accept a run, so every id
+        //     found is provably from a dead process.
+        PurgeRunSnapshots();
 
         // 3. Load profiles into the catalog. A failure here is non-fatal — the service must still come
         //    up so the user can fix the cause from the UI — but it must not be SILENT: the catalog is
@@ -217,6 +231,14 @@ internal sealed class EngineHost(
 
         // Drain the live pipeline before stopping IPC: stop dequeuing and await in-flight jobs
         // (I-ATOMIC-JOB — a started job is never suspended), then tear down the event bridges.
+        //
+        // Runs FIRST. Its StopAsync cancels the shutdown token that a detached plan's walk and the Mirror
+        // deletion pass both observe, and awaits them — so a plan of a multi-million-file tree stops
+        // instead of holding ScanScheduler's worker threads until the process dies, and the deletion pass
+        // stops at an orphan boundary rather than being killed mid-move and leaving an mrdel with no
+        // mrdone. Cancelling the runs also drops their queued payloads, which is less for the
+        // orchestrator below to drain.
+        await runs.StopAsync();
         await orchestrator.StopAsync();
         _profilesBridge?.Dispose();
         _pauseBridge?.Dispose();
@@ -269,6 +291,35 @@ internal sealed class EngineHost(
         catch (Exception ex)
         {
             logger.LogWarning(ex, "Could not prepare the dry-run scratch directory");
+        }
+    }
+
+    /// <summary>Removes run snapshot directories left behind by a previous process.
+    ///
+    /// <para>A run deletes its own when it closes, so anything here belongs to a run that died mid-flight
+    /// or to a cleanup that failed on a locked file. Neither has an owner any more: nothing else enumerates
+    /// this directory, so without this sweep a leaked snapshot — plan.json plus four ndjsonl files, up to
+    /// two rows per scanned file at the 500k cap — stays in the user's %LOCALAPPDATA% permanently. Three
+    /// separate comments used to promise this sweep existed while <c>EnginePaths</c> said it did not.</para>
+    ///
+    /// <para>Safe because it runs before anything can accept a run: every id here is from a dead process.
+    /// Non-fatal for the same reason the scratch purge is — a stale directory is untouched user-invisible
+    /// scaffolding, never a reason to refuse to start.</para></summary>
+    private void PurgeRunSnapshots()
+    {
+        try
+        {
+            if (!Directory.Exists(paths.RunsDirectory))
+                return;
+            foreach (string leftover in Directory.EnumerateDirectories(paths.RunsDirectory))
+            {
+                if (Core.Files.InfrastructurePaths.TryDeleteDirectory(leftover) is Exception ex)
+                    logger.LogWarning(ex, "Could not purge leftover run snapshot {Path}", leftover);
+            }
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "Could not sweep the run snapshot directory");
         }
     }
 

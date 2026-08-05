@@ -9,6 +9,7 @@ using FileManager.Core.Journal;
 using FileManager.Core.Observability;
 using FileManager.Core.Platform;
 using FileManager.Core.Profiles;
+using FileManager.Core.Runs;
 using FileManager.Core.Settings;
 using FileManager.Core.Watching;
 using Microsoft.Extensions.Hosting;
@@ -143,6 +144,28 @@ public sealed class EngineHostStartupTests : IDisposable
         public EngineStatusSnapshot GetStatus() => new(false, 0, 0, 0, null);
     }
 
+    /// <summary>Records only the teardown call, which is the whole reason the host holds a coordinator: its
+    /// StopAsync cancels the token a detached plan's walk and the Mirror deletion pass both observe, and
+    /// nothing invoked it — so a plan kept walking past shutdown and the deletion pass kept recycling
+    /// destination files while the process exited.</summary>
+    private sealed class RecordingRunCoordinator(List<string> order) : IRunCoordinator
+    {
+        public Task StopAsync()
+        {
+            lock (order) order.Add("runs.StopAsync");
+            return Task.CompletedTask;
+        }
+
+        public Result<RunHandle, string> Begin(Profile profile, string? scopePath) => "not used";
+        public Result Approve(Guid runId, bool approve, bool acknowledgeWarnings = false) => Result.Success();
+        public Result Cancel(Guid runId) => Result.Success();
+        public RunStatus? GetStatus(Guid runId) => null;
+        public void Coalesced(Guid runId) { }
+        public string? SnapshotDirectory(Guid runId) => null;
+        public void Settled(Guid runId, JobCompletion? completion) { }
+        public Profile? PlannedProfile(Guid runId) => null;
+    }
+
     private sealed class RecordingEventBus(List<string> order) : IEngineEventBus
     {
         public List<EngineEvent> Published { get; } = [];
@@ -217,6 +240,7 @@ public sealed class EngineHostStartupTests : IDisposable
             new StubAutostart(),
             new RecordingRecovery(_order, recoveryError),
             new RecordingOrchestrator(_order),
+            new RecordingRunCoordinator(_order),
             bus,
             new RecordingPauseState(_order),
             startup,
@@ -283,6 +307,29 @@ public sealed class EngineHostStartupTests : IDisposable
     }
 
     [Fact]
+    public async Task Startup_sweeps_run_snapshots_left_by_a_dead_process()
+    {
+        EnginePaths paths = new() { Root = Path.Combine(_root, "engine") };
+        string leaked = Path.Combine(paths.RunsDirectory, Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(leaked);
+        File.WriteAllText(Path.Combine(leaked, "plan.json"), "{}");
+        Harness h = NewHost();
+
+        await h.Host.StartAsync(CancellationToken.None);
+        await SettledOrderAsync(7);
+
+        // A run drops its own snapshot when it closes, so anything here belongs to a run that died or to a
+        // cleanup that failed on a locked file. Nothing else enumerates this directory, so without the sweep
+        // a leak — plan.json plus four ndjsonl files, up to two rows per scanned file at the 500k cap —
+        // stayed in the user's %LOCALAPPDATA% permanently. Three comments promised this sweep existed while
+        // EnginePaths said it did not; now it does.
+        Assert.False(Directory.Exists(leaked));
+
+        await h.Host.StopAsync(CancellationToken.None);
+        h.Host.Dispose();
+    }
+
+    [Fact]
     public async Task Shutdown_drains_the_pipeline_before_stopping_ipc()
     {
         // I-ATOMIC-JOB: stop dequeuing and await in-flight jobs, and only then tear IPC down — the
@@ -294,7 +341,20 @@ public sealed class EngineHostStartupTests : IDisposable
 
         await h.Host.StopAsync(CancellationToken.None);
 
-        Assert.Equal(["orchestrator.StopAsync", "ipcServer.StopAsync"], await SettledOrderAsync(2));
+        // runs.StopAsync was called by NOTHING before it was added here, though IRunCoordinator declared it
+        // as the teardown entry point and the run-profile handler it replaced had a Dispose that did the
+        // same work. The consequences were both the original hung-shutdown bug — a detached plan walking a
+        // large tree past shutdown, holding ScanScheduler's worker threads until the process died — and a
+        // worse one: the Mirror deletion pass observes that same never-cancelled token, so it kept moving
+        // destination files to the Recycle Bin while the process exited, and dying mid-move leaves an mrdel
+        // with no mrdone.
+        //
+        // FIRST of the three: cancelling the runs stops a walk and drops their queued payloads, so there is
+        // less for the orchestrator's own drain to wait on, and both publish on the way down while IPC is
+        // still up to carry it.
+        Assert.Equal(
+            ["runs.StopAsync", "orchestrator.StopAsync", "ipcServer.StopAsync"],
+            await SettledOrderAsync(3));
         h.Host.Dispose();
     }
 

@@ -60,6 +60,12 @@ public sealed class RunCoordinator(
     private readonly ConcurrentDictionary<Guid, RunState> _runs = new();
     private readonly CancellationTokenSource _shutdown = new();
 
+    /// <summary>Drains closed runs while the service is idle. Lazily created on the first
+    /// <see cref="Begin"/>, so a host that never runs anything never arms a timer, and disposed by
+    /// <see cref="StopAsync"/>.</summary>
+    private ITimer? _pruneTimer;
+    private readonly object _pruneGate = new();
+
     public Result<RunHandle, string> Begin(Profile profile, string? scopePath)
     {
         ArgumentNullException.ThrowIfNull(profile);
@@ -69,9 +75,13 @@ public sealed class RunCoordinator(
         RunState run = new(Guid.NewGuid(), profile, scopePath);
         _runs[run.RunId] = run;
         PruneClosedRuns();
+        ArmPruneTimer();
 
-        // Planning runs detached so the IPC caller is not held behind a scan (§8 rule 5). Under the
-        // coordinator's shutdown token, not None, so teardown can stop a walk in progress.
+        // Planning runs detached so the IPC caller is not held behind a scan (§8 rule 5). The token here is
+        // None deliberately — cancelling a Task.Run's token only prevents the delegate from being
+        // SCHEDULED, which would leave the run parked in Planning with nothing to close it. Stopping a walk
+        // already in progress is the job of the linked CTS inside PlanAsync, which observes both the
+        // coordinator's shutdown token and this run's own.
         run.Work = Task.Run(() => PlanAsync(run), CancellationToken.None);
         logger.LogInformation(
             "Run {RunId} started planning profile {ProfileId} ({Scope})",
@@ -226,6 +236,17 @@ public sealed class RunCoordinator(
         lock (run.Gate)
             run.Cancelled = true;
         logger.LogInformation("Run {RunId} cancelled; dropped {Dropped} pending payload(s)", runId, dropped);
+
+        // A run already PARKED for approval has nobody left to notice the cancel: PlanAsync has returned,
+        // and ExecuteAsync only runs on approval. So close it here, or it sits in AwaitingApproval forever
+        // — ClosedAt never set, so PruneClosedRuns never reaps it and CleanUpSnapshot never runs, leaking
+        // its snapshot directory (plan.json plus four ndjsonl files, up to two rows per scanned file) for
+        // the lifetime of the service. Cancelling at exactly the wrong moment was enough to do it, and
+        // repeating that filled %LOCALAPPDATA% with directories nothing reclaims.
+        //
+        // The phase is re-checked inside CloseUnstarted under the gate, so losing the race with an
+        // approval that got there first is a no-op rather than a double close.
+        CloseUnstarted(run, RunPhase.AwaitingApproval, out _);
         return Result.Success();
     }
 
@@ -279,6 +300,14 @@ public sealed class RunCoordinator(
     public async Task StopAsync()
     {
         _shutdown.Cancel();
+        ITimer? prune;
+        lock (_pruneGate)
+        {
+            prune = _pruneTimer;
+            _pruneTimer = null;
+        }
+        if (prune is not null)
+            await prune.DisposeAsync().ConfigureAwait(false);
         List<Task> pending = [];
         foreach (RunState run in _runs.Values)
         {
@@ -711,13 +740,16 @@ public sealed class RunCoordinator(
             "Run {RunId} closed {Outcome}: {Succeeded} succeeded, {Skipped} skipped, {Failed} failed, " +
             "{Dropped} dropped, {Deleted} deleted",
             run.RunId, outcome, run.Succeeded, run.SkippedJobs, run.Failed, run.Dropped, run.Deleted);
+        // This run is not eligible yet, but its predecessors may be — and a service whose last run has just
+        // finished may never call Begin again.
+        PruneClosedRuns();
     }
 
     /// <summary>Drops the run's frozen work list once the run is over. Best-effort: a failure here must
     /// never affect an outcome, since the run's real record is the journal and the audit trail.
-    /// <para>[flagged] A swallowed failure leaks the directory permanently — there is no startup sweep
-    /// of <see cref="EnginePaths.RunsDirectory"/> despite what its doc comment used to claim, and
-    /// nothing else enumerates it. The warning below is the only trace.</para></summary>
+    /// <para>A swallowed failure — a locked file, typically — leaves the directory for
+    /// <c>EngineHost.PurgeRunSnapshots</c> to collect on the next start. The warning below is the only
+    /// trace until then.</para></summary>
     private void CleanUpSnapshot(RunState run)
     {
         if (run.Directory is null)
@@ -735,13 +767,49 @@ public sealed class RunCoordinator(
     }
 
     /// <summary>Forgets long-closed runs so a long-lived service does not accumulate one per
-    /// invocation, while keeping recent ones queryable.</summary>
+    /// invocation, while keeping recent ones queryable.
+    /// <para>Driven from three places, because the only one it had — <see cref="Begin"/> — meant a service
+    /// that ran 500 profiles overnight and then went idle kept all 500 <c>RunState</c>s for the rest of the
+    /// process: each holding a whole <see cref="Profile"/>, a <c>PathsWritten</c> set of every destination
+    /// path the run wrote, and a failure list. GetStatus also kept answering for runs long past the
+    /// retention window it documents.</para></summary>
     private void PruneClosedRuns()
     {
         DateTimeOffset cutoff = time.GetUtcNow() - ClosedRunRetention;
         foreach ((Guid id, RunState run) in _runs)
             if (run.ClosedAt is { } closed && closed < cutoff)
                 _runs.TryRemove(id, out _);
+    }
+
+    /// <summary>Starts the idle sweep once, on the first run. At half the retention window, so a closed run
+    /// is forgotten within one window of becoming eligible without the timer being the thing that decides
+    /// the window.</summary>
+    private void ArmPruneTimer()
+    {
+        if (_pruneTimer is not null)
+            return;
+        lock (_pruneGate)
+        {
+            if (_pruneTimer is not null || _shutdown.IsCancellationRequested)
+                return;
+            TimeSpan period = ClosedRunRetention / 2;
+            _pruneTimer = time.CreateTimer(
+                static state => ((RunCoordinator)state!).PruneOnTimer(), this, period, period);
+        }
+    }
+
+    private void PruneOnTimer()
+    {
+        try
+        {
+            PruneClosedRuns();
+        }
+        catch (Exception ex)
+        {
+            // Last-resort catch-and-log: this runs on a timer thread with no caller to observe a throw,
+            // and failing to prune must never take the service down.
+            logger.LogDebug(ex, "Pruning closed runs on the idle timer failed");
+        }
     }
 
     private void PublishPlanned(RunState run, string? error) => Publish(new RunPlannedEvent

@@ -36,11 +36,11 @@ public sealed record RunSnapshotHeader
 
     public required DateTimeOffset PlannedAtUtc { get; init; }
 
-    /// <summary>Copy items in <c>items.ndjsonl</c> — the exact number of payloads the run will
+    /// <summary>Copy items in <c>copies.ndjsonl</c> — the exact number of payloads the run will
     /// enqueue, and therefore the barrier's target count and progress denominator.</summary>
     public required int CopyItemCount { get; init; }
 
-    /// <summary>Deletion items in <c>items.ndjsonl</c>. Always zero outside
+    /// <summary>Deletion items in <c>deletes.ndjsonl</c>. Always zero outside
     /// <see cref="SyncMode.Mirror"/>: an AdditiveArchive plan classifies pre-existing destination
     /// files as Untouched, never as orphans.</summary>
     public required int DeleteItemCount { get; init; }

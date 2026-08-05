@@ -40,12 +40,15 @@ public sealed record EnginePaths
     /// default resolves against the process-global %LOCALAPPDATA%, which a test cannot move.</summary>
     public string ScratchDirectory => Path.Combine(Root, "scratch");
 
-    /// <summary>Frozen work lists for live runs: runs/&lt;run-id&gt;/{plan.json, items.ndjsonl}. A run
-    /// captures what it is going to do BEFORE it does any of it, then executes from that capture, so
-    /// the work cannot drift with the filesystem underneath it and the user can approve an itemized
-    /// list rather than an intention. Deleted when a run closes, before the run's terminal phase
-    /// becomes observable. [flagged] A directory left behind belongs to a run that died or to a
-    /// cleanup that failed, and is NOT swept at startup — nothing enumerates this directory today.</summary>
+    /// <summary>Frozen work lists for live runs:
+    /// runs/&lt;run-id&gt;/{plan.json, copies.ndjsonl, deletes.ndjsonl, sources.ndjsonl,
+    /// destinations.ndjsonl} — see <c>RunSnapshotPaths</c> for the authoritative names. A run captures
+    /// what it is going to do BEFORE it does any of it, then executes from that capture, so the work
+    /// cannot drift with the filesystem underneath it and the user can approve an itemized list rather
+    /// than an intention. Deleted when a run closes, before the run's terminal phase becomes observable.
+    /// <para>A directory left behind belongs to a run that died or to a cleanup that failed on a locked
+    /// file. Both are swept at startup by <c>EngineHost.PurgeRunSnapshots</c>, which is safe there because
+    /// nothing can have accepted a run yet, so every id it finds is from a dead process.</para></summary>
     public string RunsDirectory => Path.Combine(Root, "runs");
 
     /// <summary>Machine-level settings (§9): a single settings.json at the root.</summary>

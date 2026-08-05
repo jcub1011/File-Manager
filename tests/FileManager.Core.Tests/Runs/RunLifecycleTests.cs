@@ -257,6 +257,35 @@ public sealed class RunLifecycleTests
     }
 
     [Fact]
+    public async Task Cancelling_a_PARKED_run_closes_it_and_drops_its_snapshot()
+    {
+        using RunPlanHarness h = new("run-cancel-parked");
+        h.WriteSource("a.txt", "aaa");
+        h.WriteTarget("orphan.txt", "orphaned");
+        RunCoordinator runs = h.Coordinator();
+
+        runs.Begin(h.MirrorProfile(), null).TryGetValue(out RunHandle? handle);
+        await RunPlanHarness.WaitForPhaseAsync(runs, handle!.RunId, RunPhase.AwaitingApproval);
+        string directory = runs.SnapshotDirectory(handle.RunId)!;
+        Assert.True(Directory.Exists(directory));
+
+        runs.Cancel(handle.RunId);
+
+        // A run already parked for approval has nobody left to notice a cancel — PlanAsync has returned and
+        // ExecuteAsync only runs on approval — so it used to sit in AwaitingApproval forever: ClosedAt never
+        // set, so PruneClosedRuns never reaped it and CleanUpSnapshot never ran. Cancelling at exactly the
+        // wrong moment leaked a snapshot directory (plan.json plus four ndjsonl files) for the lifetime of
+        // the service, and repeating it filled %LOCALAPPDATA% with directories nothing reclaims.
+        RunStatus status = await RunPlanHarness.WaitForPhaseAsync(runs, handle.RunId, RunPhase.Closed);
+        Assert.Equal(RunOutcome.Cancelled, status.Outcome);
+        Assert.False(Directory.Exists(directory));
+        Assert.Null(runs.SnapshotDirectory(handle.RunId));
+        // And it is genuinely a cancel, not a run that quietly did its work.
+        Assert.Equal(0, status.Deleted);
+        Assert.Equal(0, status.Succeeded);
+    }
+
+    [Fact]
     public async Task Cancelling_mid_execution_drops_the_queued_work_and_skips_the_deletion_phase()
     {
         using RunPlanHarness h = new("run-cancel-exec");
