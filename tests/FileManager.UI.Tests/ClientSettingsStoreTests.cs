@@ -247,4 +247,66 @@ public sealed class ClientSettingsStoreTests
             Directory.Delete(dir, recursive: true);
         }
     }
+
+    // ── The preview staleness threshold ─────────────────────────────────────────────────────────
+
+    /// <summary>The absent case, and the reason the backing field is nullable. This is a POSITIONAL record,
+    /// so System.Text.Json deserializes it through the constructor and an absent member arrives as
+    /// <c>default(int)</c> — 0, not 15. Stored as <c>int?</c>, absent stays absent and reads as the default.
+    /// A plain <c>int</c> here would have made every existing settings file report "stale immediately".</summary>
+    [Fact]
+    public void An_absent_staleness_threshold_reads_back_as_the_shipped_default()
+    {
+        string dir = NewDir();
+        try
+        {
+            string file = Path.Combine(dir, "client-settings.json");
+            File.WriteAllText(file, """{ "ThemeMode": "Dark" }""");
+
+            ClientSettings read = ClientSettingsStore.Read(file);
+
+            Assert.Null(read.PreviewStaleAfterMinutes);
+            Assert.Equal(
+                TimeSpan.FromMinutes(ClientSettings.DefaultPreviewStaleAfterMinutes),
+                read.PreviewStaleAfter);
+        }
+        finally
+        {
+            Directory.Delete(dir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void An_explicit_staleness_threshold_round_trips()
+    {
+        string dir = NewDir();
+        try
+        {
+            string file = Path.Combine(dir, "client-settings.json");
+            ClientSettingsStore.Write(file, ClientSettings.Default with { PreviewStaleAfterMinutes = 45 });
+
+            ClientSettings read = ClientSettingsStore.Read(file);
+
+            Assert.Equal(45, read.PreviewStaleAfterMinutes);
+            Assert.Equal(TimeSpan.FromMinutes(45), read.PreviewStaleAfter);
+        }
+        finally
+        {
+            Directory.Delete(dir, recursive: true);
+        }
+    }
+
+    /// <summary>A hand-edited zero or negative must read as the default, not as "always stale" — the file
+    /// is documented as hand-editable, so a nonsense value has to degrade to something usable.</summary>
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-5)]
+    public void A_nonsense_staleness_threshold_falls_back_to_the_default(int stored)
+    {
+        ClientSettings settings = ClientSettings.Default with { PreviewStaleAfterMinutes = stored };
+
+        Assert.Equal(
+            TimeSpan.FromMinutes(ClientSettings.DefaultPreviewStaleAfterMinutes),
+            settings.PreviewStaleAfter);
+    }
 }

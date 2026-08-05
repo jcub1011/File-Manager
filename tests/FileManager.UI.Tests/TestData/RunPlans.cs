@@ -19,10 +19,12 @@ internal static class RunPlans
     internal static RunPlannedEvent Planned(
         Guid runId, Guid profileId,
         int copies = 1, int deletes = 0, long copyBytes = 1024, long deleteBytes = 0,
-        bool truncated = false, string? error = null) =>
+        bool truncated = false, string? error = null, DateTimeOffset? plannedAtUtc = null) =>
         new()
         {
-            AtUtc = DateTimeOffset.UnixEpoch,
+            // The plan's own timestamp, and what a client measures staleness against. Defaults to the epoch
+            // so a test that does not care is deterministic; a staleness test passes its clock's now.
+            AtUtc = plannedAtUtc ?? DateTimeOffset.UnixEpoch,
             RunId = runId,
             ProfileId = profileId,
             PlannedCopies = copies,
@@ -38,15 +40,16 @@ internal static class RunPlans
     /// id so a test can assert what was approved.</summary>
     internal static async Task<Guid> PreviewAsync(
         DryRunViewModel viewModel, FakeIpcGateway gateway,
-        int copies = 1, int deletes = 0, bool truncated = false)
+        int copies = 1, int deletes = 0, bool truncated = false, DateTimeOffset? plannedAtUtc = null)
     {
         Guid runId = Guid.NewGuid();
         // The report the test scripted onto DryRunResult is the rows it expects to see; the plan stream is
         // simply where they now arrive from.
         gateway.RunPlanResults[runId] = gateway.DryRunResult;
         viewModel.BeginPlanning();
-        await viewModel.LoadPlanAsync(
-            Planned(runId, viewModel.ProfileId ?? Guid.NewGuid(), copies, deletes, truncated: truncated));
+        await viewModel.LoadPlanAsync(Planned(
+            runId, viewModel.ProfileId ?? Guid.NewGuid(), copies, deletes,
+            truncated: truncated, plannedAtUtc: plannedAtUtc));
         return runId;
     }
 }

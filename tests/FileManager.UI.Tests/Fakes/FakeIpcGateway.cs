@@ -268,6 +268,26 @@ internal sealed class FakeIpcGateway : IIpcGateway
         return Task.FromResult(CancelRunResult);
     }
 
+    public List<(Guid RunId, bool Paused)> SetRunPausedCalls { get; } = [];
+    public Result<bool, IpcError> SetRunPausedResult { get; set; } = true;
+
+    public Task<Result<bool, IpcError>> SetRunPausedAsync(
+        Guid runId, bool paused, CancellationToken ct = default)
+    {
+        SetRunPausedCalls.Add((runId, paused));
+        return Task.FromResult(SetRunPausedResult);
+    }
+
+    public int GetRunsCalls { get; private set; }
+    public Result<IReadOnlyList<RunSummaryDto>, IpcError> RunsResult { get; set; } =
+        Result<IReadOnlyList<RunSummaryDto>, IpcError>.Success([]);
+
+    public Task<Result<IReadOnlyList<RunSummaryDto>, IpcError>> GetRunsAsync(CancellationToken ct = default)
+    {
+        GetRunsCalls++;
+        return Task.FromResult(RunsResult);
+    }
+
     public async Task<Result<bool, IpcError>> SetPausedAsync(bool paused, CancellationToken ct = default)
     {
         SetPausedCalls.Add(paused);

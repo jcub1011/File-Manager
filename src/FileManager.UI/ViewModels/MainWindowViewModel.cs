@@ -33,13 +33,23 @@ public sealed partial class MainWindowViewModel : ViewModelBase
     private readonly ILogFolderService _logFolder;
     private readonly ISystemDrives? _systemDrives;
     private readonly string _clientSettingsPath;
+    private readonly TimeProvider _time;
+
+    /// <summary>How often the retained preview's age caption and staleness flag are recomputed. A minute is
+    /// the finest granularity the caption shows, so anything shorter would repaint identical text.</summary>
+    private static readonly TimeSpan PreviewAgeTick = TimeSpan.FromMinutes(1);
 
     public MainWindowViewModel(IIpcGateway gateway, IFolderPicker folderPicker, ILogFolderService logFolder,
-        IDryRunItemActions dryRunActions, string? clientSettingsPath = null, ISystemDrives? systemDrives = null)
+        IDryRunItemActions dryRunActions, string? clientSettingsPath = null, ISystemDrives? systemDrives = null,
+        TimeProvider? time = null)
     {
         _gateway = gateway;
         _folderPicker = folderPicker;
         _logFolder = logFolder;
+        // Drives the retained previews' staleness age. Injected so a test can advance it rather than
+        // waiting out the real threshold.
+        TimeProvider timeProvider = time ?? TimeProvider.System;
+        _time = timeProvider;
         // Only used when the settings dialog opens; null lets SettingsViewModel fall back to the real
         // enumeration, so tests that never open settings need not supply one.
         _systemDrives = systemDrives;
@@ -48,9 +58,11 @@ public sealed partial class MainWindowViewModel : ViewModelBase
         _clientSettingsPath = clientSettingsPath ?? UiPaths.ClientSettingsFilePath;
         List = new ProfileListViewModel(gateway);
         Editor = new ProfileEditorViewModel(gateway, folderPicker);
-        DryRun = new DryRunViewModel(gateway, dryRunActions);
+        DryRun = new DryRunViewModel(gateway, dryRunActions, time: timeProvider);
         StatusBar = new StatusBarViewModel(gateway);
         Activity = new ActivityViewModel(gateway);
+        Previews = new PreviewStore(gateway);
+        Queue = new JobQueueViewModel(gateway);
         // A degraded engine startup, learned from the status poll rather than from the engine-warning
         // event — the event is published before any client can have subscribed. Same sink as the event
         // so the two are indistinguishable to the user, and the poll's own de-duplication keeps it from
@@ -119,18 +131,46 @@ public sealed partial class MainWindowViewModel : ViewModelBase
             }
         };
 
+        // The queue shows every run, including ones another client started — but Approve is offered only
+        // for a plan THIS window displayed, which is the invariant the two-phase run exists to protect.
+        Queue.IsOwnRun = runId => _ownRunIds.Contains(runId);
+        Queue.AnswerRun = AnswerRunFromQueueAsync;
+        Queue.ViewPlan = ShowQueuedPlanAsync;
+
         // Restore the persisted sidebar layout (collapsed state + expanded width). The view applies
         // the column geometry from these once its template is loaded.
         ClientSettings client = ClientSettingsStore.Read(_clientSettingsPath);
         SidebarCollapsed = client.SidebarCollapsed;
         SidebarExpandedWidth = Math.Max(MinExpandedSidebarWidth, client.SidebarWidth);
+        DryRun.PreviewStaleAfter = client.PreviewStaleAfter;
     }
+
+    /// <summary>Starts the minute tick that ages the retained preview's caption, and the queue's first
+    /// seed. Returns a disposable the composition root keeps for the process lifetime.</summary>
+    public IDisposable StartPreviewAgeTicker() =>
+        _time.CreateTimer(
+            static state => ((MainWindowViewModel)state!).DryRun.RefreshPreviewAge(),
+            this, PreviewAgeTick, PreviewAgeTick);
+
+    /// <summary>Re-reads the client-side settings this shell caches. Called after the settings window
+    /// closes, so a changed staleness threshold takes effect without a restart.</summary>
+    public void ReloadClientSettings() =>
+        DryRun.PreviewStaleAfter = ClientSettingsStore.Read(_clientSettingsPath).PreviewStaleAfter;
 
     public ProfileListViewModel List { get; }
     public ProfileEditorViewModel Editor { get; }
     public DryRunViewModel DryRun { get; }
     public StatusBarViewModel StatusBar { get; }
     public ActivityViewModel Activity { get; }
+
+    /// <summary>Retained preview results, one per profile, so navigating away from the Preview tab no longer
+    /// destroys what it was showing. Holds metadata only; the rows are re-streamed from the run's snapshot.</summary>
+    public PreviewStore Previews { get; }
+
+    /// <summary>The job queue's rows. Owned here rather than by the window so the queue survives the window
+    /// being closed and reopened, and so it keeps receiving engine events while the window is shut — a queue
+    /// that only counted what happened while you were watching would be worse than none.</summary>
+    public JobQueueViewModel Queue { get; }
 
     /// <summary>The Profile tab's index in the document TabControl.</summary>
     public const int ProfileTabIndex = 0;
@@ -203,6 +243,18 @@ public sealed partial class MainWindowViewModel : ViewModelBase
         ActivityVisible = !ActivityVisible;
         if (ActivityVisible)
             _ = Activity.ReconcileAsync();   // the event stream is lossy; re-seed on open
+    }
+
+    /// <summary>Set by the composition root to show the NON-MODAL queue window, or focus the one already
+    /// open. Non-modal is the requirement, not a preference: the point of the queue is to watch work while
+    /// carrying on editing profiles.</summary>
+    public Action? ShowJobQueue { get; set; }
+
+    [RelayCommand]
+    public void OpenJobQueue()
+    {
+        ShowJobQueue?.Invoke();
+        _ = Queue.ReconcileAsync();   // the event stream is lossy; re-seed on open
     }
 
     // Run ids this window started, pending their run-queued event. Bounded: a run whose event never
@@ -350,6 +402,99 @@ public sealed partial class MainWindowViewModel : ViewModelBase
         }
     }
 
+    /// <summary>Answers a parked run from the queue window, routing through the Preview tab's own footer
+    /// when that is the run it is showing.
+    /// <para>Routing matters: the tab holds the acknowledgment checkbox for the run's blocking warnings, and
+    /// answering around it would send <c>acknowledgeWarnings: false</c> for a run the user just ticked. When
+    /// the tab is showing something else, the queue answers directly — a run whose plan was shown earlier
+    /// and superseded on screen is still one the user has seen.</para></summary>
+    private async Task AnswerRunFromQueueAsync(Guid runId, bool approve)
+    {
+        if (DryRun.PendingRunId == runId)
+        {
+            await (approve ? DryRun.ApproveRunCommand : DryRun.DeclineRunCommand).ExecuteAsync(null);
+            // The tab's own path does not know the store is holding this run; the answer consumed it.
+            Previews.Drop(runId);
+            return;
+        }
+        try
+        {
+            var answered = await _gateway.ApproveRunAsync(runId, approve);
+            if (answered.IsCanceled)
+                return;
+            if (answered.TryGetError(out IpcError? error))
+            {
+                Queue.ErrorMessage = $"Could not {(approve ? "start" : "discard")} the run: {error.Message}";
+                return;
+            }
+            Previews.Drop(runId);
+            if (approve)
+                ActivityVisible = true;   // the payoff: the user watches the run land
+            Activity.ShowNotice(approve
+                ? "Run approved — starting now."
+                : "Run discarded — nothing was changed.");
+        }
+        catch (Exception ex)
+        {
+            // Last-resort catch-all (directive): this runs from a command with no boundary of its own.
+            Log.Error(ex, "Answering run {RunId} from the queue with approve={Approve} failed", runId, approve);
+            Queue.ErrorMessage = $"Could not {(approve ? "start" : "discard")} the run: {ex.Message}";
+        }
+    }
+
+    /// <summary>Shows a queued run's plan on the Preview tab.
+    /// <para>This is how a run this window did not plan becomes approvable: by being looked at. It selects
+    /// the run's profile so the tab's surrounding state (name, policies) describes what is on screen, then
+    /// streams the frozen plan from the run's own snapshot.</para></summary>
+    private async Task ShowQueuedPlanAsync(JobQueueRow row)
+    {
+        try
+        {
+            // Refuse rather than navigate over unsaved work, the same guard a preview applies.
+            if (Editor.IsDirty)
+            {
+                Editor.ShowUnsavedWarning = true;
+                return;
+            }
+            if (List.Profiles.FirstOrDefault(p => p.ProfileId == row.ProfileId) is { } item
+                && List.SelectedProfile?.ProfileId != row.ProfileId)
+            {
+                List.SelectedProfile = item;
+                await _selectionLoad;
+            }
+            SelectedTabIndex = PreviewTabIndex;
+
+            // Synthesized from the row, because the original run-planned event may have been dropped by the
+            // lossy stream or belonged to another client entirely. Only the fields LoadPlanAsync reads are
+            // needed; the rows themselves come from the snapshot.
+            RunPlannedEvent planned = new()
+            {
+                AtUtc = row.StartedAtUtc,
+                RunId = row.RunId,
+                ProfileId = row.ProfileId,
+                ProfileName = row.ProfileName,
+                PlannedCopies = row.PlannedCopies,
+                PlannedDeletes = row.PlannedDeletes,
+                PlannedCopyBytes = row.PlannedCopyBytes,
+                PlannedDeleteBytes = 0,
+                Truncated = false,
+            };
+            // Remembered as ours from here on: the user has now seen this plan, which is exactly what
+            // Approve is gated on.
+            RememberOwnRun(row.RunId);
+            row.PlanWasShown = true;
+            if (await DryRun.RestoreAsync(new StoredPreview(planned, row.StartedAtUtc)))
+                Previews.Remember(row.ProfileId, new StoredPreview(planned, row.StartedAtUtc));
+            else
+                Queue.ErrorMessage = "That run's plan is no longer available.";
+        }
+        catch (Exception ex)
+        {
+            Log.Error(ex, "Showing the queued plan for run {RunId} failed", row.RunId);
+            Queue.ErrorMessage = $"Could not show that run's plan: {ex.Message}";
+        }
+    }
+
     /// <summary>Set by the composition root to confirm a delete before it is submitted. Mirrors
     /// <see cref="ConfirmClose"/>: a modal, so the same confirmation appears whether the delete came
     /// from the Profile tab, a list row, or the collapsed rail. A null callback proceeds, so headless
@@ -401,6 +546,11 @@ public sealed partial class MainWindowViewModel : ViewModelBase
             }
 
             await DryRun.LoadPlanAsync(planned);
+            // Retained only once the rows are actually on screen. Remembering a plan whose ingest failed
+            // would leave the store holding a run the user never saw and cannot get back to — and the entry
+            // it displaced would have been declined for nothing.
+            if (DryRun.PendingRunId == planned.RunId)
+                Previews.Remember(planned.ProfileId, new StoredPreview(planned, planned.AtUtc));
         }
         catch (Exception ex)
         {
@@ -430,6 +580,7 @@ public sealed partial class MainWindowViewModel : ViewModelBase
     public async Task ReconcileEngineStateAsync()
     {
         await Activity.ReconcileAsync();
+        await Queue.ReconcileAsync();        // run-level state; the event stream is drop-oldest lossy
         await StatusBar.PollOnceAsync();     // authoritative Paused + JobsInFlight
     }
 
@@ -472,6 +623,10 @@ public sealed partial class MainWindowViewModel : ViewModelBase
                 }
                 break;
             case RunPlannedEvent planned:
+                // The QUEUE takes every run, ours or not — that is what makes it a queue rather than a
+                // second copy of this window's state. The ownership filter below governs only what gets
+                // SHOWN on the Preview tab and offered for approval.
+                Queue.OnRunPlanned(planned);
                 // Only OUR run: the bus is a broadcast, and a second window must not show — let alone be
                 // asked to approve — work this user did not start. The id stays remembered until the run
                 // closes, because run-completed needs it too.
@@ -484,6 +639,7 @@ public sealed partial class MainWindowViewModel : ViewModelBase
                     BufferUnclaimedPlan(planned);
                 break;
             case RunProgressEvent runProgress:
+                Queue.OnRunProgress(runProgress);
                 if (!_ownRunIds.Contains(runProgress.RunId))
                     break;
                 // Planning samples belong on the Preview tab's caption, not in the activity panel: the
@@ -499,6 +655,11 @@ public sealed partial class MainWindowViewModel : ViewModelBase
                         + (runProgress.Deleted > 0 ? $", {runProgress.Deleted} removed" : "") + "…");
                 break;
             case RunCompletedEvent runCompleted:
+                Queue.OnRunCompleted(runCompleted);
+                // A retained preview whose run has ended is no longer restorable — dropped WITHOUT
+                // declining, because the run is already closed and declining it would log a failure on the
+                // most ordinary path there is (the user approved it, and it finished).
+                Previews.Drop(runCompleted.RunId);
                 if (_ownRunIds.Remove(runCompleted.RunId))
                     Activity.ShowNotice(DescribeRunOutcome(runCompleted));
                 break;
@@ -540,10 +701,15 @@ public sealed partial class MainWindowViewModel : ViewModelBase
     {
         try
         {
-            // Whatever the mode, a preview left on screen is a run parked in AwaitingApproval holding a
-            // snapshot directory that nothing will answer for once this window is gone. Decline it first
-            // — before the branch below can return early and leave it stranded.
-            DryRun.AbandonPendingRun();
+            // Whatever the mode, every RETAINED preview is a run parked in AwaitingApproval holding a
+            // snapshot directory that nothing will answer for once this window is gone. Decline them all
+            // first — before the branch below can return early and leave them stranded.
+            //
+            // Awaited, unlike the old fire-and-forget single decline: this is the last chance, and the
+            // process may exit immediately after. DeclineAllAsync swallows its own failures, so a service
+            // that has already gone away cannot trap the user in the window.
+            await Previews.DeclineAllAsync();
+            DryRun.AbandonPendingRun();   // a plan on screen that the store never took ownership of
 
             var settingsResult = await _gateway.GetSettingsAsync();
             // If settings can't be read (e.g. service unreachable), fall back to the default mode so a
@@ -610,6 +776,9 @@ public sealed partial class MainWindowViewModel : ViewModelBase
             Task loading = settings.LoadAsync();
             await ShowSettingsDialog(settings);
             await loading;      // observe it; the window has already closed by now
+            // Pick up a changed client-side value (today: the preview staleness threshold) without a
+            // restart. Cheap — one small local file read on a transition the user just made.
+            ReloadClientSettings();
         }
         catch (Exception ex)
         {
@@ -785,11 +954,33 @@ public sealed partial class MainWindowViewModel : ViewModelBase
             DryRun.SetProfile(profile!.Id, profile.Name);
             DryRun.ApplyPolicies(
                 profile.SyncMode, profile.Policies.OnSuccess, profile.Policies.ArchiveFolder);
+            await RestorePreviewAsync(profile.Id);
         }
         catch (Exception ex)
         {
             Log.Error(ex, "Failed to load profile selection {ProfileId}", item?.ProfileId);
             List.ErrorMessage = $"Could not open the profile: {ex.Message}";
+        }
+    }
+
+    /// <summary>Re-shows this profile's retained preview, if it has one.
+    ///
+    /// <para>This is what makes a preview survive navigation: the rows are NOT held in memory (a
+    /// materialized preview costs ~200–350 MB at scale), so coming back re-streams them from the run's
+    /// frozen snapshot. Nothing happens for a profile with no stored result — the tab keeps its empty
+    /// state.</para>
+    ///
+    /// <para>A run that has gone (the service restarted, or something else answered it) drops the entry
+    /// silently. That is the ORDINARY path after a restart, not a failure, so it raises no banner.</para></summary>
+    private async Task RestorePreviewAsync(Guid? profileId)
+    {
+        if (Previews.For(profileId) is not { } stored)
+            return;
+        RememberOwnRun(stored.RunId);   // its plan is on screen again, so its events are ours again
+        if (!await DryRun.RestoreAsync(stored))
+        {
+            Previews.Drop(stored.RunId);
+            _ownRunIds.Remove(stored.RunId);
         }
     }
 

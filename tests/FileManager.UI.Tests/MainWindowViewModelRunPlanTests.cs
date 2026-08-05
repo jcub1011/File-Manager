@@ -1,6 +1,7 @@
 using FileManager.Contracts.IPC;
 using FileManager.Contracts.Primitives;
 using FileManager.Contracts.Profiles;
+using FileManager.UI.Services;
 using FileManager.UI.Tests.Fakes;
 using FileManager.UI.Tests.TestData;
 using FileManager.UI.ViewModels;
@@ -316,7 +317,7 @@ public sealed class MainWindowViewModelRunPlanTests
         (MainWindowViewModel shell, FakeIpcGateway gateway) = NewShell();
         Guid runId = await StartPreviewAsync(shell, gateway);
         shell.HandleEngineEvent(Planned(runId));
-        await WaitUntilAsync(() => shell.DryRun.PendingRunId is not null);
+        await WaitUntilAsync(() => shell.Previews.For(ProfileId)?.RunId == runId);
 
         await shell.RequestCloseAsync();
 
@@ -372,6 +373,178 @@ public sealed class MainWindowViewModelRunPlanTests
         // of the source, and the user has to be told that in the same breath as the success count.
         Assert.Contains("1 FAILED", shell.Activity.Notice);
         Assert.Contains("No files were removed", shell.Activity.Notice);
+    }
+
+    // ---- retained previews ------------------------------------------------------------------------
+
+    /// <summary>The change this feature is made of. Looking away from a profile used to DECLINE its run,
+    /// destroying the result; now the run stays parked so the rows can be re-streamed from its snapshot.</summary>
+    [Fact]
+    public async Task Switching_profiles_keeps_the_preview_result_instead_of_declining_it()
+    {
+        (MainWindowViewModel shell, FakeIpcGateway gateway) = NewShell();
+        Guid runId = await StartPreviewAsync(shell, gateway);
+        shell.HandleEngineEvent(Planned(runId));
+        await WaitUntilAsync(() => shell.Previews.For(ProfileId)?.RunId == runId);
+
+        shell.DryRun.ClearProfile();     // what selecting a different profile does to the tab
+
+        Assert.Empty(gateway.ApproveRunCalls);              // the run was NOT declined
+        Assert.Equal(runId, shell.Previews.For(ProfileId)?.RunId);
+        Assert.Null(shell.DryRun.PendingRunId);             // nothing on screen to approve
+    }
+
+    /// <summary>And coming back re-streams it. Note the second plan-stream call: the rows are re-fetched
+    /// from the snapshot rather than kept in memory, which is what stops N retained previews costing N ×
+    /// a few hundred megabytes.</summary>
+    [Fact]
+    public async Task Returning_to_a_profile_re_streams_its_retained_preview()
+    {
+        (MainWindowViewModel shell, FakeIpcGateway gateway) = NewShell();
+        Guid runId = await StartPreviewAsync(shell, gateway);
+        shell.HandleEngineEvent(Planned(runId));
+        await WaitUntilAsync(() => shell.Previews.For(ProfileId)?.RunId == runId);
+
+        // Away and back, through the list's selection — the path that actually loads a profile and so the
+        // only one that can restore its preview. Deselecting first because ProfileListItem is a record:
+        // re-assigning an equal instance is a no-op and would never re-fire the selection.
+        ProfileListItem row = Row();
+        shell.List.Profiles.Add(row);
+        shell.List.SelectedProfile = null;
+        await WaitUntilAsync(() => !shell.Editor.HasProfile);
+        Assert.Null(shell.DryRun.PendingRunId);
+
+        shell.List.SelectedProfile = row;
+        await WaitUntilAsync(() => shell.DryRun.PendingRunId is not null);
+
+        Assert.Equal(runId, shell.DryRun.PendingRunId);
+        Assert.Equal(2, gateway.RunPlanStreamCalls.Count(id => id == runId));
+        Assert.True(shell.DryRun.HasReport);
+        Assert.Empty(gateway.ApproveRunCalls);
+    }
+
+    /// <summary>Re-previewing the SAME profile supersedes its own retained result, and the run that result
+    /// held must be declined — nothing else will ever answer for it, and it is holding a snapshot
+    /// directory with no expiry.</summary>
+    [Fact]
+    public async Task Re_previewing_a_profile_declines_the_run_its_retained_result_was_holding()
+    {
+        (MainWindowViewModel shell, FakeIpcGateway gateway) = NewShell();
+        Guid first = await StartPreviewAsync(shell, gateway);
+        shell.HandleEngineEvent(Planned(first));
+        await WaitUntilAsync(() => shell.DryRun.PendingRunId == first);
+
+        Guid second = Guid.NewGuid();
+        gateway.RunProfileResult = new RunProfileResponse { RunId = second };
+        await shell.PreviewProfileAsync(Row());
+        shell.HandleEngineEvent(Planned(second));
+        // Waits on the STORE, not on PendingRunId: the plan is remembered a step after the footer is
+        // raised, so waiting on the footer can observe the gap between them.
+        await WaitUntilAsync(() => shell.Previews.For(ProfileId)?.RunId == second);
+
+        Assert.Equal((first, false), Assert.Single(gateway.ApproveRunCalls));
+    }
+
+    /// <summary>Window close is the last chance to release every retained run's snapshot directory, and
+    /// there may now be several rather than one.</summary>
+    [Fact]
+    public async Task Closing_the_window_declines_every_retained_preview()
+    {
+        (MainWindowViewModel shell, FakeIpcGateway gateway) = NewShell();
+        Guid runId = await StartPreviewAsync(shell, gateway);
+        shell.HandleEngineEvent(Planned(runId));
+        await WaitUntilAsync(() => shell.Previews.For(ProfileId)?.RunId == runId);
+        // A second profile's retained result, so this covers the many case the store exists for.
+        Guid otherProfile = Guid.NewGuid(), otherRun = Guid.NewGuid();
+        shell.Previews.Remember(otherProfile, new StoredPreview(
+            RunPlans.Planned(otherRun, otherProfile), DateTimeOffset.UnixEpoch));
+
+        await shell.RequestCloseAsync();
+
+        Assert.Contains((runId, false), gateway.ApproveRunCalls);
+        Assert.Contains((otherRun, false), gateway.ApproveRunCalls);
+        Assert.Equal(0, shell.Previews.Count);
+    }
+
+    /// <summary>A run that has ENDED is no longer restorable, and must be dropped WITHOUT declining —
+    /// declining a closed run answers RUN_NOT_APPROVABLE, which would put a failure in the log on the most
+    /// ordinary path there is: the user approved the run and it finished.</summary>
+    [Fact]
+    public async Task A_retained_preview_whose_run_finished_is_forgotten_silently()
+    {
+        (MainWindowViewModel shell, FakeIpcGateway gateway) = NewShell();
+        Guid runId = await StartPreviewAsync(shell, gateway);
+        shell.HandleEngineEvent(Planned(runId));
+        await WaitUntilAsync(() => shell.Previews.For(ProfileId)?.RunId == runId);
+
+        shell.HandleEngineEvent(new RunCompletedEvent
+        {
+            AtUtc = DateTimeOffset.UnixEpoch,
+            RunId = runId,
+            ProfileId = ProfileId,
+            Outcome = "Succeeded",
+            Succeeded = 3,
+            Skipped = 0,
+            Failed = 0,
+            Deleted = 2,
+            BytesDeleted = 2_000,
+        });
+
+        Assert.Null(shell.Previews.For(ProfileId));
+        Assert.Empty(gateway.ApproveRunCalls);
+    }
+
+    // ---- the job queue ----------------------------------------------------------------------------
+
+    /// <summary>The queue takes EVERY run, ours or not — that is what makes it a queue rather than a second
+    /// copy of this window's state. The ownership filter governs only what the Preview tab shows.</summary>
+    [Fact]
+    public async Task The_queue_shows_another_clients_run_even_though_the_preview_tab_ignores_it()
+    {
+        (MainWindowViewModel shell, FakeIpcGateway gateway) = NewShell();
+        await StartPreviewAsync(shell, gateway);
+        Guid theirs = Guid.NewGuid();
+
+        shell.HandleEngineEvent(Planned(theirs));
+
+        JobQueueRow row = Assert.Single(shell.Queue.Runs);
+        Assert.Equal(theirs, row.RunId);
+        // Shown, but not approvable here: nobody approves work they have not looked at.
+        Assert.False(row.CanApproveHere);
+        Assert.True(row.IsAwaitingApproval);
+        Assert.Null(shell.DryRun.PendingRunId);
+    }
+
+    /// <summary>Our own run's row IS approvable, because this window showed its plan.</summary>
+    [Fact]
+    public async Task The_queue_offers_approve_for_a_plan_this_window_showed()
+    {
+        (MainWindowViewModel shell, FakeIpcGateway gateway) = NewShell();
+        Guid runId = await StartPreviewAsync(shell, gateway);
+
+        shell.HandleEngineEvent(Planned(runId));
+        await WaitUntilAsync(() => shell.DryRun.PendingRunId is not null);
+
+        Assert.True(Assert.Single(shell.Queue.Runs).CanApproveHere);
+    }
+
+    /// <summary>Approving from the QUEUE while the tab is showing that same run must route through the
+    /// tab's own footer — the acknowledgment checkbox for the run's blocking warnings lives there, and
+    /// answering around it would send acknowledgeWarnings: false for a run the user just ticked.</summary>
+    [Fact]
+    public async Task Approving_from_the_queue_routes_through_the_tab_when_it_is_showing_that_run()
+    {
+        (MainWindowViewModel shell, FakeIpcGateway gateway) = NewShell();
+        Guid runId = await StartPreviewAsync(shell, gateway);
+        shell.HandleEngineEvent(Planned(runId));
+        await WaitUntilAsync(() => shell.Previews.For(ProfileId)?.RunId == runId);
+        shell.DryRun.AcknowledgedWarnings = true;
+
+        await shell.Queue.ApproveCommand.ExecuteAsync(shell.Queue.Runs[0]);
+
+        Assert.Equal((runId, true), Assert.Single(gateway.ApproveRunCalls));
+        Assert.True(Assert.Single(gateway.ApproveRunAcknowledgements));
+        Assert.Null(shell.Previews.For(ProfileId));   // the answer consumed the retained result
     }
 
     private static async Task WaitUntilAsync(Func<bool> condition)

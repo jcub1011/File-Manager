@@ -53,6 +53,8 @@ public sealed class IpcRequestTypesTests
             nameof(ApproveRunRequest) => new ApproveRunRequest { RunId = id, Approve = true },
             nameof(CancelRunRequest) => new CancelRunRequest { RunId = id },
             nameof(GetRunPlanStreamRequest) => new GetRunPlanStreamRequest { RunId = id },
+            nameof(GetRunsRequest) => new GetRunsRequest(),
+            nameof(SetRunPausedRequest) => new SetRunPausedRequest { RunId = id, Paused = true },
             _ => throw new InvalidOperationException(
                 $"{type.Name} is in IpcRequest's [JsonDerivedType] table but this test cannot construct it — add a case"),
         };

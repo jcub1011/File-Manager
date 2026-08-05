@@ -76,7 +76,7 @@ internal sealed class RunPlanHarness : IDisposable
         DeletionConfig = new EngineConfig();
         Pass = new MirrorDeletionPass(
             Journal, Locks, Suppression, Trash, Audit, Pause, JobLog, DeletionConfig,
-            TimeProvider.System, NullLogger<MirrorDeletionPass>.Instance);
+            TimeProvider.System, NullLogger<MirrorDeletionPass>.Instance, RunPause);
     }
 
     private readonly JobJournal _realJournal;
@@ -103,7 +103,7 @@ internal sealed class RunPlanHarness : IDisposable
         DeletionConfig = config;
         Pass = new MirrorDeletionPass(
             Journal, Locks, Suppression, Trash, Audit, Pause, JobLog, config,
-            TimeProvider.System, NullLogger<MirrorDeletionPass>.Instance);
+            TimeProvider.System, NullLogger<MirrorDeletionPass>.Instance, RunPause);
     }
 
     // ---- the run coordinator ---------------------------------------------------------------------
@@ -125,17 +125,27 @@ internal sealed class RunPlanHarness : IDisposable
     /// honest default for a run planned from a draft, which is in no catalog.</summary>
     public IProfileCatalog Catalog { get; set; } = new FakeProfileCatalog();
 
+    /// <summary>The per-run pause flags, shared by the coordinator (which writes), the trigger queue and
+    /// the deletion pass (which read) — exactly as the real composition wires them. One instance, or a
+    /// pause set through the coordinator would be invisible to the queue that has to honour it.</summary>
+    public RunPauseRegistry RunPause { get; } = new(NullLogger<RunPauseRegistry>.Instance);
+
+    /// <summary>The coordinator's clock. Assign a <c>FakeTimeProvider</c> before <see cref="Coordinator"/>
+    /// to drive the drain barrier's deadline deterministically — the only way to assert that a long pause
+    /// does not time it out without waiting out a real one.</summary>
+    public TimeProvider Time { get; set; } = TimeProvider.System;
+
     public RunCoordinator Coordinator(EngineConfig? config = null)
     {
         if (_coordinator is not null)
             return _coordinator;
-        Queue = new TriggerQueue(Pause, NullLogger<TriggerQueue>.Instance);
+        Queue = new TriggerQueue(Pause, NullLogger<TriggerQueue>.Instance, RunPause);
         EngineConfig effective = config ?? DeletionConfig;
         if (config is not null)
             UseConfig(config);
         _coordinator = new RunCoordinator(
-            Planner, Queue, Pass, Bus, Validator, Catalog, Paths, effective, TimeProvider.System,
-            NullLogger<RunCoordinator>.Instance);
+            Planner, Queue, Pass, Bus, Validator, Catalog, Paths, effective, Time,
+            RunPause, NullLogger<RunCoordinator>.Instance);
         return _coordinator;
     }
 
@@ -230,14 +240,17 @@ internal sealed class RunPlanHarness : IDisposable
         int copyJobsFailed = 0,
         IReadOnlySet<string>? pathsWritten = null,
         IReadOnlyDictionary<string, int>? sweptByRoot = null,
-        Profile? profile = null)
+        Profile? profile = null,
+        Guid? runId = null)
     {
         RunSnapshotHeader header = Header(runDirectory);
         IReadOnlyList<RunDeleteItem> items = orphans ?? Deletes(runDirectory);
         return new MirrorDeletionRequest
         {
             PassId = JobId.New(),
-            RunId = header.RunId,
+            // Overridable so a per-run-pause test can hold a pass by an id it controls, rather than having
+            // to reach back into the snapshot header for one.
+            RunId = runId ?? header.RunId,
             Profile = profile ?? header.Profile,
             Orphans = items,
             ScopePath = scopePath ?? header.ScopePath,

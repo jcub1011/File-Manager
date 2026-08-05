@@ -258,13 +258,18 @@ frame = one serialized `IpcRequest`, `IpcResponse`, or `EngineEvent` (§5.2), se
   the connection becomes a one-way event stream of `EngineEvent` frames until the client
   disconnects. The tray and the GUI activity view each hold one subscription connection.
 - **Versioning:** every request carries `ProtocolVersion` (`IpcRequest.CurrentProtocolVersion`,
-  currently `7`). History: 2 normalized the dry-run wire against a shared directory table; 3 added
+  currently `12`). History: 2 normalized the dry-run wire against a shared directory table; 3 added
   interleaved dry-run progress frames; 4 added inline profile drafts; 5 added `relocate-profiles`;
   6 added the `job-progress` and `run-queued` events and gave `run-profile` a `run-profile-result`
   reply; 7 dropped `ThemeMode` from `GlobalSettings` (settings.json schema v5), which moved to the
-  UI's client-settings.json, and added `EngineStatusSnapshot.ExecutablePath`. The authoritative value
-  is the constant in `IpcRequest.cs` — see its history comment. The server rejects mismatches with
-  `ErrorResponse("IPC_VERSION_MISMATCH", …)`.
+  UI's client-settings.json, and added `EngineStatusSnapshot.ExecutablePath`; 8 made
+  `DryRunChunkResponse` columnar; 9 made manual runs snapshot-driven and two-phase (`approve-run`,
+  `cancel-run`, `get-run-plan-stream`, and the three run events); 10 added
+  `RunProfileRequest.InlineProfile`; 11 enforced blocking warnings at approval and published
+  planning-phase `run-progress`; **12 made runs individually enumerable and individually pausable**
+  (`get-runs` / `runs`, `set-run-paused`; `run-planned` gained `ProfileName`, `run-progress` gained
+  `Paused`) — the job-queue set. The authoritative value is the constant in `IpcRequest.cs` — see its
+  history comment. The server rejects mismatches with `ErrorResponse("IPC_VERSION_MISMATCH", …)`.
 
 ### 3.3 Start-if-not-running handshake
 
@@ -549,16 +554,24 @@ public interface ISourceScanner
 **Responsibility:** the single funnel for all payloads regardless of trigger. Coalesces on
 `(ProfileId, SourcePath)` while pending; the dequeue side blocks while the engine is paused
 (watcher, schedule, and manual payloads all queue — spec §3.2.4); FIFO otherwise.
-**Collaborators:** `IPauseStateService`. **Spec:** §3.2.4.
+**Collaborators:** `IPauseStateService`, `IRunPauseGate`. **Spec:** §3.2.4.
 
 ```csharp
 public interface ITriggerQueue
 {
-    void Enqueue(Payload payload);                                // coalesces duplicates
+    EnqueueOutcome Enqueue(Payload payload);                      // coalesces duplicates
     IAsyncEnumerable<Payload> DequeueAsync(CancellationToken ct); // gate shut while paused
     int PendingCount { get; }
+    int DropRun(Guid runId);                                      // cancel: drop what has not started
+    int PendingCountForRun(Guid runId);
 }
 ```
+
+**Two pauses, two shapes.** The GLOBAL pause shuts the dequeue gate outright — nothing is served. A
+PER-RUN pause is a *filter*: the consumer walks past a paused run's entries to the next eligible
+payload, so holding one run does not stall every other. A paused run's entries keep their FIFO
+positions, so resuming does not send it to the back of the line. The walk is bounded by the number of
+paused entries ahead of the first eligible one — zero in the ordinary case.
 
 #### IPauseStateService
 
@@ -574,9 +587,52 @@ public interface IPauseStateService
 }
 ```
 
+#### IRunPauseGate / RunPauseRegistry
+
+**Responsibility:** the per-run pause flags — one run held without holding the engine. Written by
+`IRunCoordinator.SetPaused` (which validates the run and keeps the barrier-clock accounting a pause
+implies); read by `ITriggerQueue` and `IMirrorDeletionPass`.
+**Lifecycle:** singleton. **Wire:** `set-run-paused`; reported as `RunSummaryDto.Paused` and
+`RunProgressEvent.Paused`.
+
+```csharp
+public interface IRunPauseGate
+{
+    bool IsRunPaused(Guid runId);                          // false for unknown/closed — see below
+    IDisposable Subscribe(Action<Guid, bool> pauseHandler);
+}
+```
+
+**A per-run pause only withholds work that has not started. It never aborts anything.** That is the
+deliberate difference from the global pause, which `MirrorDeletionPass` treats as a reason to abort
+fail-closed — the global pause is a safety brake on the whole engine, while a per-run pause is the user
+saying "hold this one" about a run they already approved. Answering that by abandoning its deletion half
+would leave the destination not a mirror of the source, reported as an abort reason they never asked
+for. A user who wants a run to *stop* has `cancel-run`. Jobs already in flight always finish either way
+(I-ATOMIC-JOB), so pausing an executing run means "start no more copies", not "stop mid-file".
+
+Three consequences that are not optional:
+
+1. **The drain barrier subtracts paused time.** `MirrorBarrierTimeout` is 30 minutes and expiring it
+   sets `BarrierTimedOut`, which refuses the deletion phase. Without the subtraction, pausing a run over
+   a lunch break would bring it back and delete nothing — a safety message about something that was
+   never unsafe.
+2. **A paused run is never quiescent.** The quiescence backstop's ordinary guard ("nothing of ours is
+   pending") is satisfied in the window after a paused run's last payload was dequeued, and reading that
+   as drained would start the destructive phase while the user believes the run is held.
+3. **Cancel supersedes pause.** `Cancel` clears the flag, because (2) means a cancelled-while-paused run
+   has nothing left that can release its drain loop: its work is dropped so nothing settles, and
+   quiescence is held off by the pause. It would sit in `Executing` until the deadline expired, never
+   reaching `Closed`, never cleaning up its snapshot, and never leaving the queue.
+
+**A standalone registry, not a member of the coordinator**, because the coordinator depends on
+`ITriggerQueue` and the queue must read pause state on every dequeue — a coordinator that also answered
+`IRunPauseGate` would close a dependency cycle the container refuses to resolve. Same shape as the other
+small pieces of shared cross-thread state (§8 rule 1).
+
 **Review checklist for §4.1–4.2** — Which validation codes block a save? What re-fires after a
 watcher buffer overflow? Where do *all* payloads converge, and what happens to them while
-paused?
+paused? What is the difference between pausing the engine and pausing one run?
 
 ---
 
@@ -1422,6 +1478,8 @@ engine error, 2 on unreachable service):
 | `filemanager list-profiles` | `ListProfilesRequest` | ID, name, active flag, trigger summary. |
 | `filemanager run <profile> <path>` | `RunProfileRequest` | Profile by name or ID; bypasses the picker (spec §3.2); starts the service via `ServiceLauncher`. |
 | `filemanager pause` / `resume` | `SetPausedRequest` | Global pause (spec §3.2.4). |
+| `filemanager runs` | `GetRunsRequest` | Every run still held, newest first. |
+| `filemanager hold <run>` / `release` | `SetRunPausedRequest` | Pauses ONE run — withholds work that has not started, never aborts (§4.2). |
 
 ### 4.10 Dry-run & observability subsystem
 
@@ -2579,6 +2637,13 @@ public sealed record EngineConfig
     public IReadOnlyList<string>? ExecutableAllowlist { get; init; }  // null = any existing file (spec §9)
     public bool LaunchTrayOnStart { get; init; } = true;
     public long JournalRotateAtBytes { get; init; }            // default: 4 MiB
+
+    /// How many runs may be WALKING their plan at once; the surplus queues and reports the Waiting
+    /// phase. A safety valve, not a throughput knob: planning is the memory-hungry half of a run
+    /// (~292 MB measured for ONE 33k-file plan), so an unbounded fan-out of large profiles exhausts
+    /// the service. The slot is released when the work list freezes, NOT when the run closes — a run
+    /// parked awaiting approval must hold nothing, or a queue of retained previews deadlocks.
+    public int MaxConcurrentPlans { get; init; }               // default: 3
 }
 ```
 

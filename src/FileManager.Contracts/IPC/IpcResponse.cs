@@ -24,6 +24,7 @@ namespace FileManager.Contracts.IPC;
 [JsonDerivedType(typeof(JobLogResponse), "job-log")]
 [JsonDerivedType(typeof(SettingsResponse), "settings")]
 [JsonDerivedType(typeof(RelocateProfilesResponse), "relocate-profiles-result")]
+[JsonDerivedType(typeof(RunsResponse), "runs")]
 public abstract record IpcResponse;
 
 public sealed record OkResponse : IpcResponse;
@@ -119,6 +120,9 @@ public sealed record DryRunCompleteResponse : IpcResponse
     public SpaceProjection? Space { get; init; }
 }
 public sealed record RecentJobsResponse : IpcResponse { public required IReadOnlyList<JobSummaryDto> Jobs { get; init; } }
+/// <summary>Answer to <see cref="GetRunsRequest"/>: every run the coordinator still holds, newest first.
+/// An empty list is a legitimate answer (an idle engine), never an error.</summary>
+public sealed record RunsResponse : IpcResponse { public required IReadOnlyList<RunSummaryDto> Runs { get; init; } }
 public sealed record JobLogResponse : IpcResponse { public required IReadOnlyList<string> Lines { get; init; } }
 public sealed record SettingsResponse : IpcResponse { public required GlobalSettings Settings { get; init; } }
 /// <summary>Answer to RelocateProfilesRequest: the persisted settings plus what happened to the

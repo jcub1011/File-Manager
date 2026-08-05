@@ -12,6 +12,21 @@ public sealed record EngineConfig
     public bool LaunchTrayOnStart { get; init; } = true;
     public long JournalRotateAtBytes { get; init; } = 4L * 1024 * 1024;         // 4 MiB
 
+    /// <summary>How many runs may be WALKING their plan at once. Surplus runs queue and report the
+    /// <c>Waiting</c> phase; the slot is released when the work list is frozen, not when the run closes,
+    /// so runs parked awaiting approval never hold one.
+    ///
+    /// <para>A safety valve rather than a throughput knob. Concurrent previews are deliberate — that is
+    /// what the job queue is for — but planning is the memory-hungry half of a run: the service was
+    /// measured at ~292 MB producing ONE 33,449-file plan, so an unbounded fan-out of large profiles
+    /// exhausts it. Three is enough that concurrency is real and the ceiling is roughly a gigabyte in the
+    /// worst case.</para>
+    ///
+    /// <para>Note this does NOT bound scan threads — <c>IScanScheduler</c> already applies a global and a
+    /// per-drive budget across every walk. This bounds the number of plan-sized working sets alive at
+    /// once.</para></summary>
+    public int MaxConcurrentPlans { get; init; } = 3;
+
     // ---- Mirror deletion pass (§10.1) -----------------------------------------------------------
     // Every one of these has a fail-closed default: when a bound is hit, NOTHING is deleted. None is
     // user-editable yet (EngineConfig is registered with defaults only, like the rest of this type).

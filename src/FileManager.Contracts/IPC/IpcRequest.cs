@@ -27,6 +27,8 @@ namespace FileManager.Contracts.IPC;
 [JsonDerivedType(typeof(ApproveRunRequest), "approve-run")]
 [JsonDerivedType(typeof(CancelRunRequest), "cancel-run")]
 [JsonDerivedType(typeof(GetRunPlanStreamRequest), "get-run-plan-stream")]
+[JsonDerivedType(typeof(GetRunsRequest), "get-runs")]
+[JsonDerivedType(typeof(SetRunPausedRequest), "set-run-paused")]
 public abstract record IpcRequest
 {
     /// <summary>The protocol this build speaks. History: 1 — original wire format; 2 — dry-run
@@ -74,8 +76,17 @@ public abstract record IpcRequest
     /// optional-additive because the failure mode of an old client is silent and destructive: it would
     /// send no acknowledgment, and a service that refused would look like an approve button that does
     /// nothing — while an old SERVICE would ignore the flag and run a draft the validator would have
-    /// refused to save, which is the hole this closes.</summary>
-    public const int CurrentProtocolVersion = 11;
+    /// refused to save, which is the hole this closes.
+    /// 12 — runs became individually enumerable and individually pausable, for the job-queue window.
+    /// New get-runs (answered with a runs frame carrying a RunSummaryDto per run) and set-run-paused
+    /// requests; run-planned gained ProfileName and run-progress gained Paused. Two reasons this is a
+    /// version bump and not an additive extension. First, run-planned's ProfileName is load-bearing for
+    /// the queue window and cannot be resolved client-side: a run planned from an unsaved draft has a
+    /// profile that is in no catalog, so an old service's omission would leave the row permanently
+    /// nameless rather than briefly so. Second, per-run pause changes what the GLOBAL pause means to a
+    /// client — an old client offering only the global toggle would show "not paused" for an engine with
+    /// several individually paused runs, and its user would conclude the queue was wedged.</summary>
+    public const int CurrentProtocolVersion = 12;
 
     public int ProtocolVersion { get; init; } = CurrentProtocolVersion;
 }
@@ -146,6 +157,28 @@ public sealed record CancelRunRequest : IpcRequest
 public sealed record GetRunPlanStreamRequest : IpcRequest
 {
     public required Guid RunId { get; init; }
+}
+/// <summary>Every run the service still knows about, newest first — the authoritative re-seed for a
+/// job-queue view.
+/// <para>It exists because the event stream is <b>lossy by contract</b> (each subscriber has a bounded,
+/// drop-oldest frame channel), so a client that has just connected, or that dropped frames under
+/// back-pressure, cannot reconstruct the queue from <c>run-planned</c>/<c>run-progress</c> alone. Same
+/// role as <c>get-recent-jobs</c> plays for the per-file activity feed.</para>
+/// <para>The answer includes CLOSED runs for as long as the coordinator retains them (~10 minutes), so a
+/// client that asks moments after a run finished sees its outcome rather than a hole.</para></summary>
+public sealed record GetRunsRequest : IpcRequest;
+
+/// <summary>Pauses or resumes ONE run, independently of the global engine pause
+/// (<see cref="SetPausedRequest"/>).
+/// <para><b>A per-run pause only withholds work that has not started; it never aborts anything.</b> That
+/// is the deliberate difference from the global pause, which the Mirror deletion pass treats as a reason
+/// to abort fail-closed. Jobs already in flight always finish (I-ATOMIC-JOB), so pausing an executing run
+/// means "start no more copies", not "stop mid-file".</para>
+/// <para>RUN_NOT_FOUND for an unknown or already-closed id — a normal race, not a fault.</para></summary>
+public sealed record SetRunPausedRequest : IpcRequest
+{
+    public required Guid RunId { get; init; }
+    public required bool Paused { get; init; }
 }
 public sealed record SetPausedRequest : IpcRequest { public required bool Paused { get; init; } }
 public sealed record DryRunRequest : IpcRequest

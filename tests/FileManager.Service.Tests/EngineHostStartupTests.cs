@@ -164,6 +164,8 @@ public sealed class EngineHostStartupTests : IDisposable
         public string? SnapshotDirectory(Guid runId) => null;
         public void Settled(Guid runId, JobCompletion? completion) { }
         public Profile? PlannedProfile(Guid runId) => null;
+        public IReadOnlyList<RunSummaryDto> ListRuns() => [];
+        public Result SetPaused(Guid runId, bool paused) => Result.Success();
     }
 
     private sealed class RecordingEventBus(List<string> order) : IEngineEventBus

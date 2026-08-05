@@ -21,7 +21,7 @@ fixed (kept here for the diagnosis); everything else is additive.
 | ~~1~~ | ~~[Placer leaves `.fmtmp-` temps when sibling cancellation races rollback](#1-fixed-jobexecutiontargets-was-built-by-a-torn-lazy-initializer)~~ | **DONE** — root cause was a torn lazy initializer in `JobExecution`, not the placer | — |
 | 2 | [Decide the ratio-guard override](#2-decision-the-ratio-guard-has-no-override) | Blocks confident use against real archives | S (after a decision) |
 | ~~3~~ | ~~[Itemized approval view](#3-done-itemized-approval-view-in-the-preview-tab)~~ | **DONE** — the dry-run tab became the Preview tab and its footer approves the run | — |
-| 4 | [Cancel affordance in the activity panel](#4-cancel-affordance-in-the-activity-panel) | `cancel-run` works but has no button *during execution* — the planning phase now has one | S |
+| ~~4~~ | ~~[Cancel affordance for an executing run](#4-done-cancel-affordance-for-an-executing-run)~~ | **DONE** — shipped in the new non-modal Job Queue window (with per-run pause), not in the activity panel | — |
 | 5 | [Reconcile history (`get-recent-reconciles`)](#5-reconcile-history-get-recent-reconciles) | A deletion pass is invisible in the activity list | S–M |
 | 6 | [Remove emptied directories at a Mirror destination](#6-remove-emptied-directories-at-a-mirror-destination) | Destination accumulates an empty skeleton | S |
 | 7 | [Whole-profile reconcile for automation](#7-whole-profile-reconcile-for-automation) | Scoped runs never reconcile; needs Set 5 or a new request | M, design first |
@@ -227,23 +227,25 @@ an `AcknowledgeLargeDeletion` checkbox in this footer, beside the count it is ab
 
 ---
 
-## 4. Cancel affordance in the activity panel
+## 4. DONE: cancel affordance for an executing run
 
-`cancel-run` works end to end (`CancelRunHandler`, `IRunCoordinator.Cancel`,
-`IIpcGateway.CancelRunAsync`, `ITriggerQueue.DropRun`) and is covered by
-`RunLifecycleTests.Cancelling_mid_execution_drops_the_queued_work_and_skips_the_deletion_phase`.
+**Status:** shipped, as part of the job-queue set — and in a new window rather than in the activity panel,
+which is where this item originally pointed it.
 
-The **planning** phase now has its button: `DryRunViewModel.CancelPreviewCommand`, shown on the Preview
-tab while `PlanningRunId` is set. What is still missing is a cancel for a run already **executing** —
-`ActivityViewModel` has no cancel command.
+The reason it moved: the activity panel is the per-**file** feed, and a run is a different level of the
+same story. Rather than mixing run rows into a job list, runs got their own **non-modal Job Queue window**
+(`JobQueueViewModel` / `JobQueueWindow`) listing every run the engine knows about — previews included,
+since a dry run IS a run's planning phase — fed by `run-planned` / `run-progress` / `run-completed` and
+re-seeded from the new `get-runs` request, because the event stream is drop-oldest lossy.
 
-**To do:** a run-level row in `ActivityViewModel` showing phase and progress against the known total
-(`RunProgressEvent` carries `Completed` / `Total` / `Deleted`), with a Cancel command wired to
-`CancelRunAsync`. `MainWindowViewModel.HandleEngineEvent` already routes `RunProgressEvent` to a notice
-string — that is where the row should be fed from instead.
+Each row carries Cancel (`CancelRunAsync`), **Pause/Resume** (the new `set-run-paused`), and either
+Approve/Discard or "View plan" depending on whether this window showed the plan. The copy states the
+semantics this item asked for: cancelling drops work that has not started, **jobs already in flight always
+finish** (I-ATOMIC-JOB), and the deletion phase is skipped entirely.
 
-Semantics to preserve in the copy: cancelling drops work that has not started, but **jobs already in
-flight always finish** (I-ATOMIC-JOB), and the deletion phase is skipped entirely.
+`MainWindowViewModel.HandleEngineEvent` still routes `RunProgressEvent` to the activity notice for the
+window's own run; the queue takes every run in addition, which is what makes it a queue rather than a
+second copy of this window's state.
 
 ---
 

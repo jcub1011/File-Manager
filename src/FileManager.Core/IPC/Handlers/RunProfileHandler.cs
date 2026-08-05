@@ -147,3 +147,42 @@ public sealed class CancelRunHandler(IRunCoordinator runs) : IIpcRequestHandler
         return Task.FromResult(response);
     }
 }
+
+/// <summary>Handles get-runs: every run the coordinator still holds, newest first.
+///
+/// <para>Answered entirely from in-memory state, like get-status and unlike get-recent-jobs' file reads —
+/// so it is cheap enough for a queue window to re-seed from on every reconnect, which it must, because the
+/// event stream it otherwise follows is bounded and drop-oldest.</para>
+///
+/// <para>An empty list is a legitimate answer (an idle engine), never an error — the same contract
+/// get-recent-jobs documents for its wiped-on-restart ring.</para></summary>
+public sealed class GetRunsHandler(IRunCoordinator runs) : IIpcRequestHandler
+{
+    public string RequestType => IpcRequestTypes.GetRuns;
+
+    public Task<IpcResponse> HandleAsync(IpcRequest request, CancellationToken ct = default)
+    {
+        IpcResponse response = new RunsResponse { Runs = runs.ListRuns() };
+        return Task.FromResult(response);
+    }
+}
+
+/// <summary>Handles set-run-paused: holds or releases ONE run, independently of the global engine pause.
+///
+/// <para>RUN_NOT_FOUND covers both an unknown id and a run that has already closed. Both are normal races
+/// for a queue window whose rows come from a lossy stream, so the code is deliberately the same one
+/// <c>cancel-run</c> uses rather than a new one a client would have to learn.</para></summary>
+public sealed class SetRunPausedHandler(IRunCoordinator runs) : IIpcRequestHandler
+{
+    public string RequestType => IpcRequestTypes.SetRunPaused;
+
+    public Task<IpcResponse> HandleAsync(IpcRequest request, CancellationToken ct = default)
+    {
+        var typed = (SetRunPausedRequest)request;
+        Result result = runs.SetPaused(typed.RunId, typed.Paused);
+        IpcResponse response = result.TryGetError(out string? error)
+            ? new ErrorResponse { Code = "RUN_NOT_FOUND", Message = error }
+            : new OkResponse();
+        return Task.FromResult(response);
+    }
+}

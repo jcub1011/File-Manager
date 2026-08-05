@@ -337,6 +337,31 @@
             <TextBlock Text="{Binding TruncationNotice}" FontWeight="SemiBold" TextWrapping="Wrap" />
         </Border>
 
+        <!-- The retained preview's age. This tab's results now SURVIVE navigating away — the run stays
+             parked and its rows are re-streamed from the snapshot — so what is on screen may have been
+             computed some time ago, and the user has no other way to tell.
+
+             Note what the warning does and does not claim. The plan is exactly what the run will do: it
+             was frozen, and the executor re-screens so it can only ever do LESS than planned, never more.
+             What may have drifted is the filesystem, so an old plan risks being INCOMPLETE, never wrong.
+             That is why this is a warning bar and not a gate, and why Approve stays enabled. -->
+        <Border DockPanel.Dock="Top" Classes="infoBar warning" Margin="0,8,0,0"
+                IsVisible="{Binding IsPreviewStale}">
+            <Grid ColumnDefinitions="*,Auto">
+                <TextBlock Grid.Column="0" Text="{Binding PreviewStaleNotice}" TextWrapping="Wrap"
+                           VerticalAlignment="Center" />
+                <Button Grid.Column="1" Content="Preview again" Margin="10,0,0,0"
+                        VerticalAlignment="Center"
+                        Command="{Binding $parent[Window].((vm:MainWindowViewModel)DataContext).PreviewProfileCommand}" />
+            </Grid>
+        </Border>
+
+        <!-- Shown whether or not it is stale: a user who can always see how old a result is never has to
+             work out whether the threshold has been crossed. -->
+        <TextBlock DockPanel.Dock="Top" Classes="caption" Margin="0,6,0,0"
+                   Text="{Binding PreviewAgeText}"
+                   IsVisible="{Binding HasPreviewAge}" />
+
         <!-- ═══════════════ Approval footer ═══════════════
              Only present while a planned run is waiting for an answer. The rows above are that run's
              frozen work list — read back from its snapshot, not re-planned — so approving here executes

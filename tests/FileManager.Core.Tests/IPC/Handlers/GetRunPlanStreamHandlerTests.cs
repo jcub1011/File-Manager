@@ -305,6 +305,8 @@ public sealed class GetRunPlanStreamHandlerTests
         public void Settled(Guid id, JobCompletion? completion) { }
         public Profile? PlannedProfile(Guid id) => null;
         public void Coalesced(Guid id) { }
+        public IReadOnlyList<RunSummaryDto> ListRuns() => [];
+        public Result SetPaused(Guid id, bool paused) => Result.Success();
         public Task StopAsync() => Task.CompletedTask;
     }
 }

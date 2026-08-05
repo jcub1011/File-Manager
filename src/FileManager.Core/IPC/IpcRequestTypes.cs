@@ -28,6 +28,8 @@ public static class IpcRequestTypes
     public const string ApproveRun = "approve-run";
     public const string CancelRun = "cancel-run";
     public const string GetRunPlanStream = "get-run-plan-stream";
+    public const string GetRuns = "get-runs";
+    public const string SetRunPaused = "set-run-paused";
 
     public static string DiscriminatorOf(IpcRequest request) => request switch
     {
@@ -52,6 +54,8 @@ public static class IpcRequestTypes
         ApproveRunRequest => ApproveRun,
         CancelRunRequest => CancelRun,
         GetRunPlanStreamRequest => GetRunPlanStream,
+        GetRunsRequest => GetRuns,
+        SetRunPausedRequest => SetRunPaused,
         _ => throw new System.ArgumentOutOfRangeException(nameof(request),
             $"unmapped request type {request.GetType().Name} — add it here and to IpcRequest's [JsonDerivedType] table"),
     };

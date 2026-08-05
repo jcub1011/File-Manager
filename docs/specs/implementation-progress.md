@@ -53,10 +53,21 @@ Three coherent increments are complete:
    hard-deleted**, write-ahead journalled and recorded in a dedicated `audit/mirror-YYYYMM.ndjsonl`
    trail. Runs report aggregate progress and a terminal `run-completed`, and can be cancelled.
 
-**Test status:** 1426 tests passing across the solution (Core 674, UI 559, Contracts 150,
-Platform.Windows 14, Service 31). 0 errors. One pre-existing flaky test is documented below. A clean build emits 18 analyzer warnings, all in test
-projects (xUnit1031/xUnit2031 in Core.Tests, CA1416 platform-guard notices in Platform.Windows.Tests);
-`src/` is warning-free.
+5. **The job queue: concurrent runs, retained previews, and per-run pause.** A run is now something the
+   user can *watch and hold*. A non-modal **Job Queue window** lists every run the engine knows about —
+   previews included, since a dry run IS a run's planning phase — with live progress, **per-run
+   pause/resume**, cancel, and inline approve. Previews are **retained per profile**: navigating away no
+   longer declines the run, so re-opening the Preview tab re-streams the frozen plan from the run's own
+   snapshot (metadata is cached, never rows — a materialized preview costs ~200–350 MB), and a
+   configurable staleness banner says when a result may be out of date. Several previews can plan at once,
+   bounded by `EngineConfig.MaxConcurrentPlans`.
+
+**Test status:** 1658 tests passing across the solution (Core 825, UI 634, Contracts 153,
+Platform.Windows 14, Service 32). 0 errors. One pre-existing flaky test is documented below. A clean
+Release build emits 19 analyzer warnings: 18 in test projects (xUnit1031/xUnit2031 in Core.Tests, CA1416
+platform-guard notices in Platform.Windows.Tests) plus one pre-existing CS9107 in
+`FileManager.Core/Files/FileSystemService.cs` — the earlier claim that `src/` is warning-free was
+inaccurate, not a regression.
 
 **File-operation assurance.** The live path now has a dedicated integration suite that drives the real
 substrate (real journal, hasher, conflict resolver, placer, rollback executor, disposition service) over
@@ -93,6 +104,7 @@ triggers and transformers are the next sets.
 | `IWatcherService` / `ISettleTracker` / `IReadinessProbe` | ⬜ | Automatic-trigger set. |
 | `ISchedulerService` (+ `CronExpression`) | 🟡 | `CronExpression` parser exists; service not built. |
 | `ITriggerQueue` / `IPauseStateService` | ✅ | Coalescing FIFO with a pause-gated dequeue; pause persists to `state/pause.json`. |
+| `IRunPauseGate` / `RunPauseRegistry` | ✅ | Per-run pause. The global pause BLOCKS the dequeue; a per-run pause FILTERS it, so holding one run does not stall the rest. Withholds unstarted work only — never aborts (§4.2). |
 
 ### §4.3 Jobs
 | Component | Status | Note |
@@ -144,8 +156,9 @@ triggers and transformers are the next sets.
 | `IIpcServer` + framing/client/launcher | ✅ | |
 | Handlers: status, list/get/save/delete/validate profile, dry-run(+stream), settings, shutdown | ✅ | `get-status` now sources the real snapshot from `IJobOrchestrator`. |
 | Handlers: `run-profile`, `set-paused`, `get-matching`, `get-recent-jobs`, `get-job-log` | ✅ | Registered in the dispatch table. |
+| Handlers: `get-runs`, `set-run-paused` | ✅ | The job queue's re-seed (the event stream is drop-oldest lossy) and its pause toggle. 22 entries in the dispatch table. |
 | `subscribe` + `IIpcServer.Broadcast` | ✅ | Handled by the server directly: ack + open-ended one-way `EngineEvent` stream over a bounded, drop-oldest per-subscriber channel. |
-| Protocol version | ✅ | **7** — drops `ThemeMode` from `GlobalSettings` (settings.json schema v5); it moved to the UI-owned `client-settings.json`. Prior: 6 added `job-progress` / `run-queued` events and gave `run-profile` a `run-profile-result` reply. UI and Service must ship together. |
+| Protocol version | ✅ | **12** — `get-runs` / `set-run-paused`; `run-planned` gained `ProfileName` (a draft-planned run is in no catalog, so a client-side lookup leaves exactly the GUI's own runs nameless), `run-progress` gained `Paused`. UI and Service must ship together. Prior: **7** — drops `ThemeMode` from `GlobalSettings` (settings.json schema v5); it moved to the UI-owned `client-settings.json`. Prior: 6 added `job-progress` / `run-queued` events and gave `run-profile` a `run-profile-result` reply. UI and Service must ship together. |
 
 ### §4.10 Dry-run & observability
 | Component | Status | Note |
@@ -167,7 +180,7 @@ triggers and transformers are the next sets.
 | Host | Status | Note |
 | --- | --- | --- |
 | `FileManager.Service` | 🟡 | Runs recovery-first + IPC + the orchestrator/trigger-queue consumer + event-bus→IPC broadcast bridge; watcher/scheduler/shell/tray startup slots still empty (§2.4). |
-| `FileManager.UI` | 🟡 | List/editor/dry-run/settings/status bar **+ activity panel, pause toggle, and "Run now"**; no tray, `--pick`, or `--tray`. |
+| `FileManager.UI` | 🟡 | List/editor/preview/settings/status bar, activity panel, global pause toggle **+ the non-modal Job Queue window, retained per-profile previews, and the staleness banner**; no tray, `--pick`, or `--tray`. |
 | `FileManager.Cli` | ⬜ | Project does not exist yet. |
 
 ---
@@ -206,6 +219,65 @@ placer temp-cleanup bug and the open ratio-guard decision.*
 ---
 
 ## Notable decisions & documented limitations
+
+### Job queue, retained previews & per-run pause (Set 5)
+
+- **A per-run pause withholds; it never aborts.** The global pause is a safety brake on the whole engine,
+  so `MirrorDeletionPass` aborts fail-closed under it. A per-run pause is the user saying "hold this one"
+  about a run they already approved, so the pass WAITS instead — abandoning its deletion half would leave
+  the destination not a mirror of the source, reported as an abort reason they never asked for. Two pauses
+  with different semantics is a real wart; the alternative was worse. Cancel is how a run stops.
+- **Three things fall out of that, none optional.** The drain barrier subtracts paused time (or a run
+  paused over lunch comes back and deletes nothing, reported as unaccounted copies); a paused run is never
+  quiescent (or the destructive phase starts while the user believes the run is held); and **cancel clears
+  the pause flag** — without it a cancelled-while-paused run has nothing left that can release its drain
+  loop and sits in `Executing` until the 30-minute deadline, never closing, never cleaning up its
+  snapshot, never leaving the queue. Found by a test teardown hanging; pinned by
+  `RunPauseTests.Cancelling_a_paused_run_closes_it_instead_of_waiting_out_the_barrier`.
+- **`RunPauseRegistry` is standalone, not a member of `RunCoordinator`.** The coordinator depends on
+  `ITriggerQueue` and the queue must read pause state on every dequeue, so a coordinator that answered
+  `IRunPauseGate` itself would close a dependency cycle the container refuses to resolve.
+- **A preview is retained per PROFILE, and the store owns the leak.** A run parked in `AwaitingApproval`
+  holds a snapshot directory with no expiry, which is why `DryRunViewModel` used to decline one on every
+  profile switch. Retaining results deliberately keeps those runs parked, so `PreviewStore` inherited the
+  obligation: it declines every entry it supersedes and declines all of them on window close. Nothing else
+  may leave a run parked. `PreviewStoreTests` is mostly about that, not about the dictionary.
+- **Metadata is cached; rows are not.** The store holds the `RunPlannedEvent` (a few hundred bytes) and
+  re-streams the rows from the run's snapshot on demand, because a materialized preview costs ~200–350 MB
+  of process footprint. `Clearing_the_preview_releases_the_row_store` is the guard that this stayed true —
+  it fails if anything ever re-roots the store, and it still reports 0.3 MB residual (0% retained).
+- **Retained previews do NOT survive a service restart.** `EngineHost.PurgeRunSnapshots` sweeps `runs/` at
+  startup and the coordinator's run table is in-memory, so every parked run is gone. `RUN_NOT_FOUND` on a
+  restore is therefore the ORDINARY case, not an error: the entry is dropped and the tab shows "the saved
+  preview has expired" with no banner.
+- **A parked run still has no expiry.** One per profile bounds it, but previewing 50 profiles holds 50
+  snapshot directories until the window closes. `PruneClosedRuns` only touches *closed* runs. Worth a cap
+  later; not built here.
+- **Approve is gated on having SEEN the plan.** The queue shows every run, including another client's, but
+  a row offers Approve only when this window planned it; otherwise it offers "View plan", which loads it
+  into the Preview tab and *then* makes it approvable. That is the invariant the two-phase run exists to
+  protect. Approving from the queue while the tab shows that same run routes through the tab's footer, so
+  the blocking-warning acknowledgment the user just ticked is not sent as false.
+- **`MaxConcurrentPlans` (3) is a safety valve, not a throughput knob.** Concurrent previews are the point,
+  but the service was measured at ~292 MB producing ONE 33k-file plan. The slot is released when the work
+  list freezes, not when the run closes — a parked run holding one would deadlock the queue after three
+  previews. A queued run reports the `Waiting` phase, which is a display distinction over `Planning` and
+  deliberately NOT a `RunPhase` member: adding one would ripple through the §7.1 tables, `RunStatus` and
+  every consumer of both to express something only a caption needs.
+- **A queue row cannot list its own files.** `JobSummaryDto` and `JobStartedEvent` carry a `ProfileId`, not
+  a `RunId` — a deliberate Set 3b decision, since the trigger queue coalesces across runs and a run id
+  would misattribute the survivor. So the queue shows run-level `Completed`/`Total` and per-file detail
+  stays in the activity panel.
+- **The staleness threshold is client-side** (§2.3): the engine never reads it, and a stale preview is a
+  statement about what the USER is looking at — the plan is exactly as valid as when it was frozen. Stored
+  as `int?` because `ClientSettings` is a positional record, so an absent member deserializes through the
+  constructor as 0, not 15; a plain `int` would have made every existing settings file report "stale
+  immediately". The banner is advisory and Approve stays enabled: an old plan risks being INCOMPLETE,
+  never wrong, because the executor re-screens and can only ever do less than planned.
+- **The queue window is the app's only non-modal window.** Every other secondary window is `ShowDialog`.
+  A queue you must dismiss before editing a profile is a dialog, not a queue. The composition root tracks
+  the instance so a second press focuses the open window rather than stacking duplicates, and the view
+  model is owned by the shell so it keeps consuming events while the window is shut.
 
 ### Snapshot-driven runs & Mirror (Set 3c)
 - **A run executes from a frozen snapshot, produced by the preview's own planner.** `IProfilePlanner`

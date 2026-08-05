@@ -108,6 +108,13 @@ internal static class EngineComposition
         services.AddSingleton<MemoryTrimCoordinator>();
         services.AddSingleton<IMemoryTrimCoordinator>(sp => sp.GetRequiredService<MemoryTrimCoordinator>());
         services.AddSingleton<IJobLogStore, JobLogStore>();
+        // The per-run pause flags. A standalone registry rather than a member of RunCoordinator because
+        // the coordinator depends on ITriggerQueue and the queue must read pause state on every dequeue —
+        // a coordinator that answered IRunPauseGate itself would close a cycle the container refuses.
+        // Concrete + interface: the coordinator writes through the concrete type (Set/Forget), while the
+        // queue and the deletion pass only ever read, and the narrow interface is what says so.
+        services.AddSingleton<RunPauseRegistry>();
+        services.AddSingleton<IRunPauseGate>(sp => sp.GetRequiredService<RunPauseRegistry>());
         services.AddSingleton<ITriggerQueue, TriggerQueue>();
         services.AddSingleton<IProfileMatcher, ProfileMatcher>();
         services.AddSingleton<JobPlanFactory>();
@@ -137,6 +144,8 @@ internal static class EngineComposition
         services.AddSingleton<IIpcRequestHandler, RunProfileHandler>();
         services.AddSingleton<IIpcRequestHandler, ApproveRunHandler>();
         services.AddSingleton<IIpcRequestHandler, CancelRunHandler>();
+        services.AddSingleton<IIpcRequestHandler, GetRunsHandler>();
+        services.AddSingleton<IIpcRequestHandler, SetRunPausedHandler>();
         // Streaming handler: IpcServer type-tests the table's values for IIpcStreamingRequestHandler.
         services.AddSingleton<IIpcRequestHandler, GetRunPlanStreamHandler>();
         services.AddSingleton<IIpcRequestHandler, SetPausedHandler>();

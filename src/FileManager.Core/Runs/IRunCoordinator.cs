@@ -1,3 +1,4 @@
+using FileManager.Contracts.IPC;
 using FileManager.Contracts.Primitives;
 using FileManager.Contracts.Profiles;
 using FileManager.Core.Jobs;
@@ -77,6 +78,16 @@ public interface IRunCoordinator : IRunSettleSink
     /// <summary>The run's current state, or null when the id is unknown (an unknown id is a normal
     /// case: runs are forgotten a while after they close).</summary>
     RunStatus? GetStatus(Guid runId);
+
+    /// <summary>Every run still held, newest first — the authoritative answer for a job-queue view, whose
+    /// live feed is the lossy event stream. Includes closed runs for as long as they are retained.</summary>
+    IReadOnlyList<RunSummaryDto> ListRuns();
+
+    /// <summary>Pauses or resumes ONE run. Idempotent, and refused only for a run that has already closed.
+    /// <para>A pause withholds work that has not started and <b>never aborts anything</b> — see
+    /// <see cref="Watching.IRunPauseGate"/> for why that differs from the global engine pause. Jobs in
+    /// flight always finish (I-ATOMIC-JOB).</para></summary>
+    Result SetPaused(Guid runId, bool paused);
 
     /// <summary>Reports that a payload will never produce a job because the queue superseded it, so the
     /// barrier stops waiting for one.</summary>

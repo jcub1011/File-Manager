@@ -2626,10 +2626,17 @@ public sealed partial class DryRunViewModel : ViewModelBase
     /// headless view-model tests, where the menu commands simply no-op.</summary>
     private readonly IDryRunItemActions? _actions;
 
-    public DryRunViewModel(IIpcGateway gateway, IDryRunItemActions? actions = null, TimeSpan? searchDebounce = null)
+    /// <summary>Clock behind the staleness age. Injected so a test can advance it with
+    /// <c>FakeTimeProvider</c> instead of waiting fifteen real minutes.</summary>
+    private readonly TimeProvider _time;
+
+    public DryRunViewModel(
+        IIpcGateway gateway, IDryRunItemActions? actions = null, TimeSpan? searchDebounce = null,
+        TimeProvider? time = null)
     {
         _gateway = gateway;
         _actions = actions;
+        _time = time ?? TimeProvider.System;
         TimeSpan debounce = searchDebounce ?? TimeSpan.FromMilliseconds(200);
         Sources = new DryRunSourcesTab(debounce, actions);
         Destinations = new DryRunDestinationsTab(debounce, actions);
@@ -2872,13 +2879,20 @@ public sealed partial class DryRunViewModel : ViewModelBase
     public void BeginPlanning()
     {
         ClearReport();
-        // A previous preview's run is superseded by this one, so decline it rather than leaving it parked
-        // in AwaitingApproval with a snapshot directory nothing will ever answer for.
-        AbandonPendingRun();
-        // And one still PLANNING is superseded too. This used to null PlanningRunId outright: the engine
-        // kept walking a tree nobody would answer for, and that run's late run-planned event could still
-        // arrive, be recognized as ours, and overwrite this preview's rows and PendingRunId — so Approve
-        // would execute the profile as it was before the edit that prompted the re-preview.
+        // The PLAN is no longer declined here. Retained previews mean a parked run outlives the tab that
+        // showed it, and it is the PreviewStore — keyed by profile — that decides when one is superseded:
+        // re-previewing profile A must not decline the result held for profile B. The store declines the
+        // entry this new plan replaces, once it knows what that plan is.
+        //
+        // What IS still abandoned is the footer's own state, so the tab cannot offer to approve the
+        // previous plan while the next one is being computed. ForgetPendingPlan is state-only — it tells
+        // the engine nothing, which is exactly right: the run it names is still retained.
+        ForgetPendingPlan();
+        PreviewTakenAtUtc = null;
+        // And a run still PLANNING is superseded outright. This one IS cancelled, not retained: an
+        // unfinished scan has no result to come back to, and leaving it running would mean the engine keeps
+        // walking a tree nobody will answer for — and its late run-planned event could still arrive, be
+        // recognized as ours, and overwrite this preview's rows.
         AbandonPlanningRun();
         EmptyStateText = DefaultEmptyState;   // a previous "nothing to do" says nothing about this run
         IsPreviewing = true;
@@ -2907,6 +2921,75 @@ public sealed partial class DryRunViewModel : ViewModelBase
     /// otherwise a late <c>run-planned</c> for a superseded scan is still treated as ours and applied over
     /// the newer plan. A null callback is a no-op, so headless tests are not blocked.</summary>
     public Action<Guid>? Superseded { get; set; }
+
+    // ── Staleness of a retained preview ───────────────────────────────────────────────────────────
+    /// <summary>When the plan on screen was frozen, or null when there is no plan.
+    /// <para>Set from the <c>run-planned</c> event's own <c>AtUtc</c>, which is the instant the engine
+    /// stamped into the snapshot header — so the age shown is the age of the WORK LIST, not of the moment
+    /// this window happened to render it. A restored preview therefore reports its original age rather than
+    /// looking freshly taken, which is the entire point of the warning.</para></summary>
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(IsPreviewStale), nameof(PreviewAgeText), nameof(HasPreviewAge))]
+    public partial DateTimeOffset? PreviewTakenAtUtc { get; set; }
+
+    /// <summary>How old a preview may get before <see cref="IsPreviewStale"/> trips. Pushed in from
+    /// <c>ClientSettings.PreviewStaleAfter</c> by the shell, so this view model does not read settings.</summary>
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(IsPreviewStale), nameof(PreviewAgeText))]
+    public partial TimeSpan PreviewStaleAfter { get; set; } =
+        TimeSpan.FromMinutes(ClientSettings.DefaultPreviewStaleAfterMinutes);
+
+    /// <summary>Re-read on every tick so the age and the staleness flag advance without a plan reload.
+    /// Not an <c>[ObservableProperty]</c> of its own — the tick raises the three derived properties.</summary>
+    private TimeSpan PreviewAge =>
+        PreviewTakenAtUtc is { } taken ? _time.GetUtcNow() - taken : TimeSpan.Zero;
+
+    /// <summary>Whether there is a preview old enough to warn about.
+    /// <para>Deliberately advisory. The plan is still exactly what the run will do — it was frozen, and the
+    /// executor re-screens and re-checks-unchanged so it can only ever do LESS than planned, never more.
+    /// What may have drifted is the FILESYSTEM, so a stale plan risks being incomplete, never wrong. The
+    /// banner says "may be out of date" for that reason and Approve stays enabled.</para></summary>
+    public bool IsPreviewStale => PreviewTakenAtUtc is not null && PreviewAge >= PreviewStaleAfter;
+
+    public bool HasPreviewAge => PreviewTakenAtUtc is not null;
+
+    /// <summary>The preview's age in prose, shown whether or not it is stale — a user who can always see
+    /// how old a result is never has to guess whether the threshold has been crossed.</summary>
+    public string PreviewAgeText
+    {
+        get
+        {
+            if (PreviewTakenAtUtc is not { } taken)
+                return "";
+            TimeSpan age = PreviewAge;
+            string when = taken.ToLocalTime().ToString("HH:mm");
+            return age < TimeSpan.FromMinutes(1)
+                ? $"Previewed just now ({when})"
+                : age < TimeSpan.FromHours(1)
+                    ? $"Previewed {(int)age.TotalMinutes} min ago ({when})"
+                    : age < TimeSpan.FromDays(1)
+                        ? $"Previewed {(int)age.TotalHours} hr ago ({when})"
+                        : $"Previewed {taken.ToLocalTime():yyyy-MM-dd HH:mm}";
+        }
+    }
+
+    /// <summary>The staleness banner's text. Names the age and what to do about it, and states the limit of
+    /// the claim — an out-of-date preview may be INCOMPLETE, never wrong.</summary>
+    public string PreviewStaleNotice =>
+        $"This preview is {PreviewAgeText.Replace("Previewed ", "", StringComparison.Ordinal)} and may be out of "
+        + "date — files may have been added, changed or removed since. Approving still runs exactly the work "
+        + "listed below; anything that changed since will be picked up by the next run. Preview again to refresh.";
+
+    /// <summary>Recomputes the age-derived properties. Called on a timer by the shell (and directly by
+    /// tests), because nothing else changes when time passes.</summary>
+    public void RefreshPreviewAge()
+    {
+        if (PreviewTakenAtUtc is null)
+            return;
+        OnPropertyChanged(nameof(PreviewAgeText));
+        OnPropertyChanged(nameof(PreviewStaleNotice));
+        OnPropertyChanged(nameof(IsPreviewStale));
+    }
 
     /// <summary>The run whose PLANNING is in flight, once the engine has accepted it. Distinct from
     /// <see cref="PendingRunId"/>, which is a plan already on screen: this one exists only during the
@@ -3076,6 +3159,10 @@ public sealed partial class DryRunViewModel : ViewModelBase
             // must appear together, never the button first.
             BlockingIssues = planned.BlockingIssues;
             AcknowledgedWarnings = false;
+            // The event's own stamp, not "now": a RESTORED preview must report the age of the work list,
+            // which is the whole basis of the staleness warning. Taking the current time here would make
+            // every reopened result look freshly taken.
+            PreviewTakenAtUtc = planned.AtUtc;
             PendingRunId = planned.RunId;
             // What the app now sits at with a preview on screen — the number a user reports.
             UiMemoryLog.Sample("preview-applied", allocatedBefore);
@@ -3097,6 +3184,50 @@ public sealed partial class DryRunViewModel : ViewModelBase
             RunStatusText = "";
             IsPreviewing = false;
         }
+    }
+
+    /// <summary>Re-shows a retained preview by re-streaming its plan from the run's snapshot.
+    ///
+    /// <para><b>Re-streamed rather than cached in memory, deliberately.</b> A materialized preview costs
+    /// ~200–350 MB of process footprint at scale (see <c>docs/dry-run-ui-memory-next-steps.md</c>), so
+    /// keeping several on screen's worth of rows alive to make a tab switch instant would trade the app's
+    /// whole memory budget for a second or two of latency. The rows already exist on disk in the run's
+    /// snapshot, and <c>get-run-plan-stream</c> replays them as the same frames a fresh preview ingests —
+    /// so this reuses <see cref="LoadPlanAsync"/> whole rather than adding a second ingest path that could
+    /// disagree with it.</para>
+    ///
+    /// <para>Returns false when the run is gone, which is the ORDINARY case after a service restart: the
+    /// engine sweeps its runs directory at startup and keeps no run table across processes. The caller
+    /// drops the stored entry and shows the normal empty state — this is not an error and raises no
+    /// banner.</para></summary>
+    public async Task<bool> RestoreAsync(StoredPreview stored, CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(stored);
+        // Same clear-first sequence a fresh preview uses, so the tab shows a progress bar rather than the
+        // previous profile's rows while this streams. State-only: the run being restored must survive.
+        ClearReport();
+        ForgetPendingPlan();
+        AbandonPlanningRun();
+        EmptyStateText = DefaultEmptyState;
+        IsPreviewing = true;
+        RunStatusText = "Reopening the last preview…";
+
+        int epoch = _reportEpoch;
+        await LoadPlanAsync(stored.Planned, ct).ConfigureAwait(true);
+        if (_reportEpoch != epoch)
+            return true;   // superseded mid-restore; the newer action owns the tab now
+
+        // LoadPlanAsync reports a vanished run through ErrorMessage, since for a FRESH plan that really is a
+        // failure. For a restore it is expected, so translate it back into the benign empty state and let
+        // the caller forget the entry.
+        if (PendingRunId is null)
+        {
+            ErrorMessage = null;
+            EmptyStateText = "The saved preview has expired — preview again to see what a run would do.";
+            PreviewTakenAtUtc = null;
+            return false;
+        }
+        return true;
     }
 
     // ── Answering the pending run ─────────────────────────────────────────────────────────────
@@ -3145,12 +3276,15 @@ public sealed partial class DryRunViewModel : ViewModelBase
         }
     }
 
-    /// <summary>Declines the pending run without narrating it, for the paths that abandon a preview
-    /// rather than answer it: a superseding preview, and the profile being closed or switched.
-    /// <para>Not optional housekeeping. A run parked in <c>AwaitingApproval</c> holds a snapshot
-    /// directory and has no expiry of its own, so a preview left unanswered leaks one for the lifetime
-    /// of the service. Fire-and-forget: the caller is mid-transition and the answer is not interesting,
-    /// and an already-closed run answering RUN_NOT_APPROVABLE is a normal race here.</para></summary>
+    /// <summary>Declines the pending run without narrating it.
+    ///
+    /// <para><b>No longer called on a profile switch or a superseding preview</b> — those retain the run
+    /// now, and <c>PreviewStore</c> owns declining what it supersedes. What remains is the case where the
+    /// run must genuinely go and no store entry will account for it: a plan the shell answered on the
+    /// user's behalf (nothing to do), and any path that decided this window is done with the run outright.
+    ///
+    /// <para>Fire-and-forget: the caller is mid-transition and the answer is not interesting, and an
+    /// already-closed run answering RUN_NOT_APPROVABLE is a normal race here.</para></summary>
     public void AbandonPendingRun()
     {
         if (ForgetPendingPlan() is not Guid runId)
@@ -3177,6 +3311,7 @@ public sealed partial class DryRunViewModel : ViewModelBase
         // and carrying either into the next plan would acknowledge something the user never saw.
         BlockingIssues = [];
         AcknowledgedWarnings = false;
+        PreviewTakenAtUtc = null;   // no plan on screen, so nothing has an age
         return runId;
     }
 
@@ -3319,9 +3454,15 @@ public sealed partial class DryRunViewModel : ViewModelBase
         // selection/deselection where there is nothing to report.
         bool hadReport = HasReport;
         ClearReport();
-        // The user is done with this preview, and its run is still parked in AwaitingApproval holding a
-        // snapshot directory with no expiry of its own. Closing the profile is abandonment, so decline it.
-        AbandonPendingRun();
+        // The run is NO LONGER declined here, and that is the change retained previews are made of. Looking
+        // away from a profile is not abandoning its result: the run stays parked so the rows can be
+        // re-streamed from its snapshot when the user comes back. Only the footer's state is dropped, so
+        // the tab cannot approve a plan whose rows are no longer on screen.
+        //
+        // The obligation that used to live here has moved to PreviewStore, which declines an entry it
+        // supersedes and declines every entry on window close. Nothing else may leave a run parked.
+        ForgetPendingPlan();
+        PreviewTakenAtUtc = null;
         if (!hadReport)
             return;
         // The rows are unrooted but not yet collected, so this reads barely changed from

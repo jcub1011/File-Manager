@@ -1,0 +1,192 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:conv="using:FileManager.UI.Converters"
+        xmlns:vm="using:FileManager.UI.ViewModels"
+        xmlns:chrome="using:Avalonia.Controls.Chrome"
+        x:Class="FileManager.UI.Views.JobQueueWindow"
+        x:DataType="vm:JobQueueViewModel"
+        Width="720" Height="520"
+        MinWidth="520" MinHeight="320"
+        WindowStartupLocation="CenterOwner"
+        FontFamily="{StaticResource AppFontFamily}"
+        FontSize="{StaticResource Font.Body}"
+        Background="{DynamicResource Brush.Window.Background}"
+        Title="Job queue"
+        ExtendClientAreaToDecorationsHint="True"
+        WindowDecorations="BorderOnly">
+
+    <!-- NON-MODAL (shown with Show, not ShowDialog — see App.axaml.cs). The whole point of a queue is to
+         watch work while carrying on editing profiles, so this window must never block the main one.
+         Every other secondary window in the app is a dialog; this is the deliberate exception.
+
+         Chrome and layout follow SettingsWindow exactly: a custom title bar with an accent-badged icon,
+         and a pinned footer holding the buttons and any message. Same recipe, same reasons — the OS keeps
+         the resizable frame but draws no system caption, so the bar follows the app theme instead of the
+         Windows default. -->
+
+    <DockPanel LastChildFill="True">
+
+        <!-- The ElementRole markers are load-bearing: TitleBar makes the grid the drag region, and the
+             close button needs its own role or the drag region swallows its clicks. -->
+        <Grid DockPanel.Dock="Top" Height="32" ColumnDefinitions="Auto,*,Auto"
+              Background="{DynamicResource Brush.Chrome.Background}"
+              chrome:WindowDecorationProperties.ElementRole="TitleBar">
+            <StackPanel Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Center" Margin="10,0,0,0">
+                <Border Width="18" Height="18" CornerRadius="4" Background="{DynamicResource Brush.Accent}">
+                    <!-- The same glyph the main window's queue button uses, so the entry point and the
+                         window it opens are recognizably one thing. -->
+                    <PathIcon Data="{StaticResource IconOverwrite}" Width="11" Height="11" Foreground="White" />
+                </Border>
+                <TextBlock Text="Job queue" VerticalAlignment="Center"
+                           Margin="8,0,0,0" FontSize="{StaticResource Font.Title}"
+                           Foreground="{DynamicResource Brush.Text.Primary}" />
+                <!-- The count the main window's badge shows, repeated here: with the window open the badge
+                     is behind it, and "3 running" is the first thing a queue should say about itself. -->
+                <TextBlock Classes="caption" VerticalAlignment="Center" Margin="10,0,0,0"
+                           IsVisible="{Binding HasRuns}">
+                    <Run Text="{Binding ActiveCount}" />
+                    <Run Text="active" />
+                </TextBlock>
+            </StackPanel>
+
+            <Button Grid.Column="2" Classes="caption close"
+                    chrome:WindowDecorationProperties.ElementRole="CloseButton"
+                    Click="OnCloseClick" ToolTip.Tip="Close the job queue">
+                <PathIcon Data="{StaticResource IconClose}" Width="10" Height="10" />
+            </Button>
+        </Grid>
+
+        <!-- Footer: pinned so the buttons and any message stay put however far the list scrolls. Split
+             like the settings footer — actions on the content to the left, the action that resolves the
+             window to the right. -->
+        <Border DockPanel.Dock="Bottom" Padding="16,10"
+                Background="{DynamicResource Brush.Chrome.Background}"
+                BorderBrush="{DynamicResource Brush.Panel.Border}" BorderThickness="0,1,0,0">
+            <StackPanel Spacing="8">
+                <Border Classes="infoBar danger"
+                        IsVisible="{Binding ErrorMessage, Converter={x:Static ObjectConverters.IsNotNull}}">
+                    <Grid ColumnDefinitions="*,Auto">
+                        <TextBlock Grid.Column="0" Text="{Binding ErrorMessage}" TextWrapping="Wrap"
+                                   VerticalAlignment="Center" />
+                        <Button Grid.Column="1" Classes="iconButton onChrome" Command="{Binding DismissErrorCommand}"
+                                Margin="6,0,0,0" VerticalAlignment="Center" ToolTip.Tip="Dismiss">
+                            <PathIcon Data="{StaticResource IconClose}" Width="9" Height="9" />
+                        </Button>
+                    </Grid>
+                </Border>
+                <Grid ColumnDefinitions="Auto,*">
+                    <!-- onChrome, like the settings footer: the default iconButton hover is a lift off
+                         Brush.Panel.Background and is invisible on this bar's chrome fill. -->
+                    <Button Grid.Column="0" Classes="iconButton onChrome" Command="{Binding RefreshCommand}"
+                            ToolTip.Tip="Refresh — re-read the queue from the service">
+                        <PathIcon Data="{StaticResource IconRefresh}" Width="16" Height="16" />
+                    </Button>
+                    <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="8" HorizontalAlignment="Right">
+                        <!-- One size down, as everywhere else: a bare cross fills its box corner to corner
+                             and overshoots the outline glyphs beside it at a matched size. -->
+                        <Button x:Name="FooterCloseButton"
+                                Classes="iconButton onChrome tintDanger" Click="OnCloseClick"
+                                ToolTip.Tip="Close the job queue. Runs keep going — this window only stops watching them.">
+                            <PathIcon Data="{StaticResource IconClose}" Width="14" Height="14" />
+                        </Button>
+                    </StackPanel>
+                </Grid>
+            </StackPanel>
+        </Border>
+
+        <DockPanel Margin="16" LastChildFill="True">
+            <TextBlock DockPanel.Dock="Top" TextWrapping="Wrap" Classes="secondary" Margin="0,0,0,8"
+                       Text="Every run this engine knows about, including previews. Pausing holds work that has not started — files already being copied always finish. Runs are forgotten a few minutes after they end." />
+
+            <StackPanel IsVisible="{Binding HasNoRuns}" VerticalAlignment="Center" Spacing="8">
+                <PathIcon Data="{StaticResource IconDocument}" Width="28" Height="28"
+                          HorizontalAlignment="Center"
+                          Foreground="{DynamicResource Brush.Muted}" />
+                <TextBlock Classes="secondary" HorizontalAlignment="Center" TextAlignment="Center"
+                           TextWrapping="Wrap"
+                           Text="Nothing running. Preview or run a profile and it will appear here." />
+            </StackPanel>
+
+            <ScrollViewer IsVisible="{Binding HasRuns}">
+                <ItemsControl ItemsSource="{Binding Runs}">
+                    <ItemsControl.ItemTemplate>
+                        <DataTemplate x:DataType="vm:JobQueueRow">
+                            <Border Classes="card" Margin="0,0,0,6" Padding="10,8">
+                                <Grid ColumnDefinitions="Auto,*,Auto" RowDefinitions="Auto,Auto,Auto">
+
+                                    <!-- Glyph + colour arrive as resource-key strings from the view model,
+                                         resolved here — the same approach the activity and dry-run rows use,
+                                         so the view model needs no Avalonia dependency. -->
+                                    <PathIcon Grid.Row="0" Grid.Column="0" Grid.RowSpan="2"
+                                              Width="16" Height="16" Margin="0,0,10,0"
+                                              VerticalAlignment="Top"
+                                              Data="{Binding StatusIconKey, Converter={x:Static conv:IconConverters.Geometry}}"
+                                              Foreground="{Binding StatusColorKey, Converter={x:Static conv:IconConverters.Brush}}" />
+
+                                    <StackPanel Grid.Row="0" Grid.Column="1" Spacing="1">
+                                        <TextBlock Text="{Binding ProfileName}" FontWeight="SemiBold"
+                                                   TextTrimming="CharacterEllipsis" />
+                                        <TextBlock Classes="caption" TextTrimming="CharacterEllipsis">
+                                            <Run Text="{Binding StartedText}" />
+                                            <Run Text="·" />
+                                            <Run Text="{Binding StatusText}" />
+                                        </TextBlock>
+                                        <TextBlock Classes="caption" Text="{Binding ProgressText}"
+                                                   Foreground="{DynamicResource Brush.Info}"
+                                                   TextTrimming="CharacterEllipsis" />
+                                    </StackPanel>
+
+                                    <!-- Row actions. Pause/Cancel apply to any live run; Approve/Discard only
+                                         to a plan THIS window showed, which is what CanApproveHere encodes.
+                                         A parked run planned elsewhere gets View plan instead — nobody
+                                         approves work they have not looked at. -->
+                                    <StackPanel Grid.Row="0" Grid.Column="2" Orientation="Horizontal"
+                                                Spacing="4" VerticalAlignment="Top">
+                                        <Button Classes="iconButton" IsVisible="{Binding IsPausable}"
+                                                Command="{Binding $parent[ItemsControl].((vm:JobQueueViewModel)DataContext).TogglePauseCommand}"
+                                                CommandParameter="{Binding}"
+                                                ToolTip.Tip="{Binding PauseLabel}">
+                                            <PathIcon Width="12" Height="12"
+                                                      Data="{Binding PauseIconKey, Converter={x:Static conv:IconConverters.Geometry}}" />
+                                        </Button>
+                                        <Button Classes="iconButton tintDanger" IsVisible="{Binding IsCancellable}"
+                                                Command="{Binding $parent[ItemsControl].((vm:JobQueueViewModel)DataContext).CancelRunCommand}"
+                                                CommandParameter="{Binding}"
+                                                ToolTip.Tip="Cancel this run. Work that has not started is dropped; files already being copied finish. A Mirror run removes nothing.">
+                                            <PathIcon Data="{StaticResource IconClose}" Width="11" Height="11" />
+                                        </Button>
+                                    </StackPanel>
+
+                                    <ProgressBar Grid.Row="1" Grid.Column="1" Grid.ColumnSpan="2"
+                                                 Margin="0,6,0,0" Height="4"
+                                                 IsVisible="{Binding ShowProgress}"
+                                                 IsIndeterminate="{Binding IsIndeterminate}"
+                                                 Minimum="0" Maximum="1" Value="{Binding ProgressFraction}" />
+
+                                    <StackPanel Grid.Row="2" Grid.Column="1" Grid.ColumnSpan="2"
+                                                Orientation="Horizontal" Spacing="8" Margin="0,8,0,0"
+                                                IsVisible="{Binding IsAwaitingApproval}">
+                                        <Button Content="Approve run" Classes="success"
+                                                IsVisible="{Binding CanApproveHere}"
+                                                Command="{Binding $parent[ItemsControl].((vm:JobQueueViewModel)DataContext).ApproveCommand}"
+                                                CommandParameter="{Binding}" />
+                                        <Button Content="View plan…"
+                                                IsVisible="{Binding !CanApproveHere}"
+                                                Command="{Binding $parent[ItemsControl].((vm:JobQueueViewModel)DataContext).ViewPlanCommand}"
+                                                CommandParameter="{Binding}"
+                                                ToolTip.Tip="Show what this run will do on the Preview tab, where it can be approved." />
+                                        <Button Content="Discard"
+                                                Command="{Binding $parent[ItemsControl].((vm:JobQueueViewModel)DataContext).DiscardCommand}"
+                                                CommandParameter="{Binding}"
+                                                ToolTip.Tip="Close this run without changing anything." />
+                                    </StackPanel>
+                                </Grid>
+                            </Border>
+                        </DataTemplate>
+                    </ItemsControl.ItemTemplate>
+                </ItemsControl>
+            </ScrollViewer>
+        </DockPanel>
+    </DockPanel>
+
+</Window>

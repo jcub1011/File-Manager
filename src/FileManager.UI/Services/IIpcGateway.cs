@@ -90,6 +90,22 @@ public interface IIpcGateway
     /// <summary>Cancels a run. Work not yet started is dropped; work in flight finishes.</summary>
     Task<Result<bool, IpcError>> CancelRunAsync(Guid runId, CancellationToken ct = default);
 
+    /// <summary>Every run the service still holds, newest first — the job queue's authoritative re-seed.
+    /// <para>Needed for the same reason <see cref="GetRecentJobsAsync"/> is: the event stream is bounded
+    /// and drop-oldest, so a queue view built only from <c>run-planned</c>/<c>run-progress</c> silently
+    /// drifts. Re-seed on window open and on every (re)connect. An empty list is a legitimate answer.</para>
+    /// <para>Closed runs are included for as long as the service retains them (~10 minutes), so a row does
+    /// not vanish the instant its run finishes.</para></summary>
+    Task<Result<IReadOnlyList<RunSummaryDto>, IpcError>> GetRunsAsync(CancellationToken ct = default);
+
+    /// <summary>Pauses or resumes ONE run, independently of the global <see cref="SetPausedAsync"/>.
+    /// <para>A pause only withholds work that has not started — it never aborts anything, and jobs already
+    /// in flight always finish (I-ATOMIC-JOB). So pausing an executing run means "start no more copies",
+    /// not "stop mid-file"; the UI copy must say so.</para>
+    /// <para>RUN_NOT_FOUND covers an unknown id AND a run that has already closed — a normal race for a
+    /// view fed by a lossy stream, not a fault worth a banner.</para></summary>
+    Task<Result<bool, IpcError>> SetRunPausedAsync(Guid runId, bool paused, CancellationToken ct = default);
+
     /// <summary>Sets the global pause flag. The service publishes <c>pause-changed</c> only on an
     /// actual transition, so a caller must treat this ack — not an echoed event — as its confirmation.</summary>
     Task<Result<bool, IpcError>> SetPausedAsync(bool paused, CancellationToken ct = default);

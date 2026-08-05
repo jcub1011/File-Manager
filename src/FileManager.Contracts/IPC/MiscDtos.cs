@@ -41,3 +41,35 @@ public sealed record ValidationIssue(ValidationSeverity Severity, string Code, s
 public sealed record JobSummaryDto(
     Guid JobId, Guid ProfileId, string SourcePath, string Outcome,
     string? SkipReason, DateTimeOffset StartedAtUtc, TimeSpan Duration);
+
+/// <summary>One run as a job-queue row: where it is, what it plans to do, and how much of that is done.
+/// The wire form of Core's <c>RunStatus</c>, answered by <c>get-runs</c>.
+///
+/// <para><b>Why <see cref="ProfileName"/> is on the wire rather than resolved client-side.</b> Every other
+/// run-shaped DTO carries only a <c>ProfileId</c> and lets the client look the name up in its profile
+/// list. That cannot work here: a run planned from an unsaved draft has a profile that exists in no
+/// catalog, so the lookup returns null and the row is permanently nameless. The coordinator holds the
+/// frozen profile the run was planned against, so it is the only thing that can answer.</para>
+///
+/// <para><b>Snapshot semantics</b>, like <c>RunStatus</c> — read once, do not expect it to update. Live
+/// movement arrives as <c>run-progress</c>; this is what a client re-seeds from.</para></summary>
+/// <param name="Phase">The run's <c>RunPhase</c> as a string (<c>Planning</c>, <c>AwaitingApproval</c>,
+/// <c>Executing</c>, <c>Closed</c>). A string for the same reason <c>RunProgressEvent.Phase</c> is one:
+/// the phase is engine-internal and crossing the IPC boundary as a name keeps an added member from being
+/// a breaking wire change.</param>
+/// <param name="Outcome">The run's <c>RunOutcome</c> as a string. <c>None</c> until it closes.</param>
+/// <param name="Paused">Whether THIS run is individually paused (see <see cref="SetRunPausedRequest"/>).
+/// Independent of the global engine pause reported by <see cref="EngineStatusSnapshot.Paused"/>.</param>
+/// <param name="Waiting">The run is in <c>Planning</c> but has not started walking — it is queued behind
+/// the concurrent-plan limit. Distinguished from "planning slowly" deliberately: an unchanging caption
+/// that could mean either is the exact complaint the planning-progress counts were added to fix.</param>
+/// <param name="StartedAtUtc">When the run was created. Always set, unlike
+/// <paramref name="PlannedAtUtc"/>, so it is what a queue orders by — a still-planning run has no plan
+/// timestamp and would otherwise have no position.</param>
+/// <param name="PlannedAtUtc">When planning finished and the work list was frozen — the age a client
+/// measures staleness against. Null while still planning.</param>
+public sealed record RunSummaryDto(
+    Guid RunId, Guid ProfileId, string ProfileName, string Phase, string Outcome,
+    bool Paused, bool Waiting, DateTimeOffset StartedAtUtc, DateTimeOffset? PlannedAtUtc,
+    int PlannedCopies, int PlannedDeletes, long PlannedCopyBytes, long PlannedDeleteBytes,
+    int Succeeded, int Skipped, int Failed, int Deleted, bool PlanTruncated, string? PlanError);

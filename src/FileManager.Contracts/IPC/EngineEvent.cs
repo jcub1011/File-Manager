@@ -96,6 +96,12 @@ public sealed record RunPlannedEvent : EngineEvent
 {
     public required Guid RunId { get; init; }
     public required Guid ProfileId { get; init; }
+
+    /// <summary>The name of the profile this run was planned against.
+    /// <para>On the event rather than looked up from <see cref="ProfileId"/> because a run planned from an
+    /// unsaved draft has a profile that is in NO catalog — the lookup every other run DTO relies on
+    /// returns null for exactly the runs the GUI starts. Empty only if the profile itself is unnamed.</para></summary>
+    public string ProfileName { get; init; } = "";
     public required int PlannedCopies { get; init; }
     /// <summary>Destination files that will be moved to the Recycle Bin. Non-zero only under
     /// <c>SyncMode.Mirror</c>, and the most consequential number in this event.</summary>
@@ -146,6 +152,13 @@ public sealed record RunProgressEvent : EngineEvent
     /// <summary>Destination files the plan's sweep has discovered so far, during <c>Planning</c>. Stays
     /// zero for a profile that does not scan its destination, which is most of them.</summary>
     public long ScannedDestinations { get; init; }
+
+    /// <summary>Whether this run is individually paused (<see cref="SetRunPausedRequest"/>), independent
+    /// of the global engine pause.
+    /// <para>Carried on the progress sample rather than as an event of its own so a paused run keeps
+    /// saying so: the counters below stop moving while paused, and without this flag a paused run and a
+    /// wedged one are indistinguishable — the same reason the scan counts exist.</para></summary>
+    public bool Paused { get; init; }
 }
 
 /// <summary>A run reached its terminal state. The only authoritative statement of what a run did.</summary>

@@ -13,6 +13,7 @@ namespace FileManager.UI
     {
         private readonly CancellationTokenSource _shutdown = new();
         private IpcGateway? _gateway;
+        private IDisposable? _previewAgeTicker;
 
         public override void Initialize()
         {
@@ -73,6 +74,29 @@ namespace FileManager.UI
                 viewModel.ConfirmDeleteProfile = async message =>
                     await new ConfirmWindow(message, "Delete", "Cancel", confirmIsDanger: true)
                         .ShowDialog<bool>(window);
+
+                // The ONE non-modal window in the app, and deliberately so: a queue you must dismiss before
+                // you can edit a profile is a dialog, not a queue. Show(owner) keeps it above the main
+                // window and closing with it, without blocking input to it.
+                //
+                // The instance is tracked so a second press focuses the window already open rather than
+                // stacking duplicates — there is no existing precedent for this because every other window
+                // here is modal and cannot be opened twice.
+                JobQueueWindow? queue = null;
+                viewModel.ShowJobQueue = () =>
+                {
+                    if (queue is not null)
+                    {
+                        queue.Activate();
+                        return;
+                    }
+                    // DataContext is the SHELL's view model, not a fresh one: the queue keeps consuming
+                    // engine events while this window is closed, so reopening shows current state instead of
+                    // starting empty.
+                    queue = new JobQueueWindow { DataContext = viewModel.Queue };
+                    queue.Closed += (_, _) => queue = null;
+                    queue.Show(window);
+                };
                 window.DataContext = viewModel;
                 desktop.MainWindow = window;
 
@@ -107,6 +131,9 @@ namespace FileManager.UI
                         // resolves its profile name through the shell's loaded profile list — starting
                         // the pump before that list existed left every row of the first seed nameless.
                         _ = pump.RunAsync(_shutdown.Token);
+                        // Ages the retained preview's caption once a minute, so "Previewed 3 min ago"
+                        // advances and the staleness banner appears without the user touching anything.
+                        _previewAgeTicker = viewModel.StartPreviewAgeTicker();
                         // The idle baseline every later sample is read against: posted at Background
                         // priority so it runs once the first paint, the font atlases and the profile
                         // list are done, rather than mid-startup.
@@ -120,6 +147,7 @@ namespace FileManager.UI
                 desktop.Exit += (_, _) =>
                 {
                     _shutdown.Cancel();
+                    _previewAgeTicker?.Dispose();
                     _gateway?.DisposeAsync().AsTask().GetAwaiter().GetResult();
                 };
             }

@@ -12,11 +12,20 @@ namespace FileManager.Core.Watching;
 /// on <c>(ProfileId, SourcePath)</c> while pending, FIFO otherwise; the dequeue side blocks while the
 /// engine is paused. One consumer (the orchestrator's loop, §8) calls <see cref="DequeueAsync"/>;
 /// many producers call <see cref="Enqueue"/>. The pause gate re-arms from
-/// <see cref="IPauseStateService.Subscribe"/>.</summary>
+/// <see cref="IPauseStateService.Subscribe"/>.
+///
+/// <para><b>Two independent pauses, with different shapes.</b> The GLOBAL pause
+/// (<see cref="IPauseStateService"/>) shuts the dequeue gate outright — nothing is served. A PER-RUN pause
+/// (<see cref="IRunPauseGate"/>) is a filter instead: the consumer skips past a paused run's payloads and
+/// serves the next eligible one, so pausing one run does not stall every other. The queue stays FIFO among
+/// eligible payloads, and a paused run's entries keep their positions, so resuming does not send it to the
+/// back of the line.</para></summary>
 public sealed class TriggerQueue : ITriggerQueue, IDisposable
 {
     private readonly ILogger<TriggerQueue> _logger;
+    private readonly IRunPauseGate _runPause;
     private readonly IDisposable _pauseSubscription;
+    private readonly IDisposable _runPauseSubscription;
 
     private readonly object _gate = new();
     private readonly LinkedList<Payload> _queue = new();
@@ -29,12 +38,19 @@ public sealed class TriggerQueue : ITriggerQueue, IDisposable
     private TaskCompletionSource _wakeup = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private volatile bool _paused;
 
-    public TriggerQueue(IPauseStateService pauseState, ILogger<TriggerQueue> logger)
+    public TriggerQueue(IPauseStateService pauseState, ILogger<TriggerQueue> logger, IRunPauseGate? runPause = null)
     {
         ArgumentNullException.ThrowIfNull(pauseState);
         _logger = logger;
+        // Optional so every existing test and any host without a run coordinator keeps constructing this
+        // with two arguments and gets the never-paused behaviour it had before per-run pause existed.
+        _runPause = runPause ?? NullRunPauseGate.Instance;
         _paused = pauseState.IsPaused;
         _pauseSubscription = pauseState.Subscribe(OnPauseChanged);
+        // A resumed run may have payloads that were skipped while the consumer was parked on _wakeup, so
+        // the same wake the global resume needs is needed here — without it a resume takes effect only
+        // when the NEXT unrelated Enqueue happens to signal.
+        _runPauseSubscription = _runPause.Subscribe(OnRunPauseChanged);
     }
 
     public int PendingCount
@@ -111,9 +127,12 @@ public sealed class TriggerQueue : ITriggerQueue, IDisposable
             Task wait;
             lock (_gate)
             {
-                if (!_paused && _queue.First is { } head)
+                // FirstEligible, not First: a per-run pause filters rather than blocks, so the consumer
+                // walks past a paused run's entries to the next payload it may serve. Null means "nothing
+                // servable right now" — an empty queue and an all-paused one are the same wait.
+                if (!_paused && FirstEligible() is { } head)
                 {
-                    _queue.RemoveFirst();
+                    _queue.Remove(head);
                     _index.Remove(KeyOf(head.Value));
                     next = head.Value;
                     wait = Task.CompletedTask;
@@ -134,11 +153,43 @@ public sealed class TriggerQueue : ITriggerQueue, IDisposable
         }
     }
 
+    /// <summary>The first pending payload the consumer may serve: the earliest one whose run is not
+    /// individually paused. Must be called under <see cref="_gate"/>.
+    ///
+    /// <para>Walks rather than peeking, which is the cost of per-run pause and is bounded by the number of
+    /// PAUSED entries ahead of the first eligible one — zero in the ordinary case, since
+    /// <see cref="IRunPauseGate.IsRunPaused"/> short-circuits on <see cref="Guid.Empty"/> and nothing is
+    /// paused. It is a linear scan only while a paused run has a long pending prefix, which is exactly the
+    /// situation the user created on purpose.</para>
+    ///
+    /// <para>The gate is read here rather than cached per payload deliberately: a run's pause state can
+    /// change between two dequeues, and the coordinator is the only authority on it.</para></summary>
+    private LinkedListNode<Payload>? FirstEligible()
+    {
+        for (LinkedListNode<Payload>? node = _queue.First; node is not null; node = node.Next)
+        {
+            // A null RunId is a payload belonging to no run (a watcher or scheduler trigger), which no
+            // per-run pause can withhold — so it is eligible without consulting the gate at all.
+            if (node.Value.RunId is not Guid runId || !_runPause.IsRunPaused(runId))
+                return node;
+        }
+        return null;
+    }
+
     private void OnPauseChanged(bool paused)
     {
         _paused = paused;
         if (!paused)
             Wake();   // let the consumer re-check the gate
+    }
+
+    /// <summary>Re-checks the gate after a per-run pause transition. Only a RESUME can make a previously
+    /// ineligible payload servable, so only a resume needs the wake — a pause takes effect on the
+    /// consumer's next pass either way, and waking on it would be a spurious loop.</summary>
+    private void OnRunPauseChanged(Guid runId, bool paused)
+    {
+        if (!paused)
+            Wake();
     }
 
     private void Wake()
@@ -155,5 +206,9 @@ public sealed class TriggerQueue : ITriggerQueue, IDisposable
     private static string KeyOf(Payload payload) =>
         payload.ProfileId.ToString("N") + "\0" + payload.SourcePath;
 
-    public void Dispose() => _pauseSubscription.Dispose();
+    public void Dispose()
+    {
+        _pauseSubscription.Dispose();
+        _runPauseSubscription.Dispose();
+    }
 }

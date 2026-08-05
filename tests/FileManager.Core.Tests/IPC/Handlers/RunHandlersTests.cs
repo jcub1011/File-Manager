@@ -294,6 +294,64 @@ public sealed class RunHandlersTests : IDisposable
         Assert.Equal("RUN_NOT_FOUND", Assert.IsType<ErrorResponse>(response).Code);
     }
 
+    // ---- get-runs / set-run-paused ---------------------------------------------------------------
+
+    [Fact]
+    public async Task Get_runs_answers_with_what_the_coordinator_holds()
+    {
+        RunSummaryDto run = new(
+            Guid.NewGuid(), Guid.NewGuid(), "Photos", "Executing", "None",
+            Paused: false, Waiting: false, DateTimeOffset.UnixEpoch, DateTimeOffset.UnixEpoch,
+            10, 0, 1024, 0, 3, 0, 0, 0, false, null);
+        FakeRunCoordinator runs = new() { Runs = [run] };
+        GetRunsHandler handler = new(runs);
+
+        IpcResponse response = await handler.HandleAsync(new GetRunsRequest());
+
+        Assert.Equal(run, Assert.Single(Assert.IsType<RunsResponse>(response).Runs));
+        Assert.Equal(1, runs.ListRunsCalls);
+    }
+
+    /// <summary>An idle engine answers an empty list, not an error — the same contract get-recent-jobs
+    /// documents, and what lets a queue window show an honest empty state rather than a banner.</summary>
+    [Fact]
+    public async Task Get_runs_on_an_idle_engine_is_an_empty_list_not_an_error()
+    {
+        IpcResponse response = await new GetRunsHandler(new FakeRunCoordinator())
+            .HandleAsync(new GetRunsRequest());
+
+        Assert.Empty(Assert.IsType<RunsResponse>(response).Runs);
+    }
+
+    [Fact]
+    public async Task Set_run_paused_passes_the_run_and_the_flag_through()
+    {
+        FakeRunCoordinator runs = new();
+        SetRunPausedHandler handler = new(runs);
+        Guid runId = Guid.NewGuid();
+
+        Assert.IsType<OkResponse>(
+            await handler.HandleAsync(new SetRunPausedRequest { RunId = runId, Paused = true }));
+        Assert.IsType<OkResponse>(
+            await handler.HandleAsync(new SetRunPausedRequest { RunId = runId, Paused = false }));
+
+        Assert.Equal([(runId, true), (runId, false)], runs.PauseCalls);
+    }
+
+    /// <summary>RUN_NOT_FOUND — the same code cancel-run uses, deliberately: for a client whose rows come
+    /// from a lossy stream, "that run is gone" is one situation, not two to learn.</summary>
+    [Fact]
+    public async Task Pausing_a_run_the_coordinator_refuses_is_RUN_NOT_FOUND()
+    {
+        FakeRunCoordinator runs = new() { SetPausedError = "no run with id" };
+        SetRunPausedHandler handler = new(runs);
+
+        IpcResponse response = await handler.HandleAsync(
+            new SetRunPausedRequest { RunId = Guid.NewGuid(), Paused = true });
+
+        Assert.Equal("RUN_NOT_FOUND", Assert.IsType<ErrorResponse>(response).Code);
+    }
+
     /// <summary>Records what the handlers asked for, and can be scripted to refuse. Hand-written like
     /// every other double in this suite.</summary>
     private sealed class FakeRunCoordinator : IRunCoordinator
@@ -336,6 +394,26 @@ public sealed class RunHandlersTests : IDisposable
                 return CancelError;
             Cancellations.Add(runId);
             return Result.Success();
+        }
+
+        public List<(Guid RunId, bool Paused)> PauseCalls { get; } = [];
+        public string? SetPausedError { get; init; }
+
+        public Result SetPaused(Guid runId, bool paused)
+        {
+            if (SetPausedError is not null)
+                return SetPausedError;
+            PauseCalls.Add((runId, paused));
+            return Result.Success();
+        }
+
+        public IReadOnlyList<RunSummaryDto> Runs { get; init; } = [];
+        public int ListRunsCalls { get; private set; }
+
+        public IReadOnlyList<RunSummaryDto> ListRuns()
+        {
+            ListRunsCalls++;
+            return Runs;
         }
 
         public RunStatus? GetStatus(Guid runId) => null;

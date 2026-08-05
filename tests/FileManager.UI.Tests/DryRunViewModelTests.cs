@@ -1,5 +1,6 @@
 using System.Linq;
 using FileManager.Contracts.DryRun;
+using Microsoft.Extensions.Time.Testing;
 using FileManager.Contracts.IPC;
 using FileManager.Contracts.Primitives;
 using FileManager.Contracts.Profiles;
@@ -12,11 +13,11 @@ namespace FileManager.UI.Tests;
 
 public sealed class DryRunViewModelTests
 {
-    private static (DryRunViewModel ViewModel, FakeIpcGateway Gateway) NewViewModel()
+    private static (DryRunViewModel ViewModel, FakeIpcGateway Gateway) NewViewModel(TimeProvider? time = null)
     {
         FakeIpcGateway gateway = new();
         // Zero debounce keeps search-driven rebuilds synchronous so tests can assert immediately.
-        DryRunViewModel viewModel = new(gateway, searchDebounce: TimeSpan.Zero);
+        DryRunViewModel viewModel = new(gateway, searchDebounce: TimeSpan.Zero, time: time);
         viewModel.SetProfile(Guid.NewGuid(), "P");
         return (viewModel, gateway);
     }
@@ -1510,32 +1511,123 @@ public sealed class DryRunViewModelTests
         Assert.Contains("not awaiting approval", viewModel.ErrorMessage);
     }
 
+    /// <summary>Previously this view model declined the previous run itself. It must NOT any more: a
+    /// preview is retained per PROFILE now, and this type has no idea which profile a run belongs to — so
+    /// declining here would kill the result held for a different profile. <c>PreviewStore</c> owns the
+    /// obligation, and <c>PreviewStoreTests</c> pins that it is honoured.</summary>
     [Fact]
-    public async Task A_superseding_preview_declines_the_run_the_previous_one_left_parked()
+    public async Task A_superseding_preview_leaves_the_previous_run_for_the_store_to_answer()
     {
-        // A run in AwaitingApproval holds a snapshot directory and has no expiry, so an unanswered
-        // preview would leak one for the lifetime of the service.
         var (viewModel, gateway) = NewViewModel();
         gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value);
-        Guid first = await RunPlans.PreviewAsync(viewModel, gateway);
+        await RunPlans.PreviewAsync(viewModel, gateway);
 
         Guid second = await RunPlans.PreviewAsync(viewModel, gateway);
 
-        Assert.Equal((first, false), Assert.Single(gateway.ApproveRunCalls));
+        Assert.Empty(gateway.ApproveRunCalls);
         Assert.Equal(second, viewModel.PendingRunId);
     }
 
+    /// <summary>Closing the profile drops the FOOTER's state but keeps the run alive, so re-selecting the
+    /// profile can re-stream its rows. This is the change that makes a preview survive navigation; the
+    /// snapshot it holds is released by <c>PreviewStore.DeclineAllAsync</c> on window close.</summary>
     [Fact]
-    public async Task Closing_the_profile_declines_the_run_the_preview_left_parked()
+    public async Task Closing_the_profile_keeps_the_run_parked_so_the_preview_can_be_reopened()
+    {
+        var (viewModel, gateway) = NewViewModel();
+        gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value);
+        await RunPlans.PreviewAsync(viewModel, gateway);
+
+        viewModel.ClearProfile();
+
+        Assert.Empty(gateway.ApproveRunCalls);
+        Assert.Null(viewModel.PendingRunId);   // nothing on screen to approve
+        Assert.False(viewModel.HasReport);
+    }
+
+    /// <summary>The age comes from the PLAN's own timestamp, not from when the tab rendered it. The second
+    /// case is the one that matters: a long-ago plan reads stale the moment it is shown, which is exactly
+    /// what a preview restored after the app sat open all afternoon must do.</summary>
+    [Fact]
+    public async Task A_plan_carries_the_age_its_staleness_is_measured_from()
+    {
+        var (viewModel, gateway) = NewViewModel();
+        gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value);
+
+        DateTimeOffset now = DateTimeOffset.UtcNow;
+        await RunPlans.PreviewAsync(viewModel, gateway, plannedAtUtc: now);
+        Assert.Equal(now, viewModel.PreviewTakenAtUtc);
+        Assert.True(viewModel.HasPreviewAge);
+        Assert.False(viewModel.IsPreviewStale);
+
+        await RunPlans.PreviewAsync(viewModel, gateway, plannedAtUtc: now - TimeSpan.FromHours(3));
+        Assert.True(viewModel.IsPreviewStale);
+        Assert.Contains("3 hr ago", viewModel.PreviewAgeText);
+    }
+
+    /// <summary>The threshold really governs the flag, and the age comes from the PLAN's timestamp rather
+    /// than from when the tab rendered it — which is what makes a reopened preview report its true age
+    /// instead of looking freshly taken.</summary>
+    [Fact]
+    public async Task A_preview_older_than_the_threshold_reads_as_stale()
+    {
+        FakeTimeProvider clock = new(DateTimeOffset.Parse("2026-08-05T12:00:00Z"));
+        var (viewModel, gateway) = NewViewModel(time: clock);
+        gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value);
+        viewModel.PreviewStaleAfter = TimeSpan.FromMinutes(15);
+        await RunPlans.PreviewAsync(viewModel, gateway, plannedAtUtc: clock.GetUtcNow());
+
+        Assert.False(viewModel.IsPreviewStale);
+
+        clock.Advance(TimeSpan.FromMinutes(14));
+        viewModel.RefreshPreviewAge();
+        Assert.False(viewModel.IsPreviewStale);
+        Assert.Contains("14 min ago", viewModel.PreviewAgeText);
+
+        clock.Advance(TimeSpan.FromMinutes(2));
+        viewModel.RefreshPreviewAge();
+        Assert.True(viewModel.IsPreviewStale);
+        Assert.Contains("may be out of date", viewModel.PreviewStaleNotice);
+    }
+
+    /// <summary>A restore whose run has gone — the ORDINARY case after a service restart, since the engine
+    /// sweeps its runs directory at startup. It must read as an expired preview, not as a failure.</summary>
+    [Fact]
+    public async Task Restoring_a_preview_whose_run_has_gone_reports_expiry_without_an_error()
+    {
+        var (viewModel, gateway) = NewViewModel();
+        Guid runId = Guid.NewGuid();
+        gateway.RunPlanResults[runId] = new IpcError("RUN_NOT_FOUND", $"no run with id {runId}");
+
+        bool restored = await viewModel.RestoreAsync(
+            new StoredPreview(RunPlans.Planned(runId, viewModel.ProfileId!.Value), DateTimeOffset.UtcNow));
+
+        Assert.False(restored);
+        Assert.Null(viewModel.ErrorMessage);       // not a failure — no danger banner
+        Assert.Null(viewModel.PendingRunId);
+        Assert.Null(viewModel.PreviewTakenAtUtc);
+        Assert.Contains("expired", viewModel.EmptyStateText);
+    }
+
+    /// <summary>A restore streams the run's frozen plan back through the SAME ingest path a fresh preview
+    /// uses, and raises the footer again — that is what makes the result re-approvable after navigating
+    /// away and back.</summary>
+    [Fact]
+    public async Task Restoring_a_preview_brings_back_its_rows_and_its_footer()
     {
         var (viewModel, gateway) = NewViewModel();
         gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value);
         Guid runId = await RunPlans.PreviewAsync(viewModel, gateway);
-
+        RunPlannedEvent planned = RunPlans.Planned(runId, viewModel.ProfileId!.Value);
         viewModel.ClearProfile();
+        Assert.False(viewModel.HasReport);
 
-        Assert.Equal((runId, false), Assert.Single(gateway.ApproveRunCalls));
-        Assert.Null(viewModel.PendingRunId);
+        bool restored = await viewModel.RestoreAsync(new StoredPreview(planned, planned.AtUtc));
+
+        Assert.True(restored);
+        Assert.True(viewModel.HasReport);
+        Assert.Equal(runId, viewModel.PendingRunId);
+        Assert.Equal(planned.AtUtc, viewModel.PreviewTakenAtUtc);
     }
 
     [Fact]

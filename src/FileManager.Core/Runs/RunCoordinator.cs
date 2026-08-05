@@ -32,6 +32,12 @@ namespace FileManager.Core.Runs;
 /// <c>JobOrchestrator</c> → <c>IJobExecutor</c>, entirely unchanged. The executor re-screens and
 /// re-checks-unchanged, so it can only ever do LESS than the plan predicted, never more — which is
 /// what makes the plan safe to treat as a ceiling.</para></summary>
+/// <para><b>Runs are individually pausable</b> (<see cref="IRunPauseGate"/>), and a pause only ever
+/// withholds work that has not started — it never aborts anything, which is what separates it from the
+/// global engine pause. Three places observe it: the planning walk, the trigger queue's dequeue filter,
+/// and the Mirror deletion pass. The paused interval is also SUBTRACTED from the drain barrier's deadline,
+/// without which a run paused for longer than <c>MirrorBarrierTimeout</c> would time out and have its
+/// deletion phase refused for an accounting artifact rather than a safety reason.</para></summary>
 public sealed class RunCoordinator(
     IProfilePlanner planner,
     ITriggerQueue queue,
@@ -42,8 +48,14 @@ public sealed class RunCoordinator(
     EnginePaths paths,
     EngineConfig config,
     TimeProvider time,
+    RunPauseRegistry runPause,
     ILogger<RunCoordinator> logger) : IRunCoordinator
 {
+    /// <summary>How often a paused run re-checks whether it may proceed. Only ever waited on by a run the
+    /// user deliberately paused, so a coarse poll costs nothing and keeps the gate a readable loop rather
+    /// than a per-run wait handle — the same trade <see cref="DrainPollInterval"/> makes.</summary>
+    private static readonly TimeSpan PausePollInterval = TimeSpan.FromMilliseconds(200);
+
     /// <summary>How often the drain loop re-checks the barrier. A run takes seconds to minutes, so this
     /// costs nothing and keeps the barrier logic a readable loop rather than a web of callbacks.</summary>
     private static readonly TimeSpan DrainPollInterval = TimeSpan.FromMilliseconds(200);
@@ -60,6 +72,13 @@ public sealed class RunCoordinator(
     private readonly ConcurrentDictionary<Guid, RunState> _runs = new();
     private readonly CancellationTokenSource _shutdown = new();
 
+
+    /// <summary>Caps how many runs may be WALKING at once. Held for the duration of the plan walk only —
+    /// released the moment the work list is frozen, because a run parked awaiting approval is doing no work
+    /// and holding a slot for it would deadlock the queue once
+    /// <see cref="EngineConfig.MaxConcurrentPlans"/> previews were on screen.</summary>
+    private readonly SemaphoreSlim _planSlots = new(config.MaxConcurrentPlans, config.MaxConcurrentPlans);
+
     /// <summary>Drains closed runs while the service is idle. Lazily created on the first
     /// <see cref="Begin"/>, so a host that never runs anything never arms a timer, and disposed by
     /// <see cref="StopAsync"/>.</summary>
@@ -72,7 +91,7 @@ public sealed class RunCoordinator(
         if (_shutdown.IsCancellationRequested)
             return "the service is shutting down";
 
-        RunState run = new(Guid.NewGuid(), profile, scopePath);
+        RunState run = new(Guid.NewGuid(), profile, scopePath, time.GetUtcNow());
         _runs[run.RunId] = run;
         PruneClosedRuns();
         ArmPruneTimer();
@@ -214,6 +233,7 @@ public sealed class RunCoordinator(
             }
         }
         CleanUpSnapshot(run);   // before Closed is observable — see Close()
+        runPause.Forget(run.RunId);
         lock (run.Gate)
         {
             run.Phase = RunPhase.Closed;
@@ -230,6 +250,18 @@ public sealed class RunCoordinator(
         if (!_runs.TryGetValue(runId, out RunState? run))
             return $"no run with id {runId}";
         run.Cancel.Cancel();
+        // CANCEL SUPERSEDES PAUSE, and this line is load-bearing rather than tidy-up. A paused run's
+        // remaining work is dropped below and its deletion phase is skipped, so the pause has nothing left
+        // to withhold — but the drain loop treats a paused run as never quiescent (deliberately, so the
+        // destructive phase cannot start behind the user's back). Leaving the flag set therefore parks a
+        // cancelled run in Executing until the 30-minute barrier deadline expires: it never reaches Closed,
+        // never cleans up its snapshot, and never leaves the queue. Found by
+        // RunPauseTests.A_paused_run_is_never_treated_as_drained_by_the_quiescence_backstop, whose teardown
+        // hung on exactly this.
+        //
+        // Forget rather than resume: it does not notify, so a cancelled run cannot emit a phantom wake
+        // telling the trigger queue to look for work that has just been dropped.
+        runPause.Forget(runId);
         // Work not yet started need not happen. Work already in flight is never interrupted
         // (I-ATOMIC-JOB) — the drain loop waits for it, and the deletion phase is skipped.
         int dropped = queue.DropRun(runId);
@@ -250,8 +282,71 @@ public sealed class RunCoordinator(
         return Result.Success();
     }
 
+    public Result SetPaused(Guid runId, bool paused)
+    {
+        if (!_runs.TryGetValue(runId, out RunState? run))
+            return $"no run with id {runId}";
+
+        lock (run.Gate)
+        {
+            // A closed run cannot be paused, and saying so beats silently accepting it: the caller's UI
+            // would otherwise show a paused row for a run that has already finished.
+            if (run.Phase == RunPhase.Closed)
+                return $"run {runId} has already finished";
+        }
+
+        // The registry is the source of truth for the FLAG (the trigger queue reads it on every dequeue);
+        // this method owns the accounting a transition implies. Set reports whether anything changed, so
+        // pausing an already-paused run stays idempotent rather than announcing a phantom transition.
+        if (!runPause.Set(runId, paused))
+            return Result.Success();
+
+        lock (run.Gate)
+        {
+            // The drain barrier's deadline must not run while the user is holding the run. Started on
+            // pause, folded into PausedElapsed on resume — see AwaitDrainAsync.
+            if (paused)
+                run.PausedSinceTicks = time.GetTimestamp();
+            else if (run.PausedSinceTicks is { } since)
+            {
+                run.PausedElapsed += time.GetElapsedTime(since);
+                run.PausedSinceTicks = null;
+            }
+        }
+
+        logger.LogInformation("Run {RunId} was {State}", runId, paused ? "paused" : "resumed");
+        // So a paused run keeps saying so rather than looking wedged — the counters stop moving, and this
+        // sample is the only thing that distinguishes the two.
+        PublishProgress(run);
+        return Result.Success();
+    }
+
+    /// <summary>Blocks while this run is paused. Returns when it resumes, is cancelled, or the service is
+    /// shutting down — never throws for a pause, only for the cancellation the caller already handles.
+    /// <para>Polls rather than waiting on a handle: only a deliberately paused run ever gets here, and the
+    /// caller is a loop that must also observe cancellation, which a poll gives for free.</para></summary>
+    private async Task WaitWhileRunPausedAsync(RunState run, CancellationToken ct)
+    {
+        while (runPause.IsRunPaused(run.RunId) && !run.Cancelled && !ct.IsCancellationRequested)
+            await Task.Delay(PausePollInterval, ct).ConfigureAwait(false);
+    }
+
     public RunStatus? GetStatus(Guid runId) =>
         _runs.TryGetValue(runId, out RunState? run) ? run.Snapshot() : null;
+
+    public IReadOnlyList<RunSummaryDto> ListRuns()
+    {
+        List<RunSummaryDto> runs = [];
+        // ConcurrentDictionary enumeration is a moving snapshot, which is exactly right here: a run that
+        // starts or is pruned mid-enumeration simply is or is not in this answer, and the caller re-seeds
+        // from the event stream either way.
+        foreach (RunState run in _runs.Values)
+            runs.Add(run.Summarize(runPause.IsRunPaused(run.RunId)));
+        // Newest first, matching get-recent-jobs, so a client can prepend without re-sorting. StartedAt is
+        // monotonic per run because Begin stamps it before publishing anything.
+        runs.Sort(static (a, b) => b.StartedAtUtc.CompareTo(a.StartedAtUtc));
+        return runs;
+    }
 
     public string? SnapshotDirectory(Guid runId) =>
         _runs.TryGetValue(runId, out RunState? run) ? run.Directory : null;
@@ -325,6 +420,9 @@ public sealed class RunCoordinator(
             // cancellation unwind, and teardown must finish regardless.
             logger.LogDebug(ex, "A run did not unwind cleanly during shutdown");
         }
+        // After the runs have unwound: a run still queued on a plan slot is released by _shutdown
+        // cancelling its WaitAsync, and disposing the semaphore while one waits would throw there instead.
+        _planSlots.Dispose();
         _shutdown.Dispose();
     }
 
@@ -344,9 +442,30 @@ public sealed class RunCoordinator(
         // whose source it simply never saw, so it has to reach the deletion gate.
         DryRunProgressCounters counters = new();
         string? failure = null;
+        DateTimeOffset? plannedAt = null;
+        bool slotHeld = false;
 
         try
         {
+            // Bounded concurrency. Several previews at once is the point of the job queue, but planning is
+            // the memory-hungry half of a run — the service measured ~292 MB producing ONE 33k-file plan,
+            // so an unbounded fan-out of large profiles exhausts it. The run stays in RunPhase.Planning
+            // while queued and reports the Waiting phase, so a client can say "waiting" instead of showing
+            // a scan stuck at zero.
+            //
+            // Taken BEFORE the writer is constructed: a queued run should not be holding an open snapshot
+            // file, and the directory it would create is cleaned up on the failure path either way.
+            if (!_planSlots.Wait(0))
+            {
+                lock (run.Gate)
+                    run.WaitingToPlan = true;
+                PublishPlanningProgress(run, counters);   // so the wait is visible, not silent
+                await _planSlots.WaitAsync(linked.Token).ConfigureAwait(false);
+                lock (run.Gate)
+                    run.WaitingToPlan = false;
+            }
+            slotHeld = true;
+
             using RunSnapshotWriter writer = new(directory, logger);
             // Seeded with a real timestamp, never left at 0: GetElapsedTime(0) reads as machine uptime,
             // which would make the interval below meaningless.
@@ -362,6 +481,15 @@ public sealed class RunCoordinator(
                 }
                 chunk.TryGetValue(out PlanChunk planned);
                 writer.Consume(planned, run.Profile);
+                // Between chunks, never mid-chunk: the writer has just consumed a complete chunk, so this
+                // is a point at which the snapshot on disk is coherent and the enumerator holds no
+                // half-read directory. Pausing inside the planner would mean holding scan-scheduler slots
+                // and directory handles open for as long as the user cared to wait.
+                if (runPause.IsRunPaused(run.RunId))
+                {
+                    PublishPlanningProgress(run, counters);   // say so before going quiet
+                    await WaitWhileRunPausedAsync(run, linked.Token).ConfigureAwait(false);
+                }
                 // Live scan counts, so a multi-minute preview is distinguishable from a wedged one. Chunks
                 // already arrive in batches, and the interval bounds it again for a tree of small chunks;
                 // the event is lossy by contract, so a dropped sample costs nothing.
@@ -377,6 +505,7 @@ public sealed class RunCoordinator(
 
             if (failure is null)
             {
+                plannedAt = time.GetUtcNow();
                 run.PlannedCopies = writer.CopyCount;
                 run.PlannedDeletes = writer.DeleteCount;
                 run.PlannedCopyBytes = writer.CopyBytes;
@@ -389,7 +518,10 @@ public sealed class RunCoordinator(
                     RunId = run.RunId,
                     Profile = run.Profile,
                     ScopePath = run.ScopePath,
-                    PlannedAtUtc = time.GetUtcNow(),
+                    // The same instant reported to clients as RunSummaryDto.PlannedAtUtc, not a second
+                    // call: a client measures a stored preview's staleness against that value, and the
+                    // snapshot is what it is measuring the age OF.
+                    PlannedAtUtc = plannedAt.Value,
                     CopyItemCount = writer.CopyCount,
                     DeleteItemCount = writer.DeleteCount,
                     CopyBytes = writer.CopyBytes,
@@ -417,10 +549,25 @@ public sealed class RunCoordinator(
             logger.LogError(ex, "Run {RunId} failed while planning", run.RunId);
             failure = ex.Message;
         }
+        finally
+        {
+            // Released as soon as the WALK is over, not when the run closes: a run parked in
+            // AwaitingApproval is doing no work and must not hold a planning slot — with previews now
+            // retained per profile, several parked runs are the normal state, and holding slots for them
+            // would deadlock the queue after MaxConcurrentPlans previews.
+            if (slotHeld)
+                _planSlots.Release();
+            lock (run.Gate)
+            {
+                run.WaitingToPlan = false;
+                run.PlannedAt = plannedAt;
+            }
+        }
 
         if (failure is not null || run.Cancelled)
         {
             CleanUpSnapshot(run);   // before Closed is observable — see Close()
+            runPause.Forget(run.RunId);
             lock (run.Gate)
             {
                 run.Phase = RunPhase.Closed;
@@ -606,12 +753,23 @@ public sealed class RunCoordinator(
             PublishProgress(run);
 
             bool quiescent;
+            TimeSpan paused;
             lock (run.Gate)
             {
-                quiescent = run.EnqueueComplete
+                // A paused run is not quiescent, however long it has been still. The PendingCountForRun
+                // check below already covers the ordinary case — a paused run's payloads stay pending —
+                // but not the moment after its last payload was dequeued, where nothing is pending, the
+                // in-flight job is finishing, and the settle clock has run past the window. Reading that
+                // as "drained" would let the deletion phase start while the user believes the run is held.
+                quiescent = !runPause.IsRunPaused(run.RunId)
+                    && run.EnqueueComplete
                     && queue.PendingCountForRun(run.RunId) == 0
                     && time.GetElapsedTime(run.LastSettleTicks) > config.MirrorQuiescenceWindow
                     && run.Settled < run.Expected;
+                // Includes the pause in progress, so the deadline stays frozen for its whole duration
+                // rather than only catching up when the user resumes.
+                paused = run.PausedElapsed
+                    + (run.PausedSinceTicks is { } since ? time.GetElapsedTime(since) : TimeSpan.Zero);
             }
             if (quiescent)
             {
@@ -622,7 +780,10 @@ public sealed class RunCoordinator(
                 return;
             }
 
-            if (time.GetElapsedTime(started) >= config.MirrorBarrierTimeout)
+            // Minus the paused interval: the deadline measures how long the WORK has been unaccounted for,
+            // not how long the run object has existed. A user holding a run must not be able to talk it
+            // into a timeout.
+            if (time.GetElapsedTime(started) - paused >= config.MirrorBarrierTimeout)
             {
                 // Deliberately NOT "assume it drained": the deletion phase reads Failed/unaccounted
                 // work as a reason to delete nothing, and that is the correct outcome here.
@@ -728,6 +889,10 @@ public sealed class RunCoordinator(
         // setting the phase first left a window in which a closed run still had its snapshot
         // directory on disk and still handed out a path to it.
         CleanUpSnapshot(run);
+        // Also before Closed becomes observable, and for the same reason: a closed run must not read as
+        // paused. Forget rather than resume — it does not notify, so a run cancelled while paused cannot
+        // produce a phantom wake telling the queue to look for work that no longer exists.
+        runPause.Forget(run.RunId);
         lock (run.Gate)
         {
             run.Phase = RunPhase.Closed;
@@ -817,6 +982,10 @@ public sealed class RunCoordinator(
         AtUtc = time.GetUtcNow(),
         RunId = run.RunId,
         ProfileId = run.Profile.Id,
+        // From the FROZEN profile, which is the only thing that can answer: a run planned from an unsaved
+        // draft has a profile that is in no catalog, so a client's own lookup returns null for exactly the
+        // runs the GUI starts.
+        ProfileName = run.Profile.Name,
         PlannedCopies = run.PlannedCopies,
         PlannedDeletes = run.PlannedDeletes,
         PlannedCopyBytes = run.PlannedCopyBytes,
@@ -846,18 +1015,34 @@ public sealed class RunCoordinator(
     /// <summary>A progress sample from the PLANNING phase, where the copy counters are all still zero and
     /// the scan counts are the only live figures — there is no denominator yet, because computing one is
     /// what planning is doing.</summary>
-    private void PublishPlanningProgress(RunState run, DryRunProgressCounters counters) =>
+    private void PublishPlanningProgress(RunState run, DryRunProgressCounters counters)
+    {
+        bool paused = runPause.IsRunPaused(run.RunId);
+        bool waiting;
+        lock (run.Gate)
+            waiting = run.WaitingToPlan;
         Publish(new RunProgressEvent
         {
             AtUtc = time.GetUtcNow(),
             RunId = run.RunId,
-            Phase = RunPhase.Planning.ToString(),
+            // WaitingPhase, not Planning, while queued behind the concurrent-plan limit. Both are
+            // RunPhase.Planning to the engine; the distinction exists only because "scanning, 0 files
+            // found" and "not started yet" look identical to a user and mean very different things.
+            Phase = waiting ? WaitingPhase : RunPhase.Planning.ToString(),
             Completed = 0,
             Total = 0,
             Deleted = 0,
             ScannedSources = counters.Sources,
             ScannedDestinations = counters.Destinations,
+            Paused = paused,
         });
+    }
+
+    /// <summary>The <c>Phase</c> string a run reports while queued behind
+    /// <see cref="EngineConfig.MaxConcurrentPlans"/>. Not a <see cref="RunPhase"/> member: the run really
+    /// is in <c>Planning</c>, and adding a phase would ripple through the §7.1 transition tables,
+    /// <see cref="RunStatus"/>, and every consumer of both to express a display distinction.</summary>
+    public const string WaitingPhase = "Waiting";
 
     /// <summary>An execution progress sample.
     /// <para>Reads the counters directly rather than through <c>run.Snapshot()</c>, which allocates a whole
@@ -868,21 +1053,25 @@ public sealed class RunCoordinator(
     {
         RunPhase phase;
         int completed, total, deleted;
+        bool waiting;
+        bool paused = runPause.IsRunPaused(run.RunId);
         lock (run.Gate)
         {
             phase = run.Phase;
             completed = run.Succeeded + run.SkippedJobs + run.Failed;
             total = run.PlannedCopies;
             deleted = run.Deleted;
+            waiting = run.WaitingToPlan;
         }
         Publish(new RunProgressEvent
         {
             AtUtc = time.GetUtcNow(),
             RunId = run.RunId,
-            Phase = phase.ToString(),
+            Phase = waiting && phase == RunPhase.Planning ? WaitingPhase : phase.ToString(),
             Completed = completed,
             Total = total,
             Deleted = deleted,
+            Paused = paused,
         });
     }
 
@@ -927,13 +1116,21 @@ public sealed class RunCoordinator(
     /// <summary>One run's mutable state. Everything mutable is guarded by <see cref="Gate"/>; the
     /// counters are touched from the orchestrator's worker threads (via <c>Settled</c>) as well as the
     /// run's own task.</summary>
-    private sealed class RunState(Guid runId, Profile profile, string? scopePath)
+    private sealed class RunState(Guid runId, Profile profile, string? scopePath, DateTimeOffset startedAt)
     {
         public Guid RunId { get; } = runId;
         public Profile Profile { get; } = profile;
         public string? ScopePath { get; } = scopePath;
         public object Gate { get; } = new();
         public CancellationTokenSource Cancel { get; } = new();
+
+        /// <summary>When the run was created. Immutable, and the queue's sort key — a run that has not
+        /// finished planning has no <see cref="PlannedAt"/> and would otherwise have no position.</summary>
+        public DateTimeOffset StartedAt { get; } = startedAt;
+
+        /// <summary>When planning finished and the work list was frozen; null until then. The same value
+        /// stamped into the snapshot header, so a client's staleness age and the snapshot agree.</summary>
+        public DateTimeOffset? PlannedAt { get; set; }
 
         public Task? Work { get; set; }
         public string? Directory { get; set; }
@@ -942,6 +1139,24 @@ public sealed class RunCoordinator(
         public RunOutcome Outcome { get; set; } = RunOutcome.None;
         public bool Cancelled { get; set; }
         public DateTimeOffset? ClosedAt { get; set; }
+
+        /// <summary>Timestamp the current pause began, or null when not paused. Folded into
+        /// <see cref="PausedElapsed"/> on resume.</summary>
+        public long? PausedSinceTicks { get; set; }
+
+        /// <summary>Total time this run has spent paused across every pause, SUBTRACTED from the drain
+        /// barrier's deadline.
+        /// <para>Not bookkeeping for its own sake. The barrier's deadline is
+        /// <c>MirrorBarrierTimeout</c> (30 minutes) and expiring it sets <see cref="BarrierTimedOut"/>,
+        /// which refuses the Mirror deletion phase. Without this, pausing a run over a lunch break would
+        /// make it come back and delete nothing — reported as unaccounted copies, which is a safety
+        /// message about something that was never unsafe.</para></summary>
+        public TimeSpan PausedElapsed { get; set; }
+
+        /// <summary>Planning has started but is queued behind the concurrent-plan limit — no walking yet.
+        /// Reported so the UI can say "waiting" rather than showing a scan at zero, which is
+        /// indistinguishable from a wedged one.</summary>
+        public bool WaitingToPlan { get; set; }
 
         public int PlannedCopies { get; set; }
         public int PlannedDeletes { get; set; }
@@ -1013,6 +1228,28 @@ public sealed class RunCoordinator(
                     PlanError = PlanError,
                     DeletionFailures = [.. DeletionFailures],
                 };
+            }
+        }
+
+        /// <summary>The wire form, for <c>get-runs</c>. Separate from <see cref="Snapshot"/> rather than
+        /// projected from it because the two answer different questions: <c>RunStatus</c> is the engine's
+        /// own read model (and carries a copy of the deletion-failure list), while this is a display row
+        /// and adds the profile name, the pause/waiting flags, and the two timestamps a queue needs.</summary>
+        /// <param name="paused">Read from <see cref="RunPauseRegistry"/> by the caller — the flag lives
+        /// there, not here, so the trigger queue can consult it without knowing about runs.</param>
+        public RunSummaryDto Summarize(bool paused)
+        {
+            lock (Gate)
+            {
+                return new RunSummaryDto(
+                    RunId, Profile.Id, Profile.Name,
+                    // Waiting is a display distinction over Planning, not a phase — see
+                    // RunCoordinator.WaitingPhase.
+                    WaitingToPlan && Phase == RunPhase.Planning ? WaitingPhase : Phase.ToString(),
+                    Outcome.ToString(),
+                    paused, WaitingToPlan, StartedAt, PlannedAt,
+                    PlannedCopies, PlannedDeletes, PlannedCopyBytes, PlannedDeleteBytes,
+                    Succeeded, SkippedJobs, Failed, Deleted, PlanTruncated, PlanError);
             }
         }
     }

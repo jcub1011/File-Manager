@@ -43,8 +43,15 @@ public sealed class MirrorDeletionPass(
     IJobLogStore jobLog,
     EngineConfig config,
     TimeProvider time,
-    ILogger<MirrorDeletionPass> logger) : IMirrorDeletionPass
+    ILogger<MirrorDeletionPass> logger,
+    IRunPauseGate? runPause = null) : IMirrorDeletionPass
 {
+    /// <summary>How often a paused pass re-checks. Matches the coordinator's own pause poll.</summary>
+    private static readonly TimeSpan PausePollInterval = TimeSpan.FromMilliseconds(200);
+
+    // Optional so every existing construction and test keeps its argument list and gets never-paused.
+    private readonly IRunPauseGate _runPause = runPause ?? NullRunPauseGate.Instance;
+
     public async Task<MirrorDeletionResult> DeleteAsync(
         MirrorDeletionRequest request, CancellationToken ct = default)
     {
@@ -128,6 +135,29 @@ public sealed class MirrorDeletionPass(
             {
                 midPassAbort = "the engine was paused";
                 break;
+            }
+            // A PER-RUN pause WAITS where the global pause above ABORTS, and the difference is deliberate.
+            // The global pause is a safety brake on the whole engine, so refusing a destructive pass under
+            // it is the conservative reading. A per-run pause is this user saying "hold this one" about a
+            // run they already approved; answering that by silently abandoning its deletion half would
+            // leave the destination not a mirror of the source, reported as an abort reason they never
+            // asked for. Waiting between orphans holds no lock and no journal handle — DeleteOneAsync
+            // acquires and releases per orphan — so a long pause here costs nothing but time.
+            if (_runPause.IsRunPaused(request.RunId))
+            {
+                Log(request, "paused");
+                while (_runPause.IsRunPaused(request.RunId) && !ct.IsCancellationRequested)
+                    await Task.Delay(PausePollInterval, ct).ConfigureAwait(false);
+                Log(request, "resumed");
+                // Re-check the two gates above on the next iteration rather than falling through: the
+                // engine may have been globally paused, or the run cancelled, while we waited.
+                if (ct.IsCancellationRequested || pauseState.IsPaused)
+                {
+                    midPassAbort = ct.IsCancellationRequested
+                        ? "the pass was cancelled"
+                        : "the engine was paused";
+                    break;
+                }
             }
 
             OrphanDisposition disposition;

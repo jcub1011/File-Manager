@@ -76,6 +76,14 @@ public sealed partial class SettingsViewModel : ViewModelBase
             placeholder: "Leave blank to use the default location",
             actionButtonText: "Browse…", actionCommand: BrowseServiceExePathCommand);
 
+        PreviewStaleAfter = Setting.AutoNumber(
+            "application.previewStaleAfter", "Preview Stale After (minutes)",
+            "A preview's results are kept when you switch profiles, so you can come back to them. After "
+            + "this many minutes the Preview tab warns that they may be out of date. The plan itself stays "
+            + "exactly what the run would do — only the folders it was computed from may have changed since, "
+            + $"so an old preview risks being incomplete, never wrong. Auto uses {ClientSettings.DefaultPreviewStaleAfterMinutes} minutes.",
+            ["preview", "dry run", "stale", "out of date", "age", "expiry", "refresh", "minutes", "cache"]);
+
         StartupMode = Setting.Choice(
             "startup.serviceMode", "Startup Mode",
             "When the background service runs. Run on Startup launches it at Windows login. Start on Program Open starts it when this app opens and leaves it running. Start and Stop with Program starts it on open and stops it when the app closes (warning first if jobs are running).",
@@ -173,6 +181,11 @@ public sealed partial class SettingsViewModel : ViewModelBase
 
     public ChoiceSettingViewModel<ThemeMode> Theme { get; }
     public TextSettingViewModel ServiceExePath { get; }
+
+    /// <summary>How long a retained preview stays fresh. Client-owned (§2.3): the engine never reads it,
+    /// so it lives beside Theme in the always-editable Application category rather than greying out with
+    /// the service-backed settings.</summary>
+    public AutoNumberSettingViewModel PreviewStaleAfter { get; }
     public ChoiceSettingViewModel<ServiceStartupMode> StartupMode { get; }
     public AutoNumberSettingViewModel MaxScanThreads { get; }
     public AutoNumberSettingViewModel PerDriveDefault { get; }
@@ -206,7 +219,7 @@ public sealed partial class SettingsViewModel : ViewModelBase
 
         Categories.Add(new SettingsCategoryViewModel(
             "application", "Application")
-            .With(Theme, ServiceExePath));
+            .With(Theme, PreviewStaleAfter, ServiceExePath));
         Categories.Add(new SettingsCategoryViewModel("startup", "Service Startup") { RequiresService = true }
             .With(StartupMode));
         Categories.Add(performance.With(
@@ -542,6 +555,12 @@ public sealed partial class SettingsViewModel : ViewModelBase
             _storedClient = ClientSettingsStore.Read(_clientSettingsPath);
             Theme.Value = _storedClient.ThemeMode;
             ServiceExePath.Value = _storedClient.ServiceExecutablePath ?? "";
+            // Auto when the stored value is absent (null) — the same absent-means-default round-trip
+            // MaxScanDepth performs, and the reason the backing field is nullable: this is a positional
+            // record, so an absent member would otherwise deserialize as 0.
+            (PreviewStaleAfter.Auto, PreviewStaleAfter.Value) =
+                (_storedClient.PreviewStaleAfterMinutes is null,
+                 (int)_storedClient.PreviewStaleAfter.TotalMinutes);
             // Await it here (unlike the fire-and-forget on edit) so a window opened against a stored
             // path that has since gone missing shows the warning on its first paint.
             await RefreshServiceExeNoticeAsync();
@@ -776,6 +795,9 @@ public sealed partial class SettingsViewModel : ViewModelBase
         {
             ServiceExecutablePath = exePath,
             ThemeMode = Theme.Value,
+            // Null for Auto, so an unset threshold keeps reading as the default rather than freezing
+            // today's default into the file.
+            PreviewStaleAfterMinutes = PreviewStaleAfter.Auto ? null : PreviewStaleAfter.Value,
         };
         if (updated == _storedClient)
             return exePath;
@@ -787,6 +809,9 @@ public sealed partial class SettingsViewModel : ViewModelBase
         {
             ServiceExecutablePath = exePath,
             ThemeMode = Theme.Value,
+            // Null for Auto, so an unset threshold keeps reading as the default rather than freezing
+            // today's default into the file.
+            PreviewStaleAfterMinutes = PreviewStaleAfter.Auto ? null : PreviewStaleAfter.Value,
         });
         return exePath;
     }
