@@ -159,6 +159,51 @@ public sealed class MirrorDeletionFileOperationTests
         Assert.True(File.Exists(orphan));
     }
 
+    [Fact]
+    public async Task A_cancel_MID_ORPHAN_keeps_the_count_of_what_was_already_recycled()
+    {
+        using RunPlanHarness h = new("del-cancel-midorphan");
+        h.WriteSource("kept.txt", "kept");
+        for (int i = 0; i < 6; i++)
+            h.WriteTarget($"orphan{i}.txt", "orphaned");
+        (string dir, _, _) = await h.PlanAsync(h.MirrorProfile());
+        List<RunDeleteItem> orphans = RunPlanHarness.Deletes(dir);
+        Assert.Equal(6, orphans.Count);
+
+        // Hold the lock on the LAST orphan in plan order, with a lock wait long enough that the pass is
+        // still parked on it when the cancel lands. The earlier five are recycled first.
+        h.UseConfig(h.DeletionConfig with { MirrorLockWaitTimeout = TimeSpan.FromSeconds(30) });
+        Core.Jobs.NormalizedPath.Create(orphans[^1].Path).TryGetValue(out Core.Jobs.NormalizedPath path);
+        await using Core.Locking.PathLockSet held =
+            await h.Locks.AcquireAsync([path], Core.Jobs.JobId.New());
+
+        using CancellationTokenSource cancel = new();
+        Task<MirrorDeletionResult> pass = h.Pass.DeleteAsync(h.Request(dir), cancel.Token);
+        for (int waited = 0; h.Bin().Count < 5 && waited < 10_000; waited += 20)
+            await Task.Delay(20);
+        Assert.Equal(5, h.Bin().Count);
+        await cancel.CancelAsync();
+        MirrorDeletionResult result = await pass;
+
+        // The cancel is raised INSIDE the orphan, from the lock await. It used to unwind past the loop's
+        // counters into DeleteAsync's catch, which reported Deleted = 0 — so the user was told nothing had
+        // been removed while five of their destination files sat in the Recycle Bin, and the journal's own
+        // close record contradicted its five mrdel/mrdone pairs.
+        Assert.Equal(MirrorReconcileOutcome.AbortedMidPass, result.Outcome);
+        Assert.Equal(5, result.Deleted);
+        Assert.Equal(5, h.Bin().Count);
+        Assert.NotNull(result.AbortReason);
+
+        // The durable account agrees with the result, which is the whole point of writing one.
+        MirrorReconcileClosedRecord closed = Assert.Single(
+            h.JournalRecords().OfType<MirrorReconcileClosedRecord>());
+        Assert.Equal(5, closed.Deleted);
+        Assert.Equal(MirrorReconcileOutcome.AbortedMidPass, closed.Outcome);
+        Assert.Equal(
+            h.JournalRecords().OfType<MirrorOrphanTrashedRecord>().Count(r => r.Error is null),
+            closed.Deleted);
+    }
+
     // ---- write-ahead ordering and the audit trail ------------------------------------------------
 
     [Fact]

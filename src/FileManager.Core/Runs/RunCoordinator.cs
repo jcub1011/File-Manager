@@ -1,3 +1,4 @@
+using FileManager.Contracts;
 using FileManager.Contracts.IPC;
 using FileManager.Contracts.Primitives;
 using FileManager.Contracts.Profiles;
@@ -5,13 +6,14 @@ using FileManager.Core.DryRun;
 using FileManager.Core.Files;
 using FileManager.Core.Jobs;
 using FileManager.Core.Observability;
+using FileManager.Core.Profiles;
 using FileManager.Core.Runs.Reconcile;
 using FileManager.Core.Watching;
 using Microsoft.Extensions.Logging;
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
-using System.IO;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -35,6 +37,8 @@ public sealed class RunCoordinator(
     ITriggerQueue queue,
     IMirrorDeletionPass deletionPass,
     IEngineEventBus eventBus,
+    IProfileValidator validator,
+    IProfileCatalog catalog,
     EnginePaths paths,
     EngineConfig config,
     TimeProvider time,
@@ -70,30 +74,140 @@ public sealed class RunCoordinator(
         return new RunHandle { RunId = run.RunId, ProfileId = profile.Id };
     }
 
-    public Result Approve(Guid runId, bool approve)
+    public Result Approve(Guid runId, bool approve, bool acknowledgeWarnings = false)
     {
         if (!_runs.TryGetValue(runId, out RunState? run))
             return $"no run with id {runId}";
+        if (!approve)
+        {
+            // Declining is not a failure and must leave the filesystem exactly as it was — nothing has
+            // been touched at this point, by construction. Never gated: abandoning a plan is always
+            // allowed, whatever the validator thinks of the profile.
+            if (!CloseUnstarted(run, RunPhase.AwaitingApproval, out string? declineError))
+                return declineError!;
+            logger.LogInformation("Run {RunId} was declined; nothing was changed", runId);
+            return Result.Success();
+        }
+
+        // THE gate. Read outside run.Gate: Validate walks the profile and compiles its filters, which is
+        // not work to do while holding a lock the orchestrator's worker threads take on every settle.
+        // The phase is re-checked under the lock below, so a race here can only mean a redundant
+        // validation, never a run that executes ungated.
+        if (Refusal(run, acknowledgeWarnings) is { } refusal)
+        {
+            logger.LogWarning("Run {RunId} was not approved: {Refusal}", runId, refusal);
+            return refusal;
+        }
+
         lock (run.Gate)
         {
             if (run.Phase != RunPhase.AwaitingApproval)
                 return $"run {runId} is {run.Phase}, not awaiting approval";
-            if (!approve)
-            {
-                // Declining is not a failure and must leave the filesystem exactly as it was — nothing
-                // has been touched at this point, by construction.
-                CleanUpSnapshot(run);   // before Closed is observable — see Close()
-                run.Phase = RunPhase.Closed;
-                run.Outcome = RunOutcome.Cancelled;
-                run.ClosedAt = time.GetUtcNow();
-                PublishCompleted(run);
-                logger.LogInformation("Run {RunId} was declined; nothing was changed", runId);
-                return Result.Success();
-            }
             run.Phase = RunPhase.Executing;
         }
         run.Work = Task.Run(() => ExecuteAsync(run), CancellationToken.None);
         return Result.Success();
+    }
+
+    /// <summary>Why this run must not start, or null.
+    ///
+    /// <para>An <c>Error</c> is fatal: the profile cannot be run at all. A <c>BlockingWarning</c> is
+    /// acknowledgeable, exactly as on the save path — and is only asked about for a configuration that
+    /// never went through it. A profile persisted in the catalog has already been acknowledged, because
+    /// <c>SaveProfileAsync</c> refuses to store one whose warnings were not; re-asking on every run of a
+    /// saved Mirror profile would be warning fatigue on the one prompt that guards target-side deletion,
+    /// which is the opposite of the intent.</para></summary>
+    private string? Refusal(RunState run, bool acknowledgeWarnings)
+    {
+        IReadOnlyList<ValidationIssue> issues = ValidationIssuesFor(run);
+        foreach (ValidationIssue issue in issues)
+        {
+            if (issue.Severity == ValidationSeverity.Error)
+                return $"the profile is not valid: {issue.Code} — {issue.Message}";
+        }
+        if (acknowledgeWarnings || AlreadyAcknowledgedOnSave(run.Profile))
+            return null;
+        foreach (ValidationIssue issue in issues)
+        {
+            if (issue.Severity == ValidationSeverity.BlockingWarning)
+                return $"this run has not been acknowledged: {issue.Code} — {issue.Message}";
+        }
+        return null;
+    }
+
+    /// <summary>Whether this exact configuration is the one sitting in the catalog — which means it got
+    /// through <c>SaveProfileAsync</c>, which means its blocking warnings were acknowledged there.
+    ///
+    /// <para>Compared by serialized form, not by <c>==</c>: <see cref="Profile"/> is a record whose
+    /// members include lists, so reference equality on those makes two identical profiles unequal and
+    /// every run would look like an unsaved draft. The canonical JSON is the same form
+    /// <c>profiles.json</c> stores, so "equal here" means "equal as saved".</para>
+    ///
+    /// <para>A profile hand-edited in <c>profiles.json</c> is treated as acknowledged, since it is
+    /// indistinguishable from a saved one. That is the pre-existing reach of the save-path gate, not
+    /// something this widens.</para></summary>
+    private bool AlreadyAcknowledgedOnSave(Profile planned)
+    {
+        foreach (Profile persisted in catalog.All)
+        {
+            if (persisted.Id != planned.Id)
+                continue;
+            return string.Equals(Canonical(persisted), Canonical(planned), StringComparison.Ordinal);
+        }
+        // In no catalog at all: a draft that was never saved, so nothing ever acknowledged it.
+        return false;
+
+        static string Canonical(Profile profile) =>
+            JsonSerializer.Serialize(profile, FileManagerJsonContext.Default.Profile);
+    }
+
+    /// <summary>Validates the profile the run was PLANNED against — never the catalog's current copy,
+    /// which may have been edited or deleted since, and for an unsaved draft was never there at all.
+    /// <para>Cached on the run: it is computed once when planning finishes (so <c>run-planned</c> can
+    /// carry it) and read again on approval, and re-validating would let the answer the user acknowledged
+    /// differ from the answer that gates them.</para></summary>
+    private IReadOnlyList<ValidationIssue> ValidationIssuesFor(RunState run)
+    {
+        lock (run.Gate)
+        {
+            if (run.ValidationIssues is { } cached)
+                return cached;
+        }
+        List<Profile> others = [];
+        foreach (Profile other in catalog.All)
+            if (other.Active && other.Id != run.Profile.Id)
+                others.Add(other);
+        IReadOnlyList<ValidationIssue> issues = validator.Validate(run.Profile, others);
+        lock (run.Gate)
+            run.ValidationIssues ??= issues;
+        return issues;
+    }
+
+    /// <summary>Closes a run that never started doing anything, dropping its snapshot first.
+    /// <para>Shared by decline and by a cancel that arrives after planning finished, so the two cannot
+    /// drift: both are "this plan will never execute", and both must leave a run that
+    /// <see cref="PruneClosedRuns"/> can eventually reap. Returns false with a message when the run is
+    /// not in <paramref name="expected"/>.</para></summary>
+    private bool CloseUnstarted(RunState run, RunPhase expected, out string? error)
+    {
+        lock (run.Gate)
+        {
+            if (run.Phase != expected)
+            {
+                error = $"run {run.RunId} is {run.Phase}, not {expected}";
+                return false;
+            }
+        }
+        CleanUpSnapshot(run);   // before Closed is observable — see Close()
+        lock (run.Gate)
+        {
+            run.Phase = RunPhase.Closed;
+            run.Outcome = RunOutcome.Cancelled;
+            run.ClosedAt = time.GetUtcNow();
+        }
+        PublishCompleted(run);
+        error = null;
+        return true;
     }
 
     public Result Cancel(Guid runId)
@@ -135,8 +249,10 @@ public sealed class RunCoordinator(
                 case JobOutcome.RollbackFailed: run.Failed++; break;
                 // A null completion is a payload the orchestrator DROPPED before the executor ran (its
                 // profile vanished or went inactive, or its plan could not be built). It settles the
-                // barrier — that is the whole point of reporting it — but it is not an outcome.
-                default: break;
+                // barrier — that is the whole point of reporting it — but it is not an outcome, so it
+                // is counted apart from Failed rather than folded into it. It is still work from the
+                // approved list that did not happen, which is why the deletion gate reads it too.
+                default: run.Dropped++; break;
             }
             if (completion is not null)
                 foreach (string written in completion.ResolvedFinalPaths)
@@ -235,6 +351,7 @@ public sealed class RunCoordinator(
                     DeleteBytes = writer.DeleteBytes,
                     SourceItemCount = writer.SourceCount,
                     DestinationItemCount = writer.DestinationCount,
+                    SweptFilesByTargetRoot = writer.SweptByTargetRoot,
                     Truncated = state.Truncated,
                     SweepFaultDetail = state.SweepFaultDetail,
                     Space = state.Space,
@@ -270,6 +387,10 @@ public sealed class RunCoordinator(
             PublishCompleted(run);
             return;
         }
+
+        // Computed BEFORE the phase becomes AwaitingApproval, so an approval arriving the instant the
+        // phase flips cannot beat the list it is gated on into existence.
+        ValidationIssuesFor(run);
 
         lock (run.Gate)
             run.Phase = RunPhase.AwaitingApproval;
@@ -323,7 +444,21 @@ public sealed class RunCoordinator(
                 await DeleteOrphansAsync(run, header).ConfigureAwait(false);
 
             if (!run.Cancelled)
+            {
                 EnqueueCopies(run, header);
+            }
+            else
+            {
+                // Nothing was queued, so nothing will settle. Saying so is what lets the barrier below
+                // return at once instead of polling out its whole deadline: every one of its exit
+                // conditions is gated on EnqueueComplete, so a run cancelled before this point would
+                // otherwise sit in the drain loop for MirrorBarrierTimeout.
+                lock (run.Gate)
+                {
+                    run.EnqueueComplete = true;
+                    run.LastSettleTicks = time.GetTimestamp();
+                }
+            }
 
             await AwaitDrainAsync(run).ConfigureAwait(false);
 
@@ -332,7 +467,8 @@ public sealed class RunCoordinator(
 
             RunOutcome outcome = run.Cancelled
                 ? RunOutcome.Cancelled
-                : run.Failed > 0 || run.DeletionAbortReason is not null || run.DeletionFailures.Count > 0
+                : run.Failed > 0 || run.Dropped > 0
+                  || run.DeletionAbortReason is not null || run.DeletionFailures.Count > 0
                     ? RunOutcome.CompletedWithProblems
                     : RunOutcome.Succeeded;
             Close(run, outcome, planError: null);
@@ -360,8 +496,20 @@ public sealed class RunCoordinator(
                 header.Profile.Id, item.SourcePath, item.SourceRoot, TriggerKind.ManualShell, now,
                 Metadata: null, RunId: run.RunId));
 
-            lock (run.Gate)
-                run.Expected++;
+            // One pending entry produces exactly one job, and it settles whichever run the payload the
+            // entry now holds belongs to — us. So we expect a job when we took a new place in the
+            // queue, and when we took OVER an entry another run was holding; but not when we coalesced
+            // onto our own pending payload, which was already counted. Incrementing unconditionally
+            // left Expected permanently above the number of jobs that can ever settle, so the exact
+            // barrier could not be met and the run waited out its whole deadline — which then reads as
+            // unaccounted copies and refuses the deletion phase for an accounting artifact.
+            bool producesOurJob = outcome.Queued
+                || (outcome.Displaced is { RunId: { } other } && other != run.RunId);
+            if (producesOurJob)
+            {
+                lock (run.Gate)
+                    run.Expected++;
+            }
 
             // The payload we displaced will never produce a job. If it belonged to another run, that
             // run has to stop expecting one, or its barrier waits out the whole deadline.
@@ -369,7 +517,16 @@ public sealed class RunCoordinator(
                 Coalesced(displacedRun);
         }
         lock (run.Gate)
+        {
             run.EnqueueComplete = true;
+            // The quiescence window means "nothing of ours has settled for a while". Until the first
+            // job settles there is nothing to measure from, and the moment the work list was fully
+            // queued is the honest starting point. Left at its 0 default it read as machine uptime, so
+            // the window was satisfied on the very first poll and the run was declared drained while
+            // its copies were still in flight — which zeroes the two counters the deletion pass's
+            // self-write and incomplete-copy guards depend on.
+            run.LastSettleTicks = time.GetTimestamp();
+        }
     }
 
     /// <summary>Waits for every job this run enqueued to reach a terminal state.
@@ -448,7 +605,10 @@ public sealed class RunCoordinator(
         lock (run.Gate)
         {
             written = new HashSet<string>(run.PathsWritten, StringComparer.OrdinalIgnoreCase);
-            failed = run.Failed;
+            // Dropped counts with Failed here and nowhere else. To this gate the two are the same fact
+            // — a file from the approved list whose copy did not land — and the pass must refuse either
+            // way, or it reconciles the destination against a source set it never finished copying.
+            failed = run.Failed + run.Dropped;
             timedOut = run.BarrierTimedOut;
             unreadable = run.UnreadableSourceEntries;
         }
@@ -488,17 +648,27 @@ public sealed class RunCoordinator(
     }
 
     /// <summary>Files the plan's sweep saw under each target root, for the pass's ratio guard.
-    /// <para>Derived from the snapshot: the sweep classified every pre-existing file under a root, and
-    /// the ones it did not call orphans are exactly the survivors the copy items account for. Rather
-    /// than persist a second tally, the denominator is reconstructed as "orphans under this root plus
-    /// the copy items landing under it" — an under-estimate can only make the guard STRICTER, which is
-    /// the safe direction for a guard whose job is to refuse.</para></summary>
+    ///
+    /// <para>Read from the snapshot header, where the sweep counted them as it classified them — the one
+    /// place each destination file is seen exactly once. This used to be RECONSTRUCTED here as "orphans
+    /// under this root plus the run's copy items", on the premise that the non-orphans are the survivors
+    /// the copy items account for. That premise is false: an already-identical file is
+    /// <c>SkippedUnchanged</c> and produces no copy item, so a synchronized profile's denominator
+    /// collapsed to its own orphan count and the guard refused every steady-state pass at 100%.</para>
+    ///
+    /// <para>A snapshot predating the header field falls back to the orphan tally alone, which refuses
+    /// the pass: an under-estimate can only make the guard stricter, which is the safe direction for a
+    /// guard whose job is to refuse.</para></summary>
     private static IReadOnlyDictionary<string, int> SweptByRoot(
         RunSnapshotHeader header, IReadOnlyList<RunDeleteItem> orphans)
     {
+        if (header.SweptFilesByTargetRoot.Count > 0)
+            return new Dictionary<string, int>(header.SweptFilesByTargetRoot, StringComparer.OrdinalIgnoreCase);
+
+        // A snapshot from before the header carried the counts. The orphans alone are all that can be
+        // recovered, which makes every root look 100% orphaned and refuses the pass — the strict
+        // direction, and the right one for a plan whose survivor set cannot be established.
         Dictionary<string, int> swept = new(StringComparer.OrdinalIgnoreCase);
-        foreach (TargetConfig target in header.Profile.Targets)
-            swept[target.Path] = header.CopyItemCount;
         foreach (RunDeleteItem orphan in orphans)
             swept[orphan.TargetRoot] = swept.GetValueOrDefault(orphan.TargetRoot) + 1;
         return swept;
@@ -522,8 +692,9 @@ public sealed class RunCoordinator(
         }
         PublishCompleted(run);
         logger.LogInformation(
-            "Run {RunId} closed {Outcome}: {Succeeded} succeeded, {Skipped} skipped, {Failed} failed, {Deleted} deleted",
-            run.RunId, outcome, run.Succeeded, run.SkippedJobs, run.Failed, run.Deleted);
+            "Run {RunId} closed {Outcome}: {Succeeded} succeeded, {Skipped} skipped, {Failed} failed, " +
+            "{Dropped} dropped, {Deleted} deleted",
+            run.RunId, outcome, run.Succeeded, run.SkippedJobs, run.Failed, run.Dropped, run.Deleted);
     }
 
     /// <summary>Drops the run's frozen work list once the run is over. Best-effort: a failure here must
@@ -568,7 +739,25 @@ public sealed class RunCoordinator(
         PlannedDeleteBytes = run.PlannedDeleteBytes,
         Truncated = run.PlanTruncated,
         Error = error,
+        // What the footer has to state and the user has to acknowledge before Approve will be honoured.
+        // Only the blocking half: a plain Warning does not gate anything, so listing it beside the
+        // Approve button would spend the user's attention on something they cannot act on.
+        BlockingIssues = BlockingIssuesOf(run),
     });
+
+    private static IReadOnlyList<ValidationIssue> BlockingIssuesOf(RunState run)
+    {
+        lock (run.Gate)
+        {
+            if (run.ValidationIssues is not { } issues)
+                return [];
+            List<ValidationIssue> blocking = [];
+            foreach (ValidationIssue issue in issues)
+                if (issue.Severity is ValidationSeverity.Error or ValidationSeverity.BlockingWarning)
+                    blocking.Add(issue);
+            return blocking;
+        }
+    }
 
     private void PublishProgress(RunState run)
     {
@@ -654,6 +843,11 @@ public sealed class RunCoordinator(
 
         public string? PlanError { get; set; }
 
+        /// <summary>The §4.1 issues the planned profile raises, computed once when planning finishes.
+        /// Null until then. Cached rather than recomputed so the list the user acknowledged on the
+        /// approval footer is the same list that gates the approval.</summary>
+        public IReadOnlyList<ValidationIssue>? ValidationIssues { get; set; }
+
         /// <summary>Payloads enqueued that are expected to produce a job. Decremented when one is
         /// superseded in the queue.</summary>
         public int Expected { get; set; }
@@ -665,6 +859,13 @@ public sealed class RunCoordinator(
         public int Succeeded { get; set; }
         public int SkippedJobs { get; set; }
         public int Failed { get; set; }
+
+        /// <summary>Payloads that settled the barrier without producing an outcome — the orchestrator
+        /// dropped them before the executor ran. Not a job failure, so it stays out of
+        /// <see cref="Failed"/> and out of the counts the UI reports; but it IS work from the approved
+        /// list that did not happen, so the Mirror deletion gate has to read it or the pass proceeds
+        /// believing every copy landed.</summary>
+        public int Dropped { get; set; }
 
         public int Deleted { get; set; }
         public long BytesDeleted { get; set; }

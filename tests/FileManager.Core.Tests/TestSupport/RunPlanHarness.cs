@@ -10,6 +10,7 @@ using FileManager.Core.Journal;
 using FileManager.Core.Locking;
 using FileManager.Core.Observability;
 using FileManager.Core.Placement;
+using FileManager.Core.Profiles;
 using FileManager.Core.Runs;
 using FileManager.Core.Runs.Reconcile;
 using FileManager.Core.Scanning;
@@ -116,6 +117,14 @@ internal sealed class RunPlanHarness : IDisposable
     /// <summary>A coordinator over the real planner, a real trigger queue, and the real deletion pass.
     /// Nothing consumes the queue — the tests drain it themselves and report settlement, which is what
     /// lets the barrier be driven deterministically instead of raced against a live orchestrator.</summary>
+    /// <summary>What the coordinator's approval gate sees. Empty by default so a test that is not about
+    /// validation approves as it always did; set it before <see cref="Coordinator"/> to drive the gate.</summary>
+    public StubProfileValidator Validator { get; set; } = new();
+
+    /// <summary>The catalog the validator's "other active profiles" argument comes from. Empty is the
+    /// honest default for a run planned from a draft, which is in no catalog.</summary>
+    public IProfileCatalog Catalog { get; set; } = new FakeProfileCatalog();
+
     public RunCoordinator Coordinator(EngineConfig? config = null)
     {
         if (_coordinator is not null)
@@ -125,7 +134,7 @@ internal sealed class RunPlanHarness : IDisposable
         if (config is not null)
             UseConfig(config);
         _coordinator = new RunCoordinator(
-            Planner, Queue, Pass, Bus, Paths, effective, TimeProvider.System,
+            Planner, Queue, Pass, Bus, Validator, Catalog, Paths, effective, TimeProvider.System,
             NullLogger<RunCoordinator>.Instance);
         return _coordinator;
     }
@@ -309,6 +318,7 @@ internal sealed class RunPlanHarness : IDisposable
             DeleteBytes = writer.DeleteBytes,
             SourceItemCount = writer.SourceCount,
             DestinationItemCount = writer.DestinationCount,
+            SweptFilesByTargetRoot = writer.SweptByTargetRoot,
             Truncated = state.Truncated,
             SweepFaultDetail = state.SweepFaultDetail,
             Space = state.Space,

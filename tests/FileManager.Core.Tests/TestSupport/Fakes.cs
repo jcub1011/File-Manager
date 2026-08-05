@@ -90,6 +90,24 @@ internal sealed class FakeProfileCatalog(params Profile[] profiles) : IProfileCa
     private sealed class Noop : IDisposable { public void Dispose() { } }
 }
 
+/// <summary>A validator that returns a fixed issue list — empty by default, so a test that is not about
+/// validation is not gated by one.
+/// <para>Deliberately not the real <c>ProfileValidator</c>: it raises PROFILE_MIRROR_DELETES for every
+/// Mirror profile, which would make every run-lifecycle test an acknowledgment test as well.</para></summary>
+internal sealed class StubProfileValidator(params ValidationIssue[] issues) : IProfileValidator
+{
+    /// <summary>Each profile the coordinator asked about, so a test can assert it validated the profile
+    /// the run was PLANNED against rather than the catalog's copy of it.</summary>
+    public List<Profile> Validated { get; } = [];
+
+    public IReadOnlyList<ValidationIssue> Validate(
+        Profile candidate, IReadOnlyList<Profile> otherActiveProfiles)
+    {
+        Validated.Add(candidate);
+        return issues;
+    }
+}
+
 /// <summary>Records executed plans and returns a canned completion (Succeeded unless overridden).</summary>
 internal sealed class FakeJobExecutor : IJobExecutor
 {

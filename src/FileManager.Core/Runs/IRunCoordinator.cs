@@ -56,8 +56,18 @@ public interface IRunCoordinator : IRunSettleSink
     Result<RunHandle, string> Begin(Profile profile, string? scopePath);
 
     /// <summary>Approves a planned run (starts execution) or declines it (closes it, changing nothing).
-    /// Only valid while the run is <see cref="RunPhase.AwaitingApproval"/>.</summary>
-    Result Approve(Guid runId, bool approve);
+    /// Only valid while the run is <see cref="RunPhase.AwaitingApproval"/>.
+    ///
+    /// <para><b>This is the validator gate.</b> An approval is refused when the profile the run was
+    /// planned against raises any <c>ValidationSeverity.Error</c>, or any
+    /// <c>ValidationSeverity.BlockingWarning</c> and <paramref name="acknowledgeWarnings"/> is
+    /// false. A run may be planned from an unsaved draft, which never passed through the save path where
+    /// those gates otherwise live — so without this a profile the validator would refuse to save could
+    /// be really run, copies and PermanentDelete included. Refusing here costs nothing: the run stays
+    /// parked and nothing has been touched.</para>
+    ///
+    /// <para>Declining is never gated — abandoning a plan is always allowed.</para></summary>
+    Result Approve(Guid runId, bool approve, bool acknowledgeWarnings = false);
 
     /// <summary>Cancels a run at any phase. Planning stops; pending payloads are dropped; the deletion
     /// phase is skipped. Jobs already in flight are NEVER interrupted (I-ATOMIC-JOB) — the run closes

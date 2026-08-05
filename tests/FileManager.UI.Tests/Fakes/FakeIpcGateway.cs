@@ -239,11 +239,17 @@ internal sealed class FakeIpcGateway : IIpcGateway
     }
 
     public List<(Guid RunId, bool Approve)> ApproveRunCalls { get; } = [];
+
+    /// <summary>The acknowledgment flag each approval carried, so a test can assert the footer's
+    /// checkbox actually reaches the engine — without it the gate is unobservable from the client side.</summary>
+    public List<bool> ApproveRunAcknowledgements { get; } = [];
     public Result<bool, IpcError> ApproveRunResult { get; set; } = true;
 
-    public Task<Result<bool, IpcError>> ApproveRunAsync(Guid runId, bool approve, CancellationToken ct = default)
+    public Task<Result<bool, IpcError>> ApproveRunAsync(
+        Guid runId, bool approve, bool acknowledgeWarnings = false, CancellationToken ct = default)
     {
         ApproveRunCalls.Add((runId, approve));
+        ApproveRunAcknowledgements.Add(acknowledgeWarnings);
         return Task.FromResult(ApproveRunResult);
     }
 

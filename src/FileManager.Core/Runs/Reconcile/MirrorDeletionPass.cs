@@ -55,8 +55,8 @@ public sealed class MirrorDeletionPass(
         }
         catch (OperationCanceledException)
         {
-            // Shutdown or a run cancel. Anything already recycled stays recycled — it is retrievable,
-            // and both re-deleting and restoring it would be wrong.
+            // Shutdown or a run cancel BEFORE the deletion loop reached an orphan — a cancel inside one
+            // is caught at the call site so its counts survive, so Deleted = 0 is the truth here.
             logger.LogInformation(
                 "Mirror deletion pass {PassId} stopped on cancellation", request.PassId.Short);
             return Aborted(request, MirrorReconcileOutcome.AbortedMidPass, "the pass was cancelled");
@@ -130,7 +130,21 @@ public sealed class MirrorDeletionPass(
                 break;
             }
 
-            OrphanDisposition disposition = await DeleteOneAsync(request, orphan, ct).ConfigureAwait(false);
+            OrphanDisposition disposition;
+            try
+            {
+                disposition = await DeleteOneAsync(request, orphan, ct).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                // A cancel raised INSIDE the orphan — the lock await is the one place that can do it,
+                // and its `when (!ct.IsCancellationRequested)` filter deliberately declines a real
+                // cancel. Handled here rather than letting it unwind to DeleteAsync, whose catch
+                // returns Deleted = 0: everything already recycled has to stay in these counters and
+                // in the close record, which is this pass's only durable account of what it did.
+                midPassAbort = "the pass was cancelled";
+                break;
+            }
             switch (disposition.Kind)
             {
                 case OrphanDispositionKind.Deleted:

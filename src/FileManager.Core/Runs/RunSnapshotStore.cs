@@ -84,6 +84,32 @@ internal sealed class RunSnapshotWriter : IDisposable
     public long CopyBytes { get; private set; }
     public long DeleteBytes { get; private set; }
 
+    /// <summary>Every pre-existing file the destination sweep classified, tallied by the target root it
+    /// sits under — survivors and orphans together.
+    /// <para>This is the denominator the Mirror deletion pass's ratio guard needs, and the only place it
+    /// can be counted honestly: the sweep sees each destination file exactly once, here. Reconstructing
+    /// it downstream from the copy items cannot work, because an already-identical file is
+    /// <see cref="OperationKind.SkippedUnchanged"/> and produces no copy item at all — so a
+    /// synchronized profile's denominator collapsed to its own orphan count and the guard refused every
+    /// steady-state pass at 100%.</para></summary>
+    public IReadOnlyDictionary<string, int> SweptByTargetRoot => _sweptByTargetRoot;
+
+    private readonly Dictionary<string, int> _sweptByTargetRoot = new(StringComparer.OrdinalIgnoreCase);
+
+    private void CountSwept(string targetRoot) =>
+        _sweptByTargetRoot[targetRoot] = _sweptByTargetRoot.GetValueOrDefault(targetRoot) + 1;
+
+    /// <summary>Whether a destination row describes a file that was ALREADY on disk before this run —
+    /// which is what the ratio guard is measuring against.
+    /// <para><c>New</c> and <c>Rename</c> name paths that do not exist yet, so they are not part of the
+    /// population a deletion could remove a proportion of. Everything else on the destination side
+    /// implies a pre-existing file: something to overwrite, something that forced a conflict, something
+    /// already identical, a sweep find with no source, an orphan, or an entry the sweep could not
+    /// classify. Excluding <c>Rename</c> also under-counts by the file that forced the suffix, which is
+    /// the safe direction — an under-estimate can only make the guard stricter.</para></summary>
+    private static bool DescribesExistingFile(OperationKind kind) =>
+        kind is not (OperationKind.New or OperationKind.Rename);
+
     /// <summary>The first write failure, or null. Non-null means the snapshot is unusable and the run
     /// must fail rather than execute a partial work list — executing a truncated copy list is merely
     /// incomplete, but executing a truncated DELETE list against a complete survivor set is not a
@@ -193,6 +219,7 @@ internal sealed class RunSnapshotWriter : IDisposable
             });
             DeleteCount++;
             DeleteBytes += file.Length;
+            CountSwept(file.Root);
         }
     }
 
@@ -235,6 +262,8 @@ internal sealed class RunSnapshotWriter : IDisposable
             SubjectLastWriteUtc = subjectWritten,
         });
         DestinationCount++;
+        if (DescribesExistingFile(op.Kind))
+            CountSwept(op.Root);
     }
 
     /// <summary>Flushes the item files and writes the header. Call once, after the plan stream has

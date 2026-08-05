@@ -303,6 +303,10 @@ public sealed class RunHandlersTests : IDisposable
         // cases.
         public List<(Profile Profile, string? ScopePath)> Begun { get; } = [];
         public List<(Guid RunId, bool Approve)> Approvals { get; } = [];
+
+        /// <summary>The acknowledgment flag each approval carried — the handler's job is to pass the
+        /// request's AcknowledgeWarnings through, and this is what makes that observable.</summary>
+        public List<bool> Acknowledgements { get; } = [];
         public List<Guid> Cancellations { get; } = [];
 
         public string? BeginError { get; init; }
@@ -317,11 +321,12 @@ public sealed class RunHandlersTests : IDisposable
             return new RunHandle { RunId = Guid.NewGuid(), ProfileId = profile.Id };
         }
 
-        public Result Approve(Guid runId, bool approve)
+        public Result Approve(Guid runId, bool approve, bool acknowledgeWarnings = false)
         {
             if (ApproveError is not null)
                 return ApproveError;
             Approvals.Add((runId, approve));
+            Acknowledgements.Add(acknowledgeWarnings);
             return Result.Success();
         }
 

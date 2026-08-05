@@ -314,10 +314,277 @@ public sealed class RunLifecycleTests
             }
 
         RunStatus status = await RunPlanHarness.WaitForPhaseAsync(runs, handle.RunId, RunPhase.Closed);
-        // The barrier was met, so the deletion phase ran rather than timing out.
-        Assert.Equal(1, status.Deleted);
+        // The barrier was MET — the run closed promptly instead of waiting out its deadline, which is what
+        // reporting a dropped payload buys.
         Assert.Equal(0, status.Succeeded);
+        // ...and the deletion phase then REFUSED, which is the other half. A dropped payload is a file
+        // from the approved list that was not copied, so the destination is not a mirror of the source and
+        // an orphan removal would be reconciling against a source set the run never finished copying.
+        // Deleting it here (which is what this used to assert) was the bug: the drop incremented no
+        // counter, so the pass was told every copy had landed.
+        Assert.Equal(0, status.Deleted);
+        Assert.NotNull(status.DeletionAbortReason);
+        Assert.Contains("could not be copied", status.DeletionAbortReason, StringComparison.Ordinal);
+        // Not Failed: a drop is not a job outcome. It is counted separately and surfaces as a problem.
         Assert.Equal(0, status.Failed);
+        Assert.Equal(RunOutcome.CompletedWithProblems, status.Outcome);
+    }
+
+    [Fact]
+    public async Task QUIESCENCE_cannot_fire_before_the_first_job_settles()
+    {
+        using RunPlanHarness h = new("run-quiescence-clock");
+        h.WriteSource("a.txt", "aaa");
+        h.WriteSource("b.txt", "bbb");
+        string orphan = h.WriteTarget("orphan.txt", "orphaned");
+        // A window LONGER than this test waits, so quiescence firing at all is provably premature. The
+        // clock it measures is LastSettleTicks, which is 0 until the first job settles — so
+        // GetElapsedTime(0) returned machine uptime, cleared any window however long, and released the
+        // deletion phase on the very first poll while the copies were still in flight.
+        RunCoordinator runs = h.Coordinator(new EngineConfig
+        {
+            MirrorQuiescenceWindow = TimeSpan.FromSeconds(30),
+            MirrorBarrierTimeout = TimeSpan.FromMinutes(5),
+        });
+
+        runs.Begin(h.MirrorProfile(), null).TryGetValue(out RunHandle? handle);
+        await RunPlanHarness.WaitForPhaseAsync(runs, handle!.RunId, RunPhase.AwaitingApproval);
+        runs.Approve(handle.RunId, true);
+
+        // Stand in for slow copies: take both payloads off the queue so nothing is pending, and settle
+        // neither for longer than the whole quiescence window. The run must still be waiting.
+        List<Payload> taken = [];
+        for (int waited = 0; taken.Count < 2 && waited < 5_000; waited += 20)
+        {
+            if (h.Queue.PendingCount == 0)
+            {
+                await Task.Delay(20);
+                continue;
+            }
+            await foreach (Payload p in h.Queue.DequeueAsync(new CancellationTokenSource(200).Token))
+            {
+                taken.Add(p);
+                break;
+            }
+        }
+        Assert.Equal(2, taken.Count);
+        // Many drain polls, but nowhere near the 30-second window — so a correct clock cannot have
+        // expired and the run must still be waiting on its two copies.
+        await Task.Delay(600);
+
+        Assert.True(File.Exists(orphan), "the deletion phase ran before the copies settled");
+        Assert.Empty(h.Bin());
+        Assert.Equal(RunPhase.Executing, runs.GetStatus(handle.RunId)!.Phase);
+
+        // Settling them releases the barrier the honest way, through the exact count.
+        foreach (Payload p in taken)
+            runs.Settled(p.RunId!.Value, new JobCompletion(
+                JobId.New(), JobOutcome.Succeeded, null, null, TimeSpan.Zero));
+        RunStatus status = await RunPlanHarness.WaitForPhaseAsync(runs, handle.RunId, RunPhase.Closed);
+        Assert.Equal(1, status.Deleted);
+    }
+
+    [Fact]
+    public async Task Two_copy_items_for_ONE_source_path_expect_ONE_job()
+    {
+        using RunPlanHarness h = new("run-coalesce");
+        // Two Source roots, one nested in the other, so the same file is scanned under both and produces
+        // two copy items with the same SourcePath. The queue coalesces them onto one entry — which yields
+        // one job — so Expected must be 1. Counting both left the exact barrier unreachable forever.
+        string nested = Path.Combine(h.SourceDir, "inner");
+        Directory.CreateDirectory(nested);
+        RunPlanHarness.Write(Path.Combine(nested, "a.txt"), "aaa");
+        h.WriteTarget("orphan.txt", "orphaned");
+        Profile profile = h.MirrorProfile();
+        profile = profile with
+        {
+            Sources = [.. profile.Sources, new SourceConfig { Path = nested }],
+        };
+        RunCoordinator runs = h.Coordinator(new EngineConfig
+        {
+            // Long enough that only the EXACT barrier can close this run in time — if Expected is
+            // over-counted the test fails by timing out rather than passing by a backstop.
+            MirrorQuiescenceWindow = TimeSpan.FromMinutes(5),
+            MirrorBarrierTimeout = TimeSpan.FromMinutes(5),
+        });
+
+        runs.Begin(profile, null).TryGetValue(out RunHandle? handle);
+        RunStatus planned = await RunPlanHarness.WaitForPhaseAsync(runs, handle!.RunId, RunPhase.AwaitingApproval);
+        Assert.Equal(2, planned.PlannedCopies);   // the plan really does name it twice
+        runs.Approve(handle.RunId, true);
+
+        // Exactly ONE job comes out of the queue, and settling it is enough.
+        List<Payload> taken = [];
+        for (int waited = 0; taken.Count < 1 && waited < 5_000; waited += 20)
+        {
+            if (h.Queue.PendingCount == 0)
+            {
+                await Task.Delay(20);
+                continue;
+            }
+            await foreach (Payload p in h.Queue.DequeueAsync(new CancellationTokenSource(200).Token))
+            {
+                taken.Add(p);
+                break;
+            }
+        }
+        Assert.Single(taken);
+        runs.Settled(taken[0].RunId!.Value, new JobCompletion(
+            JobId.New(), JobOutcome.Succeeded, null, null, TimeSpan.Zero));
+
+        RunStatus status = await RunPlanHarness.WaitForPhaseAsync(runs, handle.RunId, RunPhase.Closed);
+        Assert.Null(status.DeletionAbortReason);
+        Assert.Equal(1, status.Deleted);
+    }
+
+    [Fact]
+    public async Task A_STEADY_STATE_mirror_still_removes_its_orphans()
+    {
+        using RunPlanHarness h = new("run-steady-state");
+        // The ordinary state of a mature Mirror profile: every destination file is already identical to
+        // its source, so the plan has ZERO copy items — and 25 files have since been deleted upstream.
+        for (int i = 0; i < 40; i++)
+        {
+            h.WriteSource($"kept{i}.txt", $"same-{i}");
+            h.WriteTarget($"kept{i}.txt", $"same-{i}");
+        }
+        for (int i = 0; i < 25; i++)
+            h.WriteTarget($"orphan{i}.txt", "orphaned");
+        RunCoordinator runs = h.Coordinator();
+
+        runs.Begin(h.MirrorProfile(), null).TryGetValue(out RunHandle? handle);
+        RunStatus planned = await RunPlanHarness.WaitForPhaseAsync(runs, handle!.RunId, RunPhase.AwaitingApproval);
+        Assert.Equal(0, planned.PlannedCopies);   // nothing to copy — this is the case that broke
+        Assert.Equal(25, planned.PlannedDeletes);
+
+        runs.Approve(handle.RunId, true);
+        await h.DrainAndSettleAsync(runs, handle.RunId);
+        RunStatus status = await RunPlanHarness.WaitForPhaseAsync(runs, handle.RunId, RunPhase.Closed);
+
+        // The ratio guard's denominator used to be built from the COPY items, which are zero here — so it
+        // computed 25/25 = 100%, refused the whole pass, and blamed a target-layout misconfiguration that
+        // did not exist. Every steady-state Mirror run was affected, permanently.
+        Assert.Null(status.DeletionAbortReason);
+        Assert.Equal(25, status.Deleted);
+        Assert.Equal(25, h.Bin().Count);
+        // The survivors are untouched: 40 in, 40 out.
+        Assert.Equal(40, Directory.GetFiles(h.TargetDir).Length);
+    }
+
+    // ---- the validator gate ------------------------------------------------------------------------
+
+    [Fact]
+    public async Task An_UNSAVED_draft_with_a_blocking_warning_is_refused_until_acknowledged()
+    {
+        using RunPlanHarness h = new("run-ack");
+        h.WriteSource("a.txt", "aaa");
+        string orphan = h.WriteTarget("orphan.txt", "orphaned");
+        // The profile is in NO catalog — a draft the Preview tab sent straight from the editor, which
+        // never went through SaveProfileAsync and so acknowledged nothing.
+        h.Validator = new StubProfileValidator(new ValidationIssue(
+            ValidationSeverity.BlockingWarning, "PROFILE_MIRROR_DELETES",
+            "This profile removes destination files."));
+        RunCoordinator runs = h.Coordinator();
+
+        runs.Begin(h.MirrorProfile(), null).TryGetValue(out RunHandle? handle);
+        await RunPlanHarness.WaitForPhaseAsync(runs, handle!.RunId, RunPhase.AwaitingApproval);
+
+        // Unacknowledged: refused, and the run stays parked rather than closing — the user can still
+        // acknowledge it. Nothing was touched.
+        Assert.True(runs.Approve(handle.RunId, true).TryGetError(out string? error));
+        Assert.Contains("PROFILE_MIRROR_DELETES", error, StringComparison.Ordinal);
+        Assert.Equal(RunPhase.AwaitingApproval, runs.GetStatus(handle.RunId)!.Phase);
+        Assert.True(File.Exists(orphan));
+        Assert.Empty(h.Bin());
+
+        // Acknowledged: it runs.
+        Assert.False(runs.Approve(handle.RunId, true, acknowledgeWarnings: true).TryGetError(out _));
+        await h.DrainAndSettleAsync(runs, handle.RunId);
+        RunStatus status = await RunPlanHarness.WaitForPhaseAsync(runs, handle.RunId, RunPhase.Closed);
+        Assert.Equal(1, status.Deleted);
+    }
+
+    [Fact]
+    public async Task A_SAVED_profile_is_not_re_acknowledged_on_every_run()
+    {
+        using RunPlanHarness h = new("run-ack-saved");
+        h.WriteSource("a.txt", "aaa");
+        h.WriteTarget("orphan.txt", "orphaned");
+        Profile saved = h.MirrorProfile();
+        // In the catalog means it got through SaveProfileAsync, which refuses to store a profile whose
+        // blocking warnings were not acknowledged. Re-asking here would be warning fatigue on the one
+        // prompt that guards target-side deletion.
+        h.Catalog = new FakeProfileCatalog(saved);
+        h.Validator = new StubProfileValidator(new ValidationIssue(
+            ValidationSeverity.BlockingWarning, "PROFILE_MIRROR_DELETES",
+            "This profile removes destination files."));
+        RunCoordinator runs = h.Coordinator();
+
+        runs.Begin(saved, null).TryGetValue(out RunHandle? handle);
+        await RunPlanHarness.WaitForPhaseAsync(runs, handle!.RunId, RunPhase.AwaitingApproval);
+
+        Assert.False(runs.Approve(handle.RunId, true).TryGetError(out string? error), error);
+        await h.DrainAndSettleAsync(runs, handle.RunId);
+        RunStatus status = await RunPlanHarness.WaitForPhaseAsync(runs, handle.RunId, RunPhase.Closed);
+        Assert.Equal(1, status.Deleted);
+    }
+
+    [Fact]
+    public async Task A_validation_ERROR_is_refused_even_with_an_acknowledgment()
+    {
+        using RunPlanHarness h = new("run-error");
+        h.WriteSource("a.txt", "aaa");
+        h.Validator = new StubProfileValidator(new ValidationIssue(
+            ValidationSeverity.Error, "PROFILE_NO_TARGETS", "The profile has no Targets."));
+        RunCoordinator runs = h.Coordinator();
+
+        runs.Begin(h.MirrorProfile(), null).TryGetValue(out RunHandle? handle);
+        await RunPlanHarness.WaitForPhaseAsync(runs, handle!.RunId, RunPhase.AwaitingApproval);
+
+        // An Error is not acknowledgeable — there is no "run it anyway" for a profile that is not valid.
+        Assert.True(runs.Approve(handle.RunId, true, acknowledgeWarnings: true)
+            .TryGetError(out string? error));
+        Assert.Contains("PROFILE_NO_TARGETS", error, StringComparison.Ordinal);
+        Assert.Equal(RunPhase.AwaitingApproval, runs.GetStatus(handle.RunId)!.Phase);
+    }
+
+    [Fact]
+    public async Task Declining_is_never_gated_by_the_validator()
+    {
+        using RunPlanHarness h = new("run-decline-ungated");
+        h.WriteSource("a.txt", "aaa");
+        h.Validator = new StubProfileValidator(new ValidationIssue(
+            ValidationSeverity.Error, "PROFILE_NO_TARGETS", "The profile has no Targets."));
+        RunCoordinator runs = h.Coordinator();
+
+        runs.Begin(h.MirrorProfile(), null).TryGetValue(out RunHandle? handle);
+        await RunPlanHarness.WaitForPhaseAsync(runs, handle!.RunId, RunPhase.AwaitingApproval);
+
+        // Abandoning a plan must always be possible: a run the user cannot decline is one whose snapshot
+        // directory leaks for the lifetime of the service.
+        Assert.False(runs.Approve(handle.RunId, approve: false).TryGetError(out string? error), error);
+        RunStatus status = await RunPlanHarness.WaitForPhaseAsync(runs, handle.RunId, RunPhase.Closed);
+        Assert.Equal(RunOutcome.Cancelled, status.Outcome);
+    }
+
+    [Fact]
+    public async Task The_planned_event_carries_the_blocking_issues_the_footer_has_to_state()
+    {
+        using RunPlanHarness h = new("run-planned-issues");
+        h.WriteSource("a.txt", "aaa");
+        h.Validator = new StubProfileValidator(
+            new ValidationIssue(ValidationSeverity.BlockingWarning, "PROFILE_MIRROR_DELETES", "Removes files."),
+            new ValidationIssue(ValidationSeverity.Warning, "PROFILE_CHATTY", "Just so you know."));
+        RunCoordinator runs = h.Coordinator();
+
+        runs.Begin(h.MirrorProfile(), null).TryGetValue(out RunHandle? handle);
+        await RunPlanHarness.WaitForPhaseAsync(runs, handle!.RunId, RunPhase.AwaitingApproval);
+
+        RunPlannedEvent planned = Assert.Single(h.Bus.Events.OfType<RunPlannedEvent>());
+        // Only the blocking half: a plain Warning gates nothing, so listing it beside the Approve button
+        // would spend the user's attention on something they cannot act on.
+        ValidationIssue issue = Assert.Single(planned.BlockingIssues);
+        Assert.Equal("PROFILE_MIRROR_DELETES", issue.Code);
     }
 
     [Fact]

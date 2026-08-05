@@ -14,6 +14,7 @@ using System;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Linq;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -2689,7 +2690,9 @@ public sealed partial class DryRunViewModel : ViewModelBase
 
     /// <summary>The run whose frozen plan is on screen and waiting for an answer, or null when there is
     /// nothing to approve. Drives the footer's visibility.</summary>
-    [ObservableProperty] public partial Guid? PendingRunId { get; set; }
+    [ObservableProperty]
+    [NotifyCanExecuteChangedFor(nameof(ApproveRunCommand))]
+    public partial Guid? PendingRunId { get; set; }
 
     /// <summary>The plan's totals, straight off the <c>run-planned</c> event. These are the numbers the
     /// footer states and the numbers the run will act on — the plan is a ceiling the executor can only
@@ -2740,6 +2743,47 @@ public sealed partial class DryRunViewModel : ViewModelBase
     [ObservableProperty]
     [NotifyPropertyChangedFor(nameof(PlanTruncationNotice))]
     public partial bool PlanTruncated { get; set; }
+
+    /// <summary>The §4.1 blocking warnings this run's profile raises, straight off the
+    /// <c>run-planned</c> event. Empty for a profile with none, which is the ordinary case.
+    /// <para>These gate the run in the ENGINE — <c>approve-run</c> refuses without an acknowledgment —
+    /// so the footer states them and the checkbox below is what turns Approve back on. A run may have
+    /// been planned from an unsaved draft, which never passed the save path where these are otherwise
+    /// acknowledged, and that is the hole this closes.</para></summary>
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(HasBlockingIssues), nameof(BlockingIssuesText))]
+    public partial IReadOnlyList<ValidationIssue> BlockingIssues { get; set; } = [];
+
+    public bool HasBlockingIssues => BlockingIssues.Count > 0;
+
+    /// <summary>The blocking warnings as one block of text, one per line — the footer states them rather
+    /// than listing them as rows, because they are prose the user has to read, not data to scan.</summary>
+    public string BlockingIssuesText
+    {
+        get
+        {
+            StringBuilder text = new();
+            foreach (ValidationIssue issue in BlockingIssues)
+            {
+                if (text.Length > 0)
+                    text.Append('\n');
+                text.Append(issue.Message);
+            }
+            return text.ToString();
+        }
+    }
+
+    /// <summary>The user's confirmation of <see cref="BlockingIssues"/>. Reset by every
+    /// <see cref="BeginPlanning"/> and by <see cref="ForgetPendingPlan"/>, so an acknowledgment can never
+    /// carry from one plan to the next — the whole point is that it applies to the run on screen.</summary>
+    [ObservableProperty]
+    [NotifyCanExecuteChangedFor(nameof(ApproveRunCommand))]
+    public partial bool AcknowledgedWarnings { get; set; }
+
+    /// <summary>Whether Approve is offered. Gates on the acknowledgment so the button and the engine
+    /// agree: without this the user presses Approve and gets a RUN_NOT_APPROVABLE banner instead of a
+    /// run, with nothing on screen explaining what to do about it.</summary>
+    private bool CanApproveRun => PendingRunId is not null && (!HasBlockingIssues || AcknowledgedWarnings);
 
     /// <summary>The truncated-plan footer notice, kept beside <see cref="PlanTruncated"/> so the two
     /// cannot drift.</summary>
@@ -2953,6 +2997,10 @@ public sealed partial class DryRunViewModel : ViewModelBase
             PlannedCopyBytes = planned.PlannedCopyBytes;
             PlannedDeleteBytes = planned.PlannedDeleteBytes;
             PlanTruncated = planned.Truncated;
+            // Before PendingRunId, which is what raises the footer: the warnings and the Approve button
+            // must appear together, never the button first.
+            BlockingIssues = planned.BlockingIssues;
+            AcknowledgedWarnings = false;
             PendingRunId = planned.RunId;
             // What the app now sits at with a preview on screen — the number a user reports.
             UiMemoryLog.Sample("preview-applied", allocatedBefore);
@@ -2985,7 +3033,7 @@ public sealed partial class DryRunViewModel : ViewModelBase
 
     /// <summary>Starts the run whose plan is on screen. THIS is the moment files begin to move — every
     /// preceding phase was read-only by construction.</summary>
-    [RelayCommand]
+    [RelayCommand(CanExecute = nameof(CanApproveRun))]
     private Task ApproveRunAsync() => AnswerPendingRunAsync(approve: true);
 
     /// <summary>Declines the run whose plan is on screen, closing it and changing nothing.</summary>
@@ -2996,12 +3044,15 @@ public sealed partial class DryRunViewModel : ViewModelBase
     {
         if (PendingRunId is not Guid runId)
             return;
+        // Captured before the clear below drops it: the engine refuses an approval of a run with blocking
+        // warnings unless this says the user confirmed them.
+        bool acknowledged = AcknowledgedWarnings;
         // Cleared FIRST, so a double-click cannot answer the same run twice — the second call would be
         // refused with RUN_NOT_APPROVABLE and land in the error banner for no reason.
         PendingRunId = null;
         try
         {
-            var answered = await _gateway.ApproveRunAsync(runId, approve);
+            var answered = await _gateway.ApproveRunAsync(runId, approve, acknowledged);
             if (answered.IsCanceled)
                 return;
             if (answered.TryGetError(out IpcError? error))
@@ -3046,6 +3097,10 @@ public sealed partial class DryRunViewModel : ViewModelBase
         PlannedCopies = PlannedDeletes = 0;
         PlannedCopyBytes = PlannedDeleteBytes = 0;
         PlanTruncated = false;
+        // Both cleared with the plan they belong to: an acknowledgment is of THESE warnings on THIS run,
+        // and carrying either into the next plan would acknowledge something the user never saw.
+        BlockingIssues = [];
+        AcknowledgedWarnings = false;
         return runId;
     }
 

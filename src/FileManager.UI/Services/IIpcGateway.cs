@@ -79,8 +79,13 @@ public interface IIpcGateway
     Task<Result<DryRunCompletion, IpcError>> GetRunPlanStreamAsync(
         Guid runId, IDryRunChunkSink sink, CancellationToken ct = default);
 
-    /// <summary>Approves a planned run (starts the work) or declines it (closes it, changing nothing).</summary>
-    Task<Result<bool, IpcError>> ApproveRunAsync(Guid runId, bool approve, CancellationToken ct = default);
+    /// <summary>Approves a planned run (starts the work) or declines it (closes it, changing nothing).
+    /// <para><paramref name="acknowledgeWarnings"/> confirms the blocking warnings the run's
+    /// <c>run-planned</c> event listed. Without it an approval of a run whose profile raises any is
+    /// refused as RUN_NOT_APPROVABLE — which is the point: a run planned from an unsaved draft never
+    /// passed the save path's acknowledgment. Ignored when declining.</para></summary>
+    Task<Result<bool, IpcError>> ApproveRunAsync(
+        Guid runId, bool approve, bool acknowledgeWarnings = false, CancellationToken ct = default);
 
     /// <summary>Cancels a run. Work not yet started is dropped; work in flight finishes.</summary>
     Task<Result<bool, IpcError>> CancelRunAsync(Guid runId, CancellationToken ct = default);

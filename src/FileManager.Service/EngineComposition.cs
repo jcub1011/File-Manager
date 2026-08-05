@@ -123,7 +123,8 @@ internal static class EngineComposition
         // change — see ISourceSelector's doc for the recorded intent and its platform prerequisite.
         services.AddSingleton<ISourceSelector, PrioritySourceSelector>();
         // Concrete + interface, the MemoryTrimCoordinator pattern: RunProfileHandler and
-        // JobOrchestrator both write to run state, so both must resolve THE SAME instance.
+        // JobOrchestrator both write to run state, so both must resolve THE SAME instance — and
+        // EngineHost resolves the concrete type to drain it at shutdown.
         services.AddSingleton<RunCoordinator>();
         services.AddSingleton<IRunCoordinator>(sp => sp.GetRequiredService<RunCoordinator>());
         services.AddSingleton<IRunSettleSink>(sp => sp.GetRequiredService<RunCoordinator>());

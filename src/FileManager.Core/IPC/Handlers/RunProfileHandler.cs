@@ -31,7 +31,14 @@ namespace FileManager.Core.IPC.Handlers;
 /// <para><b>InlineProfile.</b> A request may carry an unsaved draft to plan instead of a persisted
 /// profile, exactly as <c>dry-run-stream</c> can. This is what lets the GUI's Preview tab BE this run's
 /// planning phase: the user previews what is on screen, and approving executes that same frozen plan.
-/// Every gate below applies to whichever profile was resolved — a draft is not a way around them.</para></summary>
+/// The gates below — active, has sources, scope containment — apply to whichever profile was
+/// resolved.</para>
+///
+/// <para>The §4.1 validation gates do NOT live here, deliberately. A draft that would fail them can
+/// still be PLANNED, because planning reads and writes nothing outside the run's own snapshot; it is
+/// <c>approve-run</c> that refuses to execute one, and that carries the acknowledgment. Gating here
+/// instead would refuse a read-only preview — the one thing a user needs in order to see WHY the
+/// profile is dangerous.</para></summary>
 public sealed class RunProfileHandler(
     IProfileCatalog catalog,
     IRunCoordinator runs,
@@ -113,7 +120,7 @@ public sealed class ApproveRunHandler(IRunCoordinator runs, ILogger<ApproveRunHa
     public Task<IpcResponse> HandleAsync(IpcRequest request, CancellationToken ct = default)
     {
         var typed = (ApproveRunRequest)request;
-        Result result = runs.Approve(typed.RunId, typed.Approve);
+        Result result = runs.Approve(typed.RunId, typed.Approve, typed.AcknowledgeWarnings);
         if (result.TryGetError(out string? error))
         {
             logger.LogInformation("Approve({Approve}) for run {RunId} refused: {Error}", typed.Approve, typed.RunId, error);

@@ -61,6 +61,19 @@ public sealed record RunSnapshotHeader
 
     public int DestinationItemCount { get; init; }
 
+    /// <summary>Pre-existing files the destination sweep classified under each target root — survivors
+    /// and orphans together. The denominator for <c>MirrorDeletionPass</c>'s ratio guard.
+    /// <para>Recorded here because the sweep is the only place it can be counted: it sees each
+    /// destination file exactly once. It used to be reconstructed downstream from
+    /// <see cref="CopyItemCount"/> on the premise that the non-orphans are the files the copy items
+    /// account for — false, because an already-identical file is <c>SkippedUnchanged</c> and yields no
+    /// copy item. A synchronized profile's denominator therefore collapsed to its own orphan count and
+    /// the guard refused every steady-state pass at 100%.</para>
+    /// <para>Empty for a snapshot written before this existed. The guard skips a root it has no count
+    /// for, which is the pre-existing behaviour for an unknown root.</para></summary>
+    public IReadOnlyDictionary<string, int> SweptFilesByTargetRoot { get; init; } =
+        new Dictionary<string, int>();
+
     /// <summary>Set when the plan does not cover everything it was asked to (the source scan or the
     /// destination sweep hit a bound, or a target root could not be fully walked).
     /// <para><b>Load-bearing for safety.</b> A truncated plan's orphan set is unsound — a file that

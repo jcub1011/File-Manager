@@ -66,8 +66,14 @@ public abstract record IpcRequest
     /// dry-run-stream already could. This is what makes the GUI's Preview tab the run's own plan phase
     /// rather than a separate throwaway simulation. An old service would ignore the field and silently
     /// plan the PERSISTED profile instead of the draft on screen — a wrong answer that looks right,
-    /// which is the whole reason this gate exists.</summary>
-    public const int CurrentProtocolVersion = 10;
+    /// which is the whole reason this gate exists.
+    /// 11 — a run's §4.1 blocking warnings are now enforced at APPROVAL: run-planned carries
+    /// BlockingIssues and approve-run carries AcknowledgeWarnings. Version-gated rather than
+    /// optional-additive because the failure mode of an old client is silent and destructive: it would
+    /// send no acknowledgment, and a service that refused would look like an approve button that does
+    /// nothing — while an old SERVICE would ignore the flag and run a draft the validator would have
+    /// refused to save, which is the hole this closes.</summary>
+    public const int CurrentProtocolVersion = 11;
 
     public int ProtocolVersion { get; init; } = CurrentProtocolVersion;
 }
@@ -112,6 +118,16 @@ public sealed record ApproveRunRequest : IpcRequest
 {
     public required Guid RunId { get; init; }
     public required bool Approve { get; init; }
+
+    /// <summary>Set when the user confirmed the run's blocking warnings, which arrived on its
+    /// <c>run-planned</c> event as <c>BlockingIssues</c>. Mirrors
+    /// <see cref="SaveProfileRequest.AcknowledgeWarnings"/> and exists for the same reason: the §4.1
+    /// blocking-warning codes are acknowledgeable, not fatal.
+    /// <para><b>Why approval and not the save path alone.</b> A run may be planned from an unsaved draft,
+    /// which never passed through <c>SaveProfileAsync</c> — so before this, a profile the validator would
+    /// refuse to save could be really run, copying and permanently deleting, having acknowledged nothing.
+    /// Planning is read-only and stays ungated; this is the first moment anything moves.</para></summary>
+    public bool AcknowledgeWarnings { get; init; }
 }
 
 /// <summary>Cancels a run at any phase. Planning stops, pending work is dropped, and the orphan-deletion

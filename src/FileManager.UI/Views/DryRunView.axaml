@@ -364,6 +364,17 @@
                 <Border Classes="infoBar warning" IsVisible="{Binding PlanTruncated}">
                     <TextBlock Text="{Binding PlanTruncationNotice}" FontWeight="SemiBold" TextWrapping="Wrap" />
                 </Border>
+                <!-- The §4.1 blocking warnings, and the acknowledgment that turns Approve back on. The
+                     ENGINE refuses the approval without it, so this is not a courtesy prompt: it is the
+                     acknowledgment a run planned from an unsaved draft never got on the save path.
+                     Danger, not warning: every code that reaches here is about destroying data. -->
+                <Border Classes="infoBar danger" IsVisible="{Binding HasBlockingIssues}">
+                    <StackPanel Spacing="6">
+                        <TextBlock Text="{Binding BlockingIssuesText}" FontWeight="SemiBold" TextWrapping="Wrap" />
+                        <CheckBox IsChecked="{Binding AcknowledgedWarnings}"
+                                  Content="I understand — run it anyway" />
+                    </StackPanel>
+                </Border>
                 <Grid ColumnDefinitions="*,Auto">
                     <TextBlock Grid.Column="0" VerticalAlignment="Center" Margin="0,0,12,0"
                                Text="{Binding PlanSummary}" TextWrapping="Wrap" />

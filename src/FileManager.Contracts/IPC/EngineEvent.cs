@@ -108,6 +108,14 @@ public sealed record RunPlannedEvent : EngineEvent
     /// <summary>Set when planning failed outright — there is no work list, and the run is already
     /// closed.</summary>
     public string? Error { get; init; }
+
+    /// <summary>The §4.1 blocking warnings the profile this run was planned against raises, or empty.
+    /// Non-empty means <c>approve-run</c> will be REFUSED unless it carries
+    /// <see cref="ApproveRunRequest.AcknowledgeWarnings"/>.
+    /// <para>Carried on the event rather than fetched separately so the approval footer can state what
+    /// must be acknowledged beside the rows it applies to — the same reasoning that moved the whole
+    /// blast-radius warning out of a pre-run dialog and into the footer.</para></summary>
+    public IReadOnlyList<ValidationIssue> BlockingIssues { get; init; } = [];
 }
 
 /// <summary>Best-effort run-level progress. Throttled and lossy like <see cref="JobProgressEvent"/>;
