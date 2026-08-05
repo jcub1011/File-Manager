@@ -169,11 +169,17 @@ internal sealed class FakeIpcGateway : IIpcGateway
     /// sends a draft, so "which profile is this run planning" is asserted from here.</summary>
     public List<Profile?> RunProfileDrafts { get; } = [];
 
+    /// <summary>Invoked after the call is recorded but BEFORE the reply is returned, so a test can
+    /// reproduce the real service's ordering: planning is detached there, so a fast plan's
+    /// <c>run-planned</c> can be delivered while the caller is still awaiting this reply.</summary>
+    public Action? BeforeRunProfileReply { get; set; }
+
     public Task<Result<RunProfileResponse, IpcError>> RunProfileAsync(
         Guid profileId, string? path = null, Profile? draft = null, CancellationToken ct = default)
     {
         RunProfileCalls.Add((profileId, path));
         RunProfileDrafts.Add(draft);
+        BeforeRunProfileReply?.Invoke();
         return Task.FromResult(
             path is not null && RunProfileResults.TryGetValue(path, out var scripted)
                 ? scripted

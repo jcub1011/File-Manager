@@ -353,6 +353,19 @@
                 BorderBrush="{DynamicResource Brush.Panel.Border}" BorderThickness="0,1,0,0"
                 IsVisible="{Binding PendingRunId, Converter={x:Static ObjectConverters.IsNotNull}}">
             <StackPanel Spacing="8">
+                <!-- What the run does to the SOURCE files. The modal confirmation this footer replaced was
+                     the only place the disposition was ever stated ("each source file will then be
+                     PERMANENTLY DELETED"), and the footer went without it: a user could read "1,204
+                     file(s) to copy or update" and lose all 1,204 originals having been told nothing.
+                     First in the stack, and danger-styled when it destroys, because losing a source is
+                     the one consequence of a run that no other line here describes. -->
+                <Border Classes="infoBar danger" IsVisible="{Binding SourceDispositionDestroys}">
+                    <TextBlock Text="{Binding SourceDispositionWarning}" FontWeight="SemiBold" TextWrapping="Wrap" />
+                </Border>
+                <!-- The non-destructive dispositions (archive) are worth stating but not shouting: the
+                     file is relocated, not lost. KeepSource sets the text empty and shows nothing. -->
+                <TextBlock Text="{Binding SourceDispositionWarning}" TextWrapping="Wrap"
+                           IsVisible="{Binding ShowSourceDispositionNote}" />
                 <!-- Mirror's destructive half acts on the DESTINATION, so a footer that named only the
                      counts would describe the safe part of the run and stay silent about the part that
                      deletes. -->

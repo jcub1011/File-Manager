@@ -2791,15 +2791,46 @@ public sealed partial class DryRunViewModel : ViewModelBase
         "This plan does not cover everything that was scanned, so it may be incomplete."
         + (PlannedDeletes > 0 ? " No files will be removed from the target folder(s)." : "");
 
-    /// <summary>Keeps the footer's Mirror warning in step with the editor's live sync mode. Called on
-    /// profile load and whenever the mode changes, so the warning describes the profile currently on
-    /// screen even before a plan exists.</summary>
-    public void ApplySyncMode(SyncMode mode) =>
+    /// <summary>What a run does to the SOURCE files, and whether that destroys them.
+    ///
+    /// <para>The footer's other two warnings are both about the destination. This one is the half that
+    /// was missing entirely: the modal confirmation this footer replaced was the only place
+    /// <c>Policies.OnSuccess</c> was ever stated, and it said "each source file will then be PERMANENTLY
+    /// DELETED". Without it a user could read "1,204 file(s) to copy or update (8.4 GB)", press Approve,
+    /// and lose all 1,204 originals with nothing on screen having said so.</para></summary>
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(ShowSourceDispositionNote))]
+    public partial string SourceDispositionWarning { get; set; } = "";
+
+    /// <summary>Whether <see cref="SourceDispositionWarning"/> describes destroying the sources, which is
+    /// what earns it the danger styling rather than plain text. Archiving relocates and keeps, so it is
+    /// stated without being shouted.</summary>
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(ShowSourceDispositionNote))]
+    public partial bool SourceDispositionDestroys { get; set; }
+
+    /// <summary>Whether to show the disposition as plain text: there is something to say, and it is not
+    /// the destructive case the danger bar above already covers. Gating on both matters — the empty
+    /// KeepSource case would otherwise still cost the footer a stack gap.</summary>
+    public bool ShowSourceDispositionNote =>
+        SourceDispositionWarning.Length > 0 && !SourceDispositionDestroys;
+
+    /// <summary>Keeps the footer's warnings in step with the editor's live policies. Called on profile
+    /// load and whenever the sync mode or disposition changes, so the footer describes the profile
+    /// currently on screen even before a plan exists.</summary>
+    public void ApplyPolicies(SyncMode mode, OnSuccessAction onSuccess, string? archiveFolder)
+    {
         MirrorWarning = mode == SyncMode.Mirror
             ? "This is a MIRROR profile: every file listed for removal goes to the Recycle Bin. That "
               + "includes files excluded by this profile's filters, so tightening a filter removes copies "
               + "this profile made earlier."
             : "";
+        (string text, bool destroys) = SourceDisposition.Describe(onSuccess, archiveFolder);
+        // KeepSource is the default and the safe case; stating "kept in place" beside the counts is noise
+        // that dilutes the warnings that matter.
+        SourceDispositionWarning = onSuccess == OnSuccessAction.KeepSource ? "" : text;
+        SourceDispositionDestroys = destroys;
+    }
 
     /// <summary>Attach the editor's open profile (new or existing). Enables the run and clears any
     /// prior preview. A null id is valid for a never-saved draft — the run sends the draft inline.</summary>
@@ -2819,6 +2850,8 @@ public sealed partial class DryRunViewModel : ViewModelBase
         ProfileName = "";
         HasEditableProfile = false;
         MirrorWarning = "";
+        SourceDispositionWarning = "";
+        SourceDispositionDestroys = false;
         ReportClosed();
     }
 
@@ -2842,11 +2875,38 @@ public sealed partial class DryRunViewModel : ViewModelBase
         // A previous preview's run is superseded by this one, so decline it rather than leaving it parked
         // in AwaitingApproval with a snapshot directory nothing will ever answer for.
         AbandonPendingRun();
+        // And one still PLANNING is superseded too. This used to null PlanningRunId outright: the engine
+        // kept walking a tree nobody would answer for, and that run's late run-planned event could still
+        // arrive, be recognized as ours, and overwrite this preview's rows and PendingRunId — so Approve
+        // would execute the profile as it was before the edit that prompted the re-preview.
+        AbandonPlanningRun();
         EmptyStateText = DefaultEmptyState;   // a previous "nothing to do" says nothing about this run
-        PlanningRunId = null;                 // set by PlanningStarted once the engine accepts the run
         IsPreviewing = true;
         RunStatusText = "Working out what this will do…";
     }
+
+    /// <summary>Cancels the planning run this preview supersedes, if there is one.
+    /// <para>Fire-and-forget like <see cref="AbandonPendingRun"/>: the caller is mid-transition, and a
+    /// cancel that loses a race with the run's own completion is the normal case, not a fault.</para></summary>
+    private void AbandonPlanningRun()
+    {
+        if (PlanningRunId is not Guid runId)
+            return;
+        PlanningRunId = null;
+        Superseded?.Invoke(runId);
+        _ = _gateway.CancelRunAsync(runId)
+            .ContinueWith(
+                t => Log.Debug(t.Exception, "Cancelling superseded planning run {RunId} failed", runId),
+                CancellationToken.None,
+                TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
+                TaskScheduler.Default);
+    }
+
+    /// <summary>Set by the shell, and called with the id of a run this window has stopped caring about.
+    /// The shell filters engine events by the runs it started, so it has to be told to forget this one —
+    /// otherwise a late <c>run-planned</c> for a superseded scan is still treated as ours and applied over
+    /// the newer plan. A null callback is a no-op, so headless tests are not blocked.</summary>
+    public Action<Guid>? Superseded { get; set; }
 
     /// <summary>The run whose PLANNING is in flight, once the engine has accepted it. Distinct from
     /// <see cref="PendingRunId"/>, which is a plan already on screen: this one exists only during the
@@ -2857,6 +2917,21 @@ public sealed partial class DryRunViewModel : ViewModelBase
     /// <summary>Called by the shell once <c>run-profile</c> has been accepted, so the planning scan
     /// becomes cancellable.</summary>
     public void PlanningStarted(Guid runId) => PlanningRunId = runId;
+
+    /// <summary>Renders a planning-phase progress sample as the tab's caption.
+    ///
+    /// <para>Restores what the dry run had and the two-phase run lost: previewing a 400k-file profile over
+    /// a slow share showed one unchanging sentence for minutes, so a wedged walk and a slow one looked
+    /// identical. Ignored once a plan is on screen — a late sample must not overwrite the footer's own
+    /// state.</para></summary>
+    public void PlanningProgress(long sources, long destinations)
+    {
+        if (!IsPreviewing)
+            return;
+        RunStatusText = destinations > 0
+            ? $"Scanning… {sources:N0} source file(s), {destinations:N0} destination file(s) found"
+            : $"Scanning sources… {sources:N0} file(s) found";
+    }
 
     /// <summary>Stops the planning scan. Nothing has been touched at this point, so this is free —
     /// the run is dropped and its snapshot cleaned up by the coordinator.</summary>
@@ -3080,6 +3155,7 @@ public sealed partial class DryRunViewModel : ViewModelBase
     {
         if (ForgetPendingPlan() is not Guid runId)
             return;
+        Superseded?.Invoke(runId);
         _ = _gateway.ApproveRunAsync(runId, approve: false)
             .ContinueWith(
                 t => Log.Debug(t.Exception, "Declining superseded run {RunId} failed", runId),

@@ -30,15 +30,12 @@ public sealed class ImportPreviewViewModel
         ProfileName = profile.Name,
         Sources = profile.Sources.Select(s => s.Path).ToList(),
         Targets = profile.Targets.Select(t => t.Path).ToList(),
-        DispositionText = profile.Policies.OnSuccess switch
-        {
-            OnSuccessAction.KeepSource => "Source files are kept in place.",
-            OnSuccessAction.MoveToTrash => "Source files are moved to the Recycle Bin after delivery.",
-            OnSuccessAction.PermanentDelete => "Source files are PERMANENTLY DELETED after delivery.",
-            OnSuccessAction.MoveToArchive => $"Source files are moved to the archive folder \"{profile.Policies.ArchiveFolder}\" after delivery.",
-            _ => profile.Policies.OnSuccess.ToString(),
-        },
-        IsDestructive = profile.Policies.OnSuccess is OnSuccessAction.MoveToTrash or OnSuccessAction.PermanentDelete,
+        // Shared with the Preview tab's approval footer, so the two cannot describe the same policy
+        // differently — see SourceDisposition.
+        DispositionText = SourceDisposition
+            .Describe(profile.Policies.OnSuccess, profile.Policies.ArchiveFolder).Text,
+        IsDestructive = SourceDisposition
+            .Describe(profile.Policies.OnSuccess, profile.Policies.ArchiveFolder).Destroys,
         VerificationText = $"Verification: {profile.Policies.VerificationMethod}",
         SyncModeText = $"Sync mode: {profile.SyncMode}",
         TransformerLines = profile.Transformers is { Count: > 0 } steps

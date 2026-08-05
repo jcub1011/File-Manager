@@ -79,13 +79,17 @@ public sealed partial class MainWindowViewModel : ViewModelBase
             if (Editor.HasProfile)
             {
                 DryRun.SetProfile(List.SelectedProfile?.ProfileId, Editor.ProfileName);
-                DryRun.ApplySyncMode(Editor.SyncMode);
+                ApplyEditorPolicies();
             }
             else
                 DryRun.ClearProfile();
         };
         DryRun.DraftProvider = () =>
             Editor.TryBuildDraft(out Profile? draft, out string? error) ? (draft, null) : ((Profile?)null, error);
+        // A run this window has stopped caring about must stop being recognized as ours, or its late
+        // run-planned event is still applied — over a newer plan, which is how Approve could end up
+        // executing the profile as it was before the edit that prompted the re-preview.
+        DryRun.Superseded = runId => _ownRunIds.Remove(runId);
         DryRun.RunAnswered = approved =>
         {
             if (approved)
@@ -103,11 +107,15 @@ public sealed partial class MainWindowViewModel : ViewModelBase
                 List.HasUnsavedChanges = Editor.IsDirty;
                 List.UnsavedProfileId = Editor.IsDirty ? List.SelectedProfile?.ProfileId : null;
             }
-            // Keep the Preview footer's Mirror warning in step with the editor's live sync mode, so it
-            // describes the profile on screen rather than the one the last plan was built from.
-            else if (e.PropertyName == nameof(ProfileEditorViewModel.SyncMode))
+            // Keep the Preview footer's warnings in step with the editor's live policies, so they describe
+            // the profile on screen rather than the one the last plan was built from. The disposition
+            // belongs here as much as the sync mode: it is the footer's only statement that a run destroys
+            // the SOURCE files, and it must not lag a change to the setting that decides that.
+            else if (e.PropertyName is nameof(ProfileEditorViewModel.SyncMode)
+                     or nameof(ProfileEditorViewModel.OnSuccess)
+                     or nameof(ProfileEditorViewModel.ArchiveFolder))
             {
-                DryRun.ApplySyncMode(Editor.SyncMode);
+                ApplyEditorPolicies();
             }
         };
 
@@ -177,8 +185,14 @@ public sealed partial class MainWindowViewModel : ViewModelBase
         List.SelectedProfile = null;
         Editor.LoadNew();
         DryRun.SetProfile(null, Editor.ProfileName);   // a never-saved profile is still previewable
-        DryRun.ApplySyncMode(Editor.SyncMode);
+        ApplyEditorPolicies();
     }
+
+    /// <summary>Pushes the editor's live policies into the Preview footer's warnings. One place, because
+    /// the footer must never describe a different profile than the editor is showing — and the source
+    /// disposition it states is the only warning a user gets that a run destroys their originals.</summary>
+    private void ApplyEditorPolicies() =>
+        DryRun.ApplyPolicies(Editor.SyncMode, Editor.OnSuccess, Editor.ArchiveFolder);
 
     [RelayCommand]
     public void OpenLogFolder() => _logFolder.OpenLogFolder();
@@ -196,15 +210,55 @@ public sealed partial class MainWindowViewModel : ViewModelBase
     private const int MaxTrackedRuns = 32;
     private readonly HashSet<Guid> _ownRunIds = [];
 
+    // Insertion order for _ownRunIds, so hitting the bound evicts the OLDEST rather than clearing the
+    // set. Clearing dropped ownership of runs that were still planning, which is the same lost-plan
+    // symptom as the race below — from the other direction.
+    private readonly Queue<Guid> _ownRunOrder = new();
+
+    // A run-planned event that arrived before its own run-profile reply did, keyed by run id.
+    //
+    // Planning is DETACHED on the service side, and the event pump delivers on the UI thread — so a
+    // profile whose plan takes a few milliseconds can have its event dispatched while PreviewProfileAsync
+    // is still suspended at the await that would tell us the run is ours. The event was then dropped by
+    // the ownership filter and the Preview tab sat on "Working out what this will do…" forever, with the
+    // run parked in AwaitingApproval holding a snapshot directory nothing would ever answer for.
+    //
+    // Bounded by the same MaxTrackedRuns: an event for a run this window never started (another client's)
+    // is buffered once and evicted, never accumulated.
+    private readonly Dictionary<Guid, RunPlannedEvent> _unclaimedPlans = [];
+    private readonly Queue<Guid> _unclaimedPlanOrder = new();
+
     // The in-flight editor load started by the last selection change, so a caller that moved the
     // selection itself can await it. Never null: an un-awaited completed task is the no-op case.
     private Task _selectionLoad = Task.CompletedTask;
 
     private void RememberOwnRun(Guid runId)
     {
-        if (_ownRunIds.Count >= MaxTrackedRuns)
-            _ownRunIds.Clear();   // the pending ones are stale by now; a missed notice beats unbounded growth
-        _ownRunIds.Add(runId);
+        if (!_ownRunIds.Add(runId))
+            return;
+        _ownRunOrder.Enqueue(runId);
+        while (_ownRunOrder.Count > MaxTrackedRuns)
+            _ownRunIds.Remove(_ownRunOrder.Dequeue());
+    }
+
+    /// <summary>Applies a <c>run-planned</c> that arrived before we knew the run was ours, if one did.
+    /// Called right after <see cref="RememberOwnRun"/> — the moment the answer changes.</summary>
+    private void ClaimBufferedPlan(Guid runId)
+    {
+        if (!_unclaimedPlans.Remove(runId, out RunPlannedEvent? planned))
+            return;
+        _ = ShowRunPlanAsync(planned);
+    }
+
+    /// <summary>Holds a plan for a run we have not been told is ours yet, so the imminent
+    /// <see cref="ClaimBufferedPlan"/> can pick it up.</summary>
+    private void BufferUnclaimedPlan(RunPlannedEvent planned)
+    {
+        if (!_unclaimedPlans.TryAdd(planned.RunId, planned))
+            return;
+        _unclaimedPlanOrder.Enqueue(planned.RunId);
+        while (_unclaimedPlanOrder.Count > MaxTrackedRuns)
+            _unclaimedPlans.Remove(_unclaimedPlanOrder.Dequeue());
     }
 
     /// <summary>Previews what the selected profile will do, by starting the PLANNING phase of a real run
@@ -283,6 +337,10 @@ public sealed partial class MainWindowViewModel : ViewModelBase
             // Makes the planning scan cancellable: a large profile's plan is minutes of walking, and the
             // user must be able to stop it.
             DryRun.PlanningStarted(started.RunId);
+            // LAST, and only now that the run is both remembered and cancellable: if this profile's plan
+            // was quick enough to finish while we were awaiting the reply above, its event is sitting in
+            // the buffer instead of having been dropped.
+            ClaimBufferedPlan(started.RunId);
         }
         catch (Exception ex)
         {
@@ -419,9 +477,23 @@ public sealed partial class MainWindowViewModel : ViewModelBase
                 // closes, because run-completed needs it too.
                 if (_ownRunIds.Contains(planned.RunId))
                     _ = ShowRunPlanAsync(planned);
+                else
+                    // Not ours YET. Planning is detached on the service side, so a fast plan's event can
+                    // beat its own run-profile reply here — dropping it left the tab spinning forever and
+                    // the run parked. Buffered instead, for the claim that is about to happen.
+                    BufferUnclaimedPlan(planned);
                 break;
             case RunProgressEvent runProgress:
-                if (_ownRunIds.Contains(runProgress.RunId))
+                if (!_ownRunIds.Contains(runProgress.RunId))
+                    break;
+                // Planning samples belong on the Preview tab's caption, not in the activity panel: the
+                // panel is closed until a run is approved, so a scan's progress posted only there is
+                // progress the user never sees — and planning is precisely when they are waiting.
+                // A literal because RunPhase is engine-internal: the UI reaches the service over IPC and
+                // the phase crosses it as a string, which is the contract RunProgressEvent.Phase documents.
+                if (runProgress.Phase == "Planning")
+                    DryRun.PlanningProgress(runProgress.ScannedSources, runProgress.ScannedDestinations);
+                else
                     Activity.ShowNotice(
                         $"Running: {runProgress.Completed} of {runProgress.Total} file(s)"
                         + (runProgress.Deleted > 0 ? $", {runProgress.Deleted} removed" : "") + "…");
@@ -711,7 +783,8 @@ public sealed partial class MainWindowViewModel : ViewModelBase
             loaded.TryGetValue(out Profile? profile);
             Editor.Load(profile!);
             DryRun.SetProfile(profile!.Id, profile.Name);
-            DryRun.ApplySyncMode(profile.SyncMode);
+            DryRun.ApplyPolicies(
+                profile.SyncMode, profile.Policies.OnSuccess, profile.Policies.ArchiveFolder);
         }
         catch (Exception ex)
         {
@@ -729,7 +802,7 @@ public sealed partial class MainWindowViewModel : ViewModelBase
             SuppressNextProfilesEcho();
             await List.RefreshAndSelectAsync(profileId);
             DryRun.SetProfile(profileId, Editor.ProfileName);
-            DryRun.ApplySyncMode(Editor.SyncMode);
+            ApplyEditorPolicies();
         }
         catch (Exception ex)
         {

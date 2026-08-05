@@ -68,7 +68,9 @@ public abstract record IpcRequest
     /// plan the PERSISTED profile instead of the draft on screen — a wrong answer that looks right,
     /// which is the whole reason this gate exists.
     /// 11 — a run's §4.1 blocking warnings are now enforced at APPROVAL: run-planned carries
-    /// BlockingIssues and approve-run carries AcknowledgeWarnings. Version-gated rather than
+    /// BlockingIssues and approve-run carries AcknowledgeWarnings. run-progress is additionally published
+    /// during the PLANNING phase, carrying ScannedSources/ScannedDestinations, so a preview of a large
+    /// tree shows live counts instead of one unchanging caption. Version-gated rather than
     /// optional-additive because the failure mode of an old client is silent and destructive: it would
     /// send no acknowledgment, and a service that refused would look like an approve button that does
     /// nothing — while an old SERVICE would ignore the flag and run a draft the validator would have

@@ -121,6 +121,135 @@ public sealed class MainWindowViewModelRunPlanTests
         Assert.Contains("No files will be removed", shell.DryRun.PlanTruncationNotice);
     }
 
+    // ---- the superseding preview -------------------------------------------------------------------
+
+    [Fact]
+    public async Task A_second_preview_CANCELS_the_scan_the_first_one_started()
+    {
+        (MainWindowViewModel shell, FakeIpcGateway gateway) = NewShell();
+        Guid first = await StartPreviewAsync(shell, gateway);
+
+        // The user edits a filter and presses Preview again while the first scan is still walking.
+        Guid second = Guid.NewGuid();
+        gateway.RunProfileResult = new RunProfileResponse { RunId = second };
+        await shell.PreviewProfileAsync(Row());
+
+        // The superseded run must be CANCELLED, not merely forgotten: nulling the id left the engine
+        // walking a tree nobody would ever answer for, holding a snapshot directory that nothing sweeps.
+        Assert.Equal(first, Assert.Single(gateway.CancelRunCalls));
+        Assert.Equal(second, shell.DryRun.PlanningRunId);
+    }
+
+    [Fact]
+    public async Task A_superseded_run_s_LATE_plan_can_never_overwrite_the_newer_one()
+    {
+        (MainWindowViewModel shell, FakeIpcGateway gateway) = NewShell();
+        Guid first = await StartPreviewAsync(shell, gateway);
+        Guid second = Guid.NewGuid();
+        gateway.RunProfileResult = new RunProfileResponse { RunId = second };
+        await shell.PreviewProfileAsync(Row());
+
+        // The newer plan lands...
+        shell.HandleEngineEvent(Planned(second));
+        await WaitUntilAsync(() => shell.DryRun.PendingRunId is not null);
+        Assert.Equal(second, shell.DryRun.PendingRunId);
+
+        // ...and then the abandoned scan finishes and publishes its own. It used to still be recognized as
+        // ours, so its rows and PendingRunId replaced the newer plan's — and Approve then executed the
+        // profile as it was BEFORE the edit that prompted the re-preview.
+        shell.HandleEngineEvent(Planned(first));
+        await Task.Delay(50);
+
+        Assert.Equal(second, shell.DryRun.PendingRunId);
+        Assert.Equal(second, Assert.Single(gateway.RunPlanStreamCalls));
+    }
+
+    // ---- the plan that arrives before its own reply ------------------------------------------------
+
+    [Fact]
+    public async Task A_plan_that_beats_its_own_run_profile_REPLY_is_still_shown()
+    {
+        (MainWindowViewModel shell, FakeIpcGateway gateway) = NewShell();
+        shell.Editor.Load(MirrorProfile());
+        Guid runId = Guid.NewGuid();
+        gateway.RunProfileResult = new RunProfileResponse { RunId = runId };
+
+        // Planning is DETACHED on the service side and the event pump delivers on the UI thread, so a
+        // profile whose plan takes a few milliseconds can have its run-planned dispatched while
+        // PreviewProfileAsync is still suspended at its await. Dropping it left the tab on "Working out
+        // what this will do…" forever, with the run parked in AwaitingApproval holding a snapshot.
+        gateway.BeforeRunProfileReply = () => shell.HandleEngineEvent(Planned(runId));
+
+        await shell.PreviewProfileAsync(Row());
+        await WaitUntilAsync(() => shell.DryRun.PendingRunId is not null);
+
+        Assert.Equal(runId, shell.DryRun.PendingRunId);
+        Assert.Equal(runId, Assert.Single(gateway.RunPlanStreamCalls));
+    }
+
+    [Fact]
+    public async Task A_buffered_plan_for_a_run_this_window_never_started_is_NOT_shown()
+    {
+        (MainWindowViewModel shell, FakeIpcGateway gateway) = NewShell();
+        Guid theirs = Guid.NewGuid();
+
+        // Another client's run. Buffering it must not become a way for it to be adopted later.
+        shell.HandleEngineEvent(Planned(theirs));
+        Guid ours = await StartPreviewAsync(shell, gateway);
+        await Task.Delay(50);
+
+        Assert.Null(shell.DryRun.PendingRunId);
+        Assert.Empty(gateway.RunPlanStreamCalls);
+        Assert.NotEqual(theirs, ours);
+    }
+
+    // ---- progress while planning -------------------------------------------------------------------
+
+    [Fact]
+    public async Task Planning_progress_reaches_the_TAB_and_not_the_activity_panel()
+    {
+        (MainWindowViewModel shell, FakeIpcGateway gateway) = NewShell();
+        Guid runId = await StartPreviewAsync(shell, gateway);
+
+        shell.HandleEngineEvent(new RunProgressEvent
+        {
+            AtUtc = DateTimeOffset.UnixEpoch,
+            RunId = runId,
+            Phase = "Planning",
+            Completed = 0,
+            Total = 0,
+            Deleted = 0,
+            ScannedSources = 12_345,
+            ScannedDestinations = 6_000,
+        });
+
+        // The activity panel is closed until a run is approved, so a scan's progress posted only there is
+        // progress the user never sees — and planning is exactly when they are waiting on it.
+        Assert.Contains("12,345", shell.DryRun.RunStatusText, StringComparison.Ordinal);
+        Assert.Contains("6,000", shell.DryRun.RunStatusText, StringComparison.Ordinal);
+        Assert.DoesNotContain("12,345", shell.Activity.Notice ?? "", StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Execution_progress_still_goes_to_the_activity_panel()
+    {
+        (MainWindowViewModel shell, FakeIpcGateway gateway) = NewShell();
+        Guid runId = await StartPreviewAsync(shell, gateway);
+
+        shell.HandleEngineEvent(new RunProgressEvent
+        {
+            AtUtc = DateTimeOffset.UnixEpoch,
+            RunId = runId,
+            Phase = "Executing",
+            Completed = 7,
+            Total = 10,
+            Deleted = 2,
+        });
+
+        Assert.Contains("7 of 10", shell.Activity.Notice);
+        Assert.Contains("2 removed", shell.Activity.Notice);
+    }
+
     // ---- the plans that never reach the tab -------------------------------------------------------
 
     [Fact]

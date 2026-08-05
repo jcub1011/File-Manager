@@ -118,16 +118,34 @@ public sealed record RunPlannedEvent : EngineEvent
     public IReadOnlyList<ValidationIssue> BlockingIssues { get; init; } = [];
 }
 
-/// <summary>Best-effort run-level progress. Throttled and lossy like <see cref="JobProgressEvent"/>;
-/// <see cref="RunCompletedEvent"/> is authoritative. Unlike a job's progress this has a real
-/// denominator, because the work list was frozen before execution started.</summary>
+/// <summary>Best-effort run-level progress, during PLANNING as well as execution. Throttled and lossy
+/// like <see cref="JobProgressEvent"/>;
+/// <see cref="RunCompletedEvent"/> is authoritative. Once EXECUTING this has a real denominator, unlike a
+/// job's progress, because the work list was frozen before execution started; while PLANNING there is no
+/// denominator yet — that is what planning is computing — so the two scan counts below carry it
+/// instead.</summary>
 public sealed record RunProgressEvent : EngineEvent
 {
     public required Guid RunId { get; init; }
+
+    /// <summary>The <c>RunPhase</c> this sample was taken in, as a string. <c>Planning</c> means the copy
+    /// counters below are all zero and the scan counts are the live figures.</summary>
     public required string Phase { get; init; }
     public required int Completed { get; init; }
     public required int Total { get; init; }
     public required int Deleted { get; init; }
+
+    /// <summary>Source files the plan's scan has discovered so far, during <c>Planning</c>.
+    /// <para>This exists because a preview of a large tree is minutes of walking with nothing to show. The
+    /// dry run that preceded the two-phase shape streamed exactly these counts and the caption read
+    /// "Scanning sources… 12,345 files found"; when planning moved into the run coordinator the progress
+    /// pipeline was not carried over, leaving one unchanging sentence for the whole scan — a wedged walk
+    /// and a slow one look identical.</para></summary>
+    public long ScannedSources { get; init; }
+
+    /// <summary>Destination files the plan's sweep has discovered so far, during <c>Planning</c>. Stays
+    /// zero for a profile that does not scan its destination, which is most of them.</summary>
+    public long ScannedDestinations { get; init; }
 }
 
 /// <summary>A run reached its terminal state. The only authoritative statement of what a run did.</summary>

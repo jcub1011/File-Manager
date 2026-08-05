@@ -194,9 +194,15 @@
                         <!-- A spyglass, not a play triangle: this button inspects, and the only button in
                              the app that starts moving files is Approve Run. With the label gone the glyph
                              is the whole argument, so the tooltip still spells out what a preview does. -->
+                        <!-- Disabled while a preview is in flight, matching the Preview tab's twin below.
+                             The SplitButton this replaced awaited the whole dry run, so its command stayed
+                             disabled for the scan and a second concurrent run was impossible; the icon
+                             button returns as soon as the engine ACCEPTS the run, so without this a second
+                             press starts a second full scan of the same tree. -->
                         <Button Classes="iconButton tintSuccess"
                                 Command="{Binding PreviewProfileCommand}"
                                 CommandParameter="{Binding List.SelectedProfile}"
+                                IsEnabled="{Binding !DryRun.IsPreviewing}"
                                 ToolTip.Tip="Preview — works out exactly what this profile will do and shows it on the Preview tab. Nothing is copied or deleted until you approve it there.">
                             <PathIcon Data="{StaticResource IconSearch}" Width="16" Height="16" />
                         </Button>

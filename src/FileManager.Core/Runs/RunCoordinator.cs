@@ -52,6 +52,11 @@ public sealed class RunCoordinator(
     /// event still gets an answer instead of a null.</summary>
     private static readonly TimeSpan ClosedRunRetention = TimeSpan.FromMinutes(10);
 
+    /// <summary>Minimum spacing between planning-progress samples. Matches the ~10 frames/sec the dry-run
+    /// stream used, which was measured to be enough for a caption to look live without the publish itself
+    /// becoming the scan's bottleneck.</summary>
+    private static readonly TimeSpan PlanProgressInterval = TimeSpan.FromMilliseconds(100);
+
     private readonly ConcurrentDictionary<Guid, RunState> _runs = new();
     private readonly CancellationTokenSource _shutdown = new();
 
@@ -314,6 +319,9 @@ public sealed class RunCoordinator(
         try
         {
             using RunSnapshotWriter writer = new(directory, logger);
+            // Seeded with a real timestamp, never left at 0: GetElapsedTime(0) reads as machine uptime,
+            // which would make the interval below meaningless.
+            long lastProgress = time.GetTimestamp();
             await foreach (Result<PlanChunk, string> chunk in
                 planner.PlanAsync(run.Profile, run.ScopePath, state, counters, linked.Token)
                     .ConfigureAwait(false))
@@ -325,6 +333,14 @@ public sealed class RunCoordinator(
                 }
                 chunk.TryGetValue(out PlanChunk planned);
                 writer.Consume(planned, run.Profile);
+                // Live scan counts, so a multi-minute preview is distinguishable from a wedged one. Chunks
+                // already arrive in batches, and the interval bounds it again for a tree of small chunks;
+                // the event is lossy by contract, so a dropped sample costs nothing.
+                if (time.GetElapsedTime(lastProgress) >= PlanProgressInterval)
+                {
+                    lastProgress = time.GetTimestamp();
+                    PublishPlanningProgress(run, counters);
+                }
             }
 
             if (failure is null && writer.Failure is { } writeFailure)
@@ -758,6 +774,22 @@ public sealed class RunCoordinator(
             return blocking;
         }
     }
+
+    /// <summary>A progress sample from the PLANNING phase, where the copy counters are all still zero and
+    /// the scan counts are the only live figures — there is no denominator yet, because computing one is
+    /// what planning is doing.</summary>
+    private void PublishPlanningProgress(RunState run, DryRunProgressCounters counters) =>
+        Publish(new RunProgressEvent
+        {
+            AtUtc = time.GetUtcNow(),
+            RunId = run.RunId,
+            Phase = RunPhase.Planning.ToString(),
+            Completed = 0,
+            Total = 0,
+            Deleted = 0,
+            ScannedSources = counters.Sources,
+            ScannedDestinations = counters.Destinations,
+        });
 
     private void PublishProgress(RunState run)
     {

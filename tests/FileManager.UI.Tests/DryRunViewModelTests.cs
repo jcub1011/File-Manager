@@ -28,10 +28,10 @@ public sealed class DryRunViewModelTests
     {
         var (viewModel, _) = NewViewModel();
 
-        viewModel.ApplySyncMode(SyncMode.AdditiveArchive);
+        viewModel.ApplyPolicies(SyncMode.AdditiveArchive, OnSuccessAction.KeepSource, null);
         Assert.Equal("", viewModel.MirrorWarning);
 
-        viewModel.ApplySyncMode(SyncMode.Mirror);
+        viewModel.ApplyPolicies(SyncMode.Mirror, OnSuccessAction.KeepSource, null);
         Assert.Contains("MIRROR", viewModel.MirrorWarning);
         // The filter caveat is load-bearing, not padding: tightening a filter on a Mirror profile removes
         // copies the profile made earlier, which nothing else on screen says.
@@ -42,11 +42,62 @@ public sealed class DryRunViewModelTests
     public void Closing_the_profile_drops_the_Mirror_warning()
     {
         var (viewModel, _) = NewViewModel();
-        viewModel.ApplySyncMode(SyncMode.Mirror);
+        viewModel.ApplyPolicies(SyncMode.Mirror, OnSuccessAction.KeepSource, null);
 
         viewModel.ClearProfile();
 
         Assert.Equal("", viewModel.MirrorWarning);
+    }
+
+    // ── The footer's source-disposition warning ─────────────────────────────────────────────────
+
+    /// <summary>The modal confirmation this footer replaced was the only place the source disposition was
+    /// ever stated ("each source file will then be PERMANENTLY DELETED"), and its test was deleted with
+    /// it. Without this, a user reads "1,204 file(s) to copy or update" and loses all 1,204 originals with
+    /// nothing on screen having said so.</summary>
+    [Theory]
+    [InlineData(OnSuccessAction.PermanentDelete, "PERMANENTLY DELETED")]
+    [InlineData(OnSuccessAction.MoveToTrash, "RECYCLE BIN")]
+    public void A_destructive_disposition_is_stated_and_flagged_as_destructive(
+        OnSuccessAction disposition, string expected)
+    {
+        var (viewModel, _) = NewViewModel();
+
+        viewModel.ApplyPolicies(SyncMode.AdditiveArchive, disposition, null);
+
+        Assert.Contains(expected, viewModel.SourceDispositionWarning, StringComparison.Ordinal);
+        Assert.True(viewModel.SourceDispositionDestroys);
+        // The danger bar carries it, so the plain-text note must not also render it.
+        Assert.False(viewModel.ShowSourceDispositionNote);
+    }
+
+    [Fact]
+    public void Archiving_the_sources_is_stated_WITHOUT_the_danger_styling()
+    {
+        var (viewModel, _) = NewViewModel();
+
+        viewModel.ApplyPolicies(SyncMode.AdditiveArchive, OnSuccessAction.MoveToArchive, @"D:\archive");
+
+        // The file is relocated, not lost — worth saying, not worth shouting. The folder is named because
+        // "moved to the archive folder" without one is not a statement of where anything went.
+        Assert.Contains(@"D:\archive", viewModel.SourceDispositionWarning, StringComparison.Ordinal);
+        Assert.False(viewModel.SourceDispositionDestroys);
+        Assert.True(viewModel.ShowSourceDispositionNote);
+    }
+
+    [Fact]
+    public void Keeping_the_sources_says_nothing_at_all()
+    {
+        var (viewModel, _) = NewViewModel();
+        viewModel.ApplyPolicies(SyncMode.AdditiveArchive, OnSuccessAction.PermanentDelete, null);
+
+        viewModel.ApplyPolicies(SyncMode.AdditiveArchive, OnSuccessAction.KeepSource, null);
+
+        // The safe default. Stating "kept in place" beside the counts is noise that dilutes the warnings
+        // that matter — and this also pins that switching BACK clears the destructive text.
+        Assert.Equal("", viewModel.SourceDispositionWarning);
+        Assert.False(viewModel.SourceDispositionDestroys);
+        Assert.False(viewModel.ShowSourceDispositionNote);
     }
 
     // ── New-model fixture helpers ──────────────────────────────────────────────────────────────

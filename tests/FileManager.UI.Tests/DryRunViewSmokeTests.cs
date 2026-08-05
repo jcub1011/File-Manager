@@ -128,7 +128,8 @@ public sealed class DryRunViewSmokeTests(HeadlessSessionFixture headless)
         await headless.Session.DispatchAsync(async () =>
         {
             var (vm, gateway) = PopulatedViewModel();
-            vm.ApplySyncMode(SyncMode.Mirror);   // so the Mirror warning bar renders too
+            // Mirror plus a destructive disposition, so both warning bars in the footer render too.
+            vm.ApplyPolicies(SyncMode.Mirror, OnSuccessAction.PermanentDelete, null);
             await RunPlans.PreviewAsync(vm, gateway, copies: 4, deletes: 2, truncated: true);
             Assert.NotNull(vm.PendingRunId);
 
