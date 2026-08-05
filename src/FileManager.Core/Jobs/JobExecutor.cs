@@ -182,11 +182,36 @@ public sealed class JobExecutor(
         }
         states.Transition(JobState.Screened);
 
-        // 5. SEAL SOURCE AS OUTPUT — no transform: the source itself is the sealed artifact. The
-        //    guard-only Transforming transition keeps the §7.1 sequence; no workspace is created.
+        // 5. PROBE IDENTITY (spec §3.4.1) — the unchanged-file short-circuit, run BEFORE sealing.
+        //    The order is the whole point: sealing reads the source end to end, so a file that is
+        //    already at every target must not reach it. Under a bounded-read LargeFileIdentity policy a
+        //    duplicate is settled from a few MiB (or from metadata alone) instead of two full reads.
         Report(progress, plan, JobPhase.Sealing);
+        Result<IdentityProbe, JobError> probed = await ProbeIdentityAsync(execution, ct).ConfigureAwait(false);
+        if (probed.IsCanceled)
+            return await RollBackAsync(execution, CanceledSeal(), progress, start, ct).ConfigureAwait(false);
+        if (probed.TryGetError(out JobError? probeError))
+            return await RollBackAsync(execution, probeError, progress, start, ct).ConfigureAwait(false);
+        probed.TryGetValue(out IdentityProbe probe);
+
+        if (probe.AllTargetsSatisfied)
+        {
+            // Every target already held identical content: close Skipped WITHOUT sealing, committing or
+            // disposing (spec §3.4.1 / flow §6.2 — re-delivery is idempotent). Nothing was written and
+            // nothing was sealed, so this closes directly (I-WAL).
+            states.Transition(JobState.Closed);
+            TryAppend(Close(plan, JobOutcome.Skipped, SkipReason.UnchangedAtAllTargets));
+            Log(plan, "skipped (unchanged at all targets)");
+            // Carries its resolved paths: every target already holds this content, so those paths are
+            // emphatically NOT orphans and a Mirror pass must never remove them.
+            return CompletedWithPaths(execution, JobOutcome.Skipped, SkipReason.UnchangedAtAllTargets, null, start);
+        }
+
+        // 6. SEAL SOURCE AS OUTPUT — no transform: the source itself is the sealed artifact. The
+        //    guard-only Transforming transition keeps the §7.1 sequence; no workspace is created.
         states.Transition(JobState.Transforming);
-        Result<SealedOutput, JobError> sealResult = await SealSourceAsync(plan, ct).ConfigureAwait(false);
+        Result<SealedOutput, JobError> sealResult =
+            await SealSourceAsync(plan, probe.SourceFullHash, ct).ConfigureAwait(false);
         if (sealResult.IsCanceled)
             return await RollBackAsync(execution, CanceledSeal(), progress, start, ct).ConfigureAwait(false);
         if (sealResult.TryGetError(out JobError? sealError))
@@ -207,40 +232,17 @@ public sealed class JobExecutor(
             return await RollBackAsync(execution, sealedError, progress, start, ct).ConfigureAwait(false);
         states.Transition(JobState.OutputSealed);
 
-        // 6. DISTRIBUTE + VERIFY + PLACE — bounded-parallel per target; cancel siblings on first fail.
+        // 7. DISTRIBUTE + VERIFY + PLACE — bounded-parallel per target; cancel siblings on first fail.
+        //    Targets the probe already satisfied are terminal and short-circuit inside PlaceOneAsync.
         Report(progress, plan, JobPhase.Distributing);
         states.Transition(JobState.Distributing);
         JobError? distributeError = await DistributeAsync(execution, locks, progress, ct).ConfigureAwait(false);
         if (distributeError is not null)
             return await RollBackAsync(execution, distributeError, progress, start, ct).ConfigureAwait(false);
 
-        // 7. COMMIT / SKIP decision.
-        bool anyPlaced = false, anySkippedConflict = false, allUnchanged = true;
-        foreach (TargetProgress tp in execution.Targets)
-        {
-            switch (tp.State)
-            {
-                case TargetState.Placed: anyPlaced = true; allUnchanged = false; break;
-                case TargetState.SkippedConflict: anySkippedConflict = true; allUnchanged = false; break;
-                case TargetState.SatisfiedUnchanged: break;
-                default: allUnchanged = false; break;
-            }
-        }
-
-        if (!anyPlaced && !anySkippedConflict && allUnchanged)
-        {
-            // Every target already held identical content: close Skipped WITHOUT committing or
-            // disposing (spec §3.4.1 / flow §6.2 — re-delivery is idempotent). Committed is a
-            // guard-only transition here; no JobCommittedRecord is written.
-            states.Transition(JobState.Committed);
-            states.Transition(JobState.Closed);
-            TryAppend(Close(plan, JobOutcome.Skipped, SkipReason.UnchangedAtAllTargets));
-            Log(plan, "skipped (unchanged at all targets)");
-            // Carries its resolved paths: every target already holds this content, so those paths are
-            // emphatically NOT orphans and a Mirror pass must never remove them.
-            return CompletedWithPaths(execution, JobOutcome.Skipped, SkipReason.UnchangedAtAllTargets, null, start);
-        }
-
+        // The "unchanged at every target" outcome is decided in phase 5 and returns there — reaching here
+        // means at least one target was placed or conflict-skipped, so the job commits.
+        //
         // Commit point (I-DISPOSE): source disposition is authorized by this record and nothing else.
         // A failed commit append is fatal → rollback.
         Report(progress, plan, JobPhase.Committing, TerminalTargetCount(execution));
@@ -367,17 +369,161 @@ public sealed class JobExecutor(
         return decision.Matched;
     }
 
-    private async Task<Result<SealedOutput, JobError>> SealSourceAsync(JobPlan plan, CancellationToken ct)
+    /// <summary>Outcome of the §3.4.1 identity probe (phase 5).</summary>
+    /// <param name="AllTargetsSatisfied">Every target already holds this content, so the job is a no-op.
+    /// Vacuously true for a plan with no targets, which is how that degenerate case closed before the
+    /// probe existed.</param>
+    /// <param name="SourceFullHash">The source's full content hash IF the probe needed one — handed to
+    /// <see cref="SealSourceAsync"/> so sealing never re-reads a file the probe already read whole.</param>
+    private readonly record struct IdentityProbe(bool AllTargetsSatisfied, string? SourceFullHash);
+
+    /// <summary>Runs the spec §3.4.1 unchanged-check against every target BEFORE the output is sealed.
+    ///
+    /// <para>Sealing hashes the source end to end, so doing it first made a duplicate cost a full read of
+    /// the source plus a full read of the destination. Probing first means a bounded-read
+    /// <see cref="LargeFileIdentity"/> policy settles a duplicate from a few MiB, and the full read is
+    /// paid only once it is known that something actually has to be written.</para></summary>
+    private async Task<Result<IdentityProbe, JobError>> ProbeIdentityAsync(
+        JobExecution execution, CancellationToken ct)
+    {
+        JobPlan plan = execution.Plan;
+        IdentityPlan idPlan = IdentityStrategy.For(
+            plan.Source.SizeBytes,
+            plan.Policies.Verification,
+            plan.Policies.LargeFileIdentity,
+            plan.Policies.LargeFileIdentityThresholdBytes);
+
+        // Cheap gate, one stat per target: a target can only already be satisfied if it holds a file of
+        // the same size. With no candidate there is nothing to compare against, so the incoming file needs
+        // no digest at all — a fresh copy must not pay for one. CheckUnchangedAsync re-checks existence and
+        // size authoritatively; this only decides whether to hash.
+        bool anyCandidate = false;
+        foreach (TargetPlan target in plan.Targets)
+        {
+            if (SameSizeFileExists(target.ProspectiveFinalPath, plan.Source.SizeBytes))
+            {
+                anyCandidate = true;
+                break;
+            }
+        }
+
+        string? fullHash = null;
+        if (anyCandidate)
+        {
+            byte[]? sampledHash = null;
+            switch (idPlan.ContentEvidence)
+            {
+                case IdentityEvidence.FullHash:
+                {
+                    Result<string, JobError> hashed = await hasher
+                        .HashFileAsync(plan.Source.Path, plan.Policies.Verification, ct).ConfigureAwait(false);
+                    if (hashed.IsCanceled)
+                        return Result<IdentityProbe, JobError>.Canceled();
+                    if (hashed.TryGetError(out JobError? hashError))
+                        return hashError;
+                    hashed.TryGetValue(out fullHash);
+                    break;
+                }
+                case IdentityEvidence.SampledHash:
+                {
+                    Result<byte[], JobError> sampled = await hasher
+                        .HashSampledToBytesAsync(plan.Source.Path, SampledHashLayout.Default, ct).ConfigureAwait(false);
+                    if (sampled.IsCanceled)
+                        return Result<IdentityProbe, JobError>.Canceled();
+                    if (sampled.TryGetError(out JobError? sampledError))
+                        return sampledError;
+                    sampled.TryGetValue(out sampledHash);
+                    break;
+                }
+                case null:
+                    // Metadata-only policy: nothing to read.
+                    break;
+            }
+
+            IdentityReference reference = new()
+            {
+                Path = plan.Source.Path,
+                SizeBytes = plan.Source.SizeBytes,
+                LastWriteUtc = plan.Source.LastWriteUtc,
+                Plan = idPlan,
+                FullContentHash = fullHash,
+                SampledContentHash = sampledHash,
+            };
+
+            // Concurrent, like distribution: each target's existing file is a separate read, so several
+            // destinations settle in max(target) rather than sum(targets). CheckUnchangedAsync never
+            // throws (it owns its catch-alls), so WhenAll cannot fault.
+            Task<Result<UnchangedCheckResult, JobError>>[] checks =
+                new Task<Result<UnchangedCheckResult, JobError>>[plan.Targets.Count];
+            for (int i = 0; i < plan.Targets.Count; i++)
+                checks[i] = placer.CheckUnchangedAsync(
+                    execution, i, plan.Targets[i].ProspectiveFinalPath, reference, ct);
+            await Task.WhenAll(checks).ConfigureAwait(false);
+
+            bool canceled = false;
+            foreach (Task<Result<UnchangedCheckResult, JobError>> check in checks)
+            {
+                if (check.Result.IsCanceled)
+                    canceled = true;
+                else if (check.Result.TryGetError(out JobError? checkError))
+                    return checkError;   // report the lowest-index failure
+            }
+            if (canceled)
+                return Result<IdentityProbe, JobError>.Canceled();
+        }
+
+        // CheckUnchangedAsync marks the targets it satisfied, so the mirror is the authority here.
+        bool allSatisfied = true;
+        foreach (TargetProgress tp in execution.Targets)
+        {
+            if (tp.State != TargetState.SatisfiedUnchanged)
+            {
+                allSatisfied = false;
+                break;
+            }
+        }
+
+        return new IdentityProbe(allSatisfied, fullHash);
+    }
+
+    /// <summary>One stat, used only to decide whether the identity probe needs to hash anything.
+    /// Unreadable metadata answers "yes, a candidate": costing a hash is the safe direction, whereas
+    /// answering "no" would skip a comparison that should have happened.</summary>
+    private static bool SameSizeFileExists(string path, long sizeBytes)
+    {
+        try
+        {
+            FileInfo info = new(path);
+            return info.Exists && info.Length == sizeBytes;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return true;
+        }
+    }
+
+    private async Task<Result<SealedOutput, JobError>> SealSourceAsync(
+        JobPlan plan, string? precomputedHash, CancellationToken ct)
     {
         string hash = "";
         if (plan.Policies.Verification is VerificationMethod.Sha256 or VerificationMethod.XxHash128)
         {
-            Result<string, JobError> hashed = await hasher.HashFileAsync(plan.Source.Path, plan.Policies.Verification, ct).ConfigureAwait(false);
-            if (hashed.IsCanceled)
-                return Result<SealedOutput, JobError>.Canceled();
-            if (hashed.TryGetError(out JobError? hashError))
-                return hashError;
-            hashed.TryGetValue(out hash!);
+            // The identity probe may already have hashed the source in full under this very method. Reuse
+            // that digest rather than reading the file a second time — under the default FullHash policy
+            // this is what keeps a placement at today's cost instead of adding a read.
+            if (precomputedHash is not null)
+            {
+                hash = precomputedHash;
+            }
+            else
+            {
+                Result<string, JobError> hashed = await hasher.HashFileAsync(plan.Source.Path, plan.Policies.Verification, ct).ConfigureAwait(false);
+                if (hashed.IsCanceled)
+                    return Result<SealedOutput, JobError>.Canceled();
+                if (hashed.TryGetError(out JobError? hashError))
+                    return hashError;
+                hashed.TryGetValue(out hash!);
+            }
         }
         return new SealedOutput
         {
@@ -449,16 +595,10 @@ public sealed class JobExecutor(
         SealedOutput output = execution.Output!;
         try
         {
-            // Unchanged short-circuit FIRST (spec §3.4.1, before conflict resolution). On Unchanged
-            // the placer journals target-unchanged and sets TargetProgress.State itself.
-            Result<UnchangedCheckResult, JobError> unchanged =
-                await placer.CheckUnchangedAsync(execution, index, target.ProspectiveFinalPath, ct).ConfigureAwait(false);
-            if (unchanged.IsCanceled)
-                return null;   // a sibling failed / shutdown — not this target's error
-            if (unchanged.TryGetError(out JobError? unchangedError))
-                return unchangedError;
-            unchanged.TryGetValue(out UnchangedCheckResult check);
-            if (check == UnchangedCheckResult.Unchanged)
+            // The §3.4.1 unchanged short-circuit ran in phase 5, before sealing — see
+            // ProbeIdentityAsync. A target it satisfied is terminal (the placer journalled
+            // target-unchanged and marked the state), so there is nothing to write here.
+            if (execution.Targets[index].State == TargetState.SatisfiedUnchanged)
             {
                 Log(plan, $"target {index}: unchanged, already satisfied");
                 return null;

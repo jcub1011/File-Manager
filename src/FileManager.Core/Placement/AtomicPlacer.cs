@@ -30,16 +30,11 @@ public sealed class AtomicPlacer(
     private const int CopyBufferSize = 1024 * 1024;
     private const string TempSuffix = ".fmtmp-";
 
-    /// <summary>Timestamp comparison tolerance for the VerificationMethod.None unchanged-check —
-    /// FAT/exFAT round last-write times to ~2 s, so an exact-tick compare would never short-circuit.</summary>
-    private static readonly TimeSpan TimestampTolerance = TimeSpan.FromSeconds(2);
-
     public async Task<Result<UnchangedCheckResult, JobError>> CheckUnchangedAsync(
-        JobExecution execution, int targetIndex, string finalPath, CancellationToken ct = default)
+        JobExecution execution, int targetIndex, string finalPath, IdentityReference reference,
+        CancellationToken ct = default)
     {
-        SealedOutput? output = execution.Output;
-        if (output is null)
-            return Unusable("output not sealed before unchanged-check", finalPath, targetIndex);
+        ArgumentNullException.ThrowIfNull(reference);
 
         try
         {
@@ -47,28 +42,66 @@ public sealed class AtomicPlacer(
                 return UnchangedCheckResult.NoExistingFile;
 
             var existing = new FileInfo(finalPath);
-            if (existing.Length != output.SizeBytes)
+            if (existing.Length != reference.SizeBytes)
                 return UnchangedCheckResult.ExistsDifferent;
 
-            VerificationMethod method = execution.Plan.Policies.Verification;
-            if (method is VerificationMethod.Sha256 or VerificationMethod.XxHash128)
+            // A size match plus a timestamp match is accepted outright under the metadata-tolerant
+            // policies (and under VerificationMethod None/SizeTimestamp, where no content hash exists to
+            // compare). Zero content bytes read.
+            bool settledByMetadata = reference.Plan.AcceptMetadataMatch
+                && IdentityStrategy.TimestampsMatch(
+                    File.GetLastWriteTimeUtc(finalPath), reference.LastWriteUtc);
+
+            if (!settledByMetadata)
             {
-                Result<string, JobError> hashed = await hasher.HashFileAsync(finalPath, method, ct).ConfigureAwait(false);
-                if (hashed.IsCanceled)
-                    return Result<UnchangedCheckResult, JobError>.Canceled();
-                if (hashed.TryGetError(out JobError? hashError))
-                    return hashError;
-                hashed.TryGetValue(out string? existingHash);
-                if (!string.Equals(existingHash, output.ContentHash, StringComparison.OrdinalIgnoreCase))
-                    return UnchangedCheckResult.ExistsDifferent;
-            }
-            else
-            {
-                // VerificationMethod.None: best-effort — same size and (within FAT/exFAT rounding)
-                // same last-write time.
-                TimeSpan drift = (File.GetLastWriteTimeUtc(finalPath) - output.SourceLastWriteUtc.UtcDateTime).Duration();
-                if (drift > TimestampTolerance)
-                    return UnchangedCheckResult.ExistsDifferent;
+                switch (reference.Plan.ContentEvidence)
+                {
+                    case null:
+                        // Metadata was the only evidence this policy admits, and it did not match.
+                        return UnchangedCheckResult.ExistsDifferent;
+
+                    case IdentityEvidence.FullHash:
+                    {
+                        VerificationMethod method = execution.Plan.Policies.Verification;
+                        Result<string, JobError> hashed =
+                            await hasher.HashFileAsync(finalPath, method, ct).ConfigureAwait(false);
+                        if (hashed.IsCanceled)
+                            return Result<UnchangedCheckResult, JobError>.Canceled();
+                        if (hashed.TryGetError(out JobError? hashError))
+                            return hashError;
+                        hashed.TryGetValue(out string? existingHash);
+                        if (reference.FullContentHash is null)
+                            return Unusable("identity reference carries no full content hash", finalPath, targetIndex);
+                        if (!string.Equals(existingHash, reference.FullContentHash, StringComparison.OrdinalIgnoreCase))
+                            return UnchangedCheckResult.ExistsDifferent;
+                        break;
+                    }
+
+                    case IdentityEvidence.SampledHash:
+                    {
+                        // Bounded read of the existing file — the whole point of this branch. A mismatch
+                        // PROVES the files differ; a match is the probabilistic verdict the profile opted
+                        // into by choosing a sampled policy.
+                        Result<byte[], JobError> sampled = await hasher
+                            .HashSampledToBytesAsync(finalPath, SampledHashLayout.Default, ct)
+                            .ConfigureAwait(false);
+                        if (sampled.IsCanceled)
+                            return Result<UnchangedCheckResult, JobError>.Canceled();
+                        if (sampled.TryGetError(out JobError? sampledError))
+                            return sampledError;
+                        sampled.TryGetValue(out byte[]? existingSampled);
+                        if (reference.SampledContentHash is null)
+                            return Unusable("identity reference carries no sampled content hash", finalPath, targetIndex);
+                        if (existingSampled is null
+                            || !existingSampled.AsSpan().SequenceEqual(reference.SampledContentHash))
+                            return UnchangedCheckResult.ExistsDifferent;
+                        break;
+                    }
+
+                    default:
+                        return Unusable(
+                            $"unknown identity evidence {reference.Plan.ContentEvidence}", finalPath, targetIndex);
+                }
             }
 
             // Unchanged: satisfy the target without writing (spec §3.4.1). Journal it, mark the

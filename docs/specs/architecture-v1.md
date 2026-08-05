@@ -402,6 +402,11 @@ Exhaustive validation codes (the GUI keys messages off these; tests assert them)
 | `PROFILE_OVERLAP_DISPOSAL_WARN` | Warning | ≥2 active profiles have overlapping Sources and ≥1 disposes sources (§5.4). |
 | `PROFILE_UNVERIFIED_DELETE` | BlockingWarning | `VerificationMethod: None` + `OnSuccess: PermanentDelete` (§6.1). Save allowed only with the request's `AcknowledgeWarnings` flag set (§5.2). |
 | `PROFILE_UNVERIFIED_TRASH_WARN` | Warning | `VerificationMethod: None` + `OnSuccess: MoveToTrash` (§6.1). |
+| `PROFILE_SAMPLED_IDENTITY_DELETE` | BlockingWarning | `LargeFileIdentity != FullHash` + `OnSuccess: PermanentDelete` (§3.4.1). A target wrongly judged unchanged keeps its old version; if another target *is* written the job still commits and destroys the source. |
+| `PROFILE_SAMPLED_IDENTITY_TRASH_WARN` | Warning | `LargeFileIdentity != FullHash` + `OnSuccess: MoveToTrash` (§3.4.1). |
+| `PROFILE_METADATA_IDENTITY_WARN` | Warning | `LargeFileIdentity: SizeAndTimestamp` — no file content is read at all above the threshold (§3.4.1). |
+| `PROFILE_IDENTITY_WITHOUT_HASH_WARN` | Warning | `LargeFileIdentity != FullHash` while `VerificationMethod` is `None`/`SizeTimestamp`: the setting is inert, since identity already compares only size + mtime. |
+| `PROFILE_IDENTITY_THRESHOLD_INVALID` | Error | `LargeFileIdentityThresholdBytes < 0`. |
 
 #### IProfileCatalog
 
@@ -633,18 +638,34 @@ Phase algorithm (normative ordering; states refer to §7.1):
    guarantees nothing was written.
 4. **Screen** — `CompiledFilterSet.Evaluate` (§4.4). Excluded → `job-closed(Skipped, Filtered)`
    logged as `SKIPPED` with the deciding rule (spec §4 Phase 2).
-5. **Transform** — `ITransformerChainRunner.RunAsync` (§4.5); on success compute the reference
-   hash and journal `output-sealed` (fsync).
-6. **Distribute + verify + place** — per target, bounded-parallel on the pool:
-   `IAtomicPlacer.CheckUnchanged` (spec §3.4.1, before conflict resolution) →
+5. **Probe identity** — spec §3.4.1, **before sealing**. One `IdentityStrategy.For` plan for the file,
+   then (only if some target holds a same-size file — one stat each) one reference digest for the
+   incoming file, then `IAtomicPlacer.CheckUnchangedAsync` per target, bounded-parallel. If **every**
+   target comes back `Unchanged`: journal `job-closed(Skipped, UnchangedAtAllTargets)` and return —
+   **without sealing, without `output-sealed`, without committing, without disposing**. This is the
+   `Screened → Closed` edge in the §7.1 machine, and it is the whole point of probing first: sealing
+   reads the source end to end, which is exactly what a duplicate must not pay for.
+6. **Transform + seal** — `ITransformerChainRunner.RunAsync` (§4.5); on success compute the reference
+   hash and journal `output-sealed` (fsync). Under a `FullHash` identity plan the probe already
+   computed this digest, and it is reused rather than re-reading the file.
+7. **Distribute + verify + place** — per target, bounded-parallel on the pool:
+   targets the probe marked `SatisfiedUnchanged` short-circuit; the rest go
    `IConflictResolver.Resolve` → `IAtomicPlacer.PlaceTarget` (§4.6). Per-target transient
    errors retried via `ITransientRetryPolicy` (spec §10). Any target failing after retries →
    cancel siblings, `IRollbackExecutor.Rollback`.
-7. **Commit** — all targets `Placed` / `SatisfiedUnchanged` / `SkippedConflict` → journal
-   `job-committed` (fsync). **This record alone authorizes source disposition** (I-DISPOSE).
-8. **Dispose** — `ISourceDispositionService.Dispose` (§4.8); a disposition failure is logged in
+8. **Commit** — all targets `Placed` / `SatisfiedUnchanged` / `SkippedConflict` → journal
+   `job-committed` (fsync). **This record alone authorizes source disposition** (I-DISPOSE). Reaching
+   here means at least one target was placed or conflict-skipped; the all-unchanged outcome returned in
+   step 5.
+9. **Dispose** — `ISourceDispositionService.Dispose` (§4.8); a disposition failure is logged in
    `job-closed`, never rolled back (spec §4 Phase 6). Journal `job-closed(Succeeded)`.
-9. Release suppression registrations (linger window starts) and the lock set.
+10. Release suppression registrations (linger window starts) and the lock set.
+
+> **Recovery note.** A crash during step 5 leaves an `OPEN` job with no `output-sealed` record and
+> nothing written, so recovery cleans the workspace and the file is re-detected — the correct outcome,
+> and the same one a crash during step 4 produces. `target-unchanged` records may now precede
+> `output-sealed` (or appear with no `output-sealed` at all); recovery consumes them positionally
+> (`CrashRecovery` sets `SatisfiedUnchanged` for that target index) and never depended on the ordering.
 
 #### PathLockRegistry
 
@@ -919,8 +940,64 @@ public interface IFileHasher
 {
     Task<Result<string, JobError>> HashFileAsync(string path, VerificationMethod method, CancellationToken ct);
     Task<Result<byte[], JobError>> HashFileToBytesAsync(string path, VerificationMethod method, CancellationToken ct);
+
+    /// <summary>Bounded-read digest for the §3.4.1 identity probe (spec `LargeFileIdentity`).</summary>
+    Task<Result<byte[], JobError>> HashSampledToBytesAsync(string path, SampledHashLayout layout, CancellationToken ct);
 }
 ```
+
+`HashSampledToBytesAsync` reads `SampledHashLayout` windows instead of the whole file — the default
+layout is 1 MiB × (head + 6 interior + tail) = **8 MiB flat, at any file size** — via
+`File.OpenHandle` + `RandomAccess.ReadAsync` at computed offsets (`FileOptions.RandomAccess`, same
+sharing flags as the streaming path). Always XxHash128 regardless of `VerificationMethod`, since a
+sampled digest is never an integrity attestation. The digest opens with a domain-separation prefix
+(`"FMSAMP"` + layout version + window params + file length), which is what guarantees (a) a sampled
+digest can never be confused with a full-content digest, (b) digests taken under different layouts are
+never compared, and (c) a length change alone always changes the digest. Short reads are tolerated (a
+concurrent writer may truncate); the length is already in the digest, so a size change shows up
+anyway.
+
+**Invariant (I-SAMPLED-NEVER-JOURNALLED):** a sampled digest is never written to
+`SealedOutput.ContentHash`, `OutputSealedRecord.ContentHash`, or any other journal field.
+`CrashRecovery.HashEquals`, `RollbackExecutor.IsModifiedExternally` and the §7.3 forward-completion
+gate all compare against full hashes.
+
+#### IdentityStrategy (`Core.Placement`)
+
+**Responsibility:** THE single rule for what evidence the §3.4.1 unchanged-check accepts, given a
+file's size and the Profile's `VerificationMethod` / `LargeFileIdentity` /
+`LargeFileIdentityThresholdBytes`. A pure static in the spirit of
+`Profile.ComputeEffectiveScanDestination`, called by **both** `JobExecutor`'s probe phase and
+`DryRunEngine.EvaluateTargetAsync`, so the preview and the run cannot drift apart about what counts as
+a duplicate. Also owns `TimestampTolerance` (2 s, FAT/exFAT rounding) so the two callers cannot adopt
+different tolerances.
+
+```csharp
+public enum IdentityEvidence { FullHash, SampledHash }
+
+public readonly record struct IdentityPlan
+{
+    public required bool AcceptMetadataMatch { get; init; }        // size + mtime ⇒ identical, 0 bytes read
+    public required IdentityEvidence? ContentEvidence { get; init; } // null ⇒ declare Different
+}
+
+public static IdentityPlan For(
+    long sizeBytes, VerificationMethod verification, LargeFileIdentity identity, long thresholdBytes);
+```
+
+| Condition | `AcceptMetadataMatch` | `ContentEvidence` |
+|---|---|---|
+| `verification` is `None`/`SizeTimestamp` | true | null |
+| `sizeBytes <= thresholdBytes` | false | `FullHash` |
+| above threshold, `FullHash` | false | `FullHash` |
+| above threshold, `SampledHash` | false | `SampledHash` |
+| above threshold, `TimestampOrSampledHash` | true | `SampledHash` |
+| above threshold, `SizeAndTimestamp` | true | null |
+| above threshold, unknown member (newer build) | false | `FullHash` |
+
+The first row reproduces the pre-`LargeFileIdentity` `None` behaviour exactly; the last is forward
+compatibility — a Profile from a newer build is never read as permission to use a *weaker* check than
+this build understands.
 
 #### IConflictResolver
 
@@ -981,12 +1058,17 @@ public enum UnchangedCheckResult { NoExistingFile, ExistsDifferent, Unchanged }
 
 public interface IAtomicPlacer
 {
-    /// <summary>Spec §3.4.1, BEFORE conflict resolution. Order: exists → size → (hash method: stream
-    /// hash of the existing target file vs the sealed output | None: best-effort mtime).
-    /// Compares against the SEALED OUTPUT (post-transform), never the raw source.
-    /// On Unchanged, journals target-unchanged. [seam: SizeTimestamp adds a branch here]</summary>
+    /// <summary>Spec §3.4.1, BEFORE conflict resolution AND BEFORE the output is sealed. Order:
+    /// exists → size → (IdentityPlan.AcceptMetadataMatch: mtime) → IdentityPlan.ContentEvidence
+    /// (full stream hash of the existing target file, or its bounded sampled digest, vs the matching
+    /// digest on `reference`). On Unchanged, journals target-unchanged.
+    ///
+    /// `reference` carries the incoming file's identity and a digest the CALLER computed once for all
+    /// targets. Deliberately not read from JobExecution.Output: this runs before sealing, precisely so a
+    /// duplicate never pays for sealing's full read.</summary>
     Task<Result<UnchangedCheckResult, JobError>> CheckUnchangedAsync(
-        JobExecution execution, int targetIndex, string finalPath, CancellationToken ct);
+        JobExecution execution, int targetIndex, string finalPath, IdentityReference reference,
+        CancellationToken ct);
 
     /// <summary>Journal twb → copy to temp (hash-on-write) → Flush(true) → read-back verify →
     /// journal tver → apply metadata → [journal tstg → stage] → atomic rename → journal tplc.</summary>
@@ -1540,6 +1622,13 @@ public sealed record PolicySettings
     public string? ArchiveFolder { get; init; }                   // required when OnSuccess = MoveToArchive
     public required OnFailureAction OnFailure { get; init; }
     public required MetadataOnConflict MetadataOnConflict { get; init; }
+    public MirrorDeletion MirrorDeletion { get; init; }            // additive; zero slot = AfterCopy
+
+    // §3.4.1 identity axis — additive; zero slot = FullHash (the pre-existing exact behaviour).
+    public LargeFileIdentity LargeFileIdentity { get; init; }
+    // Nullable-backing + `…Serialized` shadow property (as GlobalSettings does): the default is non-zero,
+    // and a plain long would read back as 0 from a legacy profile — which means "every file is large".
+    public long LargeFileIdentityThresholdBytes { get; init; }     // default 256 MiB
 }
 
 public sealed record FilterSet
@@ -1599,6 +1688,18 @@ public enum VerificationMethod
     Sha256,
     SizeTimestamp,        /// [reserved — fails v1 validation]
     None,                 // no verification — least recommended
+}
+
+/// <summary>What the §3.4.1 unchanged-check accepts as identity for files ABOVE
+/// PolicySettings.LargeFileIdentityThresholdBytes. Strongest first; FullHash occupies the zero slot so a
+/// legacy profile lands on the pre-existing exact behaviour. Governs identity ONLY — read-back
+/// verification of every written copy stays a full hash under VerificationMethod. Append only.</summary>
+public enum LargeFileIdentity
+{
+    FullHash,                  // int 0 — exact; reads both files end to end
+    SampledHash,               // length + 8 fixed 1 MiB windows — flat ~8 MiB per file
+    TimestampOrSampledHash,    // size+mtime, else the sampled digest
+    SizeAndTimestamp,          // metadata only — zero content bytes read
 }
 
 public enum OnSuccessAction { KeepSource, MoveToTrash, MoveToArchive, PermanentDelete }

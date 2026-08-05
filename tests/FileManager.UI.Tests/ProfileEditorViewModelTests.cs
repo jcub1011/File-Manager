@@ -127,6 +127,11 @@ public sealed class ProfileEditorViewModelTests
         Assert.Equal(OnSuccessAction.KeepSource, draft.Policies.OnSuccess);
         Assert.Equal(OverwriteHandling.StageOverwrites, draft.Policies.OverwriteHandling);
         Assert.Equal(MirrorDeletion.AfterCopy, draft.Policies.MirrorDeletion);
+        // The exact identity check and the 256 MiB threshold: a new profile must never start out on a
+        // probabilistic duplicate check.
+        Assert.Equal(LargeFileIdentity.FullHash, draft.Policies.LargeFileIdentity);
+        Assert.Equal(PolicySettings.DefaultLargeFileIdentityThresholdBytes,
+            draft.Policies.LargeFileIdentityThresholdBytes);
         SourceConfig source = Assert.Single(draft.Sources);
         Assert.Equal(2, source.SettleDelaySeconds);
         Assert.Equal(500, source.StabilityIntervalMs);
@@ -154,6 +159,64 @@ public sealed class ProfileEditorViewModelTests
         editor.SyncMode = SyncMode.Mirror;
         Assert.True(editor.ShowMirrorDeletion);
         Assert.Equal(MirrorDeletion.Proactive, editor.MirrorDeletion);
+    }
+
+    [Fact]
+    public void The_identity_threshold_shows_only_for_a_cheap_method_and_keeps_what_was_typed()
+    {
+        var (editor, _) = NewEditor();
+        editor.LoadNew();
+        Assert.False(editor.ShowLargeFileIdentityThreshold);   // FullHash ignores the threshold entirely
+
+        editor.LargeFileIdentity = LargeFileIdentity.SampledHash;
+        Assert.True(editor.ShowLargeFileIdentityThreshold);
+        editor.LargeFileIdentityThresholdText = "1048576";
+        Assert.Equal(1048576, editor.BuildProfile().Policies.LargeFileIdentityThresholdBytes);
+
+        // Like MirrorDeletion, going back to the default hides the field without discarding the value.
+        editor.LargeFileIdentity = LargeFileIdentity.FullHash;
+        Assert.False(editor.ShowLargeFileIdentityThreshold);
+        Assert.Equal("1048576", editor.LargeFileIdentityThresholdText);
+    }
+
+    [Fact]
+    public void Identity_policy_and_threshold_round_trip_through_load_and_build()
+    {
+        var (editor, _) = NewEditor();
+        Profile original = ProfileFactory.Sample();
+        original = original with
+        {
+            Policies = original.Policies with
+            {
+                LargeFileIdentity = LargeFileIdentity.TimestampOrSampledHash,
+                LargeFileIdentityThresholdBytes = 12345,
+            },
+        };
+
+        editor.Load(original);
+        Assert.Equal(LargeFileIdentity.TimestampOrSampledHash, editor.LargeFileIdentity);
+        Assert.Equal("12345", editor.LargeFileIdentityThresholdText);
+
+        Profile rebuilt = editor.BuildProfile();
+        Assert.Equal(LargeFileIdentity.TimestampOrSampledHash, rebuilt.Policies.LargeFileIdentity);
+        Assert.Equal(12345, rebuilt.Policies.LargeFileIdentityThresholdBytes);
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("   ")]
+    [InlineData("not a number")]
+    [InlineData("-1")]
+    public void An_unparseable_identity_threshold_fails_the_draft_rather_than_defaulting_to_zero(string text)
+    {
+        // A blank or bad box must not silently become 0, which would mean "treat every file as large".
+        var (editor, _) = NewEditor();
+        editor.LoadNew();
+        editor.LargeFileIdentity = LargeFileIdentity.SampledHash;
+        editor.LargeFileIdentityThresholdText = text;
+
+        Assert.False(editor.TryBuildDraft(out _, out string? error));
+        Assert.Contains("threshold", error!, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]

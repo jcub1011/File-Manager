@@ -1,4 +1,5 @@
 using FileManager.Contracts.IPC;
+using FileManager.Contracts.Primitives;
 using FileManager.Contracts.Profiles;
 using FileManager.Core.Audit;
 using FileManager.Core.Disposition;
@@ -24,6 +25,8 @@ public sealed class JobExecutorTests : IDisposable
     private readonly JobJournal _journal;
     private readonly FakeMetadataPreserver _metadata = new();
     private readonly JobExecutor _executor;
+    private readonly EnginePaths _paths;
+    private readonly EngineConfig _config = new();
 
     public JobExecutorTests()
     {
@@ -32,13 +35,21 @@ public sealed class JobExecutorTests : IDisposable
         Directory.CreateDirectory(_sourceDir);
         Directory.CreateDirectory(_targetDir);
 
-        EnginePaths paths = new() { Root = Path.Combine(_root, "engine") };
-        foreach (string dir in new[] { paths.JournalDirectory, paths.JobLogsDirectory, paths.AuditDirectory })
+        _paths = new EnginePaths { Root = Path.Combine(_root, "engine") };
+        foreach (string dir in new[] { _paths.JournalDirectory, _paths.JobLogsDirectory, _paths.AuditDirectory })
             Directory.CreateDirectory(dir);
-        EngineConfig config = new();
 
-        _journal = new JobJournal(paths, config, NullLogger<JobJournal>.Instance);
-        FileHasher hasher = new(NullLogger<FileHasher>.Instance);
+        _journal = new JobJournal(_paths, _config, NullLogger<JobJournal>.Instance);
+        _executor = CreateExecutor(new FileHasher(NullLogger<FileHasher>.Instance));
+    }
+
+    /// <summary>The full live substrate, parameterised only by the hasher so a test can observe or perturb
+    /// hashing. The SAME hasher instance goes to the executor and the placer, which is what lets a
+    /// counting decorator see the total read cost of a job.</summary>
+    private JobExecutor CreateExecutor(IFileHasher hasher)
+    {
+        EnginePaths paths = _paths;
+        EngineConfig config = _config;
         PathLockRegistry locks = new();
         SourcePriorityRegistry priorities = new();
         ConflictResolver resolver = new(locks, priorities, NullLogger<ConflictResolver>.Instance);
@@ -52,7 +63,7 @@ public sealed class JobExecutorTests : IDisposable
         FilterCompiler filterCompiler = new(NullLogger<FilterCompiler>.Instance, TimeProvider.System);
         JobLogStore jobLog = new(paths, TimeProvider.System, NullLogger<JobLogStore>.Instance);
 
-        _executor = new JobExecutor(_journal, locks, preflight, filterCompiler, hasher, resolver, placer, rollback, disposition, jobLog, TimeProvider.System, NullLogger<JobExecutor>.Instance);
+        return new JobExecutor(_journal, locks, preflight, filterCompiler, hasher, resolver, placer, rollback, disposition, jobLog, TimeProvider.System, NullLogger<JobExecutor>.Instance);
     }
 
     private PolicySnapshot Policy(
@@ -206,6 +217,171 @@ public sealed class JobExecutorTests : IDisposable
         _journal.ReadAll().TryGetValue(out IReadOnlyList<JournalRecord>? records);
         Assert.DoesNotContain(records!, r => r is JobCommittedRecord);
         Assert.Contains(records!, r => r is TargetUnchangedRecord);
+    }
+
+    [Fact]
+    public async Task An_unchanged_file_is_never_sealed_so_its_full_read_is_never_paid()
+    {
+        // The §3.4.1 identity probe runs BEFORE sealing. The absence of an output-sealed record is the
+        // observable proof: that record is written immediately after SealSourceAsync hashes the source end
+        // to end, so no record means no full source read happened.
+        string source = WriteSource("same.txt", "identical");
+        string final = Path.Combine(_targetDir, "same.txt");
+        File.WriteAllText(final, "identical");
+
+        JobCompletion completion = await _executor.ExecuteAsync(Plan(source, final, _targetDir, Policy()));
+
+        Assert.Equal(JobOutcome.Skipped, completion.Outcome);
+        Assert.Equal(SkipReason.UnchangedAtAllTargets, completion.SkipReason);
+        _journal.ReadAll().TryGetValue(out IReadOnlyList<JournalRecord>? records);
+        Assert.DoesNotContain(records!, r => r is OutputSealedRecord);
+        Assert.Contains(records!, r => r is TargetUnchangedRecord);
+    }
+
+    [Fact]
+    public async Task A_placed_file_is_still_sealed_exactly_once()
+    {
+        // The mirror of the test above: when a write IS needed the reference hash must still exist, and the
+        // probe's hash is handed to the seal rather than the source being read a second time.
+        string source = WriteSource("fresh2.txt", "content");
+        string final = Path.Combine(_targetDir, "fresh2.txt");
+
+        JobCompletion completion = await _executor.ExecuteAsync(Plan(source, final, _targetDir, Policy()));
+
+        Assert.Equal(JobOutcome.Succeeded, completion.Outcome);
+        _journal.ReadAll().TryGetValue(out IReadOnlyList<JournalRecord>? records);
+        OutputSealedRecord sealed_ = Assert.Single(records!.OfType<OutputSealedRecord>());
+        Assert.False(string.IsNullOrEmpty(sealed_.ContentHash));
+    }
+
+    [Fact]
+    public async Task A_sampled_identity_settles_a_large_duplicate_from_a_bounded_read()
+    {
+        // The headline claim, measured. The file is comfortably larger than the sampled budget, and the
+        // destination is byte-identical, so today's behaviour would have read it twice in full.
+        long length = SampledHashLayout.Default.BudgetBytes * 4;      // 32 MiB
+        string source = WriteLargeSource("movie.bin", length);
+        string final = Path.Combine(_targetDir, "movie.bin");
+        File.Copy(source, final);
+
+        CountingFileHasher counting = new(new FileHasher(NullLogger<FileHasher>.Instance));
+        JobExecutor executor = CreateExecutor(counting);
+
+        JobCompletion completion = await executor.ExecuteAsync(
+            Plan(source, final, _targetDir, Policy() with
+            {
+                LargeFileIdentity = LargeFileIdentity.SampledHash,
+                LargeFileIdentityThresholdBytes = SampledHashLayout.Default.BudgetBytes,
+            }));
+
+        Assert.Equal(JobOutcome.Skipped, completion.Outcome);
+        Assert.Equal(SkipReason.UnchangedAtAllTargets, completion.SkipReason);
+
+        // Two sampled reads (source + destination) and not one full read of either.
+        Assert.Equal(2, counting.SampledHashes);
+        Assert.Equal(0, counting.FullHashes);
+        _journal.ReadAll().TryGetValue(out IReadOnlyList<JournalRecord>? records);
+        Assert.DoesNotContain(records!, r => r is OutputSealedRecord);
+
+        // And the saving is real: a full-hash run over the same pair reads both files end to end.
+        CountingFileHasher exact = new(new FileHasher(NullLogger<FileHasher>.Instance));
+        await CreateExecutor(exact).ExecuteAsync(Plan(source, final, _targetDir, Policy()));
+        Assert.Equal(2, exact.FullHashes);
+        Assert.Equal(0, exact.SampledHashes);
+    }
+
+    [Fact]
+    public async Task A_sampled_identity_still_copies_a_same_size_file_whose_content_differs()
+    {
+        // Sampling is EXACT about "these differ". A destination of identical length but different bytes
+        // must still be overwritten — otherwise the option would be silently lossy rather than merely
+        // probabilistic.
+        long length = SampledHashLayout.Default.BudgetBytes * 4;
+        string source = WriteLargeSource("differs.bin", length, seed: 1);
+        string final = Path.Combine(_targetDir, "differs.bin");
+        WriteLargeFile(final, length, seed: 2);
+
+        JobCompletion completion = await _executor.ExecuteAsync(
+            Plan(source, final, _targetDir, Policy() with
+            {
+                LargeFileIdentity = LargeFileIdentity.SampledHash,
+                LargeFileIdentityThresholdBytes = SampledHashLayout.Default.BudgetBytes,
+            }));
+
+        Assert.Equal(JobOutcome.Succeeded, completion.Outcome);
+        Assert.Equal(File.ReadAllBytes(source), File.ReadAllBytes(final));
+
+        // Integrity is untouched: the written copy is still sealed and verified against a FULL hash.
+        _journal.ReadAll().TryGetValue(out IReadOnlyList<JournalRecord>? records);
+        Assert.Contains(records!, r => r is OutputSealedRecord);
+        Assert.Contains(records!, r => r is TargetVerifiedRecord);
+    }
+
+    [Fact]
+    public async Task A_fresh_copy_pays_no_identity_read_at_all()
+    {
+        // No destination file means nothing to compare against, so the probe must not hash the incoming
+        // file for identity — only the seal (one full read) and the read-back verify should occur.
+        string source = WriteLargeSource("brand-new.bin", SampledHashLayout.Default.BudgetBytes * 2);
+        CountingFileHasher counting = new(new FileHasher(NullLogger<FileHasher>.Instance));
+
+        JobCompletion completion = await CreateExecutor(counting).ExecuteAsync(
+            Plan(source, Path.Combine(_targetDir, "brand-new.bin"), _targetDir, Policy() with
+            {
+                LargeFileIdentity = LargeFileIdentity.SampledHash,
+                LargeFileIdentityThresholdBytes = SampledHashLayout.Default.BudgetBytes,
+            }));
+
+        Assert.Equal(JobOutcome.Succeeded, completion.Outcome);
+        Assert.Equal(0, counting.SampledHashes);
+    }
+
+    private string WriteLargeSource(string name, long length, int seed = 7)
+    {
+        string path = Path.Combine(_sourceDir, name);
+        WriteLargeFile(path, length, seed);
+        return path;
+    }
+
+    private static void WriteLargeFile(string path, long length, int seed = 7)
+    {
+        byte[] block = new byte[64 * 1024];
+        Random rng = new(seed);
+        using FileStream fs = File.Create(path);
+        for (long written = 0; written < length; written += block.Length)
+        {
+            rng.NextBytes(block);
+            fs.Write(block, 0, (int)Math.Min(block.Length, length - written));
+        }
+    }
+
+    /// <summary>Counts hash calls by kind, so a test can assert how a job actually paid for identity rather
+    /// than inferring it from the outcome.</summary>
+    private sealed class CountingFileHasher(IFileHasher inner) : IFileHasher
+    {
+        private int _full;
+        private int _sampled;
+
+        public int FullHashes => Volatile.Read(ref _full);
+        public int SampledHashes => Volatile.Read(ref _sampled);
+
+        public Task<Result<string, JobError>> HashFileAsync(string path, VerificationMethod method, CancellationToken ct = default)
+        {
+            Interlocked.Increment(ref _full);
+            return inner.HashFileAsync(path, method, ct);
+        }
+
+        public Task<Result<byte[], JobError>> HashFileToBytesAsync(string path, VerificationMethod method, CancellationToken ct = default)
+        {
+            Interlocked.Increment(ref _full);
+            return inner.HashFileToBytesAsync(path, method, ct);
+        }
+
+        public Task<Result<byte[], JobError>> HashSampledToBytesAsync(string path, SampledHashLayout layout, CancellationToken ct = default)
+        {
+            Interlocked.Increment(ref _sampled);
+            return inner.HashSampledToBytesAsync(path, layout, ct);
+        }
     }
 
     [Fact]

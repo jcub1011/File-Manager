@@ -2,8 +2,10 @@ using FileManager.Contracts.Primitives;
 using FileManager.Contracts.Profiles;
 using FileManager.Core.Jobs;
 using Microsoft.Extensions.Logging;
+using Microsoft.Win32.SafeHandles;
 using System;
 using System.Buffers;
+using System.Buffers.Binary;
 using System.IO;
 using System.IO.Hashing;
 using System.Security.Cryptography;
@@ -90,6 +92,134 @@ public sealed class FileHasher(ILogger<FileHasher> logger) : IFileHasher
             if (buffer is not null)
                 ArrayPool<byte>.Shared.Return(buffer);
         }
+    }
+
+    public Task<Result<byte[], JobError>> HashSampledToBytesAsync(
+        string path, SampledHashLayout layout, CancellationToken ct = default)
+    {
+        // A malformed layout is a programming error, not an I/O failure — throw synchronously (as
+        // CreateAccumulator does for a non-hash method) rather than returning it as a JobError.
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(layout.WindowSizeBytes);
+        ArgumentOutOfRangeException.ThrowIfNegative(layout.InteriorWindowCount);
+        return HashSampledCoreAsync(path, layout, ct);
+    }
+
+    private async Task<Result<byte[], JobError>> HashSampledCoreAsync(
+        string path, SampledHashLayout layout, CancellationToken ct)
+    {
+        byte[]? buffer = null;
+        SafeFileHandle? handle = null;
+        try
+        {
+            // A handle + RandomAccess rather than a FileStream: the reads are at computed offsets, so
+            // there is no sequential stream to seek and no FileStream position state to keep in sync.
+            // RandomAccess over SequentialScan for the same reason. Sharing flags match the streaming
+            // path — hashing must never block a concurrent writer or deleter.
+            handle = File.OpenHandle(
+                path, FileMode.Open, FileAccess.Read,
+                FileShare.ReadWrite | FileShare.Delete,
+                FileOptions.Asynchronous | FileOptions.RandomAccess);
+
+            long length = RandomAccess.GetLength(handle);
+            XxHash128 hash = CreateSampledAccumulator(layout, length);
+
+            buffer = ArrayPool<byte>.Shared.Rent(layout.WindowSizeBytes);
+
+            if (layout.CoversWholeFile(length))
+            {
+                // Windows would cover all of it anyway: read it straight through. The digest keeps the
+                // sampled framing, so it stays a sampled digest — comparable with other sampled digests
+                // of the same layout, and still not interchangeable with a full-content hash.
+                long offset = 0;
+                while (offset < length)
+                {
+                    int read = await RandomAccess
+                        .ReadAsync(handle, buffer.AsMemory(0, layout.WindowSizeBytes), offset, ct)
+                        .ConfigureAwait(false);
+                    if (read <= 0)
+                        break;
+                    hash.Append(buffer.AsSpan(0, read));
+                    offset += read;
+                }
+            }
+            else
+            {
+                foreach (long offset in layout.WindowOffsets(length))
+                    await AppendWindowAsync(handle, hash, buffer, offset, layout.WindowSizeBytes, ct)
+                        .ConfigureAwait(false);
+            }
+
+            return hash.GetHashAndReset();
+        }
+        catch (OperationCanceledException)
+        {
+            return Result<byte[], JobError>.Canceled();
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            logger.LogDebug(ex, "Could not sample-hash {Path}", path);
+            return new JobError
+            {
+                Code = JobErrorCode.SourceUnreadable,
+                Message = $"could not hash \"{path}\": {ex.Message}",
+                Path = path,
+            };
+        }
+        catch (Exception ex)
+        {
+            // Last resort: unexpected exceptions become logged failures, not faulted callers.
+            logger.LogError(ex, "Sample-hashing {Path} failed unexpectedly", path);
+            return new JobError
+            {
+                Code = JobErrorCode.SourceUnreadable,
+                Message = $"could not hash \"{path}\": {ex.GetType().Name}: {ex.Message}",
+                Path = path,
+            };
+        }
+        finally
+        {
+            if (buffer is not null)
+                ArrayPool<byte>.Shared.Return(buffer);
+            handle?.Dispose();
+        }
+    }
+
+    /// <summary>Reads one window in full and appends it. A short read means the file shrank under us (the
+    /// sharing flags allow a concurrent writer): append what arrived and carry on rather than failing —
+    /// the length is already in the digest, so a size change makes this digest differ regardless.</summary>
+    private static async Task AppendWindowAsync(
+        SafeFileHandle handle, XxHash128 hash, byte[] buffer, long offset, int windowSize, CancellationToken ct)
+    {
+        int filled = 0;
+        while (filled < windowSize)
+        {
+            int read = await RandomAccess
+                .ReadAsync(handle, buffer.AsMemory(filled, windowSize - filled), offset + filled, ct)
+                .ConfigureAwait(false);
+            if (read <= 0)
+                break;
+            filled += read;
+        }
+        hash.Append(buffer.AsSpan(0, filled));
+    }
+
+    // The domain-separation prefix, and the reason a sampled digest can never be mistaken for a full-file
+    // one: the tag, the layout that produced it, and the file's length all feed the hash before any content
+    // does. Folding the length in also means a size change alone always changes the digest. Kept in a
+    // non-async method so the stackalloc is legal.
+    private const int SampledPrefixLength = 6 + sizeof(int) + sizeof(int) + sizeof(int) + sizeof(long);
+
+    private static XxHash128 CreateSampledAccumulator(SampledHashLayout layout, long fileLength)
+    {
+        XxHash128 hash = new();
+        Span<byte> prefix = stackalloc byte[SampledPrefixLength];
+        "FMSAMP"u8.CopyTo(prefix);
+        BinaryPrimitives.WriteInt32LittleEndian(prefix[6..], SampledHashLayout.Version);
+        BinaryPrimitives.WriteInt32LittleEndian(prefix[10..], layout.WindowSizeBytes);
+        BinaryPrimitives.WriteInt32LittleEndian(prefix[14..], layout.InteriorWindowCount);
+        BinaryPrimitives.WriteInt64LittleEndian(prefix[18..], fileLength);
+        hash.Append(prefix);
+        return hash;
     }
 
     // A stream whose length can't be queried (rare for regular files) just falls back to the max

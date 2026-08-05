@@ -64,6 +64,25 @@ internal sealed class FaultyFileHasher(IFileHasher inner) : IFileHasher
         return await inner.HashFileToBytesAsync(path, method, ct).ConfigureAwait(false);
     }
 
+    /// <summary>Same two injected shapes on the bounded-read identity probe, so a test can perturb the
+    /// §3.4.1 unchanged-check without also perturbing the full hash that verifies the written copy.</summary>
+    public async Task<Result<byte[], JobError>> HashSampledToBytesAsync(
+        string path, SampledHashLayout layout, CancellationToken ct = default)
+    {
+        if (TryTakeTransientFailure(path))
+            return TransientError(path);
+        if (CorruptPathsMatching?.Invoke(path) == true)
+        {
+            var real = await inner.HashSampledToBytesAsync(path, layout, ct).ConfigureAwait(false);
+            if (!real.TryGetValue(out byte[]? digest))
+                return real;
+            byte[] corrupted = (byte[])digest!.Clone();
+            corrupted[0] ^= 0xFF;
+            return corrupted;
+        }
+        return await inner.HashSampledToBytesAsync(path, layout, ct).ConfigureAwait(false);
+    }
+
     private bool TryTakeTransientFailure(string path)
     {
         if (FailTransientlyForPathsMatching?.Invoke(path) != true)

@@ -194,6 +194,37 @@ public sealed class ProfileEditorUndoTests
         Assert.False(editor.IsDirty);
     }
 
+    [Fact]
+    public void Large_file_identity_picks_are_undoable()
+    {
+        var (editor, _) = NewEditor();
+        editor.LoadNew();
+
+        editor.LargeFileIdentity = LargeFileIdentity.SampledHash;
+        Assert.True(editor.IsDirty);
+
+        editor.History.UndoCommand.Execute(null);
+        Assert.Equal(LargeFileIdentity.FullHash, editor.LargeFileIdentity);
+        Assert.False(editor.IsDirty);
+    }
+
+    [Fact]
+    public void The_identity_threshold_is_undoable_as_one_coalesced_edit()
+    {
+        // Typed text coalesces (like the filter size boxes), so a keystroke run is one undo step rather
+        // than one per character.
+        var (editor, _) = NewEditor();
+        editor.LoadNew();
+        string original = editor.LargeFileIdentityThresholdText;
+
+        editor.LargeFileIdentityThresholdText = "1";
+        editor.LargeFileIdentityThresholdText = "10";
+        editor.LargeFileIdentityThresholdText = "104";
+
+        editor.History.UndoCommand.Execute(null);
+        Assert.Equal(original, editor.LargeFileIdentityThresholdText);
+    }
+
     // ============================ The SyncMode → ScanDestination coupling ============================
 
     [Fact]

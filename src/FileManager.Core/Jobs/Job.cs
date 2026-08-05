@@ -186,6 +186,17 @@ public sealed record PolicySnapshot
     public required OnSuccessAction OnSuccess { get; init; }
     public string? ArchiveFolder { get; init; }
     public required MetadataOnConflict MetadataOnConflict { get; init; }
+
+    /// <summary>Identity policy for the §3.4.1 unchanged-check on large files. Non-required so existing
+    /// plan construction (test fixtures, recovery) keeps compiling on the exact default,
+    /// <see cref="LargeFileIdentity.FullHash"/>.</summary>
+    public LargeFileIdentity LargeFileIdentity { get; init; }
+
+    /// <summary>Size above which <see cref="LargeFileIdentity"/> applies. Defaults to the contract's
+    /// <see cref="PolicySettings.DefaultLargeFileIdentityThresholdBytes"/> rather than 0, so a snapshot
+    /// built without it cannot accidentally mean "every file is large".</summary>
+    public long LargeFileIdentityThresholdBytes { get; init; }
+        = PolicySettings.DefaultLargeFileIdentityThresholdBytes;
 }
 
 public sealed record JobPlan

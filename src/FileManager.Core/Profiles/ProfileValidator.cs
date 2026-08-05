@@ -79,6 +79,7 @@ public sealed class ProfileValidator(
                 "OnSuccess is MoveToArchive but no ArchiveFolder is configured."));
 
         CheckVerificationPolicy(candidate, issues);
+        CheckLargeFileIdentity(candidate, issues);
         CheckMirrorDeletes(candidate, issues);
         CheckHighRiskSources(candidate, sources, issues);
         CheckCrossProfile(candidate, sources, targets, otherActiveProfiles, issues);
@@ -261,6 +262,62 @@ public sealed class ProfileValidator(
             case OnSuccessAction.MoveToTrash:
                 issues.Add(Warning("PROFILE_UNVERIFIED_TRASH_WARN",
                     "VerificationMethod None combined with MoveToTrash relies on the Recycle Bin as the only safety net (§6.1)."));
+                break;
+        }
+    }
+
+    /// <summary>Guards the cheap identity methods (spec §3.4.1). They are exact when they say two files
+    /// DIFFER and probabilistic when they say they are identical, so the failure mode is a target wrongly
+    /// judged to already hold the content — which is then never written and silently keeps its old
+    /// version.
+    ///
+    /// <para>That alone is recoverable: a job whose every target is judged unchanged closes Skipped
+    /// without committing, so the source survives and a re-run under FullHash fixes it. It becomes
+    /// DATA LOSS when the profile has another target that genuinely is written: the job then commits and
+    /// disposes the source, leaving the mis-judged target stale with the new content gone. That is the
+    /// same shape as the §6.1 combination, so it is gated the same way.</para></summary>
+    private static void CheckLargeFileIdentity(Profile candidate, List<ValidationIssue> issues)
+    {
+        PolicySettings p = candidate.Policies;
+
+        if (p.LargeFileIdentityThresholdBytes < 0)
+            issues.Add(Error("PROFILE_IDENTITY_THRESHOLD_INVALID",
+                $"LargeFileIdentityThresholdBytes is {p.LargeFileIdentityThresholdBytes}; it cannot be negative."));
+
+        if (p.LargeFileIdentity == LargeFileIdentity.FullHash)
+            return;
+
+        // Under None/SizeTimestamp there is no content hash for identity to shortcut, so the setting is
+        // inert. Say so rather than letting the user believe it took effect.
+        if (p.VerificationMethod is not (VerificationMethod.Sha256 or VerificationMethod.XxHash128))
+        {
+            issues.Add(Warning("PROFILE_IDENTITY_WITHOUT_HASH_WARN",
+                $"LargeFileIdentity {p.LargeFileIdentity} has no effect while VerificationMethod is "
+                + $"{p.VerificationMethod}: without a content hash, the unchanged-check already compares "
+                + "only size and modified time."));
+            return;
+        }
+
+        if (p.LargeFileIdentity == LargeFileIdentity.SizeAndTimestamp)
+            issues.Add(Warning("PROFILE_METADATA_IDENTITY_WARN",
+                "LargeFileIdentity SizeAndTimestamp reads no file content at all for files above the "
+                + "threshold: a file edited in place without changing its size, or whose modified time was "
+                + "restored afterwards, is treated as already copied."));
+
+        switch (p.OnSuccess)
+        {
+            case OnSuccessAction.PermanentDelete:
+                issues.Add(new ValidationIssue(ValidationSeverity.BlockingWarning, "PROFILE_SAMPLED_IDENTITY_DELETE",
+                    $"LargeFileIdentity {p.LargeFileIdentity} decides that a large file is already at a "
+                    + "target without reading all of it, so a target can be left holding an older version. "
+                    + "Combined with PermanentDelete and a second target that is written, the job commits "
+                    + "and destroys the source anyway — losing the new content (§3.4.1, §6.1). Save "
+                    + "requires explicit acknowledgment."));
+                break;
+            case OnSuccessAction.MoveToTrash:
+                issues.Add(Warning("PROFILE_SAMPLED_IDENTITY_TRASH_WARN",
+                    $"LargeFileIdentity {p.LargeFileIdentity} can leave a target holding an older version of "
+                    + "a large file; with MoveToTrash the Recycle Bin is the only way back to the source."));
                 break;
         }
     }

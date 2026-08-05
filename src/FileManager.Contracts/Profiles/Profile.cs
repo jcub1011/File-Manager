@@ -101,6 +101,48 @@ public sealed record PolicySettings
     /// Only meaningful under <see cref="SyncMode.Mirror"/>. Optional/additive: absent in legacy JSON
     /// deserializes to the zero slot, <see cref="MirrorDeletion.AfterCopy"/>.</summary>
     public MirrorDeletion MirrorDeletion { get; init; }
+
+    /// <summary>What evidence proves "the destination already holds this content" for files LARGER than
+    /// <see cref="LargeFileIdentityThresholdBytes"/> — the spec §3.4.1 unchanged-file short-circuit only.
+    /// This is an IDENTITY axis, deliberately separate from <see cref="VerificationMethod"/>: the
+    /// post-copy read-back verification of every file actually written stays a full content hash under
+    /// <see cref="VerificationMethod"/> whatever this is set to, so the guarantee that authorizes source
+    /// disposition is untouched. Optional/additive: absent in legacy JSON deserializes to the zero slot,
+    /// <see cref="LargeFileIdentity.FullHash"/>, which is the pre-existing behaviour.</summary>
+    public LargeFileIdentity LargeFileIdentity { get; init; }
+
+    private readonly long? _largeFileIdentityThresholdBytes;
+
+    /// <summary>Files at or below this size always use a full content hash for the unchanged-check —
+    /// exact, and cheap enough at this scale that there is nothing to gain. Only files ABOVE it use
+    /// <see cref="LargeFileIdentity"/>.
+    ///
+    /// <para>Nullable backing field because the default is non-zero and the source generator does not run
+    /// property initializers for absent members: a plain <c>long</c> would read back as 0 from a legacy
+    /// profile, which means "every file is large" — the dangerous direction. The setter collapses the
+    /// default to the absent representation so an omitted field and an explicit
+    /// <see cref="DefaultLargeFileIdentityThresholdBytes"/> compare equal under the record's
+    /// value-equality.</para></summary>
+    [JsonIgnore]
+    public long LargeFileIdentityThresholdBytes
+    {
+        get => _largeFileIdentityThresholdBytes ?? DefaultLargeFileIdentityThresholdBytes;
+        init => _largeFileIdentityThresholdBytes = value == DefaultLargeFileIdentityThresholdBytes ? null : value;
+    }
+
+    /// <summary>Serialization surface for <see cref="LargeFileIdentityThresholdBytes"/>: carries the
+    /// nullable backing representation so the default stays ABSENT in the profile JSON and on the wire.</summary>
+    [JsonInclude, JsonPropertyName("LargeFileIdentityThresholdBytes")]
+    public long? LargeFileIdentityThresholdBytesSerialized
+    {
+        get => _largeFileIdentityThresholdBytes;
+        init => _largeFileIdentityThresholdBytes = value == DefaultLargeFileIdentityThresholdBytes ? null : value;
+    }
+
+    /// <summary>256 MiB. Large enough that ordinary documents, photos and source files keep the exact
+    /// full-hash check (hashing them costs milliseconds), small enough that the media, disk-image and
+    /// archive files whose full read actually hurts fall on the cheap side.</summary>
+    public const long DefaultLargeFileIdentityThresholdBytes = 256L * 1024 * 1024;
 }
 
 public sealed record FilterSet
@@ -198,6 +240,33 @@ public enum VerificationMethod
     SizeTimestamp,        /// [reserved — fails v1 validation]
     [Tooltip("None")]
     None,
+}
+
+/// <summary>How the spec §3.4.1 unchanged-file short-circuit decides that a destination already holds
+/// the incoming content, for files above <see cref="PolicySettings.LargeFileIdentityThresholdBytes"/>.
+///
+/// <para>This exists because proving identity by full content hash costs a complete read of BOTH files,
+/// which dominates everything else on large media. Note the asymmetry that makes the cheap members
+/// defensible at all: a partial read is EXACT when it says "these files differ" (sampled bytes that
+/// differ prove the files differ) and only probabilistic when it says "identical". A false "identical"
+/// skips a copy, so pairing a cheap member with an <see cref="OnSuccessAction"/> that removes the source
+/// is a data-loss path — <c>IProfileValidator</c> raises a blocking warning for that combination.</para>
+///
+/// <para>FullHash occupies the zero slot so the enum default matches the app default and a legacy profile
+/// with no member deserializes to the pre-existing exact behaviour (the source-generated deserializer
+/// does not run property initializers for absent members). Members are ordered strongest first. Append
+/// only — this enum reaches <c>PolicySnapshot</c>, and profile enums serialize as INTEGERS in journal
+/// records.</para></summary>
+public enum LargeFileIdentity
+{
+    [Tooltip("Full content hash", "Read both files end to end and compare their content hashes. Exact, and the slowest — a duplicate 8 GiB video costs about 16 GiB of reads.")]
+    FullHash,
+    [Tooltip("Sampled content hash", "Hash the file's length plus a fixed 8 MiB of it — the start, the end, and six evenly spaced blocks in between — however large the file is. Catches truncation and re-encodes reliably, but an edit confined to a region it does not sample would be missed.")]
+    SampledHash,
+    [Tooltip("Timestamp, else sampled hash", "Treat files with the same size and modified time as identical without reading anything. If the timestamps differ, fall back to the sampled content hash rather than copying blindly.")]
+    TimestampOrSampledHash,
+    [Tooltip("Size & modified time", "Compare size and modified time only — no file content is read at all. The fastest option and the weakest: any tool that restores the modified time after editing a file defeats it.")]
+    SizeAndTimestamp,
 }
 
 public enum OnSuccessAction

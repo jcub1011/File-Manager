@@ -309,6 +309,94 @@ public sealed class ProfileValidatorTests
         AssertHas(Validate(candidate), "PROFILE_UNVERIFIED_DELETE", ValidationSeverity.BlockingWarning);
     }
 
+    // ---- LargeFileIdentity (spec §3.4.1 bounded-read identity) ----------------------------------
+
+    private static Profile WithIdentity(
+        LargeFileIdentity identity,
+        OnSuccessAction onSuccess = OnSuccessAction.KeepSource,
+        VerificationMethod verification = VerificationMethod.XxHash128,
+        long threshold = 256L * 1024 * 1024)
+    {
+        Profile candidate = TestProfiles.Valid();
+        return candidate with
+        {
+            Policies = candidate.Policies with
+            {
+                LargeFileIdentity = identity,
+                OnSuccess = onSuccess,
+                VerificationMethod = verification,
+                LargeFileIdentityThresholdBytes = threshold,
+            },
+        };
+    }
+
+    [Fact]
+    public void The_default_exact_identity_raises_nothing()
+    {
+        // The whole feature must be silent for anyone who does not opt in.
+        Assert.Empty(Validate(WithIdentity(LargeFileIdentity.FullHash)));
+    }
+
+    [Theory]
+    [InlineData(LargeFileIdentity.SampledHash)]
+    [InlineData(LargeFileIdentity.TimestampOrSampledHash)]
+    [InlineData(LargeFileIdentity.SizeAndTimestamp)]
+    public void A_cheap_identity_with_permanent_delete_must_be_acknowledged(LargeFileIdentity identity)
+    {
+        IReadOnlyList<ValidationIssue> issues =
+            Validate(WithIdentity(identity, OnSuccessAction.PermanentDelete));
+
+        AssertHas(issues, "PROFILE_SAMPLED_IDENTITY_DELETE", ValidationSeverity.BlockingWarning);
+        // The mechanism has to be in the words, not just the verdict: the danger is a target left on an
+        // older version while the source is destroyed.
+        ValidationIssue issue = Assert.Single(issues, i => i.Code == "PROFILE_SAMPLED_IDENTITY_DELETE");
+        Assert.Contains("older version", issue.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData(LargeFileIdentity.SampledHash)]
+    [InlineData(LargeFileIdentity.TimestampOrSampledHash)]
+    public void A_cheap_identity_with_move_to_trash_only_warns(LargeFileIdentity identity)
+    {
+        IReadOnlyList<ValidationIssue> issues = Validate(WithIdentity(identity, OnSuccessAction.MoveToTrash));
+
+        AssertHas(issues, "PROFILE_SAMPLED_IDENTITY_TRASH_WARN", ValidationSeverity.Warning);
+        Assert.DoesNotContain(issues, i => i.Severity is ValidationSeverity.Error or ValidationSeverity.BlockingWarning);
+    }
+
+    [Fact]
+    public void A_cheap_identity_that_keeps_the_source_is_not_blocked()
+    {
+        // Nothing is destroyed, so a stale destination is recoverable by re-running under FullHash.
+        IReadOnlyList<ValidationIssue> issues = Validate(WithIdentity(LargeFileIdentity.SampledHash));
+        Assert.Empty(issues);
+    }
+
+    [Fact]
+    public void Metadata_only_identity_warns_that_it_reads_nothing()
+    {
+        IReadOnlyList<ValidationIssue> issues = Validate(WithIdentity(LargeFileIdentity.SizeAndTimestamp));
+        AssertHas(issues, "PROFILE_METADATA_IDENTITY_WARN", ValidationSeverity.Warning);
+    }
+
+    [Fact]
+    public void A_cheap_identity_is_reported_as_inert_when_verification_does_not_hash()
+    {
+        // Silently ignoring a setting the user deliberately chose is worse than saying it does nothing.
+        IReadOnlyList<ValidationIssue> issues =
+            Validate(WithIdentity(LargeFileIdentity.SampledHash, verification: VerificationMethod.None));
+
+        AssertHas(issues, "PROFILE_IDENTITY_WITHOUT_HASH_WARN", ValidationSeverity.Warning);
+        // ...and it must not also claim the sampled-identity risk, which cannot arise here.
+        Assert.DoesNotContain(issues, i => i.Code == "PROFILE_METADATA_IDENTITY_WARN");
+        Assert.DoesNotContain(issues, i => i.Code == "PROFILE_SAMPLED_IDENTITY_DELETE");
+    }
+
+    [Fact]
+    public void A_negative_identity_threshold_is_an_error() =>
+        AssertHas(Validate(WithIdentity(LargeFileIdentity.FullHash, threshold: -1)),
+            "PROFILE_IDENTITY_THRESHOLD_INVALID", ValidationSeverity.Error);
+
     [Fact]
     public void Unverified_trash_warns()
     {

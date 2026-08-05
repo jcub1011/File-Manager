@@ -116,10 +116,11 @@ triggers and transformers are the next sets.
 ### §4.6 Placement & verification
 | Component | Status | Note |
 | --- | --- | --- |
-| `IFileHasher` | ✅ | |
+| `IFileHasher` | ✅ | Streaming full hash (XXH3-128/SHA-256) + `HashSampledToBytesAsync`, the bounded-read digest for §3.4.1 identity. |
+| `IdentityStrategy` / `SampledHashLayout` | ✅ | The one §3.4.1 identity rule, shared by the executor's probe phase and the dry-run engine so preview and run cannot drift. |
 | `IConflictResolver` | ✅ | `Probe` (dry-run) + `Resolve` (live, priority + lock-aware suffix). |
 | `SourcePriorityRegistry` | ✅ | Session-scoped; provenance not persisted (documented v1 limit). |
-| `IAtomicPlacer` | ✅ | Unchanged short-circuit + full journaled place sequence. |
+| `IAtomicPlacer` | ✅ | Unchanged short-circuit (now `IdentityReference`-driven, run before sealing) + full journaled place sequence. |
 | `ITransientRetryPolicy` | ✅ | Fixed 3×2 s. |
 
 ### §4.7 Journal, recovery & audit
@@ -343,6 +344,10 @@ placer temp-cleanup bug and the open ratio-guard decision.*
   futile and the duplicate the user declined.
 - **Source priority** is session-scoped in-memory; across a restart it degrades to arrival order
   (same open design as `ContentHashDedupe`, Appendix B).
+- **No content-identity cache.** `LargeFileIdentity` makes a duplicate cheap to *read*, but every run
+  still re-reads what it needs; digests are never remembered between runs, or even between a preview and
+  the run that follows it. Designed in `docs/content-identity-cache-next-steps.md`, deliberately not
+  built — it is the only part of the idea needing new durable state.
 
 ### Defects the file-operation suite found (and fixed)
 - **`RenameSuffix` never took the desired name.** A job's lock set already contains every prospective

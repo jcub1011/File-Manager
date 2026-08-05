@@ -144,7 +144,9 @@ public sealed class DryRunEngineTests : IDisposable
         ConflictResolution conflict = ConflictResolution.Skip,
         OnSuccessAction onSuccess = OnSuccessAction.KeepSource,
         VerificationMethod verification = VerificationMethod.Sha256,
-        FilterSet? filters = null)
+        FilterSet? filters = null,
+        LargeFileIdentity identity = LargeFileIdentity.FullHash,
+        long? identityThreshold = null)
     {
         Profile profile = TestProfiles.Valid(sourcePath: _source, targetPath: _target) with { Filters = filters };
         return profile with
@@ -154,6 +156,9 @@ public sealed class DryRunEngineTests : IDisposable
                 ConflictResolution = conflict,
                 OnSuccess = onSuccess,
                 VerificationMethod = verification,
+                LargeFileIdentity = identity,
+                LargeFileIdentityThresholdBytes =
+                    identityThreshold ?? PolicySettings.DefaultLargeFileIdentityThresholdBytes,
             },
         };
     }
@@ -609,6 +614,57 @@ public sealed class DryRunEngineTests : IDisposable
         string[] dirPaths = DryRunDirectoryTable.Materialize(report.Directories);
         Assert.DoesNotContain(report.DestinationFiles,
             f => PathOf(dirPaths, f).EndsWith("preexisting.txt", StringComparison.OrdinalIgnoreCase));
+    }
+
+    // ----- LargeFileIdentity in the preview (spec §3.4.1) -----
+
+    [Fact]
+    public async Task A_sampled_identity_previews_a_duplicate_as_an_unchanged_skip()
+    {
+        SourceFile("same.bin", "identical bytes");
+        TargetFile("same.bin", "identical bytes");
+
+        DryRunReport report = await Simulate(ProfileUnderTest(
+            identity: LargeFileIdentity.SampledHash, identityThreshold: 0));
+
+        Assert.Equal(OperationKind.SkippedUnchanged, Assert.Single(report.SourceOperations).Kind);
+        DryRunOperation op = Assert.Single(report.DestinationOperations);
+        Assert.Equal(OperationKind.SkipUnchanged, op.Kind);
+
+        // The detail must say the match was SAMPLED and how little was read. The user approves the plan
+        // from this text, so it must never read as a full-content proof.
+        Assert.Contains("sampled", op.Detail, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("bytes read", op.Detail, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task A_sampled_identity_previews_a_same_size_different_file_as_a_write()
+    {
+        SourceFile("differs.bin", "aaaaaaaaaa");
+        TargetFile("differs.bin", "bbbbbbbbbb");   // same length, different bytes
+
+        DryRunReport report = await Simulate(ProfileUnderTest(
+            conflict: ConflictResolution.Overwrite,
+            identity: LargeFileIdentity.SampledHash, identityThreshold: 0));
+
+        Assert.Equal(OperationKind.Processed, Assert.Single(report.SourceOperations).Kind);
+        Assert.Equal(OperationKind.Overwrite, Assert.Single(report.DestinationOperations).Kind);
+    }
+
+    [Fact]
+    public async Task A_metadata_identity_previews_a_same_size_same_time_file_as_unchanged()
+    {
+        // Different bytes of the same length with a matching timestamp: SizeAndTimestamp reads no content,
+        // so it must call this unchanged. A content check would not.
+        SourceFile("meta.bin", "aaaaaaaaaa");
+        TargetFile("meta.bin", "bbbbbbbbbb");
+        File.SetLastWriteTimeUtc(
+            Path.Combine(_target, "meta.bin"), File.GetLastWriteTimeUtc(Path.Combine(_source, "meta.bin")));
+
+        DryRunReport report = await Simulate(ProfileUnderTest(
+            identity: LargeFileIdentity.SizeAndTimestamp, identityThreshold: 0));
+
+        Assert.Equal(OperationKind.SkipUnchanged, Assert.Single(report.DestinationOperations).Kind);
     }
 
     [Fact]

@@ -72,6 +72,9 @@ public sealed partial class ProfileEditorViewModel : ViewModelBase, IUndoTrackab
         [MirrorDeletion.AfterCopy, MirrorDeletion.Proactive];
     public IReadOnlyList<VerificationMethod> VerificationOptions { get; } =
         [VerificationMethod.XxHash128, VerificationMethod.Sha256, VerificationMethod.None];  // SizeTimestamp is [reserved]
+    public IReadOnlyList<LargeFileIdentity> LargeFileIdentityOptions { get; } =
+        [LargeFileIdentity.FullHash, LargeFileIdentity.SampledHash,
+         LargeFileIdentity.TimestampOrSampledHash, LargeFileIdentity.SizeAndTimestamp];
     public IReadOnlyList<OnSuccessAction> OnSuccessOptions { get; } =
         [OnSuccessAction.KeepSource, OnSuccessAction.MoveToArchive, OnSuccessAction.MoveToTrash, OnSuccessAction.PermanentDelete];
     public IReadOnlyList<MetadataOnConflict> MetadataOptions { get; } =
@@ -91,6 +94,9 @@ public sealed partial class ProfileEditorViewModel : ViewModelBase, IUndoTrackab
     [ObservableProperty] public partial OverwriteHandling OverwriteHandling { get; set; } = OverwriteHandling.StageOverwrites;
     [ObservableProperty] public partial MirrorDeletion MirrorDeletion { get; set; } = MirrorDeletion.AfterCopy;
     [ObservableProperty] public partial VerificationMethod VerificationMethod { get; set; } = VerificationMethod.XxHash128;
+    [ObservableProperty] public partial LargeFileIdentity LargeFileIdentity { get; set; } = LargeFileIdentity.FullHash;
+    [ObservableProperty] public partial string LargeFileIdentityThresholdText { get; set; } =
+        PolicySettings.DefaultLargeFileIdentityThresholdBytes.ToString();
     [ObservableProperty] public partial OnSuccessAction OnSuccess { get; set; } = OnSuccessAction.KeepSource;
     [ObservableProperty] public partial string ArchiveFolder { get; set; } = "";
     [ObservableProperty] public partial MetadataOnConflict MetadataOnConflict { get; set; } = MetadataOnConflict.WarnAndContinue;
@@ -116,6 +122,16 @@ public sealed partial class ProfileEditorViewModel : ViewModelBase, IUndoTrackab
     public bool ShowArchiveFolder => OnSuccess == OnSuccessAction.MoveToArchive;
 
     partial void OnOnSuccessChanged(OnSuccessAction value) => OnPropertyChanged(nameof(ShowArchiveFolder));
+
+    /// <summary>The size threshold only means anything once a cheaper identity method is chosen, so it is
+    /// hidden — not disabled — under the default FullHash. Like <see cref="ShowMirrorDeletion"/> the value
+    /// is never forced, so switching away and back does not lose what the user typed.</summary>
+    public bool ShowLargeFileIdentityThreshold => LargeFileIdentity != LargeFileIdentity.FullHash;
+
+    // Fully-qualified param type: the property is also named LargeFileIdentity, so the unqualified name
+    // would bind to the property rather than the enum here (mirrors OnSyncModeChanged).
+    partial void OnLargeFileIdentityChanged(global::FileManager.Contracts.Profiles.LargeFileIdentity value) =>
+        OnPropertyChanged(nameof(ShowLargeFileIdentityThreshold));
 
     /// <summary>The destination sweep is optional in AdditiveArchive but mandatory in Mirror (its
     /// only source of Deleted-orphan previews), so the checkbox is locked on in Mirror.</summary>
@@ -222,6 +238,9 @@ public sealed partial class ProfileEditorViewModel : ViewModelBase, IUndoTrackab
         UndoableProperty.For(nameof(OverwriteHandling), () => OverwriteHandling, v => OverwriteHandling = v),
         UndoableProperty.For(nameof(MirrorDeletion), () => MirrorDeletion, v => MirrorDeletion = v),
         UndoableProperty.For(nameof(VerificationMethod), () => VerificationMethod, v => VerificationMethod = v),
+        UndoableProperty.For(nameof(LargeFileIdentity), () => LargeFileIdentity, v => LargeFileIdentity = v),
+        UndoableProperty.For(nameof(LargeFileIdentityThresholdText), () => LargeFileIdentityThresholdText,
+            v => LargeFileIdentityThresholdText = v, coalesce: true),
         UndoableProperty.For(nameof(OnSuccess), () => OnSuccess, v => OnSuccess = v),
         UndoableProperty.For(nameof(ArchiveFolder), () => ArchiveFolder, v => ArchiveFolder = v, coalesce: true),
         UndoableProperty.For(nameof(MetadataOnConflict), () => MetadataOnConflict, v => MetadataOnConflict = v),
@@ -309,6 +328,8 @@ public sealed partial class ProfileEditorViewModel : ViewModelBase, IUndoTrackab
         OverwriteHandling = OverwriteHandling.StageOverwrites;
         MirrorDeletion = MirrorDeletion.AfterCopy;                 // safest default
         VerificationMethod = VerificationMethod.XxHash128;
+        LargeFileIdentity = LargeFileIdentity.FullHash;            // exact, and the pre-existing behaviour
+        LargeFileIdentityThresholdText = PolicySettings.DefaultLargeFileIdentityThresholdBytes.ToString();
         OnSuccess = OnSuccessAction.KeepSource;
         ArchiveFolder = "";
         MetadataOnConflict = MetadataOnConflict.WarnAndContinue;
@@ -343,6 +364,8 @@ public sealed partial class ProfileEditorViewModel : ViewModelBase, IUndoTrackab
         OverwriteHandling = profile.Policies.OverwriteHandling;
         MirrorDeletion = profile.Policies.MirrorDeletion;
         VerificationMethod = profile.Policies.VerificationMethod;
+        LargeFileIdentity = profile.Policies.LargeFileIdentity;
+        LargeFileIdentityThresholdText = profile.Policies.LargeFileIdentityThresholdBytes.ToString();
         OnSuccess = profile.Policies.OnSuccess;
         ArchiveFolder = profile.Policies.ArchiveFolder ?? "";
         MetadataOnConflict = profile.Policies.MetadataOnConflict;
@@ -413,6 +436,8 @@ public sealed partial class ProfileEditorViewModel : ViewModelBase, IUndoTrackab
                 ConflictResolution = ConflictResolution,
                 OverwriteHandling = OverwriteHandling,
                 VerificationMethod = VerificationMethod,
+                LargeFileIdentity = LargeFileIdentity,
+                LargeFileIdentityThresholdBytes = ParsedIdentityThreshold(),
                 OnSuccess = OnSuccess,
                 ArchiveFolder = string.IsNullOrWhiteSpace(ArchiveFolder) ? null : ArchiveFolder.Trim(),
                 OnFailure = OnFailureAction.AbortRestoreAndClean,
@@ -537,9 +562,27 @@ public sealed partial class ProfileEditorViewModel : ViewModelBase, IUndoTrackab
             !TryParseOptionalLong(MaxSizeText, "Max size", out _, out error) ||
             !TryParseOptionalInt(MaxDepthText, "Max depth", out _, out error))
             return false;
+
+        // Unlike the filter sizes this one is not optional — it always has a value, so an empty or
+        // unparseable box is rejected rather than silently becoming "no threshold" (which would read as
+        // "treat every file as large", the dangerous direction).
+        if (!long.TryParse(LargeFileIdentityThresholdText.Trim(), out long threshold) || threshold < 0)
+        {
+            error = "Large-file identity threshold must be a non-negative whole number of bytes.";
+            return false;
+        }
+
         error = null;
         return true;
     }
+
+    /// <summary>The parsed threshold, for <c>BuildProfile</c>. Only reached after
+    /// <see cref="TryParseLocalFields"/> has accepted the text, so the fallback is unreachable in
+    /// practice — it exists so a future caller cannot turn a parse slip into a 0 threshold.</summary>
+    private long ParsedIdentityThreshold() =>
+        long.TryParse(LargeFileIdentityThresholdText.Trim(), out long parsed) && parsed >= 0
+            ? parsed
+            : PolicySettings.DefaultLargeFileIdentityThresholdBytes;
 
     private FilterSet? BuildFilters()
     {

@@ -58,12 +58,26 @@ public class FileHasherBenchmarks
         }
     }
 
-    [Benchmark]
+    [Benchmark(Baseline = true)]
     public async Task<string?> HashFile()
     {
         var result = await _hasher.HashFileAsync(_file, VerificationMethod.XxHash128);
         result.TryGetValue(out string? hash);
         return hash;
+    }
+
+    /// <summary>The bounded-read identity probe (spec §3.4.1) against the full read above. The ratio is the
+    /// case for <see cref="LargeFileIdentity.SampledHash"/>: <see cref="HashFile"/> scales with file size
+    /// while this reads a flat 8 MiB, so the two are near-identical at 4 KiB and 1 MiB (where the whole file
+    /// is inside the window budget and the sampled path streams it anyway) and diverge from there. The 64
+    /// MiB row is the one to read — and the real-world gap is larger still, since a duplicate pays this
+    /// twice (source + destination) against two full reads.</summary>
+    [Benchmark]
+    public async Task<byte[]?> HashFileSampled()
+    {
+        var result = await _hasher.HashSampledToBytesAsync(_file, SampledHashLayout.Default);
+        result.TryGetValue(out byte[]? digest);
+        return digest;
     }
 }
 

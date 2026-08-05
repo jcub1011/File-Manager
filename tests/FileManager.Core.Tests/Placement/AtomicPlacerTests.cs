@@ -64,6 +64,34 @@ public sealed class AtomicPlacerTests : IDisposable
         Verification = execution.Plan.Policies.Verification,
     };
 
+    /// <summary>Builds the identity reference the way <c>JobExecutor.ProbeIdentityAsync</c> does, so the
+    /// placer is exercised through exactly the contract the engine hands it.</summary>
+    private static async Task<IdentityReference> Reference(JobExecution execution)
+    {
+        SealedOutput output = execution.Output!;
+        PolicySnapshot p = execution.Plan.Policies;
+        IdentityPlan plan = IdentityStrategy.For(
+            output.SizeBytes, p.Verification, p.LargeFileIdentity, p.LargeFileIdentityThresholdBytes);
+
+        byte[]? sampled = null;
+        if (plan.ContentEvidence == IdentityEvidence.SampledHash)
+        {
+            var hashed = await new FileHasher(NullLogger<FileHasher>.Instance)
+                .HashSampledToBytesAsync(output.Path, SampledHashLayout.Default);
+            hashed.TryGetValue(out sampled);
+        }
+
+        return new IdentityReference
+        {
+            Path = output.Path,
+            SizeBytes = output.SizeBytes,
+            LastWriteUtc = output.SourceLastWriteUtc,
+            Plan = plan,
+            FullContentHash = output.ContentHash,
+            SampledContentHash = sampled,
+        };
+    }
+
     [Fact]
     public async Task Places_a_fresh_file_with_matching_bytes_and_journals_the_sequence()
     {
@@ -157,7 +185,8 @@ public sealed class AtomicPlacerTests : IDisposable
         Directory.CreateDirectory(Path.GetDirectoryName(finalPath)!);
         File.WriteAllText(finalPath, "identical");   // same content as the sealed source
 
-        Result<UnchangedCheckResult, JobError> result = await _placer.CheckUnchangedAsync(execution, 0, finalPath);
+        Result<UnchangedCheckResult, JobError> result =
+            await _placer.CheckUnchangedAsync(execution, 0, finalPath, await Reference(execution));
 
         Assert.True(result.TryGetValue(out UnchangedCheckResult verdict));
         Assert.Equal(UnchangedCheckResult.Unchanged, verdict);
@@ -172,9 +201,88 @@ public sealed class AtomicPlacerTests : IDisposable
         Directory.CreateDirectory(Path.GetDirectoryName(finalPath)!);
         File.WriteAllText(finalPath, "different");
 
-        Result<UnchangedCheckResult, JobError> result = await _placer.CheckUnchangedAsync(execution, 0, finalPath);
+        Result<UnchangedCheckResult, JobError> result =
+            await _placer.CheckUnchangedAsync(execution, 0, finalPath, await Reference(execution));
         result.TryGetValue(out UnchangedCheckResult verdict);
         Assert.Equal(UnchangedCheckResult.ExistsDifferent, verdict);
+    }
+
+    [Fact]
+    public async Task Absent_target_is_NoExistingFile()
+    {
+        (JobExecution execution, string finalPath) = Setup("incoming", "out.dat");
+
+        Result<UnchangedCheckResult, JobError> result =
+            await _placer.CheckUnchangedAsync(execution, 0, finalPath, await Reference(execution));
+        result.TryGetValue(out UnchangedCheckResult verdict);
+        Assert.Equal(UnchangedCheckResult.NoExistingFile, verdict);
+    }
+
+    [Fact]
+    public async Task A_sampled_identity_policy_matches_a_duplicate_without_reading_it_whole()
+    {
+        // Threshold 0 forces every file onto the sampled path regardless of size, so the fixture stays
+        // small. A byte-identical destination must still be recognised.
+        var policy = JobFixtures.Policy() with
+        {
+            LargeFileIdentity = LargeFileIdentity.SampledHash,
+            LargeFileIdentityThresholdBytes = 0,
+        };
+        (JobExecution execution, string finalPath) = Setup("identical", "out.dat", policy);
+        Directory.CreateDirectory(Path.GetDirectoryName(finalPath)!);
+        File.WriteAllText(finalPath, "identical");
+
+        Result<UnchangedCheckResult, JobError> result =
+            await _placer.CheckUnchangedAsync(execution, 0, finalPath, await Reference(execution));
+
+        Assert.True(result.TryGetValue(out UnchangedCheckResult verdict));
+        Assert.Equal(UnchangedCheckResult.Unchanged, verdict);
+        Assert.Equal(TargetState.SatisfiedUnchanged, execution.Targets[0].State);
+        Assert.Contains(ReadJournal(), r => r is TargetUnchangedRecord);
+    }
+
+    [Fact]
+    public async Task A_sampled_identity_policy_still_rejects_a_same_size_but_different_file()
+    {
+        // Same length, different bytes — the head window differs, so the sampled digest PROVES they
+        // differ. This is the verdict sampling is exact about.
+        var policy = JobFixtures.Policy() with
+        {
+            LargeFileIdentity = LargeFileIdentity.SampledHash,
+            LargeFileIdentityThresholdBytes = 0,
+        };
+        (JobExecution execution, string finalPath) = Setup("incoming!", "out.dat", policy);
+        Directory.CreateDirectory(Path.GetDirectoryName(finalPath)!);
+        File.WriteAllText(finalPath, "different");   // same 9-byte length
+
+        Result<UnchangedCheckResult, JobError> result =
+            await _placer.CheckUnchangedAsync(execution, 0, finalPath, await Reference(execution));
+
+        Assert.True(result.TryGetValue(out UnchangedCheckResult verdict));
+        Assert.Equal(UnchangedCheckResult.ExistsDifferent, verdict);
+    }
+
+    [Fact]
+    public async Task A_metadata_only_identity_policy_reads_no_content()
+    {
+        // SizeAndTimestamp accepts a size + mtime match outright. Give the destination DIFFERENT bytes of
+        // the same length and the same timestamp: a content check would reject it, so a verdict of
+        // Unchanged is proof that no content was read.
+        var policy = JobFixtures.Policy() with
+        {
+            LargeFileIdentity = LargeFileIdentity.SizeAndTimestamp,
+            LargeFileIdentityThresholdBytes = 0,
+        };
+        (JobExecution execution, string finalPath) = Setup("incoming!", "out.dat", policy);
+        Directory.CreateDirectory(Path.GetDirectoryName(finalPath)!);
+        File.WriteAllText(finalPath, "different");
+        File.SetLastWriteTimeUtc(finalPath, execution.Output!.SourceLastWriteUtc.UtcDateTime);
+
+        Result<UnchangedCheckResult, JobError> result =
+            await _placer.CheckUnchangedAsync(execution, 0, finalPath, await Reference(execution));
+
+        Assert.True(result.TryGetValue(out UnchangedCheckResult verdict));
+        Assert.Equal(UnchangedCheckResult.Unchanged, verdict);
     }
 
     [Fact]

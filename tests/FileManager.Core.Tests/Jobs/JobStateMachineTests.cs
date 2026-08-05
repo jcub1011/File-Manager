@@ -45,6 +45,34 @@ public sealed class JobStateMachineTests
     }
 
     [Fact]
+    public void A_screened_job_may_close_directly_when_the_identity_probe_finds_nothing_to_do()
+    {
+        // The §3.4.1 all-targets-unchanged outcome: nothing was written and nothing was even sealed, so the
+        // job closes from Screened rather than walking guard-only transitions through OutputSealed and
+        // Distributing that would assert work which never happened.
+        JobStateMachine m = New();
+        foreach (JobState s in new[] { JobState.Locked, JobState.Opened, JobState.Preflighted, JobState.Screened })
+            m.Transition(s);
+
+        m.Transition(JobState.Closed);
+        Assert.Equal(JobState.Closed, m.State);
+    }
+
+    [Fact]
+    public void Closing_from_screened_does_not_open_a_shortcut_past_distribution()
+    {
+        // The new edge must not have widened anything else: Screened still cannot jump to Committed or
+        // Distributing, so a job can never dispose a source without going through placement.
+        foreach (JobState illegal in new[] { JobState.Committed, JobState.Distributing, JobState.OutputSealed, JobState.Disposing })
+        {
+            JobStateMachine m = New();
+            foreach (JobState s in new[] { JobState.Locked, JobState.Opened, JobState.Preflighted, JobState.Screened })
+                m.Transition(s);
+            Assert.Throws<InvalidOperationException>(() => m.Transition(illegal));
+        }
+    }
+
+    [Fact]
     public void Target_happy_path_transitions_are_legal()
     {
         JobStateMachine m = New();

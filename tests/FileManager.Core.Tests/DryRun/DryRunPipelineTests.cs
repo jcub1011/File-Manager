@@ -328,6 +328,14 @@ public sealed class DryRunPipelineTests : IDisposable
                 onFirstHash();
             return _inner.HashFileToBytesAsync(path, method, ct);
         }
+
+        public Task<Result<byte[], JobError>> HashSampledToBytesAsync(string path, SampledHashLayout layout, CancellationToken ct = default)
+        {
+            // Counts toward the same signal: a sampled probe is still the first read of a file.
+            if (Interlocked.Increment(ref _calls) == 1)
+                onFirstHash();
+            return _inner.HashSampledToBytesAsync(path, layout, ct);
+        }
     }
 
     /// <summary>Cancels the run from inside the first hash, the way a user cancel lands mid-evaluation.</summary>
@@ -337,6 +345,12 @@ public sealed class DryRunPipelineTests : IDisposable
             throw new NotSupportedException();
 
         public Task<Result<byte[], JobError>> HashFileToBytesAsync(string path, VerificationMethod method, CancellationToken ct = default)
+        {
+            cts.Cancel();
+            return Task.FromResult(Result<byte[], JobError>.Canceled());
+        }
+
+        public Task<Result<byte[], JobError>> HashSampledToBytesAsync(string path, SampledHashLayout layout, CancellationToken ct = default)
         {
             cts.Cancel();
             return Task.FromResult(Result<byte[], JobError>.Canceled());

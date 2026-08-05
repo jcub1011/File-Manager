@@ -130,7 +130,7 @@
 
                 <!-- policies -->
                 <Border Classes="sectionHeader"><TextBlock Text="Policies" /></Border>
-                <Grid ColumnDefinitions="140,*" RowDefinitions="Auto,Auto,Auto,Auto,Auto,Auto,Auto" Margin="0,0,0,4">
+                <Grid ColumnDefinitions="140,*" RowDefinitions="Auto,Auto,Auto,Auto,Auto,Auto,Auto,Auto,Auto" Margin="0,0,0,4">
                     <TextBlock Grid.Row="0" Grid.Column="0" Classes="fieldLabel" Text="On conflict" />
                     <ComboBox Grid.Row="0" Grid.Column="1" ItemsSource="{Binding ConflictResolutionOptions}"
                               SelectedItem="{Binding ConflictResolution}" Margin="0,2" MinWidth="220">
@@ -170,8 +170,24 @@
                             </DataTemplate>
                         </ComboBox.ItemTemplate>
                     </ComboBox>
-                    <TextBlock Grid.Row="4" Grid.Column="0" Classes="fieldLabel" Text="On success" />
-                    <ComboBox Grid.Row="4" Grid.Column="1" ItemsSource="{Binding OnSuccessOptions}"
+                    <TextBlock Grid.Row="4" Grid.Column="0" Classes="fieldLabel" Text="Large-file identity" />
+                    <ComboBox Grid.Row="4" Grid.Column="1" ItemsSource="{Binding LargeFileIdentityOptions}"
+                              SelectedItem="{Binding LargeFileIdentity}" Margin="0,2" MinWidth="220"
+                              ToolTip.Tip="How a large file already sitting at a destination is recognised as the same file, so it is not copied again. Reading both copies end to end is exact but slow — a duplicate video can cost several gigabytes of reading before anything happens. The cheaper options read a fixed slice of the file, or just its size and modified time, which is dramatically faster but can miss a change and leave that destination on an older version.">
+                        <ComboBox.ItemTemplate>
+                            <DataTemplate x:DataType="prof:LargeFileIdentity">
+                                <TextBlock Text="{Binding Converter={x:Static conv:EnumTitleConverters.LargeFileIdentity}}" />
+                            </DataTemplate>
+                        </ComboBox.ItemTemplate>
+                    </ComboBox>
+                    <TextBlock Grid.Row="5" Grid.Column="0" Classes="fieldLabel" Text="…above size"
+                               IsVisible="{Binding ShowLargeFileIdentityThreshold}" />
+                    <TextBox Grid.Row="5" Grid.Column="1" Text="{Binding LargeFileIdentityThresholdText}" Margin="0,2"
+                             PlaceholderText="Bytes — files this size or smaller always use the exact check"
+                             IsVisible="{Binding ShowLargeFileIdentityThreshold}"
+                             ToolTip.Tip="Files at or below this size are always compared exactly, because hashing them costs almost nothing. Only files larger than this use the option above. 268435456 is 256 MiB." />
+                    <TextBlock Grid.Row="6" Grid.Column="0" Classes="fieldLabel" Text="On success" />
+                    <ComboBox Grid.Row="6" Grid.Column="1" ItemsSource="{Binding OnSuccessOptions}"
                               SelectedItem="{Binding OnSuccess}" Margin="0,2" MinWidth="220">
                         <ComboBox.ItemTemplate>
                             <DataTemplate x:DataType="prof:OnSuccessAction">
@@ -179,13 +195,13 @@
                             </DataTemplate>
                         </ComboBox.ItemTemplate>
                     </ComboBox>
-                    <TextBlock Grid.Row="5" Grid.Column="0" Classes="fieldLabel" Text="Archive folder"
+                    <TextBlock Grid.Row="7" Grid.Column="0" Classes="fieldLabel" Text="Archive folder"
                                IsVisible="{Binding ShowArchiveFolder}" />
-                    <TextBox Grid.Row="5" Grid.Column="1" Text="{Binding ArchiveFolder}" Margin="0,2"
+                    <TextBox Grid.Row="7" Grid.Column="1" Text="{Binding ArchiveFolder}" Margin="0,2"
                              PlaceholderText="Absolute archive folder path"
                              IsVisible="{Binding ShowArchiveFolder}" />
-                    <TextBlock Grid.Row="6" Grid.Column="0" Classes="fieldLabel" Text="Metadata loss" />
-                    <ComboBox Grid.Row="6" Grid.Column="1" ItemsSource="{Binding MetadataOptions}"
+                    <TextBlock Grid.Row="8" Grid.Column="0" Classes="fieldLabel" Text="Metadata loss" />
+                    <ComboBox Grid.Row="8" Grid.Column="1" ItemsSource="{Binding MetadataOptions}"
                               SelectedItem="{Binding MetadataOnConflict}" Margin="0,2" MinWidth="220">
                         <ComboBox.ItemTemplate>
                             <DataTemplate x:DataType="prof:MetadataOnConflict">

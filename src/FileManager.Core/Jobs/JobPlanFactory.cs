@@ -53,6 +53,8 @@ public sealed class JobPlanFactory(EnginePaths paths, EngineConfig config)
             OnSuccess = p.OnSuccess,
             ArchiveFolder = p.ArchiveFolder,
             MetadataOnConflict = p.MetadataOnConflict,
+            LargeFileIdentity = p.LargeFileIdentity,
+            LargeFileIdentityThresholdBytes = p.LargeFileIdentityThresholdBytes,
         };
 
         string tempRoot = string.IsNullOrWhiteSpace(config.TempRoot) ? paths.WorkDirectory : config.TempRoot!;

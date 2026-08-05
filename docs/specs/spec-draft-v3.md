@@ -309,6 +309,66 @@ If identical, the Target write is **skipped** and logged as `SKIPPED (UnchangedA
 still counts that Target as satisfied (its content is provably in place), so source disposition
 proceeds normally if all Targets are satisfied.
 
+The check runs **before the output is sealed**, and that ordering is load-bearing: sealing hashes the
+final artifact end to end, so probing afterwards made a duplicate cost a full read of the incoming
+file *plus* a full read of the existing Target. A Job whose every Target is already satisfied
+therefore never seals — it closes `Skipped (UnchangedAtAllTargets)` without writing an
+`output-sealed` journal record, without committing, and without disposing the source.
+
+##### `LargeFileIdentity` — bounded-read identity above a size threshold
+
+A full content hash is exact but costs a complete read of **both** files, which dominates everything
+else on large media: one duplicate 8 GiB video is ~16 GiB of reading before the Job can conclude it
+has nothing to do. `LargeFileIdentity` chooses what evidence the check above will accept for files
+**larger than** `LargeFileIdentityThresholdBytes`; at or below the threshold a full hash is always
+used, because hashing a small file is free and exactness costs nothing.
+
+| Value | Evidence for a file above the threshold | Bytes read per file |
+|---|---|---|
+| `FullHash` *(default)* | Same size **and** same full content hash | the whole file |
+| `SampledHash` | Same size **and** same *sampled* digest | ~8 MiB, flat |
+| `TimestampOrSampledHash` | Same size **and** same modified-time; failing that, same sampled digest | 0, or ~8 MiB |
+| `SizeAndTimestamp` | Same size **and** same modified-time | 0 |
+
+The **sampled digest** is XXH3-128 over a domain-separation prefix, the file's length, and eight 1 MiB
+windows — the first, the last, and six evenly spaced in between — so its cost is flat in file size. A
+sampled digest is never interchangeable with a full-content digest (the prefix guarantees it) and is
+never stored in `output-sealed.ContentHash` or any other journal field: recovery and rollback compare
+against full hashes only.
+
+**What this trades away, precisely.** Comparing partial reads is **exact when it says the files
+differ** — sampled bytes that differ prove the files differ — and **probabilistic only when it says
+they are identical**. So the failure mode is one-directional: a Target wrongly judged to already hold
+the content is not written, and silently keeps its older version. A change confined to a region the
+windows do not sample, in a file of unchanged length, is what can produce that.
+
+Two consequences follow, and the second is why this is opt-in:
+
+* On its own the mis-judgement is **recoverable**: because an all-Targets-unchanged Job closes
+  `Skipped` without committing, the source survives, and re-running under `FullHash` repairs the
+  Target.
+* It becomes **data loss** when the Profile has another Target that genuinely is written. That Job
+  commits and disposes the source per `OnSuccess`, leaving the mis-judged Target stale with the new
+  content gone. This is the shape of [§6.1](#61-the-one-data-losing-combination), and the GUI gates it
+  the same way: a blocking warning for any non-`FullHash` value combined with
+  `OnSuccess: PermanentDelete`, a non-blocking warning for `MoveToTrash`.
+
+`SizeAndTimestamp` additionally reads no content at all, so a file edited in place without changing
+its length — or one whose modified-time was restored afterwards by another tool — is treated as
+already copied. It warns on selection for that reason.
+
+**Verification is untouched.** This axis governs only the identity comparison above. Every Target
+that is actually written is still copied to a temp name, fsync'd, read back, and verified against the
+full content hash under `VerificationMethod` ([§3.3](#33-transactional-verification--rollback)) before
+any rename or source disposition. Nothing here makes a *written* copy less trustworthy; it only
+changes how confidently the engine concludes it need not write at all. Because the identity probe is
+never an integrity attestation, it always uses XXH3-128 — a `SHA256` Profile gets the cheap probe at
+XXH3 speed and keeps SHA-256 for the verification that matters.
+
+The preview ([§8](#8-dry-run)) applies the identical rule from the same shared decision function, and
+labels a sampled match as sampled (naming the bytes read) rather than as a full-content proof, so an
+approved plan cannot mean something different from the run that follows.
+
 > **Why this is mandatory, not an optimization:** without it, any re-delivery of the same file — a
 > watcher re-event (metadata touch, editor save-twice), a `CatchUpOnce` re-evaluation, a re-run of
 > a manual action — hits `ConflictResolution`. Under `RenameSuffix` that accumulates
@@ -501,7 +561,9 @@ are not portable across OSes).
     "ArchiveFolder": null,
     "OnFailure": "AbortRestoreAndClean",
     "MetadataOnConflict": "WarnAndContinue",
-    "MirrorDeletion": "AfterCopy"
+    "MirrorDeletion": "AfterCopy",
+    "LargeFileIdentity": "FullHash",
+    "LargeFileIdentityThresholdBytes": 268435456
   },
 
   "Filters": {
@@ -535,6 +597,14 @@ are not portable across OSes).
 > (suits a nearly-full destination, at the cost of losing the old copy before its replacement exists).
 > Optional/additive — absent in an existing profile means `AfterCopy`. Inert outside `Mirror`. The
 > dry-run space projection reflects the choice in its peak figures ([§8](#8-dry-run));
+> `LargeFileIdentity ∈ {FullHash (default), SampledHash, TimestampOrSampledHash, SizeAndTimestamp}`
+> with `LargeFileIdentityThresholdBytes` (default `268435456` = 256 MiB) — what evidence the §3.4.1
+> unchanged-check accepts for files **larger than** the threshold. This is an *identity* axis and does
+> **not** weaken `VerificationMethod`: every file actually written is still read back and verified
+> against a full content hash. Optional/additive — absent in an existing profile means `FullHash` and
+> 256 MiB, i.e. the pre-existing exact behavior. Inert when `VerificationMethod` is `None`. Note this
+> does not un-reserve `VerificationMethod: SizeTimestamp`: the objections to that value are about
+> attesting a *copy*, which nothing here changes;
 > `SyncMode ∈ {AdditiveArchive, Mirror (reserved)}`;
 > `TargetLayout ∈ {PreserveStructure, Flatten}`;
 > `ArgumentMode ∈ {Literal, Shell (reserved)}`;

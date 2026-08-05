@@ -22,7 +22,11 @@ public sealed class JobStateMachine(JobId jobId)
             [JobState.Locked] = [JobState.Opened, JobState.Closed],
             [JobState.Opened] = [JobState.Preflighted, JobState.RollingBack, JobState.Closed],
             [JobState.Preflighted] = [JobState.Screened, JobState.RollingBack, JobState.Closed],
-            [JobState.Screened] = [JobState.Transforming, JobState.RollingBack],
+            // Screened → Closed: the §3.4.1 identity probe found the content already at every target.
+            // Nothing was written and nothing was even sealed, so this closes directly for the same
+            // reason the preflight/filter outcomes do (I-WAL) rather than walking guard-only
+            // transitions through OutputSealed/Distributing that would assert work that never happened.
+            [JobState.Screened] = [JobState.Transforming, JobState.RollingBack, JobState.Closed],
             [JobState.Transforming] = [JobState.OutputSealed, JobState.RollingBack],
             [JobState.OutputSealed] = [JobState.Distributing, JobState.RollingBack],
             [JobState.Distributing] = [JobState.Committed, JobState.RollingBack],

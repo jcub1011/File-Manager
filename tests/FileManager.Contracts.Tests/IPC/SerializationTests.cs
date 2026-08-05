@@ -505,6 +505,70 @@ public sealed class SerializationTests
     }
 
     [Fact]
+    public void Profile_saved_before_LargeFileIdentity_existed_loads_as_the_exact_full_hash()
+    {
+        // The additive-field contract for the §3.4.1 identity policy. Both halves matter:
+        //  - the METHOD must land on FullHash (slot 0), the pre-existing exact behaviour;
+        //  - the THRESHOLD must land on 256 MiB, NOT on 0. A plain long would read back as 0, which means
+        //    "every file is large" — i.e. an upgrading user would be silently switched to the cheap check.
+        string json = Encoding.UTF8.GetString(JsonSerializer.SerializeToUtf8Bytes(
+            SampleProfile(), FileManagerJsonContext.Default.Profile));
+        JsonObject obj = JsonNode.Parse(json)!.AsObject();
+        obj["Policies"]!.AsObject().Remove("LargeFileIdentity");
+        obj["Policies"]!.AsObject().Remove("LargeFileIdentityThresholdBytes");
+
+        Profile? parsed = JsonSerializer.Deserialize(obj.ToJsonString(), FileManagerJsonContext.Default.Profile);
+        Assert.NotNull(parsed);
+        Assert.Equal(LargeFileIdentity.FullHash, parsed!.Policies.LargeFileIdentity);
+        Assert.Equal(PolicySettings.DefaultLargeFileIdentityThresholdBytes,
+            parsed.Policies.LargeFileIdentityThresholdBytes);
+    }
+
+    [Fact]
+    public void A_non_default_identity_threshold_round_trips()
+    {
+        Profile original = SampleProfile();
+        original = original with
+        {
+            Policies = original.Policies with
+            {
+                LargeFileIdentity = LargeFileIdentity.SampledHash,
+                LargeFileIdentityThresholdBytes = 4096,
+            },
+        };
+
+        byte[] bytes = JsonSerializer.SerializeToUtf8Bytes(original, FileManagerJsonContext.Default.Profile);
+        Profile? parsed = JsonSerializer.Deserialize(bytes, FileManagerJsonContext.Default.Profile);
+
+        Assert.NotNull(parsed);
+        Assert.Equal(LargeFileIdentity.SampledHash, parsed!.Policies.LargeFileIdentity);
+        Assert.Equal(4096, parsed.Policies.LargeFileIdentityThresholdBytes);
+    }
+
+    [Fact]
+    public void The_default_identity_threshold_stays_absent_from_the_json()
+    {
+        // The nullable-backing pattern keeps the default off the wire, so an omitted field and an explicit
+        // 256 MiB compare equal under the record's value-equality.
+        Profile original = SampleProfile();
+        Assert.Equal(PolicySettings.DefaultLargeFileIdentityThresholdBytes,
+            original.Policies.LargeFileIdentityThresholdBytes);
+
+        string json = Encoding.UTF8.GetString(JsonSerializer.SerializeToUtf8Bytes(
+            original, FileManagerJsonContext.Default.Profile));
+        Assert.DoesNotContain("LargeFileIdentityThresholdBytes", json, StringComparison.Ordinal);
+
+        Profile explicitly = original with
+        {
+            Policies = original.Policies with
+            {
+                LargeFileIdentityThresholdBytes = PolicySettings.DefaultLargeFileIdentityThresholdBytes,
+            },
+        };
+        Assert.Equal(original, explicitly);
+    }
+
+    [Fact]
     public void Malformed_and_unknown_discriminator_payloads_deserialize_to_failures()
     {
         Assert.True(IpcSerializer.DeserializeRequest("not json"u8.ToArray()).TryGetError(out string? malformed));

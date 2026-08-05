@@ -1016,7 +1016,7 @@ public sealed class DryRunEngine(
 
         List<PhysicalFile> destinationFiles = [];
         List<VirtualFileOperation> destinationOps = [];
-        byte[]? cachedSourceHash = null;
+        CachedSourceDigest? cachedSourceHash = null;
 
         foreach (TargetConfig target in profile.Targets)
         {
@@ -1076,12 +1076,18 @@ public sealed class DryRunEngine(
         return new FileEvaluation(sourceFile, sourceOp, destinationFiles, destinationOps);
     }
 
+    /// <summary>A source digest cached across one file's targets, tagged with the evidence that produced
+    /// it. The tag is the guard that a bounded-read sampled digest is never compared against a
+    /// full-content digest — they are different values over different bytes, and a silent mix-up would
+    /// read as "these files differ" and copy needlessly, or worse.</summary>
+    private readonly record struct CachedSourceDigest(IdentityEvidence Evidence, byte[] Digest);
+
     /// <summary>One target's evaluation: the operation(s) it produces, the pre-existing destination
     /// file it touches (if any), and the (possibly newly computed) cached source hash. Within
     /// <see cref="Ops"/>, <c>SourceIndex == 0</c> means "the source file", and <c>SubjectIndex == 0</c>
     /// means "<see cref="ExistingFile"/>"; the caller remaps both to bundle-local positions.</summary>
     private readonly record struct TargetEvaluation(
-        IReadOnlyList<VirtualFileOperation> Ops, PhysicalFile? ExistingFile, byte[]? SourceHash);
+        IReadOnlyList<VirtualFileOperation> Ops, PhysicalFile? ExistingFile, CachedSourceDigest? SourceHash);
 
     /// <summary>Per-target simulation, in the executor's order: unchanged-check FIRST
     /// (spec §3.4.1, before conflict resolution), then the read-only conflict probe.</summary>
@@ -1091,7 +1097,7 @@ public sealed class DryRunEngine(
         FileMetadata metadata,
         string prospectivePath,
         string targetRoot,
-        byte[]? cachedSourceHash,
+        CachedSourceDigest? cachedSourceHash,
         RunCounters counters,
         CancellationToken ct)
     {
@@ -1123,26 +1129,60 @@ public sealed class DryRunEngine(
             Detail = detail,
         };
 
-        TargetEvaluation Single(VirtualFileOperation op, byte[]? hash) =>
+        TargetEvaluation Single(VirtualFileOperation op, CachedSourceDigest? hash) =>
             new([op], existingFile, hash);
+
+        // The §3.4.1 identity rule, from the SAME shared source of truth the real run uses
+        // (IdentityStrategy → JobExecutor.ProbeIdentityAsync → AtomicPlacer.CheckUnchangedAsync), so the
+        // plan the user approves cannot disagree with what the run then decides.
+        IdentityPlan identity = IdentityStrategy.For(
+            metadata.Length, policies.VerificationMethod,
+            policies.LargeFileIdentity, policies.LargeFileIdentityThresholdBytes);
 
         if (existingMeta is not null && existingMeta.Length == metadata.Length)
         {
-            if (policies.VerificationMethod is VerificationMethod.Sha256 or VerificationMethod.XxHash128)
+            if (identity.AcceptMetadataMatch
+                && IdentityStrategy.TimestampsMatch(existingMeta.LastWritten, metadata.LastWritten))
             {
+                // Zero bytes of content read.
+                return Single(Op(OperationKind.SkipUnchanged, prospectivePath, 0, subject,
+                    policies.VerificationMethod is VerificationMethod.Sha256 or VerificationMethod.XxHash128
+                        ? "same size and modified time (no content read — LargeFileIdentity)"
+                        : "same size and modified time (best-effort — VerificationMethod is None)"),
+                    cachedSourceHash);
+            }
+
+            if (identity.ContentEvidence is IdentityEvidence evidence)
+            {
+                bool sampled = evidence == IdentityEvidence.SampledHash;
+
+                // A sampled digest and a full digest are not comparable, so a cached one is only reusable
+                // when it was produced by the SAME evidence. (Both are derived from the file's size, which
+                // is fixed per file, so in practice the evidence never varies across one file's targets —
+                // the check is what makes that a guarantee rather than an assumption.)
+                byte[]? sourceDigest = cachedSourceHash is { } cached && cached.Evidence == evidence
+                    ? cached.Digest
+                    : null;
+
+                Task<Result<byte[], JobError>> HashFor(string path) => sampled
+                    ? hasher.HashSampledToBytesAsync(path, SampledHashLayout.Default, ct)
+                    : hasher.HashFileToBytesAsync(path, policies.VerificationMethod, ct);
+
+                // Count what is actually read, never the file length: a sampled probe that reported the
+                // whole length would make the run report claim I/O it never performed.
+                long BytesFor(long length) => sampled ? SampledHashLayout.Default.BytesRead(length) : length;
+
                 Result<byte[], JobError> targetHash;
-                if (cachedSourceHash is null)
+                if (sourceDigest is null)
                 {
-                    // First hashing target for this file: the source and target full-file reads are
-                    // independent, so run them concurrently — max(src, tgt) instead of src + tgt.
-                    // HashFileToBytesAsync never throws (cancellation and errors come back as Result
-                    // states), so WhenAll cannot fault and neither task is abandoned.
-                    counters.CountHash(metadata.Length);
-                    counters.CountHash(existingMeta.Length);
-                    Task<Result<byte[], JobError>> sourceTask =
-                        hasher.HashFileToBytesAsync(sourcePath, policies.VerificationMethod, ct);
-                    Task<Result<byte[], JobError>> targetTask =
-                        hasher.HashFileToBytesAsync(prospectivePath, policies.VerificationMethod, ct);
+                    // First hashing target for this file: the source and target reads are independent, so
+                    // run them concurrently — max(src, tgt) instead of src + tgt. The hasher never throws
+                    // (cancellation and errors come back as Result states), so WhenAll cannot fault and
+                    // neither task is abandoned.
+                    counters.CountHash(BytesFor(metadata.Length));
+                    counters.CountHash(BytesFor(existingMeta.Length));
+                    Task<Result<byte[], JobError>> sourceTask = HashFor(sourcePath);
+                    Task<Result<byte[], JobError>> targetTask = HashFor(prospectivePath);
                     await Task.WhenAll(sourceTask, targetTask).ConfigureAwait(false);
 
                     Result<byte[], JobError> sourceHash = sourceTask.Result;
@@ -1153,12 +1193,14 @@ public sealed class DryRunEngine(
                     if (sourceHash.TryGetError(out JobError? hashError))
                         return Single(Op(OperationKind.Unknown, prospectivePath, 0, subject,
                             $"could not hash the source: {hashError.Message}"), null);
-                    sourceHash.TryGetValue(out cachedSourceHash);
+                    sourceHash.TryGetValue(out sourceDigest);
+                    if (sourceDigest is not null)
+                        cachedSourceHash = new CachedSourceDigest(evidence, sourceDigest);
                 }
                 else
                 {
-                    counters.CountHash(existingMeta.Length);
-                    targetHash = await hasher.HashFileToBytesAsync(prospectivePath, policies.VerificationMethod, ct).ConfigureAwait(false);
+                    counters.CountHash(BytesFor(existingMeta.Length));
+                    targetHash = await HashFor(prospectivePath).ConfigureAwait(false);
                 }
 
                 if (targetHash.IsCanceled)
@@ -1168,16 +1210,16 @@ public sealed class DryRunEngine(
                         $"could not hash the existing target: {targetHashError.Message}"), cachedSourceHash);
                 targetHash.TryGetValue(out byte[]? existingHash);
 
-                if (cachedSourceHash is not null && existingHash is not null
-                    && existingHash.AsSpan().SequenceEqual(cachedSourceHash))
-                    return Single(Op(OperationKind.SkipUnchanged, prospectivePath, 0, subject,
-                        $"identical content ({policies.VerificationMethod})"), cachedSourceHash);
-            }
-            else if (existingMeta.LastWritten == metadata.LastWritten)
-            {
-                // VerificationMethod.None: best-effort size + mtime equality (spec §3.4.1).
-                return Single(Op(OperationKind.SkipUnchanged, prospectivePath, 0, subject,
-                    "same size and modified time (best-effort — VerificationMethod is None)"), cachedSourceHash);
+                if (sourceDigest is not null && existingHash is not null
+                    && existingHash.AsSpan().SequenceEqual(sourceDigest))
+                {
+                    // Say WHICH evidence proved it. The user approves a plan from this text, and a sampled
+                    // match must never read as a full-content proof.
+                    string detail = sampled
+                        ? $"identical content (sampled XXH3-128 — {BytesFor(metadata.Length):N0} of {metadata.Length:N0} bytes read)"
+                        : $"identical content ({policies.VerificationMethod})";
+                    return Single(Op(OperationKind.SkipUnchanged, prospectivePath, 0, subject, detail), cachedSourceHash);
+                }
             }
         }
 
