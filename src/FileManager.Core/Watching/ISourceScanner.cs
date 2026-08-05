@@ -1,4 +1,4 @@
-﻿using FileManager.Contracts.Profiles;
+using FileManager.Contracts.Profiles;
 using FileManager.Core.Files;
 using FileManager.Core.Jobs;
 using FileManager.Contracts.Primitives;

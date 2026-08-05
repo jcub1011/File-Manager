@@ -1,4 +1,4 @@
-﻿using FileManager.Contracts.Profiles;
+using FileManager.Contracts.Profiles;
 using FileManager.Contracts.Primitives;
 using System;
 using System.Collections.Generic;

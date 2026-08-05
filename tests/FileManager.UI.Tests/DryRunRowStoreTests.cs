@@ -1,4 +1,4 @@
-﻿using System.Collections;
+using System.Collections;
 using FileManager.Contracts.DryRun;
 using FileManager.Contracts.IPC;
 using FileManager.Contracts.Profiles;

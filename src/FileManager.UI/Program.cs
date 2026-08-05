@@ -1,4 +1,4 @@
-﻿using Avalonia;
+using Avalonia;
 using FileManager.UI.Services;
 using Serilog;
 using System;

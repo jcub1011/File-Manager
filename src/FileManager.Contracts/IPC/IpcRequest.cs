@@ -1,4 +1,4 @@
-﻿using FileManager.Contracts.Profiles;
+using FileManager.Contracts.Profiles;
 using FileManager.Contracts.Settings;
 using System;
 using System.Text.Json.Serialization;

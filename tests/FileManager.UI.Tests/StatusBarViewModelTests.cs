@@ -1,4 +1,4 @@
-﻿using FileManager.Contracts.IPC;
+using FileManager.Contracts.IPC;
 using FileManager.UI.Tests.Fakes;
 using FileManager.UI.ViewModels;
 

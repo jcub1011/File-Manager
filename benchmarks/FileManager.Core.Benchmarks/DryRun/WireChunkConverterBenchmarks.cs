@@ -1,4 +1,4 @@
-﻿using BenchmarkDotNet.Attributes;
+using BenchmarkDotNet.Attributes;
 using FileManager.Contracts.DryRun;
 using FileManager.Contracts.IPC;
 using FileManager.Core.Benchmarks.Fixtures;

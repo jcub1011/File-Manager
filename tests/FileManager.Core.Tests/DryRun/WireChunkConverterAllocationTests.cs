@@ -1,4 +1,4 @@
-﻿using FileManager.Contracts.DryRun;
+using FileManager.Contracts.DryRun;
 using FileManager.Contracts.IPC;
 using FileManager.Core.DryRun;
 using FileManager.Core.IPC.Handlers;

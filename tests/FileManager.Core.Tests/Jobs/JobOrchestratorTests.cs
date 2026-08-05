@@ -1,4 +1,4 @@
-﻿using FileManager.Contracts.IPC;
+using FileManager.Contracts.IPC;
 using FileManager.Contracts.Profiles;
 using FileManager.Core.Jobs;
 using FileManager.Core.Observability;

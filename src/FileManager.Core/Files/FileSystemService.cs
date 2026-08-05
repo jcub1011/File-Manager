@@ -1,4 +1,4 @@
-﻿using FileManager.Contracts.Primitives;
+using FileManager.Contracts.Primitives;
 using Microsoft.Extensions.Logging;
 using System;
 using System.Collections.Generic;

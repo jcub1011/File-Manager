@@ -1,4 +1,4 @@
-﻿using FileManager.Core.Jobs;
+using FileManager.Core.Jobs;
 using System;
 using System.Collections.Generic;
 using System.Threading;

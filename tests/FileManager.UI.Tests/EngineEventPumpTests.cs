@@ -1,4 +1,4 @@
-﻿using FileManager.Contracts.IPC;
+using FileManager.Contracts.IPC;
 using FileManager.Contracts.Primitives;
 using FileManager.UI.Services;
 using FileManager.UI.Tests.Fakes;

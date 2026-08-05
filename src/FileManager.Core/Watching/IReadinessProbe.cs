@@ -1,4 +1,4 @@
-﻿using FileManager.Contracts.Primitives;
+using FileManager.Contracts.Primitives;
 using System.Threading;
 using System.Threading.Tasks;
 

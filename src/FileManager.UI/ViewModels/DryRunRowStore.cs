@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using FileManager.Contracts.DryRun;
 using FileManager.Contracts.IPC;

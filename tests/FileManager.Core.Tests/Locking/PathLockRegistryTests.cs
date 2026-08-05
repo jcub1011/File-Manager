@@ -1,4 +1,4 @@
-﻿using FileManager.Core.Jobs;
+using FileManager.Core.Jobs;
 using FileManager.Core.Locking;
 
 namespace FileManager.Core.Tests.Locking;

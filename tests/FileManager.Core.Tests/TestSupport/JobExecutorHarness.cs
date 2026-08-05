@@ -1,4 +1,4 @@
-﻿using FileManager.Contracts.Primitives;
+using FileManager.Contracts.Primitives;
 using FileManager.Contracts.Profiles;
 using FileManager.Core.Audit;
 using FileManager.Core.Disposition;

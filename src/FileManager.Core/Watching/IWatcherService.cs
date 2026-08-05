@@ -1,4 +1,4 @@
-﻿using FileManager.Contracts.Primitives;
+using FileManager.Contracts.Primitives;
 using System;
 
 namespace FileManager.Core.Watching;

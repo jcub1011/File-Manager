@@ -1,4 +1,4 @@
-﻿using FileManager.Core;
+using FileManager.Core;
 using FileManager.Core.IPC;
 using FileManager.Core.Jobs;
 using FileManager.Core.Journal;

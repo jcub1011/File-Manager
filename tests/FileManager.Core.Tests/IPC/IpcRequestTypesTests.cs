@@ -1,4 +1,4 @@
-﻿using FileManager.Contracts.IPC;
+using FileManager.Contracts.IPC;
 using FileManager.Contracts.Settings;
 using FileManager.Core.IPC;
 using System.Reflection;

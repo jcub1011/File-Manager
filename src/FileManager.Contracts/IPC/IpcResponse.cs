@@ -1,4 +1,4 @@
-﻿using FileManager.Contracts.DryRun;
+using FileManager.Contracts.DryRun;
 using FileManager.Contracts.Profiles;
 using FileManager.Contracts.Settings;
 using System;

@@ -1,4 +1,4 @@
-﻿using System.Buffers;
+using System.Buffers;
 using FileManager.Contracts.DryRun;
 using FileManager.Contracts.IPC;
 using FileManager.Contracts.Primitives;

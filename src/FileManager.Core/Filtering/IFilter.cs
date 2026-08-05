@@ -1,4 +1,4 @@
-﻿using FileManager.Core.Files;
+using FileManager.Core.Files;
 using System.IO;
 
 namespace FileManager.Core.Filtering;
