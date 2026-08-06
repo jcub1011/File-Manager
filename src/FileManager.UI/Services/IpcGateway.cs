@@ -136,6 +136,11 @@ public sealed class IpcGateway(Func<string?>? serviceExePath = null, TimeProvide
         RequestAsync<RunsResponse, IReadOnlyList<RunSummaryDto>>(
             new GetRunsRequest(), static r => r.Runs, ct);
 
+    public Task<Result<RunDetailDto, IpcError>> GetRunDetailAsync(
+        Guid runId, CancellationToken ct = default) =>
+        RequestAsync<RunDetailResponse, RunDetailDto>(
+            new GetRunDetailRequest { RunId = runId }, static r => r.Detail, ct);
+
     public Task<Result<bool, IpcError>> SetRunPausedAsync(
         Guid runId, bool paused, CancellationToken ct = default) =>
         RequestAsync<OkResponse, bool>(

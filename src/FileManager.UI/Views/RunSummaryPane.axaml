@@ -1,0 +1,307 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:vm="using:FileManager.UI.ViewModels"
+             xmlns:v="using:FileManager.UI.Views"
+             xmlns:ctrl="using:FileManager.UI.Controls"
+             xmlns:conv="using:FileManager.UI.Converters"
+             x:Class="FileManager.UI.Views.RunSummaryPane"
+             x:DataType="vm:JobQueueViewModel">
+
+    <!-- The job queue's right-hand pane: what the SELECTED run is going to do, and the four buttons that
+         act on it.
+
+         DataContext is the whole JobQueueViewModel, not just its Summary. That is deliberate and
+         load-bearing: this pane needs BOTH halves. Summary carries the plan read from the run's snapshot
+         (counts, storage, sources, settings), while SelectedRun carries the live row — its phase, its scan
+         counts while there is no plan yet, and the flags that decide which footer buttons apply. Binding
+         only the summary would have meant duplicating row state into it and keeping the copy in step.
+
+         The buttons live here rather than on each row (where they used to) because they act on one run and
+         this pane is where that run is described. A row that carried them had to restate what Cancel does
+         in a tooltip on every one of six hundred cards; here the button sits under the counts it is about. -->
+
+    <!-- A two-ROW grid, not a DockPanel. The DockPanel this was had three children — footer, placeholder,
+         scroller — and only its LAST child filled; the placeholder therefore docked to the side and the
+         scroller was measured against whatever was left, which is how the footer came to sit over the
+         bottom of the content. A star content row over an auto footer row cannot express that: the footer
+         takes what it needs, the content gets the rest, and the two never overlap however tall either is. -->
+    <Grid RowDefinitions="*,Auto">
+
+        <!-- FOOTER: pinned, same recipe as the window's own footer below it (chrome fill, top hairline,
+             16,10 padding) — actions on the content to the left, and here they are ALL content actions, so
+             they read left to right in escalating order: hold, stop, commit, remove. Spans only this
+             column, which is what makes it the summary's footer rather than the window's. -->
+        <Border x:Name="SummaryFooter" Grid.Row="1" Padding="16,10"
+                Background="{DynamicResource Brush.Chrome.Background}"
+                BorderBrush="{DynamicResource Brush.Panel.Border}" BorderThickness="0,1,0,0"
+                IsVisible="{Binding SelectedRun, Converter={x:Static ObjectConverters.IsNotNull}}">
+            <!-- WrapPanel, not a horizontal StackPanel: four labelled buttons do not fit the 380px this
+                 pane is allowed to shrink to, and clipping the last one would hide Discard. -->
+            <WrapPanel>
+                <!-- Glyph AND label come from the row: this one button is both Pause and Resume, and
+                     PauseLabel already returns the word for the current state with notification wired to
+                     Paused. No tooltip — it used to hold this same word, and the list header is where what
+                     pausing actually does is explained. -->
+                <Button Classes="iconButton hasLabel" Margin="0,0,8,0"
+                        IsVisible="{Binding SelectedRun.IsPausable}"
+                        Command="{Binding TogglePauseCommand}" CommandParameter="{Binding SelectedRun}">
+                    <StackPanel Orientation="Horizontal" Spacing="6">
+                        <PathIcon Width="14" Height="14" VerticalAlignment="Center"
+                                  Data="{Binding SelectedRun.PauseIconKey, Converter={x:Static conv:IconConverters.Geometry}}" />
+                        <TextBlock Text="{Binding SelectedRun.PauseLabel}" VerticalAlignment="Center" />
+                    </StackPanel>
+                </Button>
+
+                <Button Classes="iconButton hasLabel" Margin="0,0,8,0"
+                        IsVisible="{Binding SelectedRun.IsCancellable}"
+                        Command="{Binding CancelRunCommand}" CommandParameter="{Binding SelectedRun}"
+                        ToolTip.Tip="Cancel this run but keep it in the queue. Work that has not started is dropped; files already being copied finish. A Mirror run removes nothing.">
+                    <StackPanel Orientation="Horizontal" Spacing="6">
+                        <PathIcon Data="{StaticResource IconSkip}" Width="14" Height="14"
+                                  VerticalAlignment="Center" />
+                        <TextBlock Text="Cancel" VerticalAlignment="Center" />
+                    </StackPanel>
+                </Button>
+
+                <!-- A checkmark, not the Preview tab's play triangle: from here the plan is a summary
+                     rather than a report on screen, so this button reads as "yes, this one" rather than
+                     "watch it start". -->
+                <Button Classes="iconButton hasLabel tintSuccess" Margin="0,0,8,0"
+                        IsVisible="{Binding SelectedRun.CanApproveHere}"
+                        Command="{Binding ApproveCommand}" CommandParameter="{Binding SelectedRun}"
+                        ToolTip.Tip="Approve run — starts this run. It copies the files the plan listed and, for a Mirror profile, removes the ones marked for removal.">
+                    <StackPanel Orientation="Horizontal" Spacing="6">
+                        <PathIcon Data="{StaticResource IconCheckmark}" Width="14" Height="14"
+                                  VerticalAlignment="Center" />
+                        <TextBlock Text="Approve run" VerticalAlignment="Center" />
+                    </StackPanel>
+                </Button>
+
+                <!-- The spyglass the Profile tab's Preview uses: this goes and looks, it does not commit.
+                     Offered INSTEAD of Approve for a run this window did not plan, which is what the
+                     two-phase design turns on — the summary beside it is aggregate counts, not the itemized
+                     file list, so it is not the "having looked at it" that Approve is gated on. -->
+                <Button Classes="iconButton hasLabel" Margin="0,0,8,0"
+                        Command="{Binding ViewPlanCommand}" CommandParameter="{Binding SelectedRun}"
+                        ToolTip.Tip="Show this run's itemized plan on the Preview tab, where it can be approved.">
+                    <Button.IsVisible>
+                        <MultiBinding Converter="{x:Static BoolConverters.And}">
+                            <Binding Path="SelectedRun.IsAwaitingApproval" />
+                            <Binding Path="!SelectedRun.CanApproveHere" />
+                        </MultiBinding>
+                    </Button.IsVisible>
+                    <StackPanel Orientation="Horizontal" Spacing="6">
+                        <PathIcon Data="{StaticResource IconSearch}" Width="14" Height="14"
+                                  VerticalAlignment="Center" />
+                        <TextBlock Text="View plan…" VerticalAlignment="Center" />
+                    </StackPanel>
+                </Button>
+
+                <!-- Offered on EVERY run, because it is the only thing that removes one — a finished run is
+                     otherwise kept until auto-delete reaps it, or forever when that setting is off. For a
+                     parked plan this IS declining it. Discarding a live run confirms first (see
+                     JobQueueViewModel.ConfirmDiscard). -->
+                <Button Classes="iconButton hasLabel tintDanger"
+                        Command="{Binding DiscardCommand}" CommandParameter="{Binding SelectedRun}"
+                        ToolTip.Tip="Discard — remove this run from the queue. A run still going is cancelled first, and a plan waiting for approval is declined.">
+                    <StackPanel Orientation="Horizontal" Spacing="6">
+                        <PathIcon Data="{StaticResource IconTrash}" Width="14" Height="14"
+                                  VerticalAlignment="Center" />
+                        <TextBlock Text="Discard" VerticalAlignment="Center" />
+                    </StackPanel>
+                </Button>
+            </WrapPanel>
+        </Border>
+
+        <!-- ── Nothing selected ──────────────────────────────────────────────────────────────────── -->
+        <!-- Centred on BOTH axes, which needs the alignment on this panel and not only on its children:
+             the children were already centred inside a panel that filled the pane's width, so the text was
+             centred and the block it sat in was not. MaxWidth keeps the sentence from stretching into one
+             long line on a wide pane. -->
+        <StackPanel x:Name="SummaryPlaceholder" Grid.Row="0"
+                    IsVisible="{Binding SelectedRun, Converter={x:Static ObjectConverters.IsNull}}"
+                    HorizontalAlignment="Center" VerticalAlignment="Center"
+                    Spacing="8" Margin="24" MaxWidth="260">
+            <PathIcon Data="{StaticResource IconSearch}" Width="28" Height="28"
+                      HorizontalAlignment="Center" Foreground="{DynamicResource Brush.Muted}" />
+            <TextBlock Classes="secondary" HorizontalAlignment="Center" TextAlignment="Center"
+                       TextWrapping="Wrap" Text="Select a job to view its summary." />
+        </StackPanel>
+
+        <!-- ── A run is selected ─────────────────────────────────────────────────────────────────── -->
+        <!-- The right padding is DELIBERATELY wider than the left: Avalonia's Fluent scrollbar floats over
+             the content and reserves no width of its own, so a symmetric inset let the bar sit on top of the
+             right edge of every card — which read as the pane clipping its own content as it narrowed.
+             DryRunView reserves the same gutter, for the same reason. -->
+        <ScrollViewer x:Name="SummaryScroller" Grid.Row="0"
+                      IsVisible="{Binding SelectedRun, Converter={x:Static ObjectConverters.IsNotNull}}"
+                      Padding="16,16,22,16" HorizontalScrollBarVisibility="Disabled">
+            <StackPanel Spacing="8">
+
+                <!-- Header: which run this is, in the same words the row uses, so the two cannot be read
+                     as describing different things. -->
+                <StackPanel Spacing="2">
+                    <TextBlock Text="{Binding SelectedRun.ProfileName}" FontWeight="SemiBold"
+                               FontSize="{StaticResource Font.Section}" TextWrapping="Wrap" />
+                    <TextBlock Classes="caption" TextWrapping="Wrap">
+                        <Run Text="Started" /><Run Text=" " /><Run Text="{Binding SelectedRun.StartedText}" />
+                        <Run Text="·" />
+                        <Run Text="{Binding SelectedRun.StatusText}" />
+                    </TextBlock>
+                    <TextBlock Classes="caption" Text="{Binding SelectedRun.FinishedAgeText}"
+                               IsVisible="{Binding SelectedRun.HasFinishedAge}" TextWrapping="Wrap" />
+                    <TextBlock Classes="caption" Text="{Binding Summary.Plan.PlannedAtText}"
+                               IsVisible="{Binding Summary.HasPlan}" TextWrapping="Wrap" />
+                </StackPanel>
+
+                <!-- Load states. Only one of these four can be true at a time; each is a different answer
+                     and none of them is the others. -->
+                <TextBlock Classes="secondary" Text="Loading this run's summary…"
+                           IsVisible="{Binding Summary.IsLoading}" />
+
+                <!-- NOT an error: the snapshot header a summary is read from is written when planning
+                     FINISHES, so a run being watched mid-scan has none. Its live scan counts are the whole
+                     of what is known about it, and they are on the row already. -->
+                <StackPanel Spacing="4" IsVisible="{Binding Summary.HasNoPlanYet}">
+                    <TextBlock Classes="secondary" TextWrapping="Wrap"
+                               Text="Still working out what this run will do. The summary appears once the scan finishes." />
+                    <TextBlock Classes="caption" Text="{Binding SelectedRun.ScanSourcesText}" />
+                    <TextBlock Classes="caption" Text="{Binding SelectedRun.ScanDestinationsText}"
+                               IsVisible="{Binding SelectedRun.HasScannedDestinations}" />
+                </StackPanel>
+
+                <Border Classes="infoBar danger" IsVisible="{Binding Summary.ErrorText, Converter={x:Static ObjectConverters.IsNotNull}}">
+                    <TextBlock Text="{Binding Summary.ErrorText}" TextWrapping="Wrap" />
+                </Border>
+
+                <!-- Why planning failed, which the row can only abbreviate. -->
+                <Border Classes="infoBar danger"
+                        IsVisible="{Binding SelectedRun.PlanError, Converter={x:Static ObjectConverters.IsNotNull}}">
+                    <TextBlock Text="{Binding SelectedRun.PlanError}" TextWrapping="Wrap" />
+                </Border>
+
+                <!-- ── The plan ─────────────────────────────────────────────────────────────────── -->
+                <StackPanel Spacing="8" IsVisible="{Binding Summary.HasPlan}">
+
+                    <!-- Notices first, above every count they qualify: a truncated plan's numbers mean
+                         something different from a complete one's, and a reader who meets the numbers
+                         first has already drawn a conclusion. -->
+                    <Border Classes="infoBar warning" IsVisible="{Binding Summary.Plan.IsTruncated}">
+                        <TextBlock Text="{Binding Summary.Plan.TruncationText}" TextWrapping="Wrap" />
+                    </Border>
+                    <Border Classes="infoBar warning" IsVisible="{Binding Summary.Plan.HasSweepFault}">
+                        <TextBlock Text="{Binding Summary.Plan.SweepFaultText}" TextWrapping="Wrap" />
+                    </Border>
+                    <Border Classes="infoBar warning" IsVisible="{Binding Summary.Plan.HasScope}">
+                        <TextBlock Text="{Binding Summary.Plan.ScopeText}" TextWrapping="Wrap" />
+                    </Border>
+                    <!-- Danger, not a settings row: the originals are the one thing a run can cost the
+                         user something they still had. -->
+                    <Border Classes="infoBar danger" IsVisible="{Binding Summary.Plan.ShowDispositionWarning}">
+                        <TextBlock Text="{Binding Summary.Plan.DispositionText}" TextWrapping="Wrap" />
+                    </Border>
+
+                    <!-- Blast radius: the same glyphs, colours and order the Preview tab's chip strip
+                         uses, because both describe one plan. Data-driven here (the view model builds only
+                         the chips that apply) rather than six chips behind six IsVisible gates. -->
+                    <Border Classes="card">
+                        <StackPanel Spacing="6">
+                            <TextBlock Classes="panelHeader" Text="THIS RUN" />
+                            <ItemsControl ItemsSource="{Binding Summary.Plan.Chips}">
+                                <ItemsControl.ItemsPanel>
+                                    <ItemsPanelTemplate>
+                                        <WrapPanel />
+                                    </ItemsPanelTemplate>
+                                </ItemsControl.ItemsPanel>
+                                <ItemsControl.ItemTemplate>
+                                    <DataTemplate x:DataType="vm:RunSummaryChip">
+                                        <ctrl:StatusCount Margin="0,2,12,2" ToolTip.Tip="{Binding Tooltip}"
+                                                          Text="{Binding Text}"
+                                                          Icon="{Binding IconKey, Converter={x:Static conv:IconConverters.Geometry}}"
+                                                          Glyph="{Binding ColorKey, Converter={x:Static conv:IconConverters.Brush}}" />
+                                    </DataTemplate>
+                                </ItemsControl.ItemTemplate>
+                            </ItemsControl>
+                        </StackPanel>
+                    </Border>
+
+                    <!-- Storage: the same control the Preview tab renders its forecast with, so "will it
+                         fit" looks and reads identically wherever it is asked. Absent for a truncated
+                         plan, whose totals over a partial graph would be unsound — said in words rather
+                         than left as a gap, because a missing forecast is itself information. -->
+                    <v:StoragePanelView DataContext="{Binding Summary.Plan.Space}"
+                                        IsVisible="{Binding Converter={x:Static ObjectConverters.IsNotNull}}" />
+                    <TextBlock Classes="caption" TextWrapping="Wrap"
+                               IsVisible="{Binding !Summary.Plan.HasSpace}"
+                               Text="No storage forecast: it cannot be computed for a plan that does not cover everything." />
+
+                    <Border Classes="card">
+                        <StackPanel Spacing="6">
+                            <TextBlock Classes="panelHeader" Text="READS FROM" />
+                            <ItemsControl ItemsSource="{Binding Summary.Plan.Sources}">
+                                <ItemsControl.ItemTemplate>
+                                    <DataTemplate x:DataType="vm:RunPathRow">
+                                        <StackPanel Margin="0,1">
+                                            <TextBlock Text="{Binding Path}" FontFamily="{StaticResource MonoFontFamily}"
+                                                       FontSize="{StaticResource Font.Small}"
+                                                       TextTrimming="CharacterEllipsis" ToolTip.Tip="{Binding Path}" />
+                                            <TextBlock Classes="caption" Text="{Binding Note}"
+                                                       IsVisible="{Binding HasNote}" />
+                                        </StackPanel>
+                                    </DataTemplate>
+                                </ItemsControl.ItemTemplate>
+                            </ItemsControl>
+                        </StackPanel>
+                    </Border>
+
+                    <Border Classes="card">
+                        <StackPanel Spacing="6">
+                            <TextBlock Classes="panelHeader" Text="WRITES TO" />
+                            <ItemsControl ItemsSource="{Binding Summary.Plan.Targets}">
+                                <ItemsControl.ItemTemplate>
+                                    <DataTemplate x:DataType="vm:RunPathRow">
+                                        <TextBlock Margin="0,1" Text="{Binding Path}"
+                                                   FontFamily="{StaticResource MonoFontFamily}"
+                                                   FontSize="{StaticResource Font.Small}"
+                                                   TextTrimming="CharacterEllipsis" ToolTip.Tip="{Binding Path}" />
+                                    </DataTemplate>
+                                </ItemsControl.ItemTemplate>
+                            </ItemsControl>
+                        </StackPanel>
+                    </Border>
+
+                    <!-- Read-only, and read-only by construction: these are the settings the run was
+                         PLANNED against, embedded in its snapshot. The catalog's copy may have been edited
+                         since, and what executes is this one — so there is nothing here to edit, and no
+                         disabled control pretending otherwise. -->
+                    <Border Classes="card">
+                        <StackPanel Spacing="6">
+                            <TextBlock Classes="panelHeader" Text="SETTINGS FOR THIS RUN" />
+                            <TextBlock Classes="caption" TextWrapping="Wrap"
+                                       Text="As they were when the run was planned. Editing the profile now does not change this run." />
+                            <ItemsControl ItemsSource="{Binding Summary.Plan.Settings}">
+                                <ItemsControl.ItemTemplate>
+                                    <DataTemplate x:DataType="vm:RunSettingRow">
+                                        <!-- Auto label column so a long value wraps rather than pushing the
+                                             label off, which a two-star grid would do at this width.
+                                             MinWidth aligns the values into a column at normal widths;
+                                             MaxWidth lets it give that up rather than squeeze the value to
+                                             one word per line once the pane is dragged narrow. -->
+                                        <Grid ColumnDefinitions="Auto,*" Margin="0,2">
+                                            <TextBlock Grid.Column="0" Classes="caption" Text="{Binding Label}"
+                                                       MinWidth="130" MaxWidth="180" Margin="0,0,8,0"
+                                                       TextWrapping="Wrap" />
+                                            <TextBlock Grid.Column="1" Text="{Binding Value}"
+                                                       FontSize="{StaticResource Font.Small}" TextWrapping="Wrap" />
+                                        </Grid>
+                                    </DataTemplate>
+                                </ItemsControl.ItemTemplate>
+                            </ItemsControl>
+                        </StackPanel>
+                    </Border>
+                </StackPanel>
+            </StackPanel>
+        </ScrollViewer>
+    </Grid>
+
+</UserControl>

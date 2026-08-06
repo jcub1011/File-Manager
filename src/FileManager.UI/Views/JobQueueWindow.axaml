@@ -2,11 +2,12 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:conv="using:FileManager.UI.Converters"
         xmlns:vm="using:FileManager.UI.ViewModels"
+        xmlns:v="using:FileManager.UI.Views"
         xmlns:chrome="using:Avalonia.Controls.Chrome"
         x:Class="FileManager.UI.Views.JobQueueWindow"
         x:DataType="vm:JobQueueViewModel"
-        Width="720" Height="520"
-        MinWidth="520" MinHeight="320"
+        Width="1040" Height="640"
+        MinWidth="840" MinHeight="380"
         WindowStartupLocation="CenterOwner"
         FontFamily="{StaticResource AppFontFamily}"
         FontSize="{StaticResource Font.Body}"
@@ -105,45 +106,114 @@
             </StackPanel>
         </Border>
 
-        <DockPanel Margin="16" LastChildFill="True">
-            <TextBlock DockPanel.Dock="Top" TextWrapping="Wrap" Classes="secondary" Margin="0,0,0,8"
-                       Text="Every run this engine knows about, including previews. Pausing holds work that has not started — files already being copied always finish. Runs are forgotten a few minutes after they end." />
+        <!-- TWO PANES, draggably split: the live list on the left, the selected run's summary on the
+             right. Master/detail like ActivityView, and for the same reason — the left pane's rows are a
+             fixed shape that gains nothing from extra width, while the summary is prose, paths and storage
+             bars that do.
 
-            <StackPanel IsVisible="{Binding HasNoRuns}" VerticalAlignment="Center" Spacing="8">
-                <PathIcon Data="{StaticResource IconDocument}" Width="28" Height="28"
-                          HorizontalAlignment="Center"
-                          Foreground="{DynamicResource Brush.Muted}" />
-                <TextBlock Classes="secondary" HorizontalAlignment="Center" TextAlignment="Center"
-                           TextWrapping="Wrap"
-                           Text="Nothing running. Preview or run a profile and it will appear here." />
-            </StackPanel>
+             MinWidth on both content columns so neither can be dragged away entirely. The left minimum is
+             what the row cards need before the profile name starts trimming; the right is what the
+             settings block's label column plus a value needs before it wraps to one word per line.
 
-            <ScrollViewer IsVisible="{Binding HasRuns}">
-                <ItemsControl ItemsSource="{Binding Runs}">
-                    <!-- VIRTUALIZED. An ItemsControl's default panel realizes every item, which was fine
-                         when the engine forgot a finished run after ten minutes and the list was a handful
-                         of rows. Runs are now retained until discarded (up to MaxRetainedClosedRuns), so
-                         this list can be hundreds of cards deep and every one of them would otherwise be
-                         built up front. Kept an ItemsControl rather than switched to a ListBox: the row
-                         buttons bind through $parent[ItemsControl], and changing the container type would
-                         break every one of them. -->
-                    <ItemsControl.ItemsPanel>
+             NO MARGIN ON THIS GRID — each pane insets its own content instead. The margin used to live here
+             and it put the grab area in the wrong place: the splitter sat flush against the list while the
+             visible rule (the summary panel's left border) was a dozen pixels further right, so the thing
+             that looked like the divider was not the thing that resized. The splitter is now the divider,
+             drawn and hovering as one. -->
+        <Grid x:Name="SplitRoot">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="380" MinWidth="300" />
+                <ColumnDefinition Width="6" />
+                <ColumnDefinition Width="*" MinWidth="360" />
+            </Grid.ColumnDefinitions>
+
+            <Grid.Styles>
+                <!-- The divider IS the handle. It used to be a 4px transparent column, which hit-tested
+                     correctly and looked like nothing at all — the user could only find it by sweeping the
+                     cursor for the resize arrow. Painted as the same hairline every other panel edge uses,
+                     and picking up the accent under the pointer so it reads as grabbable before it is
+                     grabbed. -->
+                <Style Selector="GridSplitter.pane">
+                    <Setter Property="Background" Value="{DynamicResource Brush.Panel.Border}" />
+                </Style>
+                <Style Selector="GridSplitter.pane:pointerover">
+                    <Setter Property="Background" Value="{DynamicResource Brush.Accent}" />
+                </Style>
+
+                <!-- Strip the default ListBoxItem chrome so the row's own Border.card is the whole visible
+                     row, exactly as DryRunView does for its own row lists. Selection is drawn by the
+                     ListBoxItem underneath the card, which is transparent-bordered, so the accent reads
+                     through as a highlight around it. -->
+                <Style Selector="ListBox.runs">
+                    <Setter Property="Background" Value="Transparent" />
+                    <Setter Property="BorderThickness" Value="0" />
+                    <Setter Property="Padding" Value="0" />
+                </Style>
+                <Style Selector="ListBox.runs > ListBoxItem">
+                    <Setter Property="Padding" Value="0" />
+                    <Setter Property="Margin" Value="0" />
+                    <Setter Property="MinHeight" Value="0" />
+                </Style>
+                <Style Selector="ListBox.runs > ListBoxItem:pointerover /template/ ContentPresenter#PART_ContentPresenter">
+                    <Setter Property="Background" Value="{DynamicResource Brush.Hover.Soft}" />
+                </Style>
+            </Grid.Styles>
+
+            <!-- ── Left: the queue ──────────────────────────────────────────────────────────────── -->
+            <!-- ALWAYS a list, with no header paragraph above it and no full-pane empty state instead of
+                 it. Both used to be here; both made the pane change shape depending on what was in it, so
+                 the eye had to re-find the list every time the queue went from empty to busy. An empty
+                 queue now shows one placeholder ROW in the list's own position (below), which keeps the
+                 layout still. What pausing and cancelling actually do is stated on the buttons that do
+                 them, in the summary footer, which is where a reader is when the question arises. -->
+            <Grid x:Name="QueuePane" Grid.Column="0" Margin="16,16,16,16">
+
+                <!-- The empty state, shaped as a job card so it sits exactly where the first row would.
+                     Dashed, because a dashed outline is the standard "nothing here yet" affordance and it
+                     cannot be mistaken for a selectable row. A Rectangle rather than a Border: Avalonia's
+                     Border draws a solid stroke only, so the dash has to come from a shape. -->
+                <Grid x:Name="EmptyQueueCard" IsVisible="{Binding HasNoRuns}"
+                      VerticalAlignment="Top" Height="64">
+                    <!-- Radius.CardScalar, not Radius.Card: a shape's radii are doubles and the card token
+                         is a CornerRadius, so the latter throws on populate. -->
+                    <Rectangle RadiusX="{StaticResource Radius.CardScalar}"
+                               RadiusY="{StaticResource Radius.CardScalar}"
+                               StrokeThickness="1" StrokeDashArray="4,3"
+                               Stroke="{DynamicResource Brush.Panel.Border}" />
+                    <TextBlock Text="No Jobs In Queue" Classes="secondary"
+                               HorizontalAlignment="Center" VerticalAlignment="Center" />
+                </Grid>
+
+                <!-- A ListBox rather than the ItemsControl this was, which is what makes a row SELECTABLE
+                     and therefore what the summary pane follows. The swap was previously blocked: every
+                     row button bound its command through $parent[ItemsControl], so changing the container
+                     type would have broken all six. Moving those buttons into the summary footer removed
+                     the last one, and only then did this become a two-line change.
+
+                     Still VIRTUALIZED, and for the same reason as before: runs are retained until
+                     discarded (up to MaxRetainedClosedRuns), so this list can be hundreds of cards deep
+                     and a non-virtualizing panel would realize every one up front. -->
+                <!-- No IsVisible gate: the list is always the list. An empty one simply lays out nothing,
+                     and the dashed placeholder above shows through where its first row would be. -->
+                <ListBox Classes="runs" ItemsSource="{Binding Runs}"
+                         SelectedItem="{Binding SelectedRun}">
+                    <ListBox.ItemsPanel>
                         <ItemsPanelTemplate>
                             <VirtualizingStackPanel />
                         </ItemsPanelTemplate>
-                    </ItemsControl.ItemsPanel>
-                    <ItemsControl.ItemTemplate>
+                    </ListBox.ItemsPanel>
+                    <ListBox.ItemTemplate>
                         <DataTemplate x:DataType="vm:JobQueueRow">
                             <!-- .old dims a run that finished a while ago: history rather than news. The
                                  class is what the ten-minute mark does now that it no longer deletes. -->
                             <Border Classes="card" Classes.old="{Binding IsOld}"
-                                    Margin="0,0,0,6" Padding="10,8">
-                                <Grid ColumnDefinitions="Auto,*,Auto" RowDefinitions="Auto,Auto,Auto">
+                                    Margin="0,0,0,6" Padding="10,8" Background="Transparent">
+                                <Grid ColumnDefinitions="Auto,*" RowDefinitions="Auto,Auto,Auto">
 
                                     <!-- Glyph + colour arrive as resource-key strings from the view model,
                                          resolved here — the same approach the activity and dry-run rows use,
                                          so the view model needs no Avalonia dependency. -->
-                                    <PathIcon Grid.Row="0" Grid.Column="0" Grid.RowSpan="2"
+                                    <PathIcon Grid.Row="0" Grid.Column="0" Grid.RowSpan="3"
                                               Width="16" Height="16" Margin="0,0,10,0"
                                               VerticalAlignment="Top"
                                               Data="{Binding StatusIconKey, Converter={x:Static conv:IconConverters.Geometry}}"
@@ -157,9 +227,33 @@
                                             <Run Text="·" />
                                             <Run Text="{Binding StatusText}" />
                                         </TextBlock>
+
+                                        <!-- PLANNING: the two scan counts, each on its own line. This is
+                                             the phase's only news, and the destination line disappears
+                                             rather than reading zero — most profiles never sweep their
+                                             destination, and "0 at the destination" reads as a fault. -->
+                                        <TextBlock Classes="caption" Text="{Binding ScanSourcesText}"
+                                                   Foreground="{DynamicResource Brush.Info}"
+                                                   IsVisible="{Binding IsPlanning}"
+                                                   TextTrimming="CharacterEllipsis" />
+                                        <TextBlock Classes="caption" Text="{Binding ScanDestinationsText}"
+                                                   Foreground="{DynamicResource Brush.Info}"
+                                                   TextTrimming="CharacterEllipsis">
+                                            <TextBlock.IsVisible>
+                                                <MultiBinding Converter="{x:Static BoolConverters.And}">
+                                                    <Binding Path="IsPlanning" />
+                                                    <Binding Path="HasScannedDestinations" />
+                                                </MultiBinding>
+                                            </TextBlock.IsVisible>
+                                        </TextBlock>
+
+                                        <!-- Every other phase's one-liner: queued, the parked plan's
+                                             forecast, the executing file counts. -->
                                         <TextBlock Classes="caption" Text="{Binding ProgressText}"
                                                    Foreground="{DynamicResource Brush.Info}"
+                                                   IsVisible="{Binding !IsPlanning}"
                                                    TextTrimming="CharacterEllipsis" />
+
                                         <!-- Shown for every finished row, not just old ones. Runs are kept
                                              now, so "when" is as much a part of the row as "what". -->
                                         <TextBlock Classes="caption" Text="{Binding FinishedAgeText}"
@@ -167,113 +261,45 @@
                                                    TextTrimming="CharacterEllipsis" />
                                     </StackPanel>
 
-                                    <!-- Row actions. Pause and Cancel apply to a live run only; DISCARD
-                                         applies to every row, because it is the only thing that removes a
-                                         run — a finished one is otherwise kept until auto-delete reaps it,
-                                         or forever when that setting is off. Discarding a live run confirms
-                                         first (see JobQueueViewModel.ConfirmDiscard). -->
-                                    <!-- Labelled and filled, like every other action in the app. Full-size
-                                         rather than the dense 12px glyphs these were: the approval strip
-                                         below the progress bar already puts full-size buttons inside this
-                                         card, so a compact variant here would only make the two disagree.
-                                         The profile name to the left already trims on overflow, which is
-                                         what gives at the window's 520px minimum. -->
-                                    <StackPanel Grid.Row="0" Grid.Column="2" Orientation="Horizontal"
-                                                Spacing="8" VerticalAlignment="Top">
-                                        <!-- Glyph AND label come from the row: this one button is both Pause
-                                             and Resume, and PauseLabel already returns the word for the
-                                             current state with notification wired to Paused. No tooltip —
-                                             it used to hold this same word, and the header paragraph is
-                                             where what pausing actually does is explained. -->
-                                        <Button Classes="iconButton hasLabel" IsVisible="{Binding IsPausable}"
-                                                Command="{Binding $parent[ItemsControl].((vm:JobQueueViewModel)DataContext).TogglePauseCommand}"
-                                                CommandParameter="{Binding}">
-                                            <StackPanel Orientation="Horizontal" Spacing="6">
-                                                <PathIcon Width="14" Height="14" VerticalAlignment="Center"
-                                                          Data="{Binding PauseIconKey, Converter={x:Static conv:IconConverters.Geometry}}" />
-                                                <TextBlock Text="{Binding PauseLabel}" VerticalAlignment="Center" />
-                                            </StackPanel>
-                                        </Button>
-                                        <Button Classes="iconButton hasLabel" IsVisible="{Binding IsCancellable}"
-                                                Command="{Binding $parent[ItemsControl].((vm:JobQueueViewModel)DataContext).CancelRunCommand}"
-                                                CommandParameter="{Binding}"
-                                                ToolTip.Tip="Cancel this run but keep it in the queue. Work that has not started is dropped; files already being copied finish. A Mirror run removes nothing.">
-                                            <StackPanel Orientation="Horizontal" Spacing="6">
-                                                <PathIcon Data="{StaticResource IconSkip}" Width="14" Height="14"
-                                                          VerticalAlignment="Center" />
-                                                <TextBlock Text="Cancel" VerticalAlignment="Center" />
-                                            </StackPanel>
-                                        </Button>
-                                        <Button Classes="iconButton hasLabel tintDanger"
-                                                Command="{Binding $parent[ItemsControl].((vm:JobQueueViewModel)DataContext).DiscardCommand}"
-                                                CommandParameter="{Binding}"
-                                                ToolTip.Tip="Discard — remove this run from the queue. A run still going is cancelled first.">
-                                            <StackPanel Orientation="Horizontal" Spacing="6">
-                                                <PathIcon Data="{StaticResource IconTrash}" Width="14" Height="14"
-                                                          VerticalAlignment="Center" />
-                                                <TextBlock Text="Discard" VerticalAlignment="Center" />
-                                            </StackPanel>
-                                        </Button>
-                                    </StackPanel>
-
-                                    <ProgressBar Grid.Row="1" Grid.Column="1" Grid.ColumnSpan="2"
+                                    <ProgressBar Grid.Row="1" Grid.Column="1"
                                                  Margin="0,6,0,0" Height="4"
                                                  IsVisible="{Binding ShowProgress}"
                                                  IsIndeterminate="{Binding IsIndeterminate}"
                                                  Minimum="0" Maximum="1" Value="{Binding ProgressFraction}" />
 
-                                    <StackPanel Grid.Row="2" Grid.Column="1" Grid.ColumnSpan="2"
-                                                Orientation="Horizontal" Spacing="8" Margin="0,8,0,0"
-                                                IsVisible="{Binding IsAwaitingApproval}">
-                                        <!-- A checkmark, not the Preview tab's play triangle: from here the
-                                             plan is a summary rather than a report on screen, so this button
-                                             reads as "yes, this one" rather than "watch it start". -->
-                                        <Button Classes="iconButton hasLabel tintSuccess"
-                                                IsVisible="{Binding CanApproveHere}"
-                                                Command="{Binding $parent[ItemsControl].((vm:JobQueueViewModel)DataContext).ApproveCommand}"
-                                                CommandParameter="{Binding}"
-                                                ToolTip.Tip="Approve run — starts this run. It copies the files the plan listed and, for a Mirror profile, removes the ones marked for removal.">
-                                            <StackPanel Orientation="Horizontal" Spacing="6">
-                                                <PathIcon Data="{StaticResource IconCheckmark}" Width="14" Height="14"
-                                                          VerticalAlignment="Center" />
-                                                <TextBlock Text="Approve run" VerticalAlignment="Center" />
-                                            </StackPanel>
-                                        </Button>
-                                        <!-- The spyglass the Profile tab's Preview uses: this goes and looks,
-                                             it does not commit. -->
-                                        <Button Classes="iconButton hasLabel"
-                                                IsVisible="{Binding !CanApproveHere}"
-                                                Command="{Binding $parent[ItemsControl].((vm:JobQueueViewModel)DataContext).ViewPlanCommand}"
-                                                CommandParameter="{Binding}"
-                                                ToolTip.Tip="Show what this run will do on the Preview tab, where it can be approved.">
-                                            <StackPanel Orientation="Horizontal" Spacing="6">
-                                                <PathIcon Data="{StaticResource IconSearch}" Width="14" Height="14"
-                                                          VerticalAlignment="Center" />
-                                                <TextBlock Text="View plan…" VerticalAlignment="Center" />
-                                            </StackPanel>
-                                        </Button>
-                                        <!-- Declining a plan IS discarding it: the run closes AND leaves the
-                                             queue, rather than lingering as a row for a plan the user said
-                                             no to. Same command, and now the same trash can, as the row's
-                                             discard button above. -->
-                                        <Button Classes="iconButton hasLabel tintDanger"
-                                                Command="{Binding $parent[ItemsControl].((vm:JobQueueViewModel)DataContext).DiscardCommand}"
-                                                CommandParameter="{Binding}"
-                                                ToolTip.Tip="Discard this plan. Nothing has been changed and nothing will be.">
-                                            <StackPanel Orientation="Horizontal" Spacing="6">
-                                                <PathIcon Data="{StaticResource IconTrash}" Width="14" Height="14"
-                                                          VerticalAlignment="Center" />
-                                                <TextBlock Text="Discard" VerticalAlignment="Center" />
-                                            </StackPanel>
-                                        </Button>
-                                    </StackPanel>
+                                    <!-- The bar's own caption, and the point of the whole byte pipeline: a
+                                         run of one disk image and ten thousand thumbnails sits at 99% by
+                                         file count while the image is still copying, so DATA is what says
+                                         how far along it is. Absent while planning (no denominator) and
+                                         against a service too old to report bytes, where the bar silently
+                                         falls back to counting files. -->
+                                    <TextBlock Grid.Row="2" Grid.Column="1" Classes="caption"
+                                               Margin="0,2,0,0" Text="{Binding ByteProgressText}"
+                                               IsVisible="{Binding HasByteProgress}"
+                                               TextTrimming="CharacterEllipsis" />
                                 </Grid>
                             </Border>
                         </DataTemplate>
-                    </ItemsControl.ItemTemplate>
-                </ItemsControl>
-            </ScrollViewer>
-        </DockPanel>
+                    </ListBox.ItemTemplate>
+                </ListBox>
+            </Grid>
+
+            <GridSplitter x:Name="PaneSplitter" Grid.Column="1" Classes="pane" ResizeDirection="Columns"
+                          ToolTip.Tip="Drag to resize" />
+
+            <!-- ── Right: the selected run ──────────────────────────────────────────────────────── -->
+            <!-- Its own panel surface, the app's convention for a docked pane, so the split reads as two
+                 regions rather than one wide list. No left border of its own — the splitter beside it draws
+                 the divider now, and a second rule 6px away read as a double line.
+
+                 Full-bleed to the frame on all three outer edges (this grid carries no margin, and the pane
+                 insets its own content) so its footer meets the window footer. DataContext is deliberately
+                 the whole view model — see RunSummaryPane.axaml for why it needs both halves. -->
+            <Border x:Name="SummaryPaneHost" Grid.Column="2"
+                    Background="{DynamicResource Brush.Panel.Background}">
+                <v:RunSummaryPane DataContext="{Binding}" />
+            </Border>
+        </Grid>
     </DockPanel>
 
 </Window>

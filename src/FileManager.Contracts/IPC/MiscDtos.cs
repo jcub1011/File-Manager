@@ -1,3 +1,5 @@
+using FileManager.Contracts.DryRun;
+using FileManager.Contracts.Profiles;
 using System;
 
 namespace FileManager.Contracts.IPC;
@@ -73,9 +75,66 @@ public sealed record JobSummaryDto(
 /// to say HOW finished — a run that ended a minute ago and one that ended yesterday are both
 /// <c>Closed</c>. The terminal event carries the same instant, but only to a client that was listening at
 /// the time; this is what lets a reconcile age a row it is seeing for the first time.</para></param>
+/// <param name="BytesSettled">Source bytes the settled jobs accounted for, against
+/// <paramref name="PlannedCopyBytes"/> — the byte counterpart of
+/// <paramref name="Succeeded"/> + <paramref name="Skipped"/> + <paramref name="Failed"/>.
+/// <para>Here as well as on <c>run-progress</c> because a queue re-seeds from this request on every
+/// reconnect and on window open: without it a byte progress bar would reset to zero every time the
+/// window was reopened mid-run, which reads as the run having restarted.</para>
+/// <para>Last in the list, and defaulted, so the twenty existing positional arguments keep their
+/// meaning.</para></param>
 public sealed record RunSummaryDto(
     Guid RunId, Guid ProfileId, string ProfileName, string Phase, string Outcome,
     bool Paused, bool Waiting, DateTimeOffset StartedAtUtc, DateTimeOffset? PlannedAtUtc,
     DateTimeOffset? ClosedAtUtc,
     int PlannedCopies, int PlannedDeletes, long PlannedCopyBytes, long PlannedDeleteBytes,
-    int Succeeded, int Skipped, int Failed, int Deleted, bool PlanTruncated, string? PlanError);
+    int Succeeded, int Skipped, int Failed, int Deleted, bool PlanTruncated, string? PlanError,
+    long BytesSettled = 0);
+
+/// <summary>What one run is going to do, summarized — the answer to <see cref="GetRunDetailRequest"/>.
+///
+/// <para><b>The whole of this is read from the run's snapshot HEADER</b>, which is written once when
+/// planning completes. No item file is opened and nothing is re-planned, which is what makes it cheap
+/// enough to fetch on every selection change in a queue.</para>
+///
+/// <para><b>Snapshot semantics, and deliberately frozen.</b> Every figure here describes the plan as it
+/// was when the run was planned — including <see cref="Profile"/>, which is the profile the run will
+/// EXECUTE, not whatever the catalog holds now. A profile can be edited or deleted while its run waits for
+/// approval, and a summary that showed the live version would describe work that is not going to
+/// happen.</para></summary>
+/// <param name="Profile">The profile the run was planned against, embedded whole. The source of the
+/// sources/destinations lists and the read-only settings a client shows beside the plan. Comes from the
+/// snapshot rather than a catalog lookup for two reasons: it is the frozen revision (see above), and a run
+/// planned from an unsaved draft has a profile that is in no catalog at all.</param>
+/// <param name="ScopePath">The single path the run was narrowed to, or null for the whole profile. Worth
+/// surfacing because a narrowed run behaves differently in a way no count reveals: its orphan set cannot be
+/// trusted over a partial source tree, so a Mirror run scoped to a subfolder copies but deletes
+/// nothing.</param>
+/// <param name="PlannedAtUtc">When the work list was frozen — what a client measures staleness from.</param>
+/// <param name="CopyItemCount">Files the run will copy or update, and their total bytes: the executable
+/// half, and the run's own progress denominator.</param>
+/// <param name="DeleteItemCount">Orphans a <c>SyncMode.Mirror</c> run will move to the Recycle Bin, and
+/// the bytes they hold. Always zero otherwise, and the most consequential pair here.</param>
+/// <param name="SourceItemCount">Every source the plan LOOKED at, whatever it decided — which is not
+/// <paramref name="CopyItemCount"/>: a filtered file and an already-identical one each produce no copy
+/// item. This is the "files scanned" figure, and the reason an already-synchronized profile reads as "up to
+/// date" rather than as "found nothing".</param>
+/// <param name="DestinationItemCount">Destination paths the plan projected.</param>
+/// <param name="OverwriteCount">The blast radius: destinations that will be overwritten, destinations that
+/// will be written under a suffixed name because something was already there, and sources that will be
+/// moved or deleted once copied. Zero for a run planned before the snapshot recorded them, which reads as
+/// "not recorded".</param>
+/// <param name="Truncated">The plan does not cover everything it was asked to. Copies may still run;
+/// orphan deletion refuses outright, because an incomplete plan's orphan list cannot be trusted.</param>
+/// <param name="SweepFaultDetail">The first Warning-severity sweep fault's message, which already names the
+/// path. Non-null implies <paramref name="Truncated"/>.</param>
+/// <param name="Space">The per-volume space projection — will it fit — or null when none was folded (a
+/// truncated plan, whose totals over a partial graph would be unsound). The same
+/// <see cref="SpaceProjection"/> a preview's terminal frame carries, so a client renders it with the
+/// storage panel it already has.</param>
+public sealed record RunDetailDto(
+    Guid RunId, Profile Profile, string? ScopePath, DateTimeOffset PlannedAtUtc,
+    int CopyItemCount, long CopyBytes, int DeleteItemCount, long DeleteBytes,
+    int SourceItemCount, int DestinationItemCount,
+    int OverwriteCount, int RenameCount, int DisposalCount,
+    bool Truncated, string? SweepFaultDetail, SpaceProjection? Space);

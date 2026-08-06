@@ -84,6 +84,26 @@ internal sealed class RunSnapshotWriter : IDisposable
     public long CopyBytes { get; private set; }
     public long DeleteBytes { get; private set; }
 
+    /// <summary>The blast-radius counts: destination files this plan will overwrite, destinations it will
+    /// write under a suffixed name because something was already there, and sources it will move or
+    /// delete after copying.
+    ///
+    /// <para><b>Recorded rather than left to the client, for the same reason as
+    /// <see cref="SweptByTargetRoot"/>: this is the only pass that sees every operation.</b> The Preview
+    /// tab folds these three itself while it streams the plan (<c>DryRunRowStore.Complete</c>), which is
+    /// fine for a view that has the rows anyway — but the job queue wants the same three numbers beside a
+    /// selected run and must not replay a 500,000-row plan to get them. Counted here they cost three
+    /// increments during a walk that is already happening, and the header read that returns them is
+    /// O(1).</para>
+    ///
+    /// <para>The rules match <c>DryRunRowStore</c>'s exactly, deliberately: two surfaces showing the same
+    /// blast radius from different sources must not disagree about it.</para></summary>
+    public int OverwriteCount { get; private set; }
+
+    public int RenameCount { get; private set; }
+
+    public int DisposalCount { get; private set; }
+
     /// <summary>Every pre-existing file the destination sweep classified, tallied by the target root it
     /// sits under — survivors and orphans together.
     /// <para>This is the denominator the Mirror deletion pass's ratio guard needs, and the only place it
@@ -164,6 +184,12 @@ internal sealed class RunSnapshotWriter : IDisposable
                 Detail = op?.Detail,
             });
             SourceCount++;
+            // A disposal that is DESTRUCTIVE — the original does not survive the run. KeepSource is the
+            // only non-destructive action, and a null disposition means the file does not process at all
+            // (filtered, or already identical), which is what keeps a skipped file out of this count.
+            // Same test as DryRunRowStore.IsSourceDisposalDestructive.
+            if (op?.SourceDisposition is { } disposition && disposition != OnSuccessAction.KeepSource)
+                DisposalCount++;
         }
 
         for (int i = 0; i < slice.SourceOperations.Count; i++)
@@ -192,6 +218,17 @@ internal sealed class RunSnapshotWriter : IDisposable
 
         foreach (IFileOperationView op in slice.DestinationOperations)
         {
+            // Counted over EVERY destination operation, including any the projection writer below drops
+            // for an unresolvable index — the blast radius is what the plan decided, not what the display
+            // half managed to record. This is also what DryRunRowStore does (its fold runs over every
+            // ingested operation, grouped or not), which is what keeps the two in agreement.
+            switch (op.Kind)
+            {
+                case OperationKind.Overwrite: OverwriteCount++; break;
+                case OperationKind.Rename: RenameCount++; break;
+                default: break;
+            }
+
             if (op.Kind != OperationKind.Deleted)
             {
                 WriteDestination(op, chunk, slice);

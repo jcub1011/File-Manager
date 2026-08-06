@@ -825,4 +825,279 @@ public sealed class JobQueueViewModelTests
         Assert.Contains(queue.Runs, r => r.RunId == live);
         Assert.Equal(1, queue.ActiveCount);
     }
+
+    // ── Byte progress ───────────────────────────────────────────────────────────────────────────────
+
+    /// <summary>The bar measures DATA once the wire supplies a byte total, which is the whole point of the
+    /// byte pipeline: a run of one disk image and ten thousand thumbnails sits at 99% by file count while
+    /// the image is still copying.</summary>
+    [Fact]
+    public void An_executing_row_measures_bytes_when_the_wire_reports_them()
+    {
+        JobQueueViewModel queue = new(new FakeIpcGateway());
+        Guid runId = Guid.NewGuid();
+
+        queue.OnRunProgress(Progress(runId, completed: 9_999, total: 10_000) with
+        {
+            CompletedBytes = 250,
+            TotalBytes = 1000,
+        });
+
+        JobQueueRow row = queue.Runs[0];
+        Assert.True(row.HasByteProgress);
+        Assert.Equal(0.25, row.ProgressFraction, 3);          // bytes, NOT 9999/10000
+        Assert.Equal("250 B of 1000 B", row.ByteProgressText);
+    }
+
+    /// <summary>Against a service too old to report bytes, both figures arrive as zero — and the row must
+    /// fall back to counting files rather than showing a bar pinned at 0% while the file count visibly
+    /// advances. That silent-wrong-answer is the one failure a mixed-version pair could otherwise
+    /// produce.</summary>
+    [Fact]
+    public void An_executing_row_falls_back_to_files_when_no_byte_total_is_reported()
+    {
+        JobQueueViewModel queue = new(new FakeIpcGateway());
+        Guid runId = Guid.NewGuid();
+
+        queue.OnRunProgress(Progress(runId, completed: 5, total: 10));
+
+        JobQueueRow row = queue.Runs[0];
+        Assert.False(row.HasByteProgress);
+        Assert.Equal(0.5, row.ProgressFraction, 3);
+    }
+
+    /// <summary>Clamped, because the two ends come from different measurements: the numerator is summed
+    /// from per-job sizes recorded at plan time, and a re-screened job can settle against a file that grew.</summary>
+    [Fact]
+    public void Byte_progress_clamps_at_one()
+    {
+        JobQueueViewModel queue = new(new FakeIpcGateway());
+        Guid runId = Guid.NewGuid();
+
+        queue.OnRunProgress(Progress(runId) with { CompletedBytes = 5000, TotalBytes = 1000 });
+
+        Assert.Equal(1.0, queue.Runs[0].ByteProgressFraction, 3);
+    }
+
+    /// <summary>The re-seed carries the byte pair too. Without it, reopening the queue part-way through a
+    /// run would show the bar back at zero, which reads as the run having restarted.</summary>
+    [Fact]
+    public async Task A_reconcile_reseeds_the_byte_figures()
+    {
+        Guid runId = Guid.NewGuid();
+        FakeIpcGateway gateway = new()
+        {
+            RunsResult = new List<RunSummaryDto> { Summary(runId) with { BytesSettled = 512 } },
+        };
+        JobQueueViewModel queue = new(gateway);
+
+        await queue.ReconcileAsync();
+
+        JobQueueRow row = queue.Runs[0];
+        Assert.Equal(512, row.CompletedBytes);
+        Assert.Equal(1024, row.TotalBytes);      // Summary's PlannedCopyBytes
+        Assert.Equal(0.5, row.ByteProgressFraction, 3);
+    }
+
+    /// <summary>The planning phase's two counts, split so the destination line can DISAPPEAR rather than
+    /// read zero — most profiles never sweep their destination, and "0 at the destination" reads as a
+    /// fault.</summary>
+    [Fact]
+    public void A_planning_row_reports_its_scan_counts_on_separate_lines()
+    {
+        JobQueueViewModel queue = new(new FakeIpcGateway());
+        Guid runId = Guid.NewGuid();
+
+        queue.OnRunProgress(Progress(runId, phase: "Planning", completed: 0, total: 0, scannedSources: 1234));
+
+        JobQueueRow row = queue.Runs[0];
+        Assert.True(row.IsPlanning);
+        Assert.Equal("Scanned 1,234 source file(s)", row.ScanSourcesText);
+        Assert.False(row.HasScannedDestinations);
+
+        queue.OnRunProgress(Progress(runId, phase: "Planning", completed: 0, total: 0, scannedSources: 1234)
+            with { ScannedDestinations = 7 });
+
+        Assert.True(row.HasScannedDestinations);
+        Assert.Equal("Scanned 7 at the destination", row.ScanDestinationsText);
+    }
+
+    // ── The summary pane ────────────────────────────────────────────────────────────────────────────
+
+    private static RunDetailDto Detail(Guid runId, string? scope = null) => new(
+        runId, TestData.ProfileFactory.Sample(), scope, DateTimeOffset.UnixEpoch,
+        CopyItemCount: 4, CopyBytes: 2048, DeleteItemCount: 0, DeleteBytes: 0,
+        SourceItemCount: 9, DestinationItemCount: 4,
+        OverwriteCount: 2, RenameCount: 0, DisposalCount: 9,
+        Truncated: false, SweepFaultDetail: null, Space: null);
+
+    [Fact]
+    public async Task Selecting_a_run_loads_its_summary()
+    {
+        Guid runId = Guid.NewGuid();
+        FakeIpcGateway gateway = new()
+        {
+            RunsResult = new List<RunSummaryDto> { Summary(runId, phase: "AwaitingApproval") },
+        };
+        gateway.RunDetailResults[runId] = Detail(runId);
+        JobQueueViewModel queue = new(gateway);
+        await queue.ReconcileAsync();
+
+        queue.SelectedRun = queue.Runs[0];
+        await Settle();
+
+        Assert.Equal([runId], gateway.GetRunDetailCalls);
+        Assert.NotNull(queue.Summary.Plan);
+        Assert.False(queue.Summary.IsLoading);
+        // The sample profile's own shape: one source root, one target root.
+        Assert.Equal([@"C:\ui-test\src"], queue.Summary.Plan!.Sources.Select(r => r.Path));
+        Assert.Equal([@"C:\ui-test\dst"], queue.Summary.Plan.Targets.Select(r => r.Path));
+    }
+
+    /// <summary>Deselecting must blank the pane rather than leave the last run's summary under no name.</summary>
+    [Fact]
+    public async Task Deselecting_clears_the_summary()
+    {
+        Guid runId = Guid.NewGuid();
+        FakeIpcGateway gateway = new()
+        {
+            RunsResult = new List<RunSummaryDto> { Summary(runId, phase: "AwaitingApproval") },
+        };
+        gateway.RunDetailResults[runId] = Detail(runId);
+        JobQueueViewModel queue = new(gateway);
+        await queue.ReconcileAsync();
+        queue.SelectedRun = queue.Runs[0];
+        await Settle();
+        Assert.NotNull(queue.Summary.Plan);
+
+        queue.SelectedRun = null;
+
+        Assert.Null(queue.Summary.Plan);
+        Assert.False(queue.Summary.HasNoPlanYet);
+        Assert.Null(queue.Summary.ErrorText);
+    }
+
+    /// <summary>RUN_PLAN_UNAVAILABLE is the NORMAL answer for a run still planning — its snapshot header is
+    /// written when planning finishes — so it must reach the pane as "no plan yet" and never as an error.</summary>
+    [Fact]
+    public async Task A_run_still_planning_reports_no_plan_yet_rather_than_an_error()
+    {
+        Guid runId = Guid.NewGuid();
+        FakeIpcGateway gateway = new()
+        {
+            RunsResult = new List<RunSummaryDto> { Summary(runId, phase: "Planning") },
+        };
+        JobQueueViewModel queue = new(gateway);   // gateway defaults to RUN_PLAN_UNAVAILABLE
+        await queue.ReconcileAsync();
+
+        queue.SelectedRun = queue.Runs[0];
+        await Settle();
+
+        Assert.True(queue.Summary.HasNoPlanYet);
+        Assert.Null(queue.Summary.ErrorText);
+        Assert.Null(queue.Summary.Plan);
+    }
+
+    /// <summary>run-planned is the moment a plan becomes readable, so the pane re-asks — otherwise a user
+    /// watching a scan finish would sit on "still working out what this will do" until they clicked away and
+    /// back.</summary>
+    [Fact]
+    public async Task The_summary_is_re_fetched_when_the_selected_runs_plan_arrives()
+    {
+        Guid runId = Guid.NewGuid();
+        FakeIpcGateway gateway = new()
+        {
+            RunsResult = new List<RunSummaryDto> { Summary(runId, phase: "Planning") },
+        };
+        JobQueueViewModel queue = new(gateway);
+        await queue.ReconcileAsync();
+        queue.SelectedRun = queue.Runs[0];
+        await Settle();
+        Assert.True(queue.Summary.HasNoPlanYet);
+        Assert.Single(gateway.GetRunDetailCalls);
+
+        // The plan lands; now there IS a header to read.
+        gateway.RunDetailResults[runId] = Detail(runId);
+        queue.OnRunPlanned(Planned(runId));
+        await Settle();
+
+        Assert.Equal(2, gateway.GetRunDetailCalls.Count);
+        Assert.NotNull(queue.Summary.Plan);
+    }
+
+    /// <summary>The two-second watch loop re-resolves the selection on every poll. Refetching there would
+    /// issue a request twice a second for a selection nobody has touched.</summary>
+    [Fact]
+    public async Task A_reconcile_that_re_resolves_the_same_selection_does_not_refetch()
+    {
+        Guid runId = Guid.NewGuid();
+        FakeIpcGateway gateway = new()
+        {
+            RunsResult = new List<RunSummaryDto> { Summary(runId, phase: "AwaitingApproval") },
+        };
+        gateway.RunDetailResults[runId] = Detail(runId);
+        JobQueueViewModel queue = new(gateway);
+        await queue.ReconcileAsync();
+        queue.SelectedRun = queue.Runs[0];
+        await Settle();
+        Assert.Single(gateway.GetRunDetailCalls);
+
+        await queue.ReconcileAsync();
+        await queue.ReconcileAsync();
+        await Settle();
+
+        Assert.Same(queue.Runs[0], queue.SelectedRun);
+        Assert.Single(gateway.GetRunDetailCalls);
+    }
+
+    /// <summary>A superseded fetch must not land. Walking the list with the arrow keys starts one per row,
+    /// and without cancellation a slow answer for an earlier row could arrive last and leave the pane
+    /// describing a run that is no longer selected.</summary>
+    [Fact]
+    public async Task A_superseded_summary_fetch_never_reaches_the_pane()
+    {
+        Guid first = Guid.NewGuid();
+        Guid second = Guid.NewGuid();
+        FakeIpcGateway gateway = new()
+        {
+            RunsResult = new List<RunSummaryDto>
+            {
+                Summary(first, phase: "AwaitingApproval"),
+                Summary(second, phase: "AwaitingApproval"),
+            },
+        };
+        // The first run's fetch is held open; the second answers at once. The two answers differ by SCOPE,
+        // which is what lets the assertions below tell which one reached the pane.
+        TaskCompletionSource held = new();
+        gateway.RunDetailGates[first] = held;
+        gateway.RunDetailResults[first] = Detail(first, scope: @"C:\only-a-subfolder");
+        gateway.RunDetailResults[second] = Detail(second);
+        JobQueueViewModel queue = new(gateway);
+        await queue.ReconcileAsync();
+
+        queue.SelectedRun = queue.Runs.First(r => r.RunId == first);
+        await Settle();
+        Assert.True(queue.Summary.IsLoading);
+
+        queue.SelectedRun = queue.Runs.First(r => r.RunId == second);
+        await Settle();
+        Assert.NotNull(queue.Summary.Plan);
+        Assert.False(queue.Summary.Plan!.HasScope);
+
+        // Release the stale fetch. It is both cancelled and no longer the selected run, so it must be
+        // dropped on the floor rather than overwrite the pane with the scoped answer.
+        held.SetResult();
+        await Settle();
+
+        Assert.NotNull(queue.Summary.Plan);
+        Assert.False(queue.Summary.Plan!.HasScope);
+    }
+
+    /// <summary>Lets a fire-and-forget load run to completion. The fake answers synchronously, so the
+    /// continuations are already queued; the loop is a bound, not a delay.</summary>
+    private static async Task Settle()
+    {
+        for (int i = 0; i < 50; i++)
+            await Task.Yield();
+    }
 }

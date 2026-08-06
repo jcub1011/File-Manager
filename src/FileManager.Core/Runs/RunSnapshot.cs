@@ -61,6 +61,24 @@ public sealed record RunSnapshotHeader
 
     public int DestinationItemCount { get; init; }
 
+    /// <summary>The blast radius, as three counts: destination files this plan will OVERWRITE,
+    /// destinations it will write under a suffixed name because something was already there, and sources
+    /// it will move or delete once copied.
+    ///
+    /// <para>Here so a client can show the numbers that decide whether a plan is safe to approve without
+    /// replaying the plan itself. They are folded by <c>RunSnapshotWriter</c> during the walk that
+    /// produces the item files, under the same rules the Preview tab uses when it counts them from the
+    /// streamed rows — see <c>RunSnapshotWriter.OverwriteCount</c> for why they are recorded rather than
+    /// re-derived.</para>
+    ///
+    /// <para>All three are zero for a snapshot written before they existed, which reads as "not recorded"
+    /// — the same honest absence <see cref="SourceItemCount"/> documents.</para></summary>
+    public int OverwriteCount { get; init; }
+
+    public int RenameCount { get; init; }
+
+    public int DisposalCount { get; init; }
+
     /// <summary>Pre-existing files the destination sweep classified under each target root — survivors
     /// and orphans together. The denominator for <c>MirrorDeletionPass</c>'s ratio guard.
     /// <para>Recorded here because the sweep is the only place it can be counted: it sees each

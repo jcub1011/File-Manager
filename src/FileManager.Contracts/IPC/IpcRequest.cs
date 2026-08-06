@@ -28,6 +28,7 @@ namespace FileManager.Contracts.IPC;
 [JsonDerivedType(typeof(CancelRunRequest), "cancel-run")]
 [JsonDerivedType(typeof(GetRunPlanStreamRequest), "get-run-plan-stream")]
 [JsonDerivedType(typeof(GetRunsRequest), "get-runs")]
+[JsonDerivedType(typeof(GetRunDetailRequest), "get-run-detail")]
 [JsonDerivedType(typeof(SetRunPausedRequest), "set-run-paused")]
 [JsonDerivedType(typeof(DiscardRunRequest), "discard-run")]
 public abstract record IpcRequest
@@ -99,8 +100,18 @@ public abstract record IpcRequest
     /// immediately instead of after an unbounded silence on a slow source. run-progress gained ProfileId
     /// and ProfileName to make that announcement nameable — without them the row a client builds from the
     /// first sample stays blank for the whole of planning, and a run whose run-planned frame was dropped
-    /// stays blank for good.</summary>
-    public const int CurrentProtocolVersion = 14;
+    /// stays blank for good.
+    /// 15 — a run can be SUMMARIZED without replaying it. New get-run-detail request, answered with a
+    /// run-detail frame carrying the run's frozen profile, its space projection, and its item and
+    /// blast-radius counts — everything the job queue's summary pane shows for the selected run, read from
+    /// the snapshot header alone (O(1), no item file touched). run-progress additionally carries
+    /// CompletedBytes/TotalBytes and RunSummaryDto carries BytesSettled, so a run's progress can be
+    /// reported in DATA rather than only in files. Version-gated on the first of those: a new client
+    /// against an old service would get NOT_IMPLEMENTED for every selection and show a permanently empty
+    /// summary pane — the same visible-dead-end that gated discard-run in 13. The byte figures alone would
+    /// not have needed it (they default to zero, which a client reads as "no byte figure" and falls back
+    /// to the file counters for — deliberately, so the bar can never sit at 0% while files advance).</summary>
+    public const int CurrentProtocolVersion = 15;
 
     public int ProtocolVersion { get; init; } = CurrentProtocolVersion;
 }
@@ -185,6 +196,28 @@ public sealed record GetRunPlanStreamRequest : IpcRequest
 /// client that asks moments after a run finished sees its outcome rather than a hole, and one that asks a
 /// day later may still see it.</para></summary>
 public sealed record GetRunsRequest : IpcRequest;
+
+/// <summary>One run's plan SUMMARIZED — the frozen profile it was planned against, its space projection,
+/// and its item and blast-radius counts.
+///
+/// <para><b>Why this exists beside <see cref="GetRunPlanStreamRequest"/>.</b> The stream is the itemized
+/// answer: every source the plan looked at and every destination it projected, which for a real archive is
+/// hundreds of thousands of frames and is the right shape for a view the user drives into. It is the wrong
+/// shape for a summary that follows a selection — a client showing a per-run summary beside a list would
+/// replay the entire plan on every arrow-key press, and the six numbers and one profile it actually wanted
+/// arrive in the stream's LAST frame.</para>
+///
+/// <para>So this reads the snapshot HEADER and nothing else: one small file, no <c>.ndjsonl</c> item file
+/// touched, no re-planning. Cheap enough to issue on every selection change.</para>
+///
+/// <para><c>RUN_NOT_FOUND</c> for an unknown id; <c>RUN_PLAN_UNAVAILABLE</c> when the run has no readable
+/// header — which includes the entirely normal case of a run still PLANNING, because the header is written
+/// when planning completes. Both codes are the ones <c>get-run-plan-stream</c> already uses, so a client
+/// learns no new vocabulary.</para></summary>
+public sealed record GetRunDetailRequest : IpcRequest
+{
+    public required Guid RunId { get; init; }
+}
 
 /// <summary>Pauses or resumes ONE run, independently of the global engine pause
 /// (<see cref="SetPausedRequest"/>).

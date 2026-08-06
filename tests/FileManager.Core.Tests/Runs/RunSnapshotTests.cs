@@ -442,6 +442,125 @@ public sealed class RunSnapshotTests
         Assert.Single(RunPlanHarness.Copies(dir));
     }
 
+    // ---- blast-radius counts ---------------------------------------------------------------------
+    // Recorded by the writer during the walk that produces the item files, so a client can show the three
+    // figures that decide whether a plan is safe to approve WITHOUT replaying the plan. The Preview tab
+    // folds the same three from the streamed rows; these tests exist because two surfaces showing one
+    // plan's blast radius from different sources must not disagree about it.
+
+    /// <summary>An existing destination file the plan will overwrite. Counted once, and — the point of the
+    /// test — recorded on the header, where a summary can read it in O(1).</summary>
+    [Fact]
+    public async Task The_header_counts_the_destinations_this_plan_will_overwrite()
+    {
+        using RunPlanHarness h = new("snap-overwrite");
+        h.WriteSource("a.txt", "new content");
+        h.WriteTarget("a.txt", "old");                 // different content, so it is a real overwrite
+        h.WriteSource("b.txt", "no clash of its own");
+
+        // The harness's default conflict policy is Skip, which is its own kind — ask for Overwrite, which
+        // is what this case is about.
+        Profile profile = h.AdditiveProfile(scanDestination: true);
+        (string dir, _, _) = await h.PlanAsync(
+            profile with
+            {
+                Policies = profile.Policies with { ConflictResolution = ConflictResolution.Overwrite },
+            });
+
+        RunSnapshotHeader header = RunPlanHarness.Header(dir);
+        Assert.Equal(1, header.OverwriteCount);
+        Assert.Equal(0, header.RenameCount);
+        // The Preview tab derives its chip from the destination operations; the writer's count must equal
+        // what those rows say, or the two surfaces disagree.
+        Assert.Equal(
+            RunPlanHarness.Destinations(dir).Count(d => d.Kind == OperationKind.Overwrite),
+            header.OverwriteCount);
+    }
+
+    /// <summary>A copy written under a suffixed name because something was already at its destination.</summary>
+    [Fact]
+    public async Task The_header_counts_the_copies_this_plan_will_rename()
+    {
+        using RunPlanHarness h = new("snap-rename");
+        h.WriteSource("a.txt", "new content");
+        h.WriteTarget("a.txt", "old");
+
+        Profile profile = h.AdditiveProfile(scanDestination: true);
+        (string dir, _, _) = await h.PlanAsync(
+            profile with
+            {
+                Policies = profile.Policies with { ConflictResolution = ConflictResolution.RenameSuffix },
+            });
+
+        RunSnapshotHeader header = RunPlanHarness.Header(dir);
+        Assert.Equal(1, header.RenameCount);
+        Assert.Equal(0, header.OverwriteCount);
+        Assert.Equal(
+            RunPlanHarness.Destinations(dir).Count(d => d.Kind == OperationKind.Rename),
+            header.RenameCount);
+    }
+
+    /// <summary>Sources the run will move or delete once copied — the count that says the run costs the
+    /// user something they still had.</summary>
+    [Fact]
+    public async Task The_header_counts_the_sources_this_plan_will_dispose_of()
+    {
+        using RunPlanHarness h = new("snap-disposal");
+        h.WriteSource("a.txt", "a");
+        h.WriteSource("b.txt", "b");
+
+        (string dir, _, _) = await h.PlanAsync(
+            h.AdditiveProfile() with
+            {
+                Policies = TestProfiles.DefaultPolicies() with { OnSuccess = OnSuccessAction.MoveToTrash },
+            });
+
+        Assert.Equal(2, RunPlanHarness.Header(dir).DisposalCount);
+    }
+
+    /// <summary>KeepSource is the only NON-destructive disposition, and it must not be counted — a profile
+    /// that leaves its sources alone showing "2 source disposals" would be a false alarm on the one figure
+    /// the reader is most entitled to trust.</summary>
+    [Fact]
+    public async Task Keeping_the_sources_counts_no_disposals()
+    {
+        using RunPlanHarness h = new("snap-keep");
+        h.WriteSource("a.txt", "a");
+        h.WriteSource("b.txt", "b");
+
+        (string dir, _, _) = await h.PlanAsync(
+            h.AdditiveProfile() with
+            {
+                Policies = TestProfiles.DefaultPolicies() with { OnSuccess = OnSuccessAction.KeepSource },
+            });
+
+        RunSnapshotHeader header = RunPlanHarness.Header(dir);
+        Assert.Equal(0, header.DisposalCount);
+        Assert.Equal(2, header.SourceItemCount);   // both files were still scanned
+    }
+
+    /// <summary>A file the filters excluded produces no work, so it must not be counted as a disposal
+    /// either — its disposition is null precisely so it stays out of this figure.</summary>
+    [Fact]
+    public async Task A_filtered_source_counts_no_disposal()
+    {
+        using RunPlanHarness h = new("snap-filtered-disposal");
+        h.WriteSource("keep.txt", "a");
+        h.WriteSource("skip.tmp", "b");
+
+        (string dir, _, _) = await h.PlanAsync(
+            h.AdditiveProfile() with
+            {
+                Filters = new FilterSet { ExcludeGlob = ["*.tmp"] },
+                Policies = TestProfiles.DefaultPolicies() with { OnSuccess = OnSuccessAction.PermanentDelete },
+            });
+
+        RunSnapshotHeader header = RunPlanHarness.Header(dir);
+        Assert.Equal(2, header.SourceItemCount);   // both were looked at
+        Assert.Equal(1, header.CopyItemCount);     // only one produces work
+        Assert.Equal(1, header.DisposalCount);     // and only that one is destroyed
+    }
+
     [Fact]
     public void Reading_a_snapshot_that_does_not_exist_is_a_typed_failure_not_a_throw()
     {

@@ -316,6 +316,138 @@ public sealed class RunLifecycleTests
         Assert.True(h.Coordinator().Cancel(Guid.NewGuid()).TryGetError(out _));
     }
 
+    // ---- byte-level progress ----------------------------------------------------------------------
+    // A run has a byte DENOMINATOR (the plan's CopyBytes) and, until now, no numerator: JobProgress counted
+    // targets and JobCompletion counted nothing, so a queue could only say "N of M files" about a run whose
+    // real shape is "400 MB of 40 GB". These pin the accounting, whose one hard requirement is that the byte
+    // pair tracks the FILE pair — a bar that cannot reach 100% on a run the file counter calls complete is
+    // worse than no bar.
+
+    [Fact]
+    public async Task A_runs_settled_bytes_reach_its_planned_total()
+    {
+        using RunPlanHarness h = new("run-bytes");
+        h.WriteSource("a.txt", "12345");     // 5
+        h.WriteSource("b.txt", "678");       // 3
+        RunCoordinator runs = h.Coordinator();
+
+        runs.Begin(h.AdditiveProfile(), null).TryGetValue(out RunHandle? handle);
+        RunStatus planned = await RunPlanHarness.WaitForPhaseAsync(
+            runs, handle!.RunId, RunPhase.AwaitingApproval);
+        Assert.Equal(8, planned.PlannedCopyBytes);
+        // Nothing has settled, so nothing is accounted for — the bar starts empty rather than at the total.
+        Assert.Equal(0, planned.BytesSettled);
+
+        runs.Approve(handle.RunId, true);
+        await h.DrainAndSettleAsync(runs, handle.RunId);
+        RunStatus closed = await RunPlanHarness.WaitForPhaseAsync(runs, handle.RunId, RunPhase.Closed);
+
+        // Full: the numerator reaches the denominator on a run that copied everything, which is the
+        // property a progress bar depends on.
+        Assert.Equal(8, closed.BytesSettled);
+        Assert.Equal(closed.PlannedCopyBytes, closed.BytesSettled);
+    }
+
+    /// <summary>A FAILED job's bytes still count. The file numerator is Succeeded + Skipped + Failed, so a
+    /// byte numerator that counted only successes would lag it and a run with any failure could never reach
+    /// 100% however complete it actually was.</summary>
+    [Fact]
+    public async Task A_failed_jobs_bytes_still_count_toward_the_total()
+    {
+        using RunPlanHarness h = new("run-bytes-failed");
+        h.WriteSource("a.txt", "12345");
+        RunCoordinator runs = h.Coordinator();
+
+        runs.Begin(h.AdditiveProfile(), null).TryGetValue(out RunHandle? handle);
+        await RunPlanHarness.WaitForPhaseAsync(runs, handle!.RunId, RunPhase.AwaitingApproval);
+        runs.Approve(handle.RunId, true);
+        await h.DrainAndSettleAsync(runs, handle.RunId, JobOutcome.Failed);
+
+        RunStatus closed = await RunPlanHarness.WaitForPhaseAsync(runs, handle.RunId, RunPhase.Closed);
+        Assert.Equal(1, closed.Failed);
+        Assert.Equal(5, closed.BytesSettled);
+    }
+
+    /// <summary>A DROPPED payload adds nothing — there is no completion to read a size from. The bar then
+    /// stops short of full, which is the honest answer and exactly what the file counters already say: a
+    /// drop is work from the approved list that did not happen, and it is absent from both numerators.</summary>
+    [Fact]
+    public async Task A_dropped_payload_contributes_no_bytes()
+    {
+        using RunPlanHarness h = new("run-bytes-dropped");
+        h.WriteSource("a.txt", "12345");
+        RunCoordinator runs = h.Coordinator();
+
+        runs.Begin(h.AdditiveProfile(), null).TryGetValue(out RunHandle? handle);
+        await RunPlanHarness.WaitForPhaseAsync(runs, handle!.RunId, RunPhase.AwaitingApproval);
+        runs.Approve(handle.RunId, true);
+        await Task.Delay(100);
+
+        while (h.Queue.PendingCount > 0)
+            await foreach (Payload p in h.Queue.DequeueAsync(new CancellationTokenSource(50).Token))
+            {
+                runs.Settled(p.RunId!.Value, completion: null);
+                break;
+            }
+
+        RunStatus closed = await RunPlanHarness.WaitForPhaseAsync(runs, handle.RunId, RunPhase.Closed);
+        Assert.Equal(5, closed.PlannedCopyBytes);
+        Assert.Equal(0, closed.BytesSettled);
+    }
+
+    /// <summary>The byte pair rides on every execution progress sample, and TotalBytes rides with it — for
+    /// the same reason Total does: this stream is drop-oldest, so a client that builds a row from a progress
+    /// sample whose run-planned it never saw would otherwise have a numerator and no denominator.</summary>
+    [Fact]
+    public async Task Progress_samples_carry_both_byte_figures()
+    {
+        using RunPlanHarness h = new("run-bytes-events");
+        h.WriteSource("a.txt", "12345");
+        RunCoordinator runs = h.Coordinator();
+
+        runs.Begin(h.AdditiveProfile(), null).TryGetValue(out RunHandle? handle);
+        await RunPlanHarness.WaitForPhaseAsync(runs, handle!.RunId, RunPhase.AwaitingApproval);
+        runs.Approve(handle.RunId, true);
+        await h.DrainAndSettleAsync(runs, handle.RunId);
+        await RunPlanHarness.WaitForPhaseAsync(runs, handle.RunId, RunPhase.Closed);
+
+        List<RunProgressEvent> executing = [.. h.Bus.Events.OfType<RunProgressEvent>()
+            .Where(e => e.Phase == nameof(RunPhase.Executing))];
+        Assert.NotEmpty(executing);
+        Assert.All(executing, e => Assert.Equal(5, e.TotalBytes));
+        Assert.Contains(executing, e => e.CompletedBytes == 5);
+
+        // Planning has neither figure, because working out the denominator is what planning IS. A non-zero
+        // total there would put a bar at a fraction of a number that does not exist yet.
+        Assert.All(
+            h.Bus.Events.OfType<RunProgressEvent>().Where(e => e.Phase != nameof(RunPhase.Executing)),
+            e =>
+            {
+                Assert.Equal(0, e.CompletedBytes);
+                Assert.Equal(0, e.TotalBytes);
+            });
+    }
+
+    /// <summary>get-runs carries the figure too. Without it, reopening the queue window part-way through a
+    /// run would show the byte bar back at zero, which reads as the run having restarted.</summary>
+    [Fact]
+    public async Task The_run_list_carries_the_settled_bytes()
+    {
+        using RunPlanHarness h = new("run-bytes-list");
+        h.WriteSource("a.txt", "12345");
+        RunCoordinator runs = h.Coordinator();
+
+        runs.Begin(h.AdditiveProfile(), null).TryGetValue(out RunHandle? handle);
+        await RunPlanHarness.WaitForPhaseAsync(runs, handle!.RunId, RunPhase.AwaitingApproval);
+        runs.Approve(handle.RunId, true);
+        await h.DrainAndSettleAsync(runs, handle.RunId);
+        await RunPlanHarness.WaitForPhaseAsync(runs, handle.RunId, RunPhase.Closed);
+
+        RunSummaryDto summary = Assert.Single(runs.ListRuns(), r => r.RunId == handle.RunId);
+        Assert.Equal(5, summary.BytesSettled);
+        Assert.Equal(5, summary.PlannedCopyBytes);
+    }
+
     // ---- the barrier's backstops ------------------------------------------------------------------
 
     [Fact]

@@ -167,6 +167,62 @@ public sealed class GetRunsHandler(IRunCoordinator runs) : IIpcRequestHandler
     }
 }
 
+/// <summary>Handles get-run-detail: one run's plan summarized from its snapshot header.
+///
+/// <para><b>The header and nothing else.</b> No <c>.ndjsonl</c> item file is opened and nothing is
+/// re-planned, which is the whole point — a client showing a summary beside a run list issues this on
+/// every selection change, and the alternative (<c>get-run-plan-stream</c>) replays the entire itemized
+/// work list to deliver figures that all sit in one small file.</para>
+///
+/// <para>Both failure codes are borrowed from <c>get-run-plan-stream</c> rather than invented:
+/// RUN_NOT_FOUND for a run the coordinator does not hold, RUN_PLAN_UNAVAILABLE for one with no readable
+/// header. The second is NOT exceptional — a run still PLANNING has no header yet, because it is written
+/// when planning finishes, so this is the normal answer for the phase in which a client most wants to ask.
+/// Callers are expected to render it as "still working out what this will do", not as a fault.</para></summary>
+public sealed class GetRunDetailHandler(IRunCoordinator runs) : IIpcRequestHandler
+{
+    public string RequestType => IpcRequestTypes.GetRunDetail;
+
+    public Task<IpcResponse> HandleAsync(IpcRequest request, CancellationToken ct = default)
+    {
+        var typed = (GetRunDetailRequest)request;
+        IpcResponse response;
+        if (runs.SnapshotDirectory(typed.RunId) is not { } directory)
+        {
+            response = new ErrorResponse
+            {
+                Code = "RUN_NOT_FOUND",
+                Message = $"no run with id {typed.RunId}",
+            };
+        }
+        else
+        {
+            Result<RunSnapshotHeader, string> read = RunSnapshotReader.ReadHeader(directory);
+            response = read.TryGetError(out string? error)
+                ? new ErrorResponse { Code = "RUN_PLAN_UNAVAILABLE", Message = error }
+                : new RunDetailResponse { Detail = Detail(Header(read)) };
+        }
+        return Task.FromResult(response);
+    }
+
+    private static RunSnapshotHeader Header(Result<RunSnapshotHeader, string> read)
+    {
+        read.TryGetValue(out RunSnapshotHeader? header);
+        return header!;
+    }
+
+    /// <summary>Flattens the header onto the wire. A projection rather than sending the header itself:
+    /// <see cref="RunSnapshotHeader"/> is a Core type carrying members no client has any use for (the
+    /// per-target-root swept counts the deletion guard needs), and Core types do not cross the
+    /// boundary.</summary>
+    private static RunDetailDto Detail(RunSnapshotHeader header) => new(
+        header.RunId, header.Profile, header.ScopePath, header.PlannedAtUtc,
+        header.CopyItemCount, header.CopyBytes, header.DeleteItemCount, header.DeleteBytes,
+        header.SourceItemCount, header.DestinationItemCount,
+        header.OverwriteCount, header.RenameCount, header.DisposalCount,
+        header.Truncated, header.SweepFaultDetail, header.Space);
+}
+
 /// <summary>Handles set-run-paused: holds or releases ONE run, independently of the global engine pause.
 ///
 /// <para>RUN_NOT_FOUND covers both an unknown id and a run that has already closed. Both are normal races

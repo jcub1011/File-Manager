@@ -772,8 +772,16 @@ public sealed class JobExecutor(
             DispositionError = dispositionError,
         };
 
+    /// <summary>The single funnel every terminal path goes through — which is why
+    /// <see cref="JobCompletion.SourceBytes"/> is stamped here rather than at each of them.</summary>
     private JobCompletion Completed(JobPlan plan, JobOutcome outcome, SkipReason? skip, JobError? error, long start) =>
-        new(plan.JobId, outcome, skip, error, time.GetElapsedTime(start));
+        new(plan.JobId, outcome, skip, error, time.GetElapsedTime(start))
+        {
+            // The plan's own recorded size, not a fresh stat: the run's denominator was summed from the
+            // sizes the PLAN saw, so re-measuring a file that grew since would make the numerator
+            // outrun a total it is not measured against.
+            SourceBytes = plan.Source.SizeBytes,
+        };
 
     /// <summary>As <see cref="Completed"/>, plus the destination paths this execution actually resolved.
     /// Used on the terminal paths that reached target processing, so a run-scoped consumer (the Mirror

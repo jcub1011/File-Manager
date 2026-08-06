@@ -80,7 +80,7 @@ public sealed class EngineCompositionTests : IDisposable
                      table.Keys.OrderBy(d => d, StringComparer.Ordinal));
         // The set equality above is the real assertion; this is the belt-and-braces count, which must
         // move deliberately whenever a request type is added.
-        Assert.Equal(23, table.Count);   // + get-runs, set-run-paused (12), discard-run (13)
+        Assert.Equal(24, table.Count);   // + get-runs, set-run-paused (12), discard-run (13), get-run-detail (15)
     }
 
     [Fact]

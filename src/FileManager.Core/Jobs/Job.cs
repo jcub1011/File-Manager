@@ -329,6 +329,22 @@ public sealed record JobCompletion(
     /// had just created.</para>
     /// <para>Empty for a job that never reached distribution.</para></summary>
     public IReadOnlyList<string> ResolvedFinalPaths { get; init; } = [];
+
+    /// <summary>The size of the source file this job was for, whatever the outcome.
+    ///
+    /// <para><b>This is the only numerator a run's byte-level progress can have.</b> A run has a
+    /// byte DENOMINATOR — <c>RunSnapshotHeader.CopyBytes</c>, summed once per copy item while
+    /// planning — but nothing reported bytes back: <see cref="JobProgress"/> counts targets and this
+    /// record counted nothing, so the queue could only ever show "N of M files" for a run whose real
+    /// shape is "400 MB of 40 GB". One file per copy item means this figure and that total are over
+    /// exactly the same population.</para>
+    ///
+    /// <para>Carried on EVERY outcome, not just <see cref="JobOutcome.Succeeded"/>: the run's file
+    /// numerator counts every settled job (succeeded, skipped, failed), so a byte numerator that
+    /// counted only successes would lag it and a run with any skip could never reach 100%. What this
+    /// measures is therefore "bytes of the plan accounted for", which is what a progress bar against a
+    /// planned total means.</para></summary>
+    public long SourceBytes { get; init; }
 }
 
 /// <summary>One intra-job progress sample, pushed by the executor at each §4.3 phase boundary and

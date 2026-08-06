@@ -136,6 +136,12 @@
     <CornerRadius x:Key="Radius.Control">4</CornerRadius>
     <CornerRadius x:Key="Radius.Card">6</CornerRadius>
 
+    <!-- The card radius again, as a SCALAR. A shape's RadiusX/RadiusY are doubles, not CornerRadius, so
+         handing them the token above throws an InvalidCastException at XAML-populate time — which is how a
+         dashed placeholder rectangle brought down the whole job-queue window. Kept beside its
+         CornerRadius twin rather than as a literal at the use site, so the two cannot silently drift. -->
+    <x:Double x:Key="Radius.CardScalar">6</x:Double>
+
     <!-- Common paddings, expressed as Thickness so views can reference them directly. -->
     <Thickness x:Key="Pad.Card">12</Thickness>
     <Thickness x:Key="Pad.Field">10,6</Thickness>

@@ -377,6 +377,96 @@ public sealed class RunHandlersTests : IDisposable
         Assert.Equal("RUN_NOT_FOUND", Assert.IsType<ErrorResponse>(response).Code);
     }
 
+    // ---- get-run-detail ---------------------------------------------------------------------------
+    // The summary a client shows beside a selected run. It reads the snapshot HEADER and nothing else,
+    // which is what makes it cheap enough to issue on every selection change — the itemized alternative
+    // (get-run-plan-stream) replays a work list that can hold half a million rows.
+
+    /// <summary>The happy path, against a REAL snapshot written by the REAL planner. Scripting a header
+    /// through a fake would prove only that the projection compiles; what has to hold is that the figures a
+    /// client shows are the ones the planner actually recorded.</summary>
+    [Fact]
+    public async Task Get_run_detail_projects_the_snapshot_header()
+    {
+        using RunPlanHarness h = new("detail-happy");
+        h.WriteSource("a.txt", "12345");
+        h.WriteSource("b.txt", "678");
+        h.WriteTarget("orphan.txt", "orphaned");
+        Guid runId = Guid.NewGuid();
+        (string dir, _, _) = await h.PlanAsync(h.MirrorProfile(), runId: runId);
+
+        GetRunDetailHandler handler = new(new FakeRunCoordinator { SnapshotDirectoryResult = dir });
+        IpcResponse response = await handler.HandleAsync(new GetRunDetailRequest { RunId = runId });
+
+        RunDetailDto detail = Assert.IsType<RunDetailResponse>(response).Detail;
+        RunSnapshotHeader header = RunPlanHarness.Header(dir);
+        Assert.Equal(runId, detail.RunId);
+        Assert.Equal(2, detail.CopyItemCount);
+        Assert.Equal(8, detail.CopyBytes);
+        Assert.Equal(1, detail.DeleteItemCount);
+        Assert.Equal(8, detail.DeleteBytes);
+        Assert.Equal(header.SourceItemCount, detail.SourceItemCount);
+        Assert.Equal(header.DestinationItemCount, detail.DestinationItemCount);
+        Assert.Equal(header.OverwriteCount, detail.OverwriteCount);
+        Assert.Equal(header.RenameCount, detail.RenameCount);
+        Assert.Equal(header.DisposalCount, detail.DisposalCount);
+        Assert.False(detail.Truncated);
+        // The FROZEN profile, embedded in the snapshot — not a catalog lookup. This handler has no catalog
+        // at all, which is the structural guarantee that it cannot answer with an edited revision.
+        Assert.Equal(h.SourceDir, Assert.Single(detail.Profile.Sources).Path);
+        Assert.Equal(SyncMode.Mirror, detail.Profile.SyncMode);
+    }
+
+    /// <summary>A scoped run says so on the wire. Worth carrying because a narrowed Mirror run copies but
+    /// deletes NOTHING — its orphan set is unsound over a partial source tree — and no count on a summary
+    /// reveals that; the deletion figure just reads zero.</summary>
+    [Fact]
+    public async Task Get_run_detail_reports_the_scope_a_narrowed_run_covered()
+    {
+        using RunPlanHarness h = new("detail-scope");
+        string scoped = Path.Combine(h.SourceDir, "sub");
+        Directory.CreateDirectory(scoped);
+        h.WriteSource("sub/a.txt", "a");
+        Guid runId = Guid.NewGuid();
+        (string dir, _, _) = await h.PlanAsync(h.AdditiveProfile(), scopePath: scoped, runId: runId);
+
+        GetRunDetailHandler handler = new(new FakeRunCoordinator { SnapshotDirectoryResult = dir });
+        IpcResponse response = await handler.HandleAsync(new GetRunDetailRequest { RunId = runId });
+
+        Assert.Equal(scoped, Assert.IsType<RunDetailResponse>(response).Detail.ScopePath);
+    }
+
+    /// <summary>RUN_NOT_FOUND — the same code cancel-run, set-run-paused and discard-run use.</summary>
+    [Fact]
+    public async Task Get_run_detail_for_an_unknown_run_is_RUN_NOT_FOUND()
+    {
+        GetRunDetailHandler handler = new(new FakeRunCoordinator());   // no snapshot directory
+
+        IpcResponse response = await handler.HandleAsync(
+            new GetRunDetailRequest { RunId = Guid.NewGuid() });
+
+        Assert.Equal("RUN_NOT_FOUND", Assert.IsType<ErrorResponse>(response).Code);
+    }
+
+    /// <summary>A run the coordinator HOLDS but which has not finished planning: the header is written when
+    /// planning completes, so there is nothing to read yet.
+    /// <para>RUN_PLAN_UNAVAILABLE rather than RUN_NOT_FOUND, and the distinction is the whole point — this
+    /// is the phase a user is most likely to be watching, and a client must render it as "still working out
+    /// what this will do" rather than as a failure or as a run that has vanished.</para></summary>
+    [Fact]
+    public async Task Get_run_detail_for_a_run_that_has_not_finished_planning_is_RUN_PLAN_UNAVAILABLE()
+    {
+        // A directory with no plan.json in it — exactly the state a run in Planning leaves behind.
+        string empty = Path.Combine(_root, "still-planning");
+        Directory.CreateDirectory(empty);
+        GetRunDetailHandler handler = new(new FakeRunCoordinator { SnapshotDirectoryResult = empty });
+
+        IpcResponse response = await handler.HandleAsync(
+            new GetRunDetailRequest { RunId = Guid.NewGuid() });
+
+        Assert.Equal("RUN_PLAN_UNAVAILABLE", Assert.IsType<ErrorResponse>(response).Code);
+    }
+
     /// <summary>Records what the handlers asked for, and can be scripted to refuse. Hand-written like
     /// every other double in this suite.</summary>
     private sealed class FakeRunCoordinator : IRunCoordinator
@@ -456,7 +546,11 @@ public sealed class RunHandlersTests : IDisposable
         public void Settled(Guid runId, JobCompletion? completion) { }
         public Profile? PlannedProfile(Guid runId) => null;
         public void Coalesced(Guid runId) { }
-        public string? SnapshotDirectory(Guid runId) => null;
+        /// <summary>The run directory get-run-detail reads its header from. Null (the default) is a run the
+        /// coordinator does not hold, which is what makes RUN_NOT_FOUND expressible.</summary>
+        public string? SnapshotDirectoryResult { get; init; }
+
+        public string? SnapshotDirectory(Guid runId) => SnapshotDirectoryResult;
         public Task StopAsync() => Task.CompletedTask;
     }
 }

@@ -52,7 +52,8 @@ public sealed partial class JobQueueRow : ObservableObject
     [ObservableProperty]
     [NotifyPropertyChangedFor(nameof(StatusText), nameof(StatusIconKey), nameof(StatusColorKey),
         nameof(IsPausable), nameof(IsCancellable), nameof(IsAwaitingApproval), nameof(IsFinished),
-        nameof(ShowProgress), nameof(IsIndeterminate))]
+        nameof(ShowProgress), nameof(IsIndeterminate), nameof(IsPlanning), nameof(HasByteProgress),
+        nameof(ProgressFraction))]
     public partial string Phase { get; set; } = nameof(RunPhaseNames.Planning);
 
     [ObservableProperty]
@@ -77,13 +78,30 @@ public sealed partial class JobQueueRow : ObservableObject
     [NotifyPropertyChangedFor(nameof(ProgressText))]
     public partial int Deleted { get; set; }
 
+    /// <summary>Bytes of the plan's copy budget the settled jobs have accounted for, and the plan's own
+    /// total — the byte pair behind the execution progress bar.
+    ///
+    /// <para>Both from the wire (<c>run-progress</c> / <c>get-runs</c>) rather than derived: there is no
+    /// client-side way to know how much data has moved, and <see cref="TotalBytes"/> rides on the progress
+    /// sample for the same reason <see cref="Total"/> does — a row synthesized from a sample whose
+    /// <c>run-planned</c> was dropped would otherwise have a numerator and no denominator.</para></summary>
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(ByteProgressFraction), nameof(ByteProgressText))]
+    public partial long CompletedBytes { get; set; }
+
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(ByteProgressFraction), nameof(ByteProgressText),
+        nameof(HasByteProgress), nameof(ProgressFraction))]
+    public partial long TotalBytes { get; set; }
+
     /// <summary>Live scan counts while planning; the only figures a plan has before it has a denominator.</summary>
     [ObservableProperty]
-    [NotifyPropertyChangedFor(nameof(ProgressText))]
+    [NotifyPropertyChangedFor(nameof(ProgressText), nameof(ScanSourcesText))]
     public partial long ScannedSources { get; set; }
 
     [ObservableProperty]
-    [NotifyPropertyChangedFor(nameof(ProgressText))]
+    [NotifyPropertyChangedFor(nameof(ProgressText), nameof(ScanDestinationsText),
+        nameof(HasScannedDestinations))]
     public partial long ScannedDestinations { get; set; }
 
     /// <summary>What the plan says it will do, once it is planned. Drives the awaiting-approval summary.</summary>
@@ -113,6 +131,9 @@ public sealed partial class JobQueueRow : ObservableObject
 
     public bool IsAwaitingApproval => Phase == nameof(RunPhaseNames.AwaitingApproval);
     public bool IsFinished => Phase == nameof(RunPhaseNames.Closed);
+
+    /// <summary>The run is walking its sources — the phase whose only news is the two scan counts.</summary>
+    public bool IsPlanning => Phase == nameof(RunPhaseNames.Planning);
 
     /// <summary>How long a finished run stays "recent" before the row is dimmed as history.
     ///
@@ -177,7 +198,30 @@ public sealed partial class JobQueueRow : ObservableObject
     /// one is what it is doing.</summary>
     public bool IsIndeterminate => ShowProgress && Total == 0;
 
-    public double ProgressFraction => Total > 0 ? Math.Min(1.0, (double)Completed / Total) : 0;
+    /// <summary>Whether the bar should measure DATA rather than files.
+    ///
+    /// <para>Executing only, and only with a byte total: an older service publishes zero for both byte
+    /// figures, and this is what makes the row fall back to the file bar instead of sitting at 0% while
+    /// the file count visibly advances — the one failure mode a mixed-version pair could otherwise
+    /// produce.</para></summary>
+    public bool HasByteProgress => Phase == nameof(RunPhaseNames.Executing) && TotalBytes > 0;
+
+    /// <summary>The bar's value: bytes when there are bytes, files otherwise.
+    ///
+    /// <para>Bytes are the better measure of "how far along" whenever the two disagree, and they disagree
+    /// most when it matters — a run of one disk image and ten thousand thumbnails is 99% done by file count
+    /// while the image is still copying.</para></summary>
+    public double ProgressFraction => HasByteProgress
+        ? ByteProgressFraction
+        : Total > 0 ? Math.Min(1.0, (double)Completed / Total) : 0;
+
+    /// <summary>Clamped: the numerator is summed from per-job sizes the plan recorded, and a re-screened
+    /// job can settle against a file that grew, so the two can cross.</summary>
+    public double ByteProgressFraction =>
+        TotalBytes > 0 ? Math.Min(1.0, (double)CompletedBytes / TotalBytes) : 0;
+
+    public string ByteProgressText =>
+        $"{ByteSize.Format(CompletedBytes)} of {ByteSize.Format(TotalBytes)}";
 
     public string PauseLabel => Paused ? "Resume" : "Pause";
     public string PauseIconKey => Paused ? "IconPlay" : "IconPause";
@@ -278,6 +322,22 @@ public sealed partial class JobQueueRow : ObservableObject
         _ => "",
     };
 
+    /// <summary>The source-scan line, and its destination counterpart below — the two figures a run in
+    /// <see cref="IsPlanning"/> has, on separate lines.
+    ///
+    /// <para>Beside <see cref="ProgressText"/> rather than replacing its planning arm: that property is the
+    /// whole-row one-liner and stays correct for every phase, but it packs both counts into one sentence
+    /// that ran past the width of a list pane once the pane was half a window wide. Two lines also let the
+    /// destination count DISAPPEAR rather than read zero — most profiles never sweep their destination, and
+    /// "0 at the destination" invites the reader to wonder what went wrong there.</para></summary>
+    public string ScanSourcesText => ScannedSources > 0
+        ? $"Scanned {ScannedSources:N0} source file(s)"
+        : "Starting the scan…";
+
+    public bool HasScannedDestinations => ScannedDestinations > 0;
+
+    public string ScanDestinationsText => $"Scanned {ScannedDestinations:N0} at the destination";
+
     private string PlannedSummary
     {
         get
@@ -338,7 +398,98 @@ public sealed partial class JobQueueViewModel(IIpcGateway gateway, TimeProvider?
 
     public ObservableCollection<JobQueueRow> Runs { get; } = [];
 
+    /// <summary>The row whose summary the right-hand pane is showing. Null shows the pane's placeholder.</summary>
     [ObservableProperty] public partial JobQueueRow? SelectedRun { get; set; }
+
+    /// <summary>The right-hand pane: what the selected run is going to do.</summary>
+    public RunSummaryPaneViewModel Summary { get; } = new();
+
+    /// <summary>The run <see cref="Summary"/> currently describes (or is fetching).
+    ///
+    /// <para>Tracked so the two-second reconcile does not refetch. <see cref="ReconcileAsync"/> re-resolves
+    /// <see cref="SelectedRun"/> by id on every poll, and although rows are mutated in place — so the
+    /// instance is normally the same one — a row that was removed and re-inserted is not. Comparing the ID
+    /// rather than the reference is what keeps a settled selection from issuing a request twice a
+    /// second.</para></summary>
+    private Guid _summaryRunId;
+
+    /// <summary>Cancels a detail fetch that is no longer wanted. A user walking the list with the arrow keys
+    /// starts one per row, and without this the answers race: a slow fetch for row 3 could land after the
+    /// fetch for row 7 and leave the pane describing a run that is no longer selected.</summary>
+    private CancellationTokenSource? _summaryLoad;
+
+    partial void OnSelectedRunChanged(JobQueueRow? value)
+    {
+        Guid runId = value?.RunId ?? Guid.Empty;
+        if (runId == _summaryRunId)
+            return;   // the same run, re-resolved by a reconcile — nothing to re-ask
+        _summaryRunId = runId;
+
+        _summaryLoad?.Cancel();
+        _summaryLoad?.Dispose();
+        _summaryLoad = null;
+
+        if (value is null)
+        {
+            Summary.Clear();
+            return;
+        }
+        CancellationTokenSource cts = new();
+        _summaryLoad = cts;
+        _ = LoadDetailAsync(value.RunId, cts.Token);
+    }
+
+    /// <summary>Re-asks for the selected run's plan when the run just became one that HAS a plan.
+    ///
+    /// <para>Called from the two event handlers that can move a run out of planning. Guarded on the pane
+    /// having answered "no plan yet": a run whose summary is already on screen has nothing to gain from a
+    /// refetch, and the snapshot it was read from is frozen — it cannot change.</para></summary>
+    private void LoadDetailIfPlanAppeared(JobQueueRow row)
+    {
+        if (row.RunId != _summaryRunId || !Summary.HasNoPlanYet || row.IsPlanning)
+            return;
+        _summaryLoad?.Cancel();
+        _summaryLoad?.Dispose();
+        CancellationTokenSource cts = new();
+        _summaryLoad = cts;
+        _ = LoadDetailAsync(row.RunId, cts.Token);
+    }
+
+    /// <summary>Fetches one run's plan summary into <see cref="Summary"/>.
+    ///
+    /// <para>Fire-and-forget by construction (a selection change is not awaitable), so it owns its own
+    /// exception boundary and writes every outcome into the pane rather than throwing. The
+    /// <see cref="_summaryRunId"/> re-check before each write is the second half of the race guard: the
+    /// token covers a fetch still in flight, this covers one that had already completed and was waiting to
+    /// resume on the UI thread.</para></summary>
+    private async Task LoadDetailAsync(Guid runId, CancellationToken ct)
+    {
+        Summary.BeginLoading();
+        try
+        {
+            var result = await gateway.GetRunDetailAsync(runId, ct);
+            if (result.IsCanceled || ct.IsCancellationRequested || runId != _summaryRunId)
+                return;
+            if (result.TryGetError(out IpcError? error))
+            {
+                Summary.Fail(error);
+                return;
+            }
+            result.TryGetValue(out RunDetailDto? detail);
+            Summary.Show(detail!);
+        }
+        catch (OperationCanceledException)
+        {
+            // Superseded by a newer selection — the pane already belongs to that one.
+        }
+        catch (Exception ex)
+        {
+            // Last-resort catch-all (directive): nothing awaits this task, so an escape would be silent.
+            Log.Error(ex, "Loading the summary for run {RunId} failed", runId);
+            if (runId == _summaryRunId)
+                Summary.Fail(new IpcError("SUMMARY_FAILED", ex.Message));
+        }
+    }
 
     [ObservableProperty] public partial string? ErrorMessage { get; set; }
 
@@ -511,6 +662,9 @@ public sealed partial class JobQueueViewModel(IIpcGateway gateway, TimeProvider?
         // event can beat the shell's own run-profile reply and the ownership answer changes a moment later.
         row.PlanWasShown = IsOwnRun?.Invoke(evt.RunId) ?? false;
         TrimAndFlag();
+        // This event IS the moment a plan becomes readable — the snapshot header is written when planning
+        // finishes — so a summary pane that answered "no plan yet" a moment ago must ask again now.
+        LoadDetailIfPlanAppeared(row);
     }
 
     /// <summary>A progress sample. Creates a row when the run-planned frame was lost — unlike the activity
@@ -542,10 +696,17 @@ public sealed partial class JobQueueViewModel(IIpcGateway gateway, TimeProvider?
         row.Paused = evt.Paused;
         row.Completed = evt.Completed;
         row.Total = evt.Total;
+        // The byte pair alongside the file pair, exactly as the wire carries them. Zero from a service
+        // that predates them, which HasByteProgress reads as "no byte figure" and falls back on.
+        row.CompletedBytes = evt.CompletedBytes;
+        row.TotalBytes = evt.TotalBytes;
         row.Deleted = evt.Deleted;
         row.ScannedSources = evt.ScannedSources;
         row.ScannedDestinations = evt.ScannedDestinations;
         TrimAndFlag();
+        // The selected run just changed phase into one that HAS a plan, so the summary pane's earlier
+        // "no plan yet" answer is now stale. Cheap to re-ask: it reads one small header.
+        LoadDetailIfPlanAppeared(row);
     }
 
     /// <summary>A run reached its terminal state — the only authoritative statement of what it did.</summary>
@@ -827,6 +988,10 @@ public sealed partial class JobQueueViewModel(IIpcGateway gateway, TimeProvider?
         row.PlannedCopyBytes = run.PlannedCopyBytes;
         row.Completed = run.Succeeded + run.Skipped + run.Failed;
         row.Total = run.PlannedCopies;
+        // Re-seeded here as well as from the progress stream, which is what keeps a byte bar from resetting
+        // to zero when the window is reopened part-way through a run.
+        row.CompletedBytes = run.BytesSettled;
+        row.TotalBytes = run.PlannedCopyBytes;
         row.Deleted = run.Deleted;
         row.PlanError = run.PlanError;
         row.PlanWasShown = IsOwnRun?.Invoke(run.RunId) ?? false;

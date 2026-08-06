@@ -189,6 +189,12 @@ internal sealed class RunPlanHarness : IDisposable
                             JobId.New(), outcome, null, null, TimeSpan.Zero)
                         {
                             ResolvedFinalPaths = finalPaths?.Invoke(payload) ?? [],
+                            // The real executor reports the source file's size on every completion, and the
+                            // run's byte progress is summed from it. Reported here too, from the file on
+                            // disk, so the coordinator's byte accounting is exercised rather than fed zeros.
+                            SourceBytes = File.Exists(payload.SourcePath)
+                                ? new FileInfo(payload.SourcePath).Length
+                                : 0,
                         });
                     break;   // one per iteration keeps the loop's accounting obvious
                 }
@@ -356,6 +362,9 @@ internal sealed class RunPlanHarness : IDisposable
             DeleteBytes = writer.DeleteBytes,
             SourceItemCount = writer.SourceCount,
             DestinationItemCount = writer.DestinationCount,
+            OverwriteCount = writer.OverwriteCount,
+            RenameCount = writer.RenameCount,
+            DisposalCount = writer.DisposalCount,
             SweptFilesByTargetRoot = writer.SweptByTargetRoot,
             Truncated = state.Truncated,
             SweepFaultDetail = state.SweepFaultDetail,

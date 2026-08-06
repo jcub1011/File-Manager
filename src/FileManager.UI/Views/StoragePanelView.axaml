@@ -1,0 +1,138 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:vm="using:FileManager.UI.ViewModels"
+             xmlns:ctrl="using:FileManager.UI.Controls"
+             x:Class="FileManager.UI.Views.StoragePanelView"
+             x:DataType="vm:DryRunSpaceViewModel">
+
+    <!-- The "will it fit" panel: per-volume used · free · bounded-maximum, with a per-folder drill-down.
+         Its DataContext IS a DryRunSpaceViewModel, so a host binds it with DataContext="{Binding Space}".
+
+         LIFTED OUT OF DryRunView, where it lived inline, because there are now two places that answer the
+         same question about the same projection: the Preview tab, and the job queue's summary pane for the
+         selected run. Both read a SpaceProjection — the preview's from its terminal stream frame, the
+         queue's from the run's snapshot header — so duplicating seventy lines of bar-and-band markup would
+         have meant two renderers that could disagree about what a drive is going to look like.
+
+         Deliberately does NOT gate its own visibility on having a projection: Space is null for a truncated
+         plan, and each host decides what to say instead (the preview hides the card, the summary pane says
+         why it cannot forecast). A control that hid itself would leave both hosts with a silent gap. -->
+
+    <UserControl.Resources>
+        <!-- One destination volume: header (root + settled used/free), the nested-increment storage
+             bar, a details line, an optional warning, and an optional per-target-root drill-down. -->
+        <DataTemplate x:Key="VolumeSpaceTemplate" x:DataType="vm:VolumeSpaceRow">
+            <Border BorderThickness="0,0,0,1" BorderBrush="{DynamicResource SystemControlBackgroundListLowBrush}"
+                    Padding="0,6">
+                <StackPanel Spacing="4">
+                    <Grid ColumnDefinitions="Auto,*">
+                        <TextBlock Grid.Column="0" Text="{Binding VolumeRoot}" FontWeight="SemiBold"
+                                   FontFamily="{StaticResource MonoFontFamily}" VerticalAlignment="Center" />
+                        <TextBlock Grid.Column="1" FontSize="11" Opacity="0.7" HorizontalAlignment="Right"
+                                   VerticalAlignment="Center" IsVisible="{Binding CapacityKnown}"
+                                   ToolTip.Tip="The drive's state right now, before this run makes any changes">
+                            <Run Text="(Current Status) " /><Run Text="{Binding UsedNowText}" /><Run Text=" used · " /><Run Text="{Binding CurrentFreeText}" /><Run Text=" free of " /><Run Text="{Binding CapacityText}" />
+                        </TextBlock>
+                    </Grid>
+
+                    <ctrl:StorageBar Height="20" IsVisible="{Binding CapacityKnown}"
+                                     CapacityBytes="{Binding CapacityBytes}" UsedNowBytes="{Binding UsedNowBytes}"
+                                     SettledBytes="{Binding SettledBytes}" RealisticPeakBytes="{Binding RealisticPeakBytes}"
+                                     SafeCeilingBytes="{Binding SafeCeilingBytes}" MarginBytes="{Binding MarginBytes}" />
+
+                    <TextBlock IsVisible="{Binding !CapacityKnown}" FontSize="11" Opacity="0.7"
+                               Text="Free space could not be determined for this volume." />
+
+                    <StackPanel Orientation="Horizontal" Spacing="6">
+                        <TextBlock FontSize="11" Opacity="0.7" ToolTip.Tip="Realistic Peak Storage Usage">
+                            <Run Text="RPSU " /><Run Text="{Binding PeakText}" />
+                        </TextBlock>
+                        <TextBlock FontSize="11" Opacity="0.4" Text="·" />
+                        <TextBlock FontSize="11" Opacity="0.7" ToolTip.Tip="Absolute Peak Storage Usage">
+                            <Run Text="APSU " /><Run Text="{Binding CeilingText}" />
+                        </TextBlock>
+                        <TextBlock FontSize="11" Opacity="0.4" Text="·" />
+                        <TextBlock FontSize="11" Opacity="0.7">
+                            <Run Text="Data Written " /><Run Text="{Binding WrittenText}" />
+                        </TextBlock>
+                        <TextBlock FontSize="11" Opacity="0.4" Text="·" />
+                        <TextBlock FontSize="11" Opacity="0.7" ToolTip.Tip="Storage Used At Rest">
+                            <Run Text="SUAR " /><Run Text="{Binding SettledUsedText}" />
+                        </TextBlock>
+                        <TextBlock FontSize="11" Opacity="0.4" Text="·" IsVisible="{Binding HasDeferredReclaim}" />
+                        <TextBlock FontSize="11" Opacity="0.7" IsVisible="{Binding HasDeferredReclaim}"
+                                   ToolTip.Tip="Space this run only gives back once it finishes, so the peak carries it throughout: files awaiting deletion, and sources awaiting disposal.">
+                            <Run Text="Freed At End " /><Run Text="{Binding DeferredReclaimText}" />
+                        </TextBlock>
+                    </StackPanel>
+
+                    <StackPanel Orientation="Horizontal" HorizontalAlignment="Left" IsVisible="{Binding HasWarning}">
+                        <ctrl:StatusCount IsVisible="{Binding IsDanger}" Text="{Binding WarningText}"
+                                          Icon="{StaticResource IconWarning}" Glyph="{DynamicResource Brush.Danger}" />
+                        <ctrl:StatusCount IsVisible="{Binding IsWarning}" Text="{Binding WarningText}"
+                                          Icon="{StaticResource IconWarning}" Glyph="{DynamicResource Brush.Warning}" />
+                    </StackPanel>
+
+                    <!-- STRETCHED, on both the expander and its content presenter. Fluent's Expander sizes
+                         to its header by default, so the drill-down opened as a narrow column against the
+                         left edge while the four-column grid inside it had a star column with nowhere to
+                         go: paths trimmed to nothing and the three figures bunched up, all with the width
+                         of the panel sitting unused to the right. -->
+                    <Expander IsVisible="{Binding HasFolders}" Header="By folder" Padding="0" Margin="0,2,0,0"
+                              HorizontalAlignment="Stretch" HorizontalContentAlignment="Stretch">
+                        <ItemsControl ItemsSource="{Binding Folders}" HorizontalAlignment="Stretch">
+                            <ItemsControl.ItemTemplate>
+                                <DataTemplate x:DataType="vm:FolderSpaceRow">
+                                    <Grid ColumnDefinitions="*,Auto,Auto,Auto" Margin="0,2">
+                                        <TextBlock Grid.Column="0" Text="{Binding Root}" FontFamily="{StaticResource MonoFontFamily}"
+                                                   FontSize="11" TextTrimming="CharacterEllipsis" ToolTip.Tip="{Binding Root}" />
+                                        <TextBlock Grid.Column="1" Text="{Binding FileCountText}" FontSize="11" Opacity="0.6" Margin="12,0,0,0" />
+                                        <TextBlock Grid.Column="2" Text="{Binding WrittenText}" FontSize="11" Margin="12,0,0,0" />
+                                        <TextBlock Grid.Column="3" Text="{Binding NetChangeText}" FontSize="11" Opacity="0.8" Margin="12,0,0,0" />
+                                    </Grid>
+                                </DataTemplate>
+                            </ItemsControl.ItemTemplate>
+                        </ItemsControl>
+                    </Expander>
+                </StackPanel>
+            </Border>
+        </DataTemplate>
+    </UserControl.Resources>
+
+    <!-- Collapsed by default to reclaim vertical space; the header carries a one-line summary and a badge,
+         and the panel auto-opens (OneWay bind — never fights a manual collapse) only when a destination
+         volume is at capacity risk. -->
+    <Border Classes="card" Padding="0" ClipToBounds="True">
+        <Expander Classes="card" HorizontalAlignment="Stretch"
+                  IsExpanded="{Binding HasWarning, Mode=OneWay}">
+            <!-- Neutralise Fluent's stock header/content chrome so the wrapping Border.card
+                 surface shows through and the panel reads like the app's other cards. -->
+            <Expander.Resources>
+                <SolidColorBrush x:Key="ExpanderHeaderBackground" Color="Transparent" />
+                <SolidColorBrush x:Key="ExpanderHeaderBackgroundPointerOver" Color="#19808080" />
+                <SolidColorBrush x:Key="ExpanderHeaderBackgroundPressed" Color="#0F808080" />
+                <SolidColorBrush x:Key="ExpanderHeaderBackgroundDisabled" Color="Transparent" />
+                <SolidColorBrush x:Key="ExpanderContentBackground" Color="Transparent" />
+                <Thickness x:Key="ExpanderHeaderBorderThickness">0</Thickness>
+                <Thickness x:Key="ExpanderContentDownBorderThickness">0</Thickness>
+                <Thickness x:Key="ExpanderContentUpBorderThickness">0</Thickness>
+                <Thickness x:Key="ExpanderHeaderPadding">12,8</Thickness>
+                <Thickness x:Key="ExpanderContentPadding">12,0,12,12</Thickness>
+                <x:Double x:Key="ExpanderMinHeight">0</x:Double>
+            </Expander.Resources>
+            <Expander.Header>
+                <StackPanel Orientation="Horizontal" Spacing="8" VerticalAlignment="Center">
+                    <TextBlock Text="Storage" FontWeight="Bold" VerticalAlignment="Center" />
+                    <TextBlock Text="{Binding SummaryText}" Classes="secondary"
+                               FontSize="11" VerticalAlignment="Center" />
+                    <ctrl:StatusCount VerticalAlignment="Center" IsVisible="{Binding HasWarning}"
+                                      Text="capacity risk" ToolTip.Tip="A destination drive may not have room"
+                                      Icon="{StaticResource IconWarning}" Glyph="{DynamicResource Brush.Warning}" />
+                </StackPanel>
+            </Expander.Header>
+
+            <ItemsControl ItemsSource="{Binding Volumes}" ItemTemplate="{StaticResource VolumeSpaceTemplate}" />
+        </Expander>
+    </Border>
+
+</UserControl>

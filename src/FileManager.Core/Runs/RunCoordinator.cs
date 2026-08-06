@@ -434,6 +434,11 @@ public sealed class RunCoordinator(
         {
             run.Settled++;
             run.LastSettleTicks = time.GetTimestamp();
+            // Before the outcome switch, and outside it: the byte numerator must track the FILE
+            // numerator below (Succeeded + Skipped + Failed), so it is added on every outcome. A null
+            // completion — a payload the orchestrator dropped — has no size to read and adds nothing,
+            // which matches run.Dropped staying out of the file numerator too.
+            run.BytesSettled += completion?.SourceBytes ?? 0;
             switch (completion?.Outcome)
             {
                 case JobOutcome.Succeeded: run.Succeeded++; break;
@@ -609,6 +614,9 @@ public sealed class RunCoordinator(
                     DeleteBytes = writer.DeleteBytes,
                     SourceItemCount = writer.SourceCount,
                     DestinationItemCount = writer.DestinationCount,
+                    OverwriteCount = writer.OverwriteCount,
+                    RenameCount = writer.RenameCount,
+                    DisposalCount = writer.DisposalCount,
                     SweptFilesByTargetRoot = writer.SweptByTargetRoot,
                     Truncated = state.Truncated,
                     SweepFaultDetail = state.SweepFaultDetail,
@@ -1166,6 +1174,9 @@ public sealed class RunCoordinator(
             Phase = waiting ? WaitingPhase : RunPhase.Planning.ToString(),
             Completed = 0,
             Total = 0,
+            // Zero for the same reason Total is: working out the denominator is what planning IS.
+            CompletedBytes = 0,
+            TotalBytes = 0,
             Deleted = 0,
             ScannedSources = counters.Sources,
             ScannedDestinations = counters.Destinations,
@@ -1188,6 +1199,7 @@ public sealed class RunCoordinator(
     {
         RunPhase phase;
         int completed, total, deleted;
+        long completedBytes, totalBytes;
         bool waiting;
         bool paused = runPause.IsRunPaused(run.RunId);
         lock (run.Gate)
@@ -1195,6 +1207,8 @@ public sealed class RunCoordinator(
             phase = run.Phase;
             completed = run.Succeeded + run.SkippedJobs + run.Failed;
             total = run.PlannedCopies;
+            completedBytes = run.BytesSettled;
+            totalBytes = run.PlannedCopyBytes;
             deleted = run.Deleted;
             waiting = run.WaitingToPlan;
         }
@@ -1207,6 +1221,11 @@ public sealed class RunCoordinator(
             Phase = waiting && phase == RunPhase.Planning ? WaitingPhase : phase.ToString(),
             Completed = completed,
             Total = total,
+            // The byte pair, alongside the file pair rather than instead of it: a run is "3,412 of
+            // 12,088 files" AND "1.2 GB of 4.5 GB", and which of those is the useful sentence depends
+            // entirely on whether the files are photos or disk images.
+            CompletedBytes = completedBytes,
+            TotalBytes = totalBytes,
             Deleted = deleted,
             Paused = paused,
         });
@@ -1329,6 +1348,16 @@ public sealed class RunCoordinator(
         public int SkippedJobs { get; set; }
         public int Failed { get; set; }
 
+        /// <summary>Source bytes accounted for by every job of this run that has settled — the numerator
+        /// for byte-level progress against <see cref="PlannedCopyBytes"/>.
+        ///
+        /// <para>Summed from <see cref="JobCompletion.SourceBytes"/> on every outcome, so it tracks
+        /// <see cref="Succeeded"/> + <see cref="SkippedJobs"/> + <see cref="Failed"/> exactly. A
+        /// <see cref="Dropped"/> payload contributes nothing (there is no completion to read a size
+        /// from), which leaves the bar short of full on a run that dropped work — the same shortfall the
+        /// file counters already show, and honest about it.</para></summary>
+        public long BytesSettled { get; set; }
+
         /// <summary>Payloads that settled the barrier without producing an outcome — the orchestrator
         /// dropped them before the executor ran. Not a job failure, so it stays out of
         /// <see cref="Failed"/> and out of the counts the UI reports; but it IS work from the approved
@@ -1370,6 +1399,7 @@ public sealed class RunCoordinator(
                     Succeeded = Succeeded,
                     Skipped = SkippedJobs,
                     Failed = Failed,
+                    BytesSettled = BytesSettled,
                     Deleted = Deleted,
                     BytesDeleted = BytesDeleted,
                     PlanTruncated = PlanTruncated,
@@ -1399,7 +1429,8 @@ public sealed class RunCoordinator(
                     Outcome.ToString(),
                     paused, WaitingToPlan, StartedAt, PlannedAt, ClosedAt,
                     PlannedCopies, PlannedDeletes, PlannedCopyBytes, PlannedDeleteBytes,
-                    Succeeded, SkippedJobs, Failed, Deleted, PlanTruncated, PlanError);
+                    Succeeded, SkippedJobs, Failed, Deleted, PlanTruncated, PlanError,
+                    BytesSettled);
             }
         }
 

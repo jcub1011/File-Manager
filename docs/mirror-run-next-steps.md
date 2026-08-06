@@ -238,14 +238,34 @@ same story. Rather than mixing run rows into a job list, runs got their own **no
 since a dry run IS a run's planning phase — fed by `run-planned` / `run-progress` / `run-completed` and
 re-seeded from the new `get-runs` request, because the event stream is drop-oldest lossy.
 
-Each row carries Cancel (`CancelRunAsync`), **Pause/Resume** (the new `set-run-paused`), and either
-Approve/Discard or "View plan" depending on whether this window showed the plan. The copy states the
+Cancel (`CancelRunAsync`), **Pause/Resume** (the new `set-run-paused`), Approve/Discard, and "View plan"
+now live in the **footer of the summary pane** rather than on each row — see below. The copy states the
 semantics this item asked for: cancelling drops work that has not started, **jobs already in flight always
 finish** (I-ATOMIC-JOB), and the deletion phase is skipped entirely.
 
 `MainWindowViewModel.HandleEngineEvent` still routes `RunProgressEvent` to the activity notice for the
 window's own run; the queue takes every run in addition, which is what makes it a queue rather than a
 second copy of this window's state.
+
+**Since then the window became two panes.** The left is the list; the right (`RunSummaryPane` over
+`RunSummaryPaneViewModel`) is a read-only summary of the *selected* run, fetched with the new
+`get-run-detail` — which reads the run's snapshot **header** and nothing else, so it can be re-issued on
+every selection change. The itemized `get-run-plan-stream` is still the route to the file list, and still
+what Approve is gated on: the summary is aggregates, so a run this window did not plan gets "View plan…".
+
+Two gaps had to be closed to build it. First, the blast-radius counts (overwrites / renames / source
+disposals) existed only as a client-side fold over streamed rows in `DryRunRowStore.Complete`, and replaying
+a 500,000-row plan to show three numbers beside a selection was not an option — so `RunSnapshotWriter` now
+records them, under the same rules, for the same reason `SweptByTargetRoot` is recorded there. Second, a run
+had a byte denominator and **no numerator at all**: `JobProgress` counted targets and `JobCompletion`
+counted nothing, so the queue could only ever say "3,412 of 12,088 files" about a run whose real shape was
+"1.2 GB of 4.5 GB". `JobCompletion.SourceBytes` → `RunState.BytesSettled` → `run-progress`'s
+`CompletedBytes`/`TotalBytes` closes it, counted on **every** outcome so the byte pair tracks the file pair
+and the bar reaches 100% on the same runs the file counter does.
+
+The storage forecast is rendered by `StoragePanelView`, lifted out of `DryRunView` so the Preview tab and
+this pane share one renderer — both read a `SpaceProjection`, and two copies of that markup could have come
+to disagree about whether a drive will fill.
 
 ---
 

@@ -172,6 +172,12 @@ public sealed record RunStatus
     public required int Skipped { get; init; }
     public required int Failed { get; init; }
 
+    /// <summary>Source bytes those settled jobs accounted for — the byte counterpart of
+    /// <see cref="Succeeded"/> + <see cref="Skipped"/> + <see cref="Failed"/>, measured against
+    /// <see cref="PlannedCopyBytes"/>. Not required, so a caller constructing a status for a run that
+    /// never executed does not have to say zero.</summary>
+    public long BytesSettled { get; init; }
+
     /// <summary>Orphans actually removed, and the bytes they held.</summary>
     public required int Deleted { get; init; }
     public required long BytesDeleted { get; init; }

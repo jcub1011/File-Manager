@@ -297,6 +297,38 @@ internal sealed class FakeIpcGateway : IIpcGateway
         return Task.FromResult(RunsResult);
     }
 
+    public List<Guid> GetRunDetailCalls { get; } = [];
+
+    /// <summary>Per-run scripted answers, falling back to <see cref="RunDetailResult"/>.</summary>
+    public Dictionary<Guid, Result<RunDetailDto, IpcError>> RunDetailResults { get; } = [];
+
+    /// <summary>Defaults to the answer a run still PLANNING really gets, so a test that does not care
+    /// about the summary pane is not made to build a whole Profile to stay quiet.</summary>
+    public Result<RunDetailDto, IpcError> RunDetailResult { get; set; } =
+        new IpcError("RUN_PLAN_UNAVAILABLE", "the run has no plan snapshot yet");
+
+    /// <summary>Held per run id, so a test can leave one fetch in flight and prove the next selection
+    /// cancels it — the same recipe <see cref="JobLogGates"/> uses.</summary>
+    public Dictionary<Guid, TaskCompletionSource> RunDetailGates { get; } = [];
+
+    public async Task<Result<RunDetailDto, IpcError>> GetRunDetailAsync(
+        Guid runId, CancellationToken ct = default)
+    {
+        GetRunDetailCalls.Add(runId);
+        if (RunDetailGates.TryGetValue(runId, out TaskCompletionSource? gate))
+        {
+            try
+            {
+                await gate.Task.WaitAsync(ct);
+            }
+            catch (OperationCanceledException)
+            {
+                return Result<RunDetailDto, IpcError>.Canceled();   // mirror the real gateway
+            }
+        }
+        return RunDetailResults.TryGetValue(runId, out var scripted) ? scripted : RunDetailResult;
+    }
+
     public async Task<Result<bool, IpcError>> SetPausedAsync(bool paused, CancellationToken ct = default)
     {
         SetPausedCalls.Add(paused);

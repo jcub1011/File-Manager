@@ -111,6 +111,16 @@ public interface IIpcGateway
     /// offer a way to clear one.</para></summary>
     Task<Result<IReadOnlyList<RunSummaryDto>, IpcError>> GetRunsAsync(CancellationToken ct = default);
 
+    /// <summary>One run's plan summarized: the frozen profile, the space projection, and the item and
+    /// blast-radius counts. Read service-side from the run's snapshot header alone, so it is cheap enough
+    /// to call on every selection change in the queue.
+    /// <para><b>RUN_PLAN_UNAVAILABLE is a NORMAL answer, not a fault.</b> The header is written when
+    /// planning finishes, so a run still in <c>Planning</c> — which is exactly when a user is most likely
+    /// to be watching it — has none. Render it as "still working out what this will do".</para>
+    /// <para>RUN_NOT_FOUND covers a run discarded or reaped while the request was in flight, the same race
+    /// every other run-scoped call here documents.</para></summary>
+    Task<Result<RunDetailDto, IpcError>> GetRunDetailAsync(Guid runId, CancellationToken ct = default);
+
     /// <summary>Pauses or resumes ONE run, independently of the global <see cref="SetPausedAsync"/>.
     /// <para>A pause only withholds work that has not started — it never aborts anything, and jobs already
     /// in flight always finish (I-ATOMIC-JOB). So pausing an executing run means "start no more copies",

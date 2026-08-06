@@ -154,6 +154,26 @@ public sealed record RunProgressEvent : EngineEvent
     public required int Total { get; init; }
     public required int Deleted { get; init; }
 
+    /// <summary>Source bytes the settled jobs have accounted for, and the plan's copy-byte total —
+    /// <see cref="Completed"/> and <see cref="Total"/> measured in data rather than in files.
+    ///
+    /// <para><b>Why both, when the file pair already exists.</b> "3,412 of 12,088 files" says nothing
+    /// useful about a run whose files are disk images, and a run of a hundred thousand thumbnails
+    /// finishes long before the file bar suggests. Which of the two sentences is the informative one
+    /// depends on the profile, so a client is given both and picks.</para>
+    ///
+    /// <para><see cref="TotalBytes"/> rides on the sample rather than being taken from
+    /// <c>run-planned</c> for the same reason <see cref="Total"/> does: this stream is drop-oldest, and a
+    /// client that synthesizes a row from a progress sample it saw first would otherwise have a
+    /// numerator and no denominator.</para>
+    ///
+    /// <para>Both zero while <c>Planning</c> — computing the total is what planning is doing — and both
+    /// zero from a service that predates them, which reads as "no byte figure" and leaves a client on
+    /// the file pair.</para></summary>
+    public long CompletedBytes { get; init; }
+
+    public long TotalBytes { get; init; }
+
     /// <summary>Source files the plan's scan has discovered so far, during <c>Planning</c>.
     /// <para>This exists because a preview of a large tree is minutes of walking with nothing to show. The
     /// dry run that preceded the two-phase shape streamed exactly these counts and the caption read

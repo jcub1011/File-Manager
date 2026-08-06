@@ -29,6 +29,7 @@ public static class IpcRequestTypes
     public const string CancelRun = "cancel-run";
     public const string GetRunPlanStream = "get-run-plan-stream";
     public const string GetRuns = "get-runs";
+    public const string GetRunDetail = "get-run-detail";
     public const string SetRunPaused = "set-run-paused";
     public const string DiscardRun = "discard-run";
 
@@ -56,6 +57,7 @@ public static class IpcRequestTypes
         CancelRunRequest => CancelRun,
         GetRunPlanStreamRequest => GetRunPlanStream,
         GetRunsRequest => GetRuns,
+        GetRunDetailRequest => GetRunDetail,
         SetRunPausedRequest => SetRunPaused,
         DiscardRunRequest => DiscardRun,
         _ => throw new System.ArgumentOutOfRangeException(nameof(request),

@@ -70,7 +70,22 @@ Three coherent increments are complete:
    `PathsWritten` set, validation issues and completed task, and finally disposes its
    `CancellationTokenSource`, so it costs scalars rather than megabytes.
 
-**Test status:** 1696 tests passing across the solution (Core 847, UI 650, Contracts 153,
+7. **The queue answers for itself: a per-run summary, and progress in DATA.** The Job Queue window became
+   two draggably-split panes. The left is the live list — while a run plans, its source and destination scan
+   counts each on their own line; while it executes, a determinate bar measuring **bytes copied against the
+   plan's copy total**, which is the figure that actually says how far along a run of one disk image and ten
+   thousand thumbnails is. The right is a read-only **summary of the selected run**: the blast-radius counts,
+   the per-volume storage forecast, the sources and destinations, and the settings the run was *planned
+   against* (frozen in its snapshot — editing the profile now does not change the run). The four run
+   actions — pause/resume, cancel, approve, discard — moved out of the row cards and into that pane's
+   footer, beside the numbers they act on. Approve stays gated on having seen the itemized plan: the summary
+   is aggregates, so a run this window did not plan still gets "View plan…". Three things made it possible:
+   `get-run-detail` (the snapshot header alone, O(1), cheap enough to fetch per selection), three
+   blast-radius counts now recorded by `RunSnapshotWriter` rather than folded client-side from streamed rows,
+   and a real byte numerator — `JobCompletion.SourceBytes` → `RunState.BytesSettled` → `run-progress` — where
+   before there was none at all.
+
+**Test status:** 1777 tests passing across the solution (Core 865, UI 713, Contracts 153,
 Platform.Windows 14, Service 32). 0 errors. One pre-existing flaky test is documented below. A clean
 Release build emits 19 analyzer warnings: 18 in test projects (xUnit1031/xUnit2031 in Core.Tests, CA1416
 platform-guard notices in Platform.Windows.Tests) plus one pre-existing CS9107 in
@@ -165,9 +180,10 @@ triggers and transformers are the next sets.
 | Handlers: status, list/get/save/delete/validate profile, dry-run(+stream), settings, shutdown | ✅ | `get-status` now sources the real snapshot from `IJobOrchestrator`. |
 | Handlers: `run-profile`, `set-paused`, `get-matching`, `get-recent-jobs`, `get-job-log` | ✅ | Registered in the dispatch table. |
 | Handlers: `get-runs`, `set-run-paused` | ✅ | The job queue's re-seed (the event stream is drop-oldest lossy) and its pause toggle. |
-| Handler: `discard-run` | ✅ | Removes a run, cancelling it first if live. The ONLY user-driven deletion, and the only thing besides auto-delete that takes an entry out of the coordinator. 23 entries in the dispatch table. |
+| Handler: `discard-run` | ✅ | Removes a run, cancelling it first if live. The ONLY user-driven deletion, and the only thing besides auto-delete that takes an entry out of the coordinator. |
+| Handler: `get-run-detail` | ✅ | One run's plan SUMMARIZED — the frozen profile, the space projection, and the item and blast-radius counts — read from the snapshot header alone (O(1), no `.ndjsonl` opened), so the queue's summary pane can fetch it on every selection change. `RUN_PLAN_UNAVAILABLE` is the NORMAL answer for a run still planning, not a fault. 24 entries in the dispatch table. |
 | `subscribe` + `IIpcServer.Broadcast` | ✅ | Handled by the server directly: ack + open-ended one-way `EngineEvent` stream over a bounded, drop-oldest per-subscriber channel. |
-| Protocol version | ✅ | **14** — a run is ANNOUNCED the moment it begins (an initial `run-progress` sample, counters at zero, published synchronously by `Begin` so it cannot be delayed by thread-pool scheduling or lose a race with the `run-profile` reply), and `run-progress` gained `ProfileId`/`ProfileName` so the row a client builds from that first sample is nameable. Prior: **13** — `discard-run`, and `RunSummaryDto.ClosedAtUtc` so a queue can age a finished run it learned about from a reconcile rather than from the terminal event. The retention CONTRACT changed, which is what makes it a bump: an old client assumes a finished run vanishes within ten minutes and offers no way to remove one. Prior: **12** — `get-runs` / `set-run-paused`; `run-planned` gained `ProfileName` (a draft-planned run is in no catalog, so a client-side lookup leaves exactly the GUI's own runs nameless), `run-progress` gained `Paused`. UI and Service must ship together. Prior: **7** — drops `ThemeMode` from `GlobalSettings` (settings.json schema v5); it moved to the UI-owned `client-settings.json`. Prior: 6 added `job-progress` / `run-queued` events and gave `run-profile` a `run-profile-result` reply. UI and Service must ship together. |
+| Protocol version | ✅ | **15** — a run can be SUMMARIZED without being replayed: new `get-run-detail` / `run-detail`, carrying the run's frozen profile, its space projection, and its item and blast-radius counts. `run-progress` additionally carries `CompletedBytes`/`TotalBytes` and `RunSummaryDto` carries `BytesSettled`, so progress can be reported in DATA rather than only in files. Gated on the request, not the byte figures: a new client against an old service would get NOT_IMPLEMENTED for every selection and show a permanently empty summary pane (the same visible dead end that gated `discard-run` in 13), while the byte fields default to zero, which a client reads as "no byte figure" and falls back to the file counters for — deliberately, so a bar can never sit at 0% while files advance. Prior: **14** — a run is ANNOUNCED the moment it begins (an initial `run-progress` sample, counters at zero, published synchronously by `Begin` so it cannot be delayed by thread-pool scheduling or lose a race with the `run-profile` reply), and `run-progress` gained `ProfileId`/`ProfileName` so the row a client builds from that first sample is nameable. Prior: **13** — `discard-run`, and `RunSummaryDto.ClosedAtUtc` so a queue can age a finished run it learned about from a reconcile rather than from the terminal event. The retention CONTRACT changed, which is what makes it a bump: an old client assumes a finished run vanishes within ten minutes and offers no way to remove one. Prior: **12** — `get-runs` / `set-run-paused`; `run-planned` gained `ProfileName` (a draft-planned run is in no catalog, so a client-side lookup leaves exactly the GUI's own runs nameless), `run-progress` gained `Paused`. UI and Service must ship together. Prior: **7** — drops `ThemeMode` from `GlobalSettings` (settings.json schema v5); it moved to the UI-owned `client-settings.json`. Prior: 6 added `job-progress` / `run-queued` events and gave `run-profile` a `run-profile-result` reply. UI and Service must ship together. |
 
 ### §4.10 Dry-run & observability
 | Component | Status | Note |
@@ -189,7 +205,7 @@ triggers and transformers are the next sets.
 | Host | Status | Note |
 | --- | --- | --- |
 | `FileManager.Service` | 🟡 | Runs recovery-first + IPC + the orchestrator/trigger-queue consumer + event-bus→IPC broadcast bridge; watcher/scheduler/shell/tray startup slots still empty (§2.4). |
-| `FileManager.UI` | 🟡 | List/editor/preview/settings/status bar, activity panel, global pause toggle **+ the non-modal Job Queue window, retained per-profile previews, and the staleness banner**; no tray, `--pick`, or `--tray`. |
+| `FileManager.UI` | 🟡 | List/editor/preview/settings/status bar, activity panel, global pause toggle **+ the non-modal Job Queue window (two panes: the live list, and a read-only summary of the selected run with the run actions in its footer), retained per-profile previews, and the staleness banner**; no tray, `--pick`, or `--tray`. |
 | `FileManager.Cli` | ⬜ | Project does not exist yet. |
 
 ---
