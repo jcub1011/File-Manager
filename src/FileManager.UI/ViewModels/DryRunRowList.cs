@@ -12,8 +12,8 @@ namespace FileManager.UI.ViewModels;
 /// Avalonia's <c>ItemsSourceView</c> uses <see cref="IList"/> for indexed access and falls back to
 /// copying the whole source into a list when the bound collection does not implement it — which
 /// would materialize every handle up front and undo the entire point of this type. It used to be
-/// satisfied by accident, because the bound instance was a <c>List&lt;T&gt;</c>. <c>DryRunRowListTests</c>
-/// pins it.</para>
+/// satisfied by accident, because the bound instance was a <c>List&lt;T&gt;</c>.
+/// <c>DryRunRowStoreTests.The_bound_row_list_is_an_IList</c> pins it.</para>
 ///
 /// <para>Handles are values, not identities: two handles for the same row are <c>Equals</c> because a
 /// row record is a record over (store, key). That is what lets selection, <see cref="IndexOf"/> and

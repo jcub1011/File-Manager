@@ -214,6 +214,58 @@ public sealed class GetRunPlanViewHandlerTests
     }
 
     [Fact]
+    public async Task Cached_views_are_bounded_so_typing_in_the_search_box_cannot_fill_the_run_directory()
+    {
+        // Every distinct filter caches a file, and the search box produces a distinct filter per
+        // debounced keystroke — so typing a word would otherwise leave one per prefix, for as long as
+        // the run is open. Twelve searches against a cache of eight.
+        using Fixture f = await PlannedAsync("view-evict");
+        for (int i = 0; i < 12; i++)
+        {
+            await ViewAsync(f, new GetRunPlanViewRequest
+            {
+                RunId = f.RunId, Side = RunPlanSide.Sources, Search = $"term-{i}",
+            });
+        }
+
+        Assert.True(
+            Directory.GetFiles(f.Dir, "view-*.ord").Length <= 8,
+            $"kept {Directory.GetFiles(f.Dir, "view-*.ord").Length} view files, above the cache bound");
+    }
+
+    [Fact]
+    public async Task A_filter_the_user_keeps_returning_to_survives_the_searches_typed_in_between()
+    {
+        // Eviction is by RECENCY, not creation order: a facet selection re-applied throughout a session
+        // must not be thrown away because of the searches typed since, or every return to it rescans.
+        using Fixture f = await PlannedAsync("view-evict-recency");
+        GetRunPlanViewRequest kept = new()
+        {
+            RunId = f.RunId, Side = RunPlanSide.Sources, Kinds = [OperationKind.Processed],
+        };
+        RunPlanViewResponse first = await ViewAsync(f, kept);
+
+        for (int i = 0; i < 6; i++)
+        {
+            await ViewAsync(f, new GetRunPlanViewRequest
+            {
+                RunId = f.RunId, Side = RunPlanSide.Sources, Search = $"noise-{i}",
+            });
+            await ViewAsync(f, kept);   // the user comes back to it
+        }
+        for (int i = 6; i < 12; i++)
+        {
+            await ViewAsync(f, new GetRunPlanViewRequest
+            {
+                RunId = f.RunId, Side = RunPlanSide.Sources, Search = $"noise-{i}",
+            });
+        }
+
+        Assert.True(File.Exists(Path.Combine(f.Dir, $"view-{first.ViewId}.ord")),
+            "the repeatedly-used view was evicted in favour of one-off searches");
+    }
+
+    [Fact]
     public async Task A_stale_view_id_falls_back_to_the_full_list_rather_than_blanking_the_panel()
     {
         using Fixture f = await PlannedAsync("view-stale");

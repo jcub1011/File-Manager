@@ -13,7 +13,8 @@ namespace FileManager.UI.ViewModels;
 /// Avalonia's <c>ItemsSourceView</c> uses it for indexed access and falls back to COPYING the whole
 /// source into a list when it is missing — which here would try to materialize every row of a plan that
 /// deliberately is not resident, i.e. exactly the failure this whole design exists to prevent.
-/// <c>DryRunRowListTests</c> pins the same property for the non-paged list.</para>
+/// <c>DryRunRowStoreTests.The_bound_row_list_is_an_IList</c> pins the same property for the non-paged
+/// list.</para>
 ///
 /// <para><b>Why placeholders rather than waiting.</b> The indexer is synchronous and runs on the UI
 /// thread during layout, so a row whose page has not arrived cannot be awaited without freezing the
