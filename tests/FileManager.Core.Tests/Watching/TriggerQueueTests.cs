@@ -27,6 +27,82 @@ public sealed class TriggerQueueTests
         Assert.Equal(@"C:\src\b", e.Current.SourcePath);
     }
 
+    // ---- producer back-pressure ------------------------------------------------------------------
+    // What bounds a run's resident payloads now that a plan has no file cap. The work list itself lives
+    // in the run snapshot on disk; only a working set of it is ever in the queue.
+
+    [Fact]
+    public async Task WaitForRoom_returns_immediately_below_the_high_water_mark()
+    {
+        Guid profile = Guid.NewGuid();
+        using TriggerQueue queue = new(new FakePauseState(), NullLogger<TriggerQueue>.Instance);
+        queue.Enqueue(P(profile, @"C:\src\a"));
+
+        using CancellationTokenSource cts = new(TimeSpan.FromSeconds(5));
+        await queue.WaitForRoomAsync(highWaterMark: 4, cts.Token);   // must not hang
+    }
+
+    [Fact]
+    public async Task WaitForRoom_parks_at_the_high_water_mark_and_resumes_once_half_drained()
+    {
+        Guid profile = Guid.NewGuid();
+        using TriggerQueue queue = new(new FakePauseState(), NullLogger<TriggerQueue>.Instance);
+        for (int i = 0; i < 4; i++)
+            queue.Enqueue(P(profile, $@"C:\src\{i}"));
+
+        using CancellationTokenSource cts = new(TimeSpan.FromSeconds(5));
+        Task room = queue.WaitForRoomAsync(highWaterMark: 4, cts.Token);
+        Assert.False(room.IsCompleted, "a full queue must park the producer");
+
+        await using IAsyncEnumerator<Payload> e = queue.DequeueAsync(cts.Token).GetAsyncEnumerator(cts.Token);
+
+        // Hysteresis: one dequeue is not enough. Resuming per payload would put the producer in lockstep
+        // with the workers instead of letting it refill in batches.
+        Assert.True(await e.MoveNextAsync());
+        Assert.False(room.IsCompleted, "one dequeue must not resume the producer");
+
+        // Down to 2 of 4 — the half-drained mark.
+        Assert.True(await e.MoveNextAsync());
+        await room;
+    }
+
+    [Fact]
+    public async Task WaitForRoom_is_released_by_cancellation()
+    {
+        // The escape hatch a paused run depends on: its own payloads fill the queue and nothing will
+        // dequeue them, so the producer can only be freed from outside.
+        Guid profile = Guid.NewGuid();
+        using TriggerQueue queue = new(new FakePauseState(), NullLogger<TriggerQueue>.Instance);
+        for (int i = 0; i < 4; i++)
+            queue.Enqueue(P(profile, $@"C:\src\{i}"));
+
+        using CancellationTokenSource cts = new();
+        Task room = queue.WaitForRoomAsync(highWaterMark: 4, cts.Token);
+        Assert.False(room.IsCompleted);
+
+        await cts.CancelAsync();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => room);
+    }
+
+    [Fact]
+    public async Task WaitForRoom_is_released_by_dropping_the_run_that_filled_the_queue()
+    {
+        // A cancel drops the backlog rather than dequeuing it, so DropRun has to signal too — otherwise
+        // the producer waits for a drain that already happened.
+        Guid profile = Guid.NewGuid();
+        Guid runId = Guid.NewGuid();
+        using TriggerQueue queue = new(new FakePauseState(), NullLogger<TriggerQueue>.Instance);
+        for (int i = 0; i < 4; i++)
+            queue.Enqueue(P(profile, $@"C:\src\{i}") with { RunId = runId });
+
+        using CancellationTokenSource cts = new(TimeSpan.FromSeconds(5));
+        Task room = queue.WaitForRoomAsync(highWaterMark: 4, cts.Token);
+        Assert.False(room.IsCompleted);
+
+        Assert.Equal(4, queue.DropRun(runId));
+        await room;
+    }
+
     [Fact]
     public void Coalesces_duplicate_profile_and_source_while_pending()
     {

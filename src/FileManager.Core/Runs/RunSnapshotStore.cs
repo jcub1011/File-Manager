@@ -15,8 +15,8 @@ using System.Text.Json.Serialization.Metadata;
 
 namespace FileManager.Core.Runs;
 
-/// <summary>Writes one run's frozen work list as the plan streams in, so a 500,000-file run never
-/// holds its work list in memory.
+/// <summary>Writes one run's frozen work list as the plan streams in, so a run of any size never holds
+/// its work list in memory.
 ///
 /// <para><b>Layout</b> — <c>&lt;RunsDirectory&gt;/&lt;run-id&gt;/</c> holding <c>plan.json</c> (the
 /// header, written last, once planning has produced its totals) plus <c>copies.ndjsonl</c>,
@@ -32,8 +32,13 @@ namespace FileManager.Core.Runs;
 /// <c>sources.ndjsonl</c> lists every file the plan LOOKED at. That difference is the whole reason they
 /// are separate — an already-synchronized profile has no copies at all, so a view built from the copy list
 /// shows an empty panel where the honest answer is "these files, every one already up to date". Together
-/// they roughly double a snapshot's size; they are bounded by the same file cap the plan is, and the whole
-/// directory is deleted when the run closes.</para>
+/// they roughly double a snapshot's size, and the whole directory is deleted when the run closes.</para>
+///
+/// <para><b>Nothing bounds a snapshot's size but the volume it sits on</b>, since the plan lost its
+/// file-count cap (a plan is executed, so a cap made a wrong work list rather than a small one). The
+/// volume is therefore checked as the plan streams — see <see cref="CheckDiskEveryRows"/> — and running
+/// out FAILS the run through the same <see cref="Failure"/> channel a write error uses. That direction
+/// matters: a snapshot that stops short is an executable work list quietly missing entries.</para>
 ///
 /// <para><b>Durability</b> is deliberately weaker than the journal's. Losing a snapshot means a run
 /// must be planned again; it is not data loss, and the journal plus
@@ -44,18 +49,28 @@ namespace FileManager.Core.Runs;
 /// afterwards.</para></summary>
 internal sealed class RunSnapshotWriter : IDisposable
 {
+    /// <summary>Rows between free-space samples. <c>DriveInfo.AvailableFreeSpace</c> is a syscall, so it
+    /// is not something to do per row; a large run writes a few hundred bytes a row, so 65,536 rows is
+    /// tens of MB of overshoot at worst — well inside the reserve the check is measuring against.</summary>
+    internal const int CheckDiskEveryRows = 65_536;
+
     private readonly string _directory;
     private readonly ILogger _logger;
+    private readonly long _diskReserveBytes;
+    private readonly DriveInfo? _volume;
+    private long _rowsWritten;
+    private long _nextDiskCheckAt = CheckDiskEveryRows;
     private FileStream? _copies;
     private FileStream? _deletes;
     private FileStream? _sources;
     private FileStream? _destinations;
     private string? _failure;
 
-    public RunSnapshotWriter(string runDirectory, ILogger logger)
+    public RunSnapshotWriter(string runDirectory, ILogger logger, long diskReserveBytes)
     {
         _directory = runDirectory;
         _logger = logger;
+        _diskReserveBytes = diskReserveBytes;
         try
         {
             Directory.CreateDirectory(runDirectory);
@@ -63,6 +78,10 @@ internal sealed class RunSnapshotWriter : IDisposable
             _deletes = Open(RunSnapshotPaths.DeletesFileName);
             _sources = Open(RunSnapshotPaths.SourcesFileName);
             _destinations = Open(RunSnapshotPaths.DestinationsFileName);
+            // Resolved once, here, rather than per check: the directory cannot move, and a run on a
+            // path DriveInfo cannot parse (a UNC runs directory) should not fail — it just goes
+            // unguarded, exactly as it was before the guard existed.
+            _volume = ResolveVolume(runDirectory, logger);
         }
         catch (Exception ex)
         {
@@ -75,6 +94,67 @@ internal sealed class RunSnapshotWriter : IDisposable
         FileStream Open(string name) => new(
             Path.Combine(runDirectory, name), FileMode.Create, FileAccess.Write, FileShare.Read,
             bufferSize: 64 * 1024);
+    }
+
+    /// <summary>The volume the snapshot lands on, or null when it cannot be determined. Null means the
+    /// space guard stands down rather than guesses — a UNC runs directory has no <see cref="DriveInfo"/>,
+    /// and refusing to plan because we could not measure the disk would be worse than not measuring
+    /// it.</summary>
+    private static DriveInfo? ResolveVolume(string runDirectory, ILogger logger)
+    {
+        try
+        {
+            string? root = Path.GetPathRoot(Path.GetFullPath(runDirectory));
+            return string.IsNullOrEmpty(root) || root.StartsWith(@"\\", StringComparison.Ordinal)
+                ? null
+                : new DriveInfo(root);
+        }
+        catch (Exception ex) when (ex is ArgumentException or IOException or UnauthorizedAccessException)
+        {
+            logger.LogDebug(ex,
+                "Run snapshot: free space on {Directory} cannot be measured; the plan runs unguarded",
+                runDirectory);
+            return null;
+        }
+    }
+
+    /// <summary>Fails the snapshot once the volume it is streaming onto drops below the reserve.
+    /// Sampled every <see cref="CheckDiskEveryRows"/> rows; a no-op when the volume is unknown.
+    ///
+    /// <para>Records into <see cref="Failure"/> rather than throwing, for the same reason the
+    /// constructor does: the planner is mid-iterator and this has to come back as a failed run.
+    /// <see cref="Consume"/> then short-circuits on every subsequent chunk, and
+    /// <c>RunCoordinator.PlanAsync</c> stops the walk instead of scanning a tree it can no longer
+    /// record.</para></summary>
+    private void CheckDiskSpace()
+    {
+        if (_volume is null || _rowsWritten < _nextDiskCheckAt)
+            return;
+        _nextDiskCheckAt = _rowsWritten + CheckDiskEveryRows;
+
+        long free;
+        try
+        {
+            free = _volume.AvailableFreeSpace;
+        }
+        catch (IOException ex)
+        {
+            // The volume went away mid-plan (a removed drive). Stop measuring rather than fail on it —
+            // the next actual write is what will report the real problem, with a better message.
+            _logger.LogDebug(ex, "Run snapshot: free space could not be read; the plan runs unguarded");
+            return;
+        }
+        if (free >= _diskReserveBytes)
+            return;
+
+        _failure =
+            $"the volume holding the run snapshot is nearly full: {free >> 20:N0} MB free, below the " +
+            $"{_diskReserveBytes >> 20:N0} MB reserve, after {_rowsWritten:N0} planned rows. " +
+            "Free space on that volume, or point the runs directory at a larger one.";
+        _logger.LogError(
+            "Run snapshot at {Directory} stopped: {FreeMb} MB free is below the {ReserveMb} MB reserve " +
+            "after {Rows} rows",
+            _directory, free >> 20, _diskReserveBytes >> 20, _rowsWritten);
     }
 
     public int CopyCount { get; private set; }
@@ -114,10 +194,23 @@ internal sealed class RunSnapshotWriter : IDisposable
     /// steady-state pass at 100%.</para></summary>
     public IReadOnlyDictionary<string, int> SweptByTargetRoot => _sweptByTargetRoot;
 
+    /// <summary>The ratio guard's NUMERATOR: orphans tallied by the target root they sit under, a
+    /// subset of <see cref="SweptByTargetRoot"/>'s population.
+    /// <para>Counted here for a reason beyond symmetry. The guard used to derive this itself by
+    /// iterating the deletion list, which meant the caller had to materialize every orphan before the
+    /// guard could decide anything — the one snapshot consumer that did not stream, and unbounded once
+    /// a plan lost its file cap. Tallied during this walk it is one dictionary increment per orphan,
+    /// and the deletion pass reads it from the header in O(1).</para></summary>
+    public IReadOnlyDictionary<string, int> OrphansByTargetRoot => _orphansByTargetRoot;
+
     private readonly Dictionary<string, int> _sweptByTargetRoot = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, int> _orphansByTargetRoot = new(StringComparer.OrdinalIgnoreCase);
 
     private void CountSwept(string targetRoot) =>
         _sweptByTargetRoot[targetRoot] = _sweptByTargetRoot.GetValueOrDefault(targetRoot) + 1;
+
+    private void CountOrphan(string targetRoot) =>
+        _orphansByTargetRoot[targetRoot] = _orphansByTargetRoot.GetValueOrDefault(targetRoot) + 1;
 
     /// <summary>Whether a destination row describes a file that was ALREADY on disk before this run —
     /// which is what the ratio guard is measuring against.
@@ -257,7 +350,13 @@ internal sealed class RunSnapshotWriter : IDisposable
             DeleteCount++;
             DeleteBytes += file.Length;
             CountSwept(file.Root);
+            CountOrphan(file.Root);
         }
+
+        // Per chunk, not per row: the counter is what paces the sample, and a chunk boundary is a point
+        // at which the files on disk are coherent — the same reason RunCoordinator pauses only here.
+        _rowsWritten = SourceCount + DestinationCount + CopyCount + DeleteCount;
+        CheckDiskSpace();
     }
 
     /// <summary>Records one non-orphan destination operation. Both index resolutions are best-effort by

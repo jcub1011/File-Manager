@@ -38,6 +38,18 @@ public sealed class TriggerQueue : ITriggerQueue, IDisposable
     private TaskCompletionSource _wakeup = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private volatile bool _paused;
 
+    // The mirror image of _wakeup, for the other side of the pipe. _wakeup parks the CONSUMER when there
+    // is nothing to serve; this parks a BULK PRODUCER when there is too much already pending. Null
+    // whenever nobody is waiting, so an ordinary dequeue does not allocate or signal anything — the
+    // cost is confined to the case that needs it.
+    //
+    // The case that needs it is a run's copy list. RunCoordinator.EnqueueCopies used to push a whole
+    // snapshot's worth of payloads in one synchronous loop, which was bounded only by the plan's file
+    // cap; with that cap gone it is bounded by nothing, and every pending payload is two live path
+    // strings. See WaitForRoomAsync.
+    private TaskCompletionSource? _room;
+    private int _roomThreshold;
+
     public TriggerQueue(IPauseStateService pauseState, ILogger<TriggerQueue> logger, IRunPauseGate? runPause = null)
     {
         ArgumentNullException.ThrowIfNull(pauseState);
@@ -110,6 +122,7 @@ public sealed class TriggerQueue : ITriggerQueue, IDisposable
     public int DropRun(Guid runId)
     {
         int dropped = 0;
+        TaskCompletionSource? room;
         lock (_gate)
         {
             LinkedListNode<Payload>? node = _queue.First;
@@ -124,7 +137,12 @@ public sealed class TriggerQueue : ITriggerQueue, IDisposable
                 }
                 node = next;
             }
+            // The other way the queue shrinks. A cancel that drops a run's backlog has to release a
+            // producer parked on it, or the cancelling run's own enqueue loop waits for a drain that
+            // just happened and will not happen again.
+            room = TakeRoomSignalIfDrained();
         }
+        room?.TrySetResult();
         if (dropped > 0)
             _logger.LogInformation("Dropped {Count} pending payload(s) for cancelled run {RunId}", dropped, runId);
         return dropped;
@@ -138,6 +156,7 @@ public sealed class TriggerQueue : ITriggerQueue, IDisposable
 
             Payload? next = null;
             Task wait;
+            TaskCompletionSource? room = null;
             lock (_gate)
             {
                 // FirstEligible, not First: a per-run pause filters rather than blocks, so the consumer
@@ -149,12 +168,17 @@ public sealed class TriggerQueue : ITriggerQueue, IDisposable
                     _index.Remove(KeyOf(head.Value));
                     next = head.Value;
                     wait = Task.CompletedTask;
+                    room = TakeRoomSignalIfDrained();
                 }
                 else
                 {
                     wait = _wakeup.Task;   // captured under the lock — see the lost-wakeup note above
                 }
             }
+
+            // Outside the lock, like Wake(): completing a TCS runs continuations, and none of them
+            // should observe this queue mid-dequeue.
+            room?.TrySetResult();
 
             if (next is not null)
             {
@@ -213,6 +237,59 @@ public sealed class TriggerQueue : ITriggerQueue, IDisposable
     {
         if (!paused)
             Wake();
+    }
+
+    /// <summary>Parks a bulk producer until the queue has drained enough to accept more.
+    ///
+    /// <para><b>Why the queue needs a producer side at all.</b> A run's approved copy list is pushed in
+    /// one loop by <c>RunCoordinator.EnqueueCopies</c>, and every pending payload holds two path strings
+    /// until a worker takes it. That was bounded by the plan's 500,000-file cap; the cap is gone,
+    /// because a plan is the work list a run executes and shortening it made a wrong job. So the bound
+    /// moved here, where it belongs: the work list stays on disk in the run snapshot (which is why the
+    /// snapshot exists), and only a working set of it is ever resident.</para>
+    ///
+    /// <para><b>Hysteresis is the point of the second threshold.</b> Resuming the producer the instant
+    /// one payload is dequeued would hand it back a slot at a time and make the whole loop lockstep with
+    /// the workers. It resumes at half <paramref name="highWaterMark"/> instead, so the producer refills
+    /// in batches while the workers keep draining.</para>
+    ///
+    /// <para>Cancellation is the caller's escape hatch and is load-bearing: a run PAUSED with a full
+    /// queue of its own payloads cannot drain itself, so the producer would otherwise park until the
+    /// resume. That is the correct behaviour — a paused run should not be filling memory — but only
+    /// because a cancel or a shutdown can still get it out.</para>
+    ///
+    /// <para>Several producers may wait at once (concurrent runs). They share one signal and each
+    /// re-checks after waking, so a losing racer simply waits again; <see cref="_roomThreshold"/> being
+    /// last-writer-wins only shifts when a wake happens, never whether the check is correct.</para></summary>
+    public async Task WaitForRoomAsync(int highWaterMark, CancellationToken ct)
+    {
+        ArgumentOutOfRangeException.ThrowIfLessThan(highWaterMark, 1);
+        int resumeAt = Math.Max(1, highWaterMark / 2);
+        while (true)
+        {
+            Task wait;
+            lock (_gate)
+            {
+                if (_queue.Count < highWaterMark)
+                    return;
+                _roomThreshold = resumeAt;
+                _room ??= new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                wait = _room.Task;
+            }
+            await wait.WaitAsync(ct).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>The signal to complete when the queue has drained to the waiting producer's threshold,
+    /// or null when there is nobody waiting or it has not drained far enough. Must be called under
+    /// <see cref="_gate"/>, immediately after a removal; the caller completes it outside the lock.</summary>
+    private TaskCompletionSource? TakeRoomSignalIfDrained()
+    {
+        if (_room is null || _queue.Count > _roomThreshold)
+            return null;
+        TaskCompletionSource signal = _room;
+        _room = null;
+        return signal;
     }
 
     private void Wake()

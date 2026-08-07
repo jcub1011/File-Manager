@@ -23,9 +23,10 @@ public class DryRunViewModelBenchmarks
     private DryRunRowStore _store = null!;
     private DryRunCompletion _completion = null!;
 
-    /// <summary>Source files to aggregate; 500k is the engine's <c>MaxStreamedFiles</c> cap — the
-    /// bound on the streamed path the UI actually uses (<c>MaxReportedFiles</c> only guards the
-    /// legacy single-frame batched path).</summary>
+    /// <summary>Source files to aggregate. 500k was the engine's streamed-path cap before plans became
+    /// unbounded; it is kept as the top point because every recorded measurement is against it, but it
+    /// is no longer a ceiling — the UI's cost here is linear in the row count, which is what
+    /// <c>docs/dry-run-ui-memory-next-steps.md</c> is about.</summary>
     [Params(1_000, 10_000, 50_000, 500_000)]
     public int FileCount { get; set; }
 

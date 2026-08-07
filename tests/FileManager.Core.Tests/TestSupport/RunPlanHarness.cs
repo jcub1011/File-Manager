@@ -27,7 +27,12 @@ namespace FileManager.Core.Tests.TestSupport;
 /// the preview described, so a harness that stubbed the planner would test nothing worth testing.</para></summary>
 internal sealed class RunPlanHarness : IDisposable
 {
-    public RunPlanHarness(string label, int? maxScanThreads = 1)
+    /// <param name="maxScanDepth">Lowers the scan's depth ceiling so a test can reach a genuine
+    /// <c>SweepFaulted</c> plan with a handful of nested directories (see <see cref="WriteDeepTarget"/>).
+    /// This is the ONLY way a plan is truncated now that the file-count cap is gone, so the truncation
+    /// tests have to produce a real unwalkable tree rather than dial a number down.
+    /// <c>ScanThreadResolver.ResolveMaxScanDepth</c> clamps at 8, so 8 is the lowest useful value.</param>
+    public RunPlanHarness(string label, int? maxScanThreads = 1, int? maxScanDepth = null)
     {
         Root = Path.Combine(Path.GetTempPath(), $"fm-{label}-" + Guid.NewGuid().ToString("N"));
         SourceDir = Path.Combine(Root, "source");
@@ -38,9 +43,11 @@ internal sealed class RunPlanHarness : IDisposable
         Directory.CreateDirectory(Paths.RunsDirectory);
 
         ThreadBudget budget = maxScanThreads is int n ? ThreadBudget.Explicit(n) : ThreadBudget.Auto;
+        GlobalSettings defaults = GlobalSettings.Default;
         GlobalSettings settings = new()
         {
             ScanThreading = new ScanThreadingSettings { MaxScanThreads = budget, PerDriveDefault = budget },
+            MaxScanDepth = maxScanDepth ?? defaults.MaxScanDepth,
         };
         FakeSettingsProvider settingsProvider = new(settings);
         // Kept so a retention test can rewrite the auto-delete settings the coordinator reads on every
@@ -280,6 +287,12 @@ internal sealed class RunPlanHarness : IDisposable
     {
         RunSnapshotHeader header = Header(runDirectory);
         IReadOnlyList<RunDeleteItem> items = orphans ?? Deletes(runDirectory);
+        // Derived from the items rather than taken from the header, because a test that supplies its own
+        // orphan list expects the counts to describe THAT list. Production reads all three straight off
+        // the header, which is what lets the pass stream the orphans instead of materializing them.
+        Dictionary<string, int> orphansByRoot = new(StringComparer.OrdinalIgnoreCase);
+        foreach (RunDeleteItem item in items)
+            orphansByRoot[item.TargetRoot] = orphansByRoot.GetValueOrDefault(item.TargetRoot) + 1;
         return new MirrorDeletionRequest
         {
             PassId = JobId.New(),
@@ -288,6 +301,9 @@ internal sealed class RunPlanHarness : IDisposable
             RunId = runId ?? header.RunId,
             Profile = profile ?? header.Profile,
             Orphans = items,
+            OrphanCount = items.Count,
+            OrphanBytes = items.Sum(i => i.SizeBytes),
+            OrphansByTargetRoot = orphansByRoot,
             ScopePath = scopePath ?? header.ScopePath,
             PlanTruncated = planTruncated || header.Truncated,
             EnumerationIncomplete = enumerationIncomplete,
@@ -336,16 +352,34 @@ internal sealed class RunPlanHarness : IDisposable
         return absolutePath;
     }
 
+    /// <summary>Writes one file <paramref name="depth"/> directory levels below the target root, so a
+    /// harness built with a lowered <c>maxScanDepth</c> produces a sweep that genuinely cannot finish
+    /// walking the tree — <c>ScanScheduler.ReportDepthCeiling</c> emits a Warning fault, the projector
+    /// folds it into <c>SweepFaulted</c>, and the planner marks the plan truncated.
+    ///
+    /// <para>The ceiling prunes a child at <c>depth &gt; MaxScanDepth</c> counting the root as 0, so
+    /// <paramref name="depth"/> must exceed the harness's ceiling for this to fault at all.</para></summary>
+    public string WriteDeepTarget(int depth, string fileName = "deep.txt", string content = "deep")
+    {
+        string path = TargetDir;
+        for (int i = 1; i <= depth; i++)
+            path = Path.Combine(path, $"l{i}");
+        return Write(Path.Combine(path, fileName), content);
+    }
+
     /// <summary>Plans the profile and writes the snapshot, returning the run directory. Mirrors what
     /// the run coordinator's planning phase does, so the tests exercise that sequence rather than a
     /// convenience shortcut.</summary>
+    /// <param name="diskReserveBytes">The snapshot volume's free-space floor. Zero (the default) means
+    /// the guard can never fire, which is what every test that is not ABOUT the guard wants — a temp
+    /// volume's free space is not something a test may assume anything about.</param>
     public async Task<(string RunDirectory, PlanState State, Result Completion)> PlanAsync(
-        Profile profile, string? scopePath = null, Guid? runId = null, int? maxFiles = null)
+        Profile profile, string? scopePath = null, Guid? runId = null, long diskReserveBytes = 0)
     {
         Guid id = runId ?? Guid.NewGuid();
         string directory = RunSnapshotPaths.DirectoryFor(Paths, id);
-        PlanState state = maxFiles is int cap ? new PlanState { MaxFiles = cap } : new PlanState();
-        using RunSnapshotWriter writer = new(directory, NullLogger.Instance);
+        PlanState state = new();
+        using RunSnapshotWriter writer = new(directory, NullLogger.Instance, diskReserveBytes);
 
         await foreach (Result<PlanChunk, string> chunk in Planner.PlanAsync(profile, scopePath, state))
         {

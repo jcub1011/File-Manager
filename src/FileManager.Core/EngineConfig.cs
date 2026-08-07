@@ -24,8 +24,34 @@ public sealed record EngineConfig
     ///
     /// <para>Note this does NOT bound scan threads — <c>IScanScheduler</c> already applies a global and a
     /// per-drive budget across every walk. This bounds the number of plan-sized working sets alive at
-    /// once.</para></summary>
+    /// once.</para>
+    ///
+    /// <para><b>A plan-sized working set is no longer bounded.</b> The "roughly a gigabyte in the worst
+    /// case" above assumed the 500,000-file cap, which is gone — a plan is the work list a run executes,
+    /// so shortening it produced a wrong job rather than a smaller one. Three is still the right number
+    /// (it is what keeps concurrent previews from multiplying whatever a single plan now costs), but what
+    /// actually protects the service is <see cref="PlanProcessHeapFloorBytes"/> and
+    /// <see cref="PlanSnapshotDiskReserveBytes"/> below.</para></summary>
     public int MaxConcurrentPlans { get; init; } = 3;
+
+    /// <summary>How large this process's managed heap must be before <c>PlanMemoryGuard</c> will fail a
+    /// plan for memory pressure. It is the second of two conditions — the first is that the RUNTIME
+    /// reports the machine at its high-memory-load line — and it exists to keep a plan this service could
+    /// have finished from being killed because some other process is the one exhausting the box.
+    ///
+    /// <para>512 MiB: comfortably above what an ordinary plan reaches (a 33,449-file plan measured ~292 MB
+    /// in the worst pre-optimization case, and far less now), so crossing it while the machine is also at
+    /// its load line genuinely means this plan is a material part of the problem.</para></summary>
+    public long PlanProcessHeapFloorBytes { get; init; } = 512L * 1024 * 1024;
+
+    /// <summary>Free space that must remain on the runs volume while a plan streams its snapshot there.
+    /// Below it the plan FAILS — the same direction as the memory guard, and for the same reason: a
+    /// snapshot that stops short is an executable work list missing entries nobody was told about.
+    ///
+    /// <para>The reserve is what keeps the failure recoverable. Running the volume to actually zero takes
+    /// the journal, the audit logs and everything else on it down with the plan, so the guard stops while
+    /// there is still room to write the failure and clean the directory up.</para></summary>
+    public long PlanSnapshotDiskReserveBytes { get; init; } = 1024L * 1024 * 1024;
 
     /// <summary>Hard cap on how many FINISHED runs the coordinator retains, evicting the oldest-closed
     /// first. Live runs are never candidates.
@@ -59,9 +85,12 @@ public sealed record EngineConfig
     /// and the orphan is SKIPPED rather than waited on.</summary>
     public TimeSpan MirrorLockWaitTimeout { get; init; } = TimeSpan.FromSeconds(5);
 
-    /// <summary>Upper bound on orphans one pass will remove. Crossing it aborts the pass entirely: a
-    /// cap that deletes the first N and abandons the rest is worse than one that refuses and explains.</summary>
-    public int MirrorMaxOrphans { get; init; } = 50_000;
+    // NO MirrorMaxOrphans. There was one (50,000, refusing the whole pass above it), and it is gone.
+    // The deletion count is on the preview footer before anything is approved, so an absolute cap only
+    // ever refused work the user had read the exact number for and agreed to — while capping executable
+    // Mirror work an order of magnitude below what a plan could describe. MirrorMaxDeleteFraction stays,
+    // because a proportion is the thing approval CANNOT check: a TargetLayout flip produces a plausible
+    // count where every orphan is correctly classified, and only the shape gives it away.
 
     /// <summary>Refuse the pass when orphans would account for more than this fraction of the files
     /// swept under a single target root.

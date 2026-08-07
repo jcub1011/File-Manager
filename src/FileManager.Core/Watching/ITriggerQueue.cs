@@ -2,6 +2,7 @@ using FileManager.Core.Jobs;
 using System;
 using System.Collections.Generic;
 using System.Threading;
+using System.Threading.Tasks;
 
 namespace FileManager.Core.Watching;
 
@@ -14,6 +15,14 @@ public interface ITriggerQueue
     /// <c>Enqueue</c> calls: a coalesced payload produces none, and the entry it DISPLACED belonged to
     /// some run that must stop expecting a job for it or its completion barrier waits forever.</para></summary>
     EnqueueOutcome Enqueue(Payload payload);
+
+    /// <summary>Back-pressure for a BULK producer: completes once fewer than
+    /// <paramref name="highWaterMark"/> payloads are pending, parking the caller until then.
+    /// <para>A producer with a handful of payloads (a watcher, the scheduler) has no reason to call
+    /// this. A producer feeding a whole run's approved copy list does: each pending payload holds live
+    /// path strings, and nothing else bounds how many a plan may name. The work list is already durable
+    /// in the run snapshot, so only a working set of it needs to be resident.</para></summary>
+    Task WaitForRoomAsync(int highWaterMark, CancellationToken ct);
 
     IAsyncEnumerable<Payload> DequeueAsync(CancellationToken ct = default);
     int PendingCount { get; }

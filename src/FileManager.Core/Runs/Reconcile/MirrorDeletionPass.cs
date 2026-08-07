@@ -86,7 +86,7 @@ public sealed class MirrorDeletionPass(
             return Aborted(request, MirrorReconcileOutcome.AbortedBeforeDeleting, refusal);
         }
 
-        if (request.Orphans.Count == 0)
+        if (request.OrphanCount == 0)
             return new MirrorDeletionResult
             {
                 PassId = request.PassId,
@@ -94,9 +94,9 @@ public sealed class MirrorDeletionPass(
             };
 
         // ---- open: from here the pass is on the record -------------------------------------------
-        long orphanBytes = 0;
-        foreach (RunDeleteItem orphan in request.Orphans)
-            orphanBytes += orphan.SizeBytes;
+        // Count and bytes come from the snapshot header rather than a pre-pass over the orphans: the
+        // sequence is walked once, below, and a plan with no file cap can name arbitrarily many.
+        long orphanBytes = request.OrphanBytes;
 
         if (TryAppend(new MirrorReconcileOpenedRecord
         {
@@ -107,14 +107,14 @@ public sealed class MirrorDeletionPass(
             RunId = request.RunId,
             Timing = request.Profile.Policies.MirrorDeletion,
             TargetRoots = [.. TargetRoots(request.Profile)],
-            OrphanCount = request.Orphans.Count,
+            OrphanCount = request.OrphanCount,
             OrphanBytes = orphanBytes,
         }) is { } openError)
         {
             // Nothing durable exists and nothing has been touched, so this is still a clean refusal.
             return Aborted(request, MirrorReconcileOutcome.AbortedBeforeDeleting, openError);
         }
-        Log(request, $"opened: {request.Orphans.Count} orphan(s), {orphanBytes} byte(s), timing={request.Profile.Policies.MirrorDeletion}");
+        Log(request, $"opened: {request.OrphanCount} orphan(s), {orphanBytes} byte(s), timing={request.Profile.Policies.MirrorDeletion}");
 
         // ---- the deletion loop -------------------------------------------------------------------
         int deleted = 0, skipped = 0, consecutiveJournalFailures = 0;
@@ -396,24 +396,27 @@ public sealed class MirrorDeletionPass(
         if (pauseState.IsPaused)
             return "the engine is paused";
 
-        if (request.Orphans.Count > config.MirrorMaxOrphans)
-            return $"the plan names {request.Orphans.Count} files to delete, above the {config.MirrorMaxOrphans} safety limit";
-
+        // NO absolute orphan-count gate. There used to be one (50,000), and it was the wrong shape of
+        // protection: the user reads the exact deletion count on the preview footer and approves THAT
+        // number, so a second opinion expressed as a constant only ever refused work someone had
+        // already looked at and agreed to. It also capped executable Mirror work an order of magnitude
+        // below what a plan could describe. What a count cannot catch is caught below instead.
         return RefuseOnRatio(request);
     }
 
-    /// <summary>Refuses a pass that would remove most of a target root.
+    /// <summary>Refuses a pass that would remove most of a target root. <b>The only shape guard left</b>,
+    /// now that the absolute orphan cap is gone — and the one that was always doing the real work.
     /// <para>The mistakes this catches — a <c>TargetLayout</c> flip, or a source share that remounted
     /// empty — produce a plan in which every existing destination file is legitimately, correctly
-    /// classified as an orphan. Every other gate reports green. Only the shape of the result is
-    /// suspicious, so only a proportion test can catch it.</para></summary>
+    /// classified as an orphan. Every other gate reports green, and the COUNT looks entirely plausible,
+    /// which is exactly why reading it on the footer and approving does not protect anyone here. Only
+    /// the shape of the result is suspicious, so only a proportion test can catch it.</para>
+    /// <para>Both sides of the ratio come from the snapshot header, tallied during the plan's own walk.
+    /// The numerator used to be counted by iterating the orphan list, which is what forced the caller to
+    /// materialize it before this gate could run at all.</para></summary>
     private string? RefuseOnRatio(MirrorDeletionRequest request)
     {
-        Dictionary<string, int> orphansByRoot = new(StringComparer.OrdinalIgnoreCase);
-        foreach (RunDeleteItem orphan in request.Orphans)
-            orphansByRoot[orphan.TargetRoot] = orphansByRoot.GetValueOrDefault(orphan.TargetRoot) + 1;
-
-        foreach ((string root, int orphans) in orphansByRoot)
+        foreach ((string root, int orphans) in request.OrphansByTargetRoot)
         {
             if (orphans < config.MirrorRatioFloor)
                 continue;

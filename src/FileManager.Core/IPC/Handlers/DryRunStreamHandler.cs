@@ -35,17 +35,6 @@ public sealed class DryRunStreamHandler(
     /// only an uncontended increment.</summary>
     private static readonly TimeSpan ProgressInterval = TimeSpan.FromMilliseconds(100);
 
-    /// <summary>Bound on the files a single streamed report forwards to the client, surfaced via
-    /// <see cref="DryRunCompleteResponse.Truncated"/>. This is the user-visible half of the safety
-    /// bound; the engine independently caps its candidate buffer at the same
-    /// <see cref="DryRunEngine.MaxStreamedFiles"/> so memory and evaluation are bounded even before
-    /// the first chunk. Against the real engine this emitted cap is a redundant backstop — the
-    /// engine's candidate cap fires first (filtering only ever reduces the count), so this rarely
-    /// trips. It is kept for defense in depth against a future engine that streams differently, and
-    /// is independently testable via the seam below.
-    /// Test seam: shrunk so truncation is reachable without half a million files.</summary>
-    internal int MaxStreamedFiles { get; init; } = DryRunEngine.MaxStreamedFiles;
-
     /// <summary>Test seam. Production (the IPC server) serializes each frame before requesting the
     /// next, so the converter reuses the previous frame's wire DTOs (see
     /// <see cref="WireChunkConverter"/>). An in-proc consumer that BUFFERS responses across advances
@@ -116,14 +105,14 @@ public sealed class DryRunStreamHandler(
         // frames stay throttled no matter how fast files are found.
         DryRunProgressCounters progressCounters = new();
         // The planner's running totals, truncation flags, and (on completion) space projection.
-        PlanState plan = new() { MaxFiles = MaxStreamedFiles };
+        PlanState plan = new();
 
         await using (IAsyncEnumerator<Result<PlanChunk, string>> chunks = planner
             .PlanAsync(profile, typed.ScopePath, plan, progressCounters, runCts.Token)
             .GetAsyncEnumerator(runCts.Token))
         {
             // The engine's whole scan+evaluate pipeline runs inside the FIRST MoveNextAsync (no chunk
-            // exists before the full evaluated set is sorted), and a big sweep can spend seconds
+            // exists before the whole tree has been walked and spooled), and a big sweep can spend seconds
             // between chunks — so discovery progress is merged into the stream by polling the shared
             // counters while each advance is pending. Only a changed count is worth a frame: a
             // stalled phase goes quiet instead of repeating itself.

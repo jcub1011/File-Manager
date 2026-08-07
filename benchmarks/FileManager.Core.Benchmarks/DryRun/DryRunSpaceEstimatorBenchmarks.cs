@@ -20,8 +20,10 @@ public class DryRunSpaceEstimatorBenchmarks
 {
     private const int ChunkSize = 2_000;
 
-    /// <summary>Total destination operations folded per invocation. 100k ≈ a large real run; 500k is
-    /// the engine's streaming candidate cap (<see cref="DryRunEngine.MaxStreamedFiles"/>).</summary>
+    /// <summary>Total destination operations folded per invocation. 100k ≈ a large real run; 500k was
+    /// the engine's streaming candidate cap before plans became unbounded, and is kept as the
+    /// large-scale point so these numbers stay comparable with the ones already recorded against
+    /// it.</summary>
     [Params(100_000, 500_000)]
     public int OperationCount { get; set; }
 

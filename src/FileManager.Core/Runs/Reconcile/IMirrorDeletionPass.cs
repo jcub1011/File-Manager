@@ -33,17 +33,39 @@ public sealed record MirrorDeletionRequest
     /// profile edited while the run was awaiting approval cannot change what gets deleted.</summary>
     public required Profile Profile { get; init; }
 
-    /// <summary>The orphans to remove, read back from the run's snapshot. This is the same list the
-    /// preview displayed and the user approved; the pass computes nothing of its own.</summary>
-    public required IReadOnlyList<RunDeleteItem> Orphans { get; init; }
+    /// <summary>The orphans to remove, read back from the run's snapshot. This is the same set the
+    /// preview displayed and the user approved; the pass computes nothing of its own.
+    ///
+    /// <para><b>Enumerated exactly once, and lazily.</b> It used to be an <c>IReadOnlyList</c>, which
+    /// meant the caller materialized every orphan before the pass could even decide whether to refuse —
+    /// the one snapshot consumer that did not stream, and unbounded now that a plan has no file cap.
+    /// Everything the pass needs BEFORE the loop is a scalar the plan already counted, so those come in
+    /// beside this rather than out of it: <see cref="OrphanCount"/>, <see cref="OrphanBytes"/> and
+    /// <see cref="OrphansByTargetRoot"/>. Implementations must not enumerate this more than once.</para></summary>
+    public required IEnumerable<RunDeleteItem> Orphans { get; init; }
+
+    /// <summary>How many orphans <see cref="Orphans"/> will yield, from the snapshot header. Separate
+    /// from the sequence because every use of it — the nothing-to-do check, the opened record, the log
+    /// line — happens before the sequence may be walked.</summary>
+    public required int OrphanCount { get; init; }
+
+    /// <summary>The bytes those orphans hold, from the snapshot header, for the same reason as
+    /// <see cref="OrphanCount"/>. Counted during the plan's own walk, so it costs nothing here.</summary>
+    public required long OrphanBytes { get; init; }
+
+    /// <summary>Orphans per target root — the ratio guard's numerator, against
+    /// <see cref="SweptFilesByTargetRoot"/> as its denominator. Tallied by the plan alongside the
+    /// denominator (same walk, same pass), so the guard can run before a single orphan is read.</summary>
+    public required IReadOnlyDictionary<string, int> OrphansByTargetRoot { get; init; }
 
     /// <summary>Non-null when the run was narrowed to a path rather than covering the whole profile.
     /// Any value at all refuses the pass: a narrowed plan's orphan list would include everything
     /// outside the scope.</summary>
     public string? ScopePath { get; init; }
 
-    /// <summary>The plan hit a file/entry bound or could not fully walk a tree, so its orphan list is
-    /// a guess. Refuses the pass.</summary>
+    /// <summary>The plan could not fully walk a tree, so its orphan list is a guess. Refuses the pass.
+    /// <para>Once also set by a file-count bound; that bound is gone, and a sweep fault is now the only
+    /// thing that raises this.</para></summary>
     public required bool PlanTruncated { get; init; }
 
     /// <summary>Part of the source or destination tree could not be read (an unreadable subdirectory,

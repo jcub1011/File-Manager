@@ -364,26 +364,24 @@ public sealed class DestinationProjectorTests : IDisposable
     // pairing and the reported Root are.
 
     private sealed record StreamedSweep(
-        List<PhysicalFile> Files, List<VirtualFileOperation> Ops, bool Capped, bool Faulted, List<int> ChunkSizes);
+        List<PhysicalFile> Files, List<VirtualFileOperation> Ops, bool Faulted, List<int> ChunkSizes);
 
     private static async Task<StreamedSweep> SweepStream(
-        DestinationProjector projector, Profile profile, int maxEntries = int.MaxValue,
+        DestinationProjector projector, Profile profile,
         int indexBase = 0, int chunkByteBudget = DryRunEngine.WireChunkByteBudget, bool truncated = false)
     {
         List<PhysicalFile> files = [];
         List<VirtualFileOperation> ops = [];
         List<int> chunkSizes = [];
-        bool capped = false;
         bool faulted = false;
         SurvivorSet survivors = new();
         await foreach (Result<DryRunChunk, string> result in projector.SweepStreamAsync(
-            profile, survivors, truncated, maxEntries, indexBase, chunkByteBudget,
+            profile, survivors, truncated, indexBase, chunkByteBudget,
             progress: null, CancellationToken.None))
         {
             Assert.False(result.TryGetError(out string? error), error);
             result.TryGetValue(out DryRunChunk? chunk);
-            capped |= chunk!.SweepCapped;
-            faulted |= chunk.SweepFaulted;
+            faulted |= chunk!.SweepFaulted;
             // Chunks carry destination entries only — there is no source half in a sweep.
             Assert.Empty(chunk.SourceFiles);
             Assert.Empty(chunk.SourceOperations);
@@ -414,7 +412,7 @@ public sealed class DestinationProjectorTests : IDisposable
                     Detail = o.Detail,
                 });
         }
-        return new StreamedSweep(files, ops, capped, faulted, chunkSizes);
+        return new StreamedSweep(files, ops, faulted, chunkSizes);
     }
 
     [Fact]
@@ -434,7 +432,7 @@ public sealed class DestinationProjectorTests : IDisposable
         Assert.Equal(
             batched.Files.Select(f => f.Path).ToHashSet(StringComparer.OrdinalIgnoreCase),
             streamed.Files.Select(f => f.Path).ToHashSet(StringComparer.OrdinalIgnoreCase));
-        Assert.False(streamed.Capped);
+        Assert.False(streamed.Faulted);
     }
 
     [Fact]
@@ -506,7 +504,7 @@ public sealed class DestinationProjectorTests : IDisposable
         List<DryRunChunkResponse> frames = [];
         SurvivorSet survivors = new();
         await foreach (Result<DryRunChunk, string> result in projector.SweepStreamAsync(
-            Mirror(), survivors, truncated: false, int.MaxValue, 0, 800, progress: null, CancellationToken.None))
+            Mirror(), survivors, truncated: false, 0, 800, progress: null, CancellationToken.None))
         {
             result.TryGetValue(out DryRunChunk? chunk);
             frames.Add(converter.Convert(chunk!));
@@ -524,19 +522,22 @@ public sealed class DestinationProjectorTests : IDisposable
     }
 
     [Fact]
-    public async Task Streamed_sweep_marks_capped_when_the_entry_budget_trips()
+    public async Task Streamed_sweep_emits_every_orphan_with_no_entry_budget()
     {
+        // Replaces the capped-budget test. The streamed sweep used to take the remainder of the plan's
+        // 500,000-file bound; it has none, because an orphan the preview never showed is one a Mirror
+        // run then refuses to delete — the budget turned "a large target tree" into "this profile
+        // cannot be mirrored". The batched Sweep keeps its cap (a response-frame limit); see
+        // Batched_sweep_applies_its_entry_budget below, which still pins that.
+        HashSet<string> expected = [];
         for (int i = 0; i < 50; i++)
-            TargetFile(Path.Combine($"d{i % 5}", $"f{i}.txt"));
+            expected.Add(TargetFile(Path.Combine($"d{i % 5}", $"f{i}.txt")));
 
-        const int budget = 10;
-        StreamedSweep streamed = await SweepStream(NewProjector(Workers), Mirror(), maxEntries: budget);
+        StreamedSweep streamed = await SweepStream(NewProjector(Workers), Mirror());
 
-        Assert.True(streamed.Capped);
-        Assert.True(
-            streamed.Files.Count <= budget,
-            $"emitted {streamed.Files.Count} entries against a budget of {budget}");
+        Assert.Equal(expected, streamed.Files.Select(f => f.Path).ToHashSet(StringComparer.OrdinalIgnoreCase));
         Assert.Equal(streamed.Files.Count, streamed.Ops.Count);   // still whole (file, op) pairs
+        Assert.False(streamed.Faulted);
     }
 
     [Fact]
@@ -567,7 +568,7 @@ public sealed class DestinationProjectorTests : IDisposable
 
         Assert.Empty(streamed.Files);
         Assert.Empty(streamed.Ops);
-        Assert.False(streamed.Capped);
+        Assert.False(streamed.Faulted);
     }
 
     [Fact]
@@ -610,8 +611,8 @@ public sealed class DestinationProjectorTests : IDisposable
         IAsyncEnumerator<Result<DryRunChunk, string>> stream = NewProjector(Workers)
             .SweepStreamAsync(
                 Mirror(), new SurvivorSet(), truncated: false,
-                maxEntries: int.MaxValue, destinationIndexBase: 0, chunkByteBudget: 800,
-                progress: null, CancellationToken.None)
+                destinationIndexBase: 0, chunkByteBudget: 800,
+                progress: null, ct: CancellationToken.None)
             .GetAsyncEnumerator(CancellationToken.None);
 
         Assert.True(await stream.MoveNextAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(30)),

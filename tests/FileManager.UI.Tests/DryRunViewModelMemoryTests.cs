@@ -9,8 +9,10 @@ using Xunit.Abstractions;
 namespace FileManager.UI.Tests;
 
 /// <summary>Measures what <see cref="DryRunViewModel.ApplyReport"/> leaves on the retained heap at
-/// the engine's <c>MaxStreamedFiles</c> cap (500k source files) — the number a populated dry-run
-/// preview holds for its lifetime. BenchmarkDotNet's Allocated column is per-op allocation, not
+/// 500,000 source files — the number a populated dry-run preview holds for its lifetime. That figure
+/// was the engine's streamed-path cap; plans are unbounded now, so it is a reference point rather than
+/// a worst case, and the cost it measures is linear in the row count.
+/// BenchmarkDotNet's Allocated column is per-op allocation, not
 /// retention, so this probe is the gauge for the memory-optimization work. Filter with
 /// <c>dotnet test --filter Category=Memory</c>; it builds a 500k-file report and is slow.</summary>
 /// <remarks>Pinned to a non-parallel collection: <see cref="GC.GetTotalMemory(bool)"/> measures the

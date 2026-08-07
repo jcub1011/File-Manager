@@ -46,11 +46,6 @@ public readonly record struct PlanChunk(
 /// consumer needs these values <em>while</em> it streams, not only at the end.</summary>
 public sealed class PlanState
 {
-    /// <summary>Bound on the files one plan covers. Both phases share it: the source phase stops
-    /// emitting past it, and the sweep's budget is what remains. Defaults to the engine's streamed
-    /// cap; a test shrinks it so truncation is reachable without half a million files.</summary>
-    public int MaxFiles { get; init; } = DryRunEngine.MaxStreamedFiles;
-
     /// <summary>Source files covered so far — also the base for the next chunk's source indices.</summary>
     public int SourceFiles { get; internal set; }
 
@@ -66,10 +61,15 @@ public sealed class PlanState
     /// projector's own running position is added to. Zero until the sweep starts.</summary>
     public int SweepIndexBase { get; internal set; }
 
-    /// <summary>Set when the plan does not cover everything it was asked to: the source scan hit its
-    /// candidate bound, the sweep hit its entry bound, or the sweep could not fully walk a target
-    /// root. A truncated plan's orphan judgements are unsound — a file no source appears to write to
-    /// may well be written by an un-evaluated source — so a Mirror deletion must never act on one.</summary>
+    /// <summary>Set when the plan does not cover everything it was asked to, which now means exactly
+    /// one thing: the sweep could not fully walk a target root. The two COUNT bounds that used to set
+    /// it are gone (see <c>DryRunEngine</c>'s note above <c>PipelineBufferCapacity</c>) — a plan is the
+    /// work list that gets executed, so a bound that shortened it produced a wrong job. A plan that
+    /// would exhaust memory or the snapshot volume now FAILS, with a message naming the resource,
+    /// rather than quietly completing short.
+    /// <para>A truncated plan's orphan judgements are unsound — a file no source appears to write to
+    /// may well be written by an un-evaluated source — so a Mirror deletion must never act on
+    /// one.</para></summary>
     public bool Truncated { get; internal set; }
 
     /// <summary>The first Warning-severity sweep fault's message (it already names the path), for the
@@ -96,11 +96,16 @@ public sealed class PlanState
 /// entire value of the preview, and under <see cref="SyncMode.Mirror"/> a live run that deletes
 /// something the preview did not show is data loss. So the sequencing that turns a profile into work
 /// lives here, once: run the source phase, accumulate the survivor set from its destination
-/// operations, OR the scan's truncation in <em>before</em> the sweep (a prefix-only survivor set makes
-/// every orphan call untrustworthy), gate the sweep on
-/// <see cref="Profile.EffectiveScanDestination"/>, and bound it by what is left of the file budget.
-/// <c>DryRunStreamHandler</c> renders the result to the wire; the run pipeline writes it to a
-/// snapshot and then executes it. Neither owns the arithmetic.</para></summary>
+/// operations, carry any incompleteness in <em>before</em> the sweep (a prefix-only survivor set makes
+/// every orphan call untrustworthy), and gate the sweep on
+/// <see cref="Profile.EffectiveScanDestination"/>. <c>DryRunStreamHandler</c> renders the result to the
+/// wire; the run pipeline writes it to a snapshot and then executes it. Neither owns the
+/// arithmetic.</para>
+///
+/// <para><b>Neither phase is bounded by a file count.</b> Both used to share a 500,000-file budget; it
+/// is gone, because the plan this produces is executed and a shortened plan is a wrong job. The
+/// resource that can actually run out is checked instead — see <see cref="PlanMemoryGuard"/> — and it
+/// fails the plan rather than truncating it.</para></summary>
 public sealed class ProfilePlanner(
     ILogger<ProfilePlanner> logger,
     IDryRunEngine engine,
@@ -138,6 +143,10 @@ public sealed class ProfilePlanner(
         // by — never the file objects. A SurvivorSet rather than a HashSet<NormalizedPath> so the
         // sweep can probe it by span, with no per-file path string.
         SurvivorSet survivors = new();
+
+        // The file-count cap's replacement (see PlanMemoryGuard). Per-plan, so a long-lived service does
+        // not carry one plan's sampling position into the next.
+        PlanMemoryGuard memory = new(config.PlanProcessHeapFloorBytes);
 
         // Folds one slice into the estimator and (source phase only) the survivor set, then advances
         // the index bases. Ordering is load-bearing and matches what the wire handler did inline: the
@@ -182,20 +191,19 @@ public sealed class ProfilePlanner(
                     }
                     chunk.TryGetValue(out DryRunChunk? slice);
 
-                    // The engine sets ScanTruncated once its candidate scan is cut short. OR it in
-                    // BEFORE the sweep so a prefix-only survivor set can never drive a bogus
-                    // Mirror-deletion plan.
-                    state.Truncated |= slice!.ScanTruncated;
-                    (int sourceBase, int destinationBase) = Fold(slice, collectSurvivors: true);
-                    yield return new PlanChunk(slice, PlanPhase.Sources, sourceBase, destinationBase);
+                    (int sourceBase, int destinationBase) = Fold(slice!, collectSurvivors: true);
+                    yield return new PlanChunk(slice!, PlanPhase.Sources, sourceBase, destinationBase);
 
-                    if (state.SourceFiles >= state.MaxFiles)
+                    // Where the old file-count cap used to break. It fails rather than truncates, and
+                    // it names the resource — see PlanMemoryGuard for why that swap is the whole point.
+                    // Checked here, after the survivor fold, because the survivor set is the plan's one
+                    // remaining structure that grows with the file count.
+                    if (memory.Check(state.SourceFiles) is { } exhausted)
                     {
-                        logger.LogWarning(
-                            "Plan for profile {ProfileId} hit the {Cap:N0}-file safety bound; work list truncated",
-                            profile.Id, state.MaxFiles);
-                        state.Truncated = true;
-                        break;
+                        logger.LogError(
+                            "Plan for profile {ProfileId} stopped: {Reason}", profile.Id, exhausted);
+                        yield return exhausted;
+                        yield break;
                     }
                     moveNext = chunks.MoveNextAsync().AsTask();
                 }
@@ -232,7 +240,7 @@ public sealed class ProfilePlanner(
 
         await using (IAsyncEnumerator<Result<DryRunChunk, string>> sweepChunks = destinationProjector
             .SweepStreamAsync(
-                profile, survivors, state.Truncated, Math.Max(0, state.MaxFiles - state.DestinationFiles),
+                profile, survivors, state.Truncated,
                 state.SweepIndexBase, ChunkByteBudget, progress, planCts.Token)
             .GetAsyncEnumerator(planCts.Token))
         {
@@ -251,14 +259,7 @@ public sealed class ProfilePlanner(
                     }
                     sweepChunk.TryGetValue(out DryRunChunk? sweepSlice);
 
-                    if (sweepSlice!.SweepCapped)
-                    {
-                        logger.LogWarning(
-                            "Plan for profile {ProfileId}: the destination sweep hit the {Cap:N0}-entry bound; work list truncated",
-                            profile.Id, state.MaxFiles);
-                        state.Truncated = true;
-                    }
-                    if (sweepSlice.SweepFaulted)
+                    if (sweepSlice!.SweepFaulted)
                     {
                         logger.LogWarning(
                             "Plan for profile {ProfileId}: the destination sweep could not fully walk one or more " +
@@ -269,8 +270,8 @@ public sealed class ProfilePlanner(
                     }
 
                     state.SweptFiles += sweepSlice.DestinationFiles.Count;
-                    // The capped/faulted signal rides an empty chunk; there is nothing to fold and
-                    // nothing a consumer should render for it.
+                    // The fault signal rides an empty chunk; there is nothing to fold and nothing a
+                    // consumer should render for it.
                     if (sweepSlice.DestinationFiles.Count == 0)
                     {
                         sweepMoveNext = sweepChunks.MoveNextAsync().AsTask();
@@ -279,6 +280,17 @@ public sealed class ProfilePlanner(
                     (int sweepSourceBase, int sweepDestinationBase) = Fold(sweepSlice, collectSurvivors: false);
                     yield return new PlanChunk(
                         sweepSlice, PlanPhase.Destinations, sweepSourceBase, sweepDestinationBase);
+
+                    // Same guard as the source phase: the sweep grows nothing per-file itself, but it
+                    // runs on top of whatever the source phase left resident.
+                    if (memory.Check(state.SourceFiles + state.DestinationFiles) is { } sweepExhausted)
+                    {
+                        logger.LogError(
+                            "Plan for profile {ProfileId} stopped during the destination sweep: {Reason}",
+                            profile.Id, sweepExhausted);
+                        yield return sweepExhausted;
+                        yield break;
+                    }
 
                     sweepMoveNext = sweepChunks.MoveNextAsync().AsTask();
                 }

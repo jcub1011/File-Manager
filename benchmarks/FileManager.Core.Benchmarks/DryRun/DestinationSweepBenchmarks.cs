@@ -94,9 +94,9 @@ public class DestinationSweepBenchmarks
     {
         int count = 0;
         await foreach (Result<DryRunChunk, string> item in _projector.SweepStreamAsync(
-            _profile, new SurvivorSet(), truncated: false, maxEntries: int.MaxValue,
+            _profile, new SurvivorSet(), truncated: false,
             destinationIndexBase: 0, chunkByteBudget: DryRunEngine.WireChunkByteBudget,
-            progress: null, default))
+            progress: null, ct: default))
         {
             if (item.TryGetValue(out DryRunChunk? chunk))
                 count += chunk.DestinationFiles.Count;

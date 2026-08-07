@@ -68,7 +68,7 @@ public sealed class DryRunStreamHandlerTests
     }
 
     private static DryRunStreamHandler NewHandler(
-        Profile profile, IDryRunEngine engine, int maxStreamedFiles, IEngineEventBus? eventBus = null)
+        Profile profile, IDryRunEngine engine, IEngineEventBus? eventBus = null)
     {
         FileSystemService fileSystem = new(NullLogger<FileSystemService>.Instance);
         ScanScheduler scheduler = new(NullLogger<ScanScheduler>.Instance, fileSystem, new FakeSettingsProvider());
@@ -77,7 +77,7 @@ public sealed class DryRunStreamHandlerTests
             eventBus ?? new EngineEventBus(NullLogger<EngineEventBus>.Instance), NullMemoryTrimCoordinator.Instance)
         // These tests buffer whole-stream frame lists (Collect) and inspect chunk contents after the
         // fact, so wire-DTO recycling must be off; Wire_frames_are_byte_identical... covers on-vs-off.
-        { MaxStreamedFiles = maxStreamedFiles, RecycleWireRecords = false };
+        { RecycleWireRecords = false };
     }
 
     /// <summary>The planner the handler delegates its phase sequencing to, over a REAL
@@ -101,14 +101,14 @@ public sealed class DryRunStreamHandlerTests
     }
 
     /// <summary>Builds a handler whose catalog is empty, so only an inline profile can drive a run.</summary>
-    private static DryRunStreamHandler NewHandlerEmptyCatalog(IDryRunEngine engine, int maxStreamedFiles)
+    private static DryRunStreamHandler NewHandlerEmptyCatalog(IDryRunEngine engine)
     {
         FileSystemService fileSystem = new(NullLogger<FileSystemService>.Instance);
         ScanScheduler scheduler = new(NullLogger<ScanScheduler>.Instance, fileSystem, new FakeSettingsProvider());
         return new(NullLogger<DryRunStreamHandler>.Instance, NewPlanner(engine, scheduler),
             new FakeCatalog(), TimeProvider.System,
             new EngineEventBus(NullLogger<EngineEventBus>.Instance), NullMemoryTrimCoordinator.Instance)
-        { MaxStreamedFiles = maxStreamedFiles, RecycleWireRecords = false };
+        { RecycleWireRecords = false };
     }
 
     /// <summary>A real source/target pair on disk, so the destination sweep actually walks something.
@@ -165,7 +165,7 @@ public sealed class DryRunStreamHandlerTests
             NewPlanner(new FakeStreamEngine(totalFiles: 100, chunkSize: 7), scheduler),
             new FakeCatalog(profile), TimeProvider.System,
             new EngineEventBus(NullLogger<EngineEventBus>.Instance), NullMemoryTrimCoordinator.Instance)
-        { MaxStreamedFiles = 1_000, RecycleWireRecords = recycle };
+        { RecycleWireRecords = recycle };
     }
 
     /// <summary>The load-bearing guard for wire-DTO recycling: with recycling ON (production — the
@@ -246,24 +246,27 @@ public sealed class DryRunStreamHandlerTests
     }
 
     [Fact]
-    public async Task Truncates_and_marks_the_completion_when_the_emitted_cap_is_reached()
+    public async Task Forwards_every_file_the_engine_streams_and_marks_nothing_truncated()
     {
+        // Replaces the emitted-cap test. The handler had its own file bound on top of the engine's,
+        // "for defense in depth"; both are gone, because a streamed plan is the work list a run
+        // executes and forwarding a prefix of it is a wrong job rather than a shorter preview. 100
+        // files through a handler that once stopped at 8 is the regression this pins.
         Profile profile = TestProfiles.Valid();
-        DryRunStreamHandler handler = NewHandler(profile, new FakeStreamEngine(totalFiles: 100, chunkSize: 4), maxStreamedFiles: 8);
+        DryRunStreamHandler handler = NewHandler(profile, new FakeStreamEngine(totalFiles: 100, chunkSize: 4));
 
         List<IpcResponse> frames = await Collect(handler, profile.Id);
 
         DryRunCompleteResponse complete = Assert.IsType<DryRunCompleteResponse>(frames[^1]);
-        Assert.True(complete.Truncated);
-        int emitted = frames.OfType<DryRunChunkResponse>().Sum(c => c.SourceFiles.Count);
-        Assert.Equal(8, emitted);   // stops at the cap rather than forwarding all 100
+        Assert.False(complete.Truncated);
+        Assert.Equal(100, frames.OfType<DryRunChunkResponse>().Sum(c => c.SourceFiles.Count));
     }
 
     [Fact]
-    public async Task Does_not_mark_the_completion_when_the_report_fits_under_the_cap()
+    public async Task Does_not_mark_the_completion_for_an_ordinary_report()
     {
         Profile profile = TestProfiles.Valid();
-        DryRunStreamHandler handler = NewHandler(profile, new FakeStreamEngine(totalFiles: 8, chunkSize: 4), maxStreamedFiles: 500);
+        DryRunStreamHandler handler = NewHandler(profile, new FakeStreamEngine(totalFiles: 8, chunkSize: 4));
 
         List<IpcResponse> frames = await Collect(handler, profile.Id);
 
@@ -320,7 +323,7 @@ public sealed class DryRunStreamHandlerTests
         List<EngineEvent> events = [];
         using IDisposable sub = bus.Subscribe(events.Add);
         DryRunStreamHandler handler = NewHandler(
-            profile, new SkippingStreamEngine(totalFiles: 4, skipped: 3), maxStreamedFiles: 500, eventBus: bus);
+            profile, new SkippingStreamEngine(totalFiles: 4, skipped: 3), eventBus: bus);
 
         List<IpcResponse> frames = await Collect(handler, profile.Id);
 
@@ -340,7 +343,7 @@ public sealed class DryRunStreamHandlerTests
         List<EngineEvent> events = [];
         using IDisposable sub = bus.Subscribe(events.Add);
         DryRunStreamHandler handler = NewHandler(
-            profile, new SkippingStreamEngine(totalFiles: 4, skipped: 0), maxStreamedFiles: 500, eventBus: bus);
+            profile, new SkippingStreamEngine(totalFiles: 4, skipped: 0), eventBus: bus);
 
         await Collect(handler, profile.Id);
 
@@ -351,7 +354,7 @@ public sealed class DryRunStreamHandlerTests
     public async Task Unknown_profile_is_a_single_PROFILE_NOT_FOUND_frame()
     {
         Profile profile = TestProfiles.Valid();
-        DryRunStreamHandler handler = NewHandler(profile, new FakeStreamEngine(totalFiles: 4, chunkSize: 4), maxStreamedFiles: 500);
+        DryRunStreamHandler handler = NewHandler(profile, new FakeStreamEngine(totalFiles: 4, chunkSize: 4));
 
         List<IpcResponse> frames = await Collect(handler, Guid.NewGuid());
 
@@ -364,7 +367,7 @@ public sealed class DryRunStreamHandlerTests
     {
         Profile draft = TestProfiles.Valid();
         DryRunStreamHandler handler = NewHandlerEmptyCatalog(
-            new FakeStreamEngine(totalFiles: 4, chunkSize: 4), maxStreamedFiles: 500);
+            new FakeStreamEngine(totalFiles: 4, chunkSize: 4));
 
         // Empty catalog → the id alone is unknown; the inline draft drives the run instead.
         List<IpcResponse> frames = await Collect(handler,
@@ -436,7 +439,7 @@ public sealed class DryRunStreamHandlerTests
                 SourceOperations: [Op(@"C:\src\a.dat", @"C:\src", OperationKind.Processed, 0)],
                 DestinationOperations: [Op(written, target, OperationKind.New, 0)]);
 
-            DryRunStreamHandler handler = NewHandler(profile, new ScriptedStreamEngine(chunk), maxStreamedFiles: 500);
+            DryRunStreamHandler handler = NewHandler(profile, new ScriptedStreamEngine(chunk));
             List<IpcResponse> frames = await Collect(handler, profile.Id);
 
             List<DryRunOperation> deleted = frames.OfType<DryRunChunkResponse>()
@@ -481,7 +484,7 @@ public sealed class DryRunStreamHandlerTests
             // Scan off (the default): no destination-only Untouched row despite the file on disk.
             Profile off = TestProfiles.Valid(source, target);   // AdditiveArchive, ScanDestination = false
             List<IpcResponse> offFrames = await Collect(
-                NewHandler(off, new ScriptedStreamEngine(Chunk()), maxStreamedFiles: 500), off.Id);
+                NewHandler(off, new ScriptedStreamEngine(Chunk())), off.Id);
             Assert.DoesNotContain(
                 offFrames.OfType<DryRunChunkResponse>().SelectMany(f => f.DestinationOperations.Kind),
                 k => k == OperationKind.Untouched);
@@ -489,7 +492,7 @@ public sealed class DryRunStreamHandlerTests
             // Scan on: the sweep runs and surfaces the pre-existing file as Untouched.
             Profile on = off with { ScanDestination = true };
             List<IpcResponse> onFrames = await Collect(
-                NewHandler(on, new ScriptedStreamEngine(Chunk()), maxStreamedFiles: 500), on.Id);
+                NewHandler(on, new ScriptedStreamEngine(Chunk())), on.Id);
             Assert.Contains(
                 onFrames.OfType<DryRunChunkResponse>().SelectMany(f => DryRunColumns.ToRecords(f.DestinationOperations)),
                 o => o.Kind == OperationKind.Untouched && o.FileName.Contains("preexisting"));
@@ -500,46 +503,14 @@ public sealed class DryRunStreamHandlerTests
         }
     }
 
-    [Fact]
-    public async Task Scan_truncation_suppresses_the_mirror_sweep_and_marks_the_report_truncated()
-    {
-        string root = Path.Combine(Path.GetTempPath(), "fm-drs-" + Guid.NewGuid().ToString("N"));
-        string source = Path.Combine(root, "source");
-        string target = Path.Combine(root, "target");
-        Directory.CreateDirectory(source);
-        Directory.CreateDirectory(target);
-        try
-        {
-            // Orphans exist on disk, but the scan was cut short — a prefix-only survivor set must NOT
-            // drive a (bogus) Mirror-deletion preview.
-            File.WriteAllText(Path.Combine(target, "orphan1.txt"), "x");
-            File.WriteAllText(Path.Combine(target, "orphan2.txt"), "x");
-
-            Profile profile = TestProfiles.Valid(source, target) with { SyncMode = SyncMode.Mirror };
-
-            DryRunChunk truncatedChunk = new(
-                SourceFiles: [Phys(@"C:\src\a.dat", @"C:\src")],
-                DestinationFiles: [],
-                SourceOperations: [Op(@"C:\src\a.dat", @"C:\src", OperationKind.Processed, 0)],
-                DestinationOperations: [],
-                ScanTruncated: true);
-
-            DryRunStreamHandler handler = NewHandler(profile, new ScriptedStreamEngine(truncatedChunk), maxStreamedFiles: 500);
-            List<IpcResponse> frames = await Collect(handler, profile.Id);
-
-            Assert.Empty(DeletedKinds(frames));   // no orphan deletions previewed despite files on disk
-
-            DryRunCompleteResponse complete = Assert.IsType<DryRunCompleteResponse>(frames[^1]);
-            Assert.True(complete.Truncated);
-        }
-        finally
-        {
-            Directory.Delete(root, recursive: true);
-        }
-    }
+    // The two cap tests that stood here — scan truncation suppressing the sweep, and the sweep hitting
+    // its share of the file budget — are gone with the bounds they drove. The soundness gate they were
+    // really about (a truncated plan must never preview deletions) survives at the layer that still has
+    // a way to be truncated: DestinationProjectorTests.Streamed_sweep_emits_nothing_when_the_source_pass_truncated
+    // for the projector, and RunSnapshotTests for the sweep-fault path that now sets the flag.
 
     [Fact]
-    public async Task Sweep_hitting_the_entry_cap_marks_the_report_truncated()
+    public async Task Sweep_previews_every_orphan_with_no_entry_cap()
     {
         string root = Path.Combine(Path.GetTempPath(), "fm-drs-" + Guid.NewGuid().ToString("N"));
         string source = Path.Combine(root, "source");
@@ -553,20 +524,20 @@ public sealed class DryRunStreamHandlerTests
 
             Profile profile = TestProfiles.Valid(source, target) with { SyncMode = SyncMode.Mirror };
 
-            // A single source file keeps the source phase under the cap, so it is the sweep that trips
-            // the bound: sweepBudget == MaxStreamedFiles (3) - destinationCount (0) < the 5 orphans.
             DryRunChunk chunk = new(
                 SourceFiles: [Phys(@"C:\src\a.dat", @"C:\src")],
                 DestinationFiles: [],
                 SourceOperations: [Op(@"C:\src\a.dat", @"C:\src", OperationKind.Processed, 0)],
                 DestinationOperations: []);
 
-            DryRunStreamHandler handler = NewHandler(profile, new ScriptedStreamEngine(chunk), maxStreamedFiles: 3);
+            DryRunStreamHandler handler = NewHandler(profile, new ScriptedStreamEngine(chunk));
             List<IpcResponse> frames = await Collect(handler, profile.Id);
 
-            Assert.Equal(3, DeletedKinds(frames).Count);   // capped at the sweep budget
+            // All five, where a budget of 3 used to show three and call the report truncated. An orphan
+            // the preview hides is one the user approves a deletion pass without ever having seen.
+            Assert.Equal(5, DeletedKinds(frames).Count);
             DryRunCompleteResponse complete = Assert.IsType<DryRunCompleteResponse>(frames[^1]);
-            Assert.True(complete.Truncated);
+            Assert.False(complete.Truncated);
         }
         finally
         {
@@ -604,7 +575,7 @@ public sealed class DryRunStreamHandlerTests
     public async Task Interleaves_throttled_progress_frames_without_disturbing_the_report()
     {
         Profile profile = TestProfiles.Valid();
-        DryRunStreamHandler handler = NewHandler(profile, new SlowScanEngine(), maxStreamedFiles: 500);
+        DryRunStreamHandler handler = NewHandler(profile, new SlowScanEngine());
 
         List<IpcResponse> frames = await Collect(handler, profile.Id);
 
@@ -699,7 +670,7 @@ public sealed class DryRunStreamHandlerTests
         new(NullLogger<DryRunStreamHandler>.Instance, NewPlanner(engine, scheduler),
             new FakeCatalog(profile), TimeProvider.System,
             new EngineEventBus(NullLogger<EngineEventBus>.Instance), NullMemoryTrimCoordinator.Instance)
-        { MaxStreamedFiles = 1_000_000, RecycleWireRecords = false };
+        { RecycleWireRecords = false };
 
     [Fact]
     public async Task Teardown_completes_when_the_stream_is_abandoned_mid_sweep()

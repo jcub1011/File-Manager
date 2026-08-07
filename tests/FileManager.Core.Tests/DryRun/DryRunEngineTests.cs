@@ -69,22 +69,19 @@ public sealed class DryRunEngineTests : IDisposable
     private static DryRunEngine NewEngine(int reportByteBudget, GlobalSettings global) =>
         NewEngine(reportByteBudget, DryRunEngine.WireChunkByteBudget, global);
 
-    private static DryRunEngine NewEngine(int reportByteBudget, int chunkByteBudget, GlobalSettings global) =>
-        NewEngine(reportByteBudget, chunkByteBudget, DryRunEngine.MaxStreamedFiles, global);
-
-    /// <summary>Shrinks the batched path's candidate cap, which also bounds its destination sweep.</summary>
+    /// <summary>Shrinks the batched path's candidate cap, which also bounds its destination sweep. The
+    /// STREAMED path has no equivalent knob any more — it has no candidate cap to shrink.</summary>
     private static DryRunEngine NewEngineWithBatchCap(int maxBatchCandidates) =>
         NewEngine(
-            DryRunEngine.MaxReportBytes, DryRunEngine.WireChunkByteBudget, DryRunEngine.MaxStreamedFiles,
+            DryRunEngine.MaxReportBytes, DryRunEngine.WireChunkByteBudget,
             GlobalSettings.Default, maxBatchCandidates);
 
     private static DryRunEngine NewEngine(
-        int reportByteBudget, int chunkByteBudget, int maxScannedCandidates, GlobalSettings global) =>
-        NewEngine(reportByteBudget, chunkByteBudget, maxScannedCandidates, global, DryRunEngine.MaxReportedFiles);
+        int reportByteBudget, int chunkByteBudget, GlobalSettings global) =>
+        NewEngine(reportByteBudget, chunkByteBudget, global, DryRunEngine.MaxReportedFiles);
 
     private static DryRunEngine NewEngine(
-        int reportByteBudget, int chunkByteBudget, int maxScannedCandidates, GlobalSettings global,
-        int maxBatchCandidates)
+        int reportByteBudget, int chunkByteBudget, GlobalSettings global, int maxBatchCandidates)
     {
         FileSystemService fileSystem = new(NullLogger<FileSystemService>.Instance);
         FakeSettings settings = new(global);
@@ -101,7 +98,6 @@ public sealed class DryRunEngineTests : IDisposable
         {
             ReportByteBudget = reportByteBudget,
             ChunkByteBudget = chunkByteBudget,
-            MaxScannedCandidates = maxScannedCandidates,
             MaxBatchCandidates = maxBatchCandidates,
         };
     }
@@ -717,22 +713,26 @@ public sealed class DryRunEngineTests : IDisposable
     // ----- streaming (SimulateStreamAsync) -----
 
     [Fact]
-    public async Task Stream_caps_the_candidate_buffer_at_the_scan_safety_bound()
+    public async Task Stream_reports_every_candidate_with_no_safety_bound()
     {
-        // The candidate buffer must be bounded so a pathological scan can't buffer (and hash) an
-        // unbounded number of files before the first chunk. A tiny cap truncates the scan to a
-        // bounded subset rather than materializing all 20.
+        // The inverse of the cap test this replaces. The streamed path used to stop at 500,000
+        // candidates; it no longer stops at all, because the stream IS the work list a run executes and
+        // a prefix of it is a wrong job rather than a smaller one. The bound the cap was standing in for
+        // is now measured directly (PlanMemoryGuard / the snapshot's disk reserve), and it FAILS a plan
+        // instead of shortening one.
+        //
+        // Twenty files cannot prove "unbounded", and no test can. What it does pin is that the engine
+        // has no knob left to truncate WITH: the seam a cap would need is gone from the type, so this
+        // stops compiling if one comes back.
         for (int i = 0; i < 20; i++)
             SourceFile($"{i:D3}.txt", $"content {i}");
         Profile profile = ProfileUnderTest();
 
-        DryRunEngine engine = NewEngine(
-            DryRunEngine.MaxReportBytes, DryRunEngine.WireChunkByteBudget, maxScannedCandidates: 5,
-            GlobalSettings.Default);
-        List<(string SourcePath, OperationKind Kind)> streamed = await CollectStream(engine, profile);
+        List<(string SourcePath, OperationKind Kind)> streamed = await CollectStream(NewEngine(), profile);
 
-        Assert.Equal(5, streamed.Count);
+        Assert.Equal(20, streamed.Count);
     }
+
 
     [Fact]
     public async Task Stream_yields_the_same_results_as_the_batched_report_regardless_of_order()

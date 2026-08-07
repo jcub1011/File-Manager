@@ -236,6 +236,10 @@ public sealed class JobOrchestratorTests : IDisposable
 
         public EnqueueOutcome Enqueue(Payload payload) => new(Queued: true, Displaced: null);
 
+        /// <summary>Never full — this fake exists to test the dequeue side's fault handling, and the
+        /// orchestrator is not a bulk producer.</summary>
+        public Task WaitForRoomAsync(int highWaterMark, CancellationToken ct) => Task.CompletedTask;
+
         public int DropRun(Guid runId) => 0;
 
         public int PendingCountForRun(Guid runId) => 0;

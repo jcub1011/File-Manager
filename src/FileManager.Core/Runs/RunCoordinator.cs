@@ -102,6 +102,21 @@ public sealed class RunCoordinator(
     /// <see cref="EngineConfig.MaxConcurrentPlans"/> previews were on screen.</summary>
     private readonly SemaphoreSlim _planSlots = new(config.MaxConcurrentPlans, config.MaxConcurrentPlans);
 
+    /// <summary>Pending payloads at which <see cref="EnqueueCopiesAsync"/> stops feeding the queue and
+    /// waits for the workers to catch up (resuming at half of it — see
+    /// <see cref="ITriggerQueue.WaitForRoomAsync"/>).
+    ///
+    /// <para>Sized to be irrelevant to throughput and relevant to memory. It is orders of magnitude
+    /// above <c>MaxWorkers</c>, so the pool can never be starved by a producer that is momentarily
+    /// parked; and at roughly a few hundred bytes of live path strings per payload it holds the queue's
+    /// share of a run to single-digit MB no matter how many files the plan names. A run of 20 files
+    /// never reaches it at all, so the ordinary case is unchanged.</para>
+    ///
+    /// <para>Not configurable, deliberately. It is a backstop rather than a knob: there is no workload
+    /// where a user wants a different answer here, only one where they want the run to finish, and this
+    /// does not change whether it does.</para></summary>
+    private const int EnqueueHighWaterMark = 8_192;
+
     /// <summary>Drains closed runs while the service is idle. Lazily created on the first
     /// <see cref="Begin"/>, so a host that never runs anything never arms a timer, and disposed by
     /// <see cref="StopAsync"/>.</summary>
@@ -571,7 +586,7 @@ public sealed class RunCoordinator(
             }
             slotHeld = true;
 
-            using RunSnapshotWriter writer = new(directory, logger);
+            using RunSnapshotWriter writer = new(directory, logger, config.PlanSnapshotDiskReserveBytes);
             // Real time, not the injected clock, and for the same reason the poll heartbeat below is: the
             // two intervals gate the same samples, so a run driven by a FakeTimeProvider would otherwise
             // have a throttle that never elapses and a heartbeat that always does — every between-chunk
@@ -671,6 +686,16 @@ public sealed class RunCoordinator(
                             ? RunPlanStages.Sweeping
                             : RunPlanStages.Building;
                         writer.Consume(planned, run.Profile);
+                        // Observed HERE and not only after the loop, which is where it used to be. With no
+                        // file cap on the plan, a snapshot that has already failed — the volume filled, a
+                        // write threw — would otherwise let the walk run to the end of an arbitrarily large
+                        // tree with every remaining chunk silently discarded. The run is doomed either way;
+                        // this stops it from spending an hour getting there.
+                        if (writer.Failure is { } writeFailed)
+                        {
+                            failure = writeFailed;
+                            break;
+                        }
                         // Between chunks, never mid-chunk: the writer has just consumed a complete chunk, so
                         // this is a point at which the snapshot on disk is coherent and the enumerator holds
                         // no half-read directory. Pausing inside the planner would mean holding scan-scheduler
@@ -739,6 +764,7 @@ public sealed class RunCoordinator(
                     RenameCount = writer.RenameCount,
                     DisposalCount = writer.DisposalCount,
                     SweptFilesByTargetRoot = writer.SweptByTargetRoot,
+                    OrphansByTargetRoot = writer.OrphansByTargetRoot,
                     Truncated = state.Truncated,
                     SweepFaultDetail = state.SweepFaultDetail,
                     Space = state.Space,
@@ -856,7 +882,7 @@ public sealed class RunCoordinator(
 
             if (!run.Cancelled)
             {
-                EnqueueCopies(run, header);
+                await EnqueueCopiesAsync(run, header).ConfigureAwait(false);
             }
             else
             {
@@ -893,14 +919,43 @@ public sealed class RunCoordinator(
     }
 
     /// <summary>Turns the snapshot's copy items into payloads. Each carries the run id so its job
-    /// settles this run's barrier and so a cancel can drop what has not started.</summary>
-    private void EnqueueCopies(RunState run, RunSnapshotHeader header)
+    /// settles this run's barrier and so a cancel can drop what has not started.
+    ///
+    /// <para><b>Paced against the queue, not pushed in one go.</b> This used to drain the whole copy
+    /// file into <c>TriggerQueue</c> in a single synchronous loop, which was survivable only because the
+    /// plan could not name more than 500,000 files. That cap is gone — a plan is the work list a run
+    /// executes, so shortening it produced a wrong job — and every pending payload holds two live path
+    /// strings, so an unpaced push makes the queue as large as the plan. The work list is already
+    /// durable in the snapshot (which is the reason the snapshot exists), so only a working set of it
+    /// needs to be resident; the reader below is lazy and simply stops pulling while the queue is
+    /// full.</para>
+    ///
+    /// <para>Nothing about the barrier's accounting changes. <c>Expected</c> is still incremented inside
+    /// the loop, per payload, on exactly the same condition — only the loop's pacing is new — and
+    /// <c>EnqueueComplete</c> still flips once, after the last item.</para></summary>
+    private async Task EnqueueCopiesAsync(RunState run, RunSnapshotHeader header)
     {
         DateTimeOffset now = time.GetUtcNow();
         foreach (RunCopyItem item in RunSnapshotReader.ReadCopies(run.Directory!, logger))
         {
             if (run.Cancelled || _shutdown.IsCancellationRequested)
                 break;
+
+            // Park while the queue is full. Cancellation is what makes this safe to await: a run PAUSED
+            // with a full queue of its own payloads cannot drain itself, and the shutdown token plus the
+            // Cancelled check above are how it still gets out. A cancel also calls DropRun, which
+            // releases this directly.
+            try
+            {
+                await queue.WaitForRoomAsync(EnqueueHighWaterMark, _shutdown.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                break;   // shutdown — the same exit the loop's own guard takes, not a failed run
+            }
+            if (run.Cancelled)
+                break;   // may have been cancelled while parked
+
             // Metadata deliberately null: JobPlanFactory re-stats, so the executor sees current truth
             // and its own screen/unchanged gates stay authoritative.
             EnqueueOutcome outcome = queue.Enqueue(new Payload(
@@ -1019,8 +1074,11 @@ public sealed class RunCoordinator(
 
     private async Task DeleteOrphansAsync(RunState run, RunSnapshotHeader header)
     {
-        List<RunDeleteItem> orphans = [.. RunSnapshotReader.ReadDeletes(run.Directory!, logger)];
-        if (orphans.Count == 0)
+        // The count comes from the header, and the items are handed over as the lazy reader — NOT
+        // materialized. This was the one snapshot consumer that built a list, and it did so before the
+        // gate that would refuse the pass had even run; with no file cap on a plan, that list is
+        // unbounded. Everything the pass needs up front is a figure the plan already counted.
+        if (header.DeleteItemCount == 0)
             return;
 
         HashSet<string> written;
@@ -1029,7 +1087,12 @@ public sealed class RunCoordinator(
         int unreadable;
         lock (run.Gate)
         {
-            written = new HashSet<string>(run.PathsWritten, StringComparer.OrdinalIgnoreCase);
+            // Handed OVER, not copied. The run's jobs have all settled by the time the deletion phase
+            // runs, so nothing will add to it again, and the close clears it regardless — duplicating
+            // every written path (one string per copied file) bought nothing. RunState takes a fresh
+            // empty set so a late settle has somewhere harmless to land, exactly as it did when this
+            // was a copy.
+            written = run.TakePathsWritten();
             // Dropped counts with Failed here and nowhere else. To this gate the two are the same fact
             // — a file from the approved list whose copy did not land — and the pass must refuse either
             // way, or it reconciles the destination against a source set it never finished copying.
@@ -1043,7 +1106,10 @@ public sealed class RunCoordinator(
             PassId = JobId.New(),
             RunId = run.RunId,
             Profile = header.Profile,
-            Orphans = orphans,
+            Orphans = RunSnapshotReader.ReadDeletes(run.Directory!, logger),
+            OrphanCount = header.DeleteItemCount,
+            OrphanBytes = header.DeleteBytes,
+            OrphansByTargetRoot = header.OrphansByTargetRoot,
             ScopePath = header.ScopePath,
             PlanTruncated = header.Truncated,
             // Three distinct ways of not knowing enough, all reaching the same gate: part of the
@@ -1053,7 +1119,7 @@ public sealed class RunCoordinator(
             EnumerationIncomplete = header.SweepFaultDetail is not null || unreadable > 0 || timedOut,
             CopyJobsFailed = failed,
             PathsWrittenByThisRun = written,
-            SweptFilesByTargetRoot = SweptByRoot(header, orphans),
+            SweptFilesByTargetRoot = SweptByRoot(header),
         }, _shutdown.Token).ConfigureAwait(false);
 
         lock (run.Gate)
@@ -1084,23 +1150,14 @@ public sealed class RunCoordinator(
     /// <c>SkippedUnchanged</c> and produces no copy item, so a synchronized profile's denominator
     /// collapsed to its own orphan count and the guard refused every steady-state pass at 100%.</para>
     ///
-    /// <para>A snapshot predating the header field falls back to the orphan tally alone, which refuses
-    /// the pass: an under-estimate can only make the guard stricter, which is the safe direction for a
-    /// guard whose job is to refuse.</para></summary>
-    private static IReadOnlyDictionary<string, int> SweptByRoot(
-        RunSnapshotHeader header, IReadOnlyList<RunDeleteItem> orphans)
-    {
-        if (header.SweptFilesByTargetRoot.Count > 0)
-            return new Dictionary<string, int>(header.SweptFilesByTargetRoot, StringComparer.OrdinalIgnoreCase);
-
-        // A snapshot from before the header carried the counts. The orphans alone are all that can be
-        // recovered, which makes every root look 100% orphaned and refuses the pass — the strict
-        // direction, and the right one for a plan whose survivor set cannot be established.
-        Dictionary<string, int> swept = new(StringComparer.OrdinalIgnoreCase);
-        foreach (RunDeleteItem orphan in orphans)
-            swept[orphan.TargetRoot] = swept.GetValueOrDefault(orphan.TargetRoot) + 1;
-        return swept;
-    }
+    /// <para>A snapshot predating the header field falls back to the header's ORPHAN tally, making every
+    /// root look 100% orphaned and refusing the pass: an under-estimate can only make the guard stricter,
+    /// which is the safe direction for a guard whose job is to refuse. That fallback used to tally the
+    /// orphan list here, which is one of the two reasons the caller had to materialize it.</para></summary>
+    private static IReadOnlyDictionary<string, int> SweptByRoot(RunSnapshotHeader header) =>
+        header.SweptFilesByTargetRoot.Count > 0
+            ? new Dictionary<string, int>(header.SweptFilesByTargetRoot, StringComparer.OrdinalIgnoreCase)
+            : new Dictionary<string, int>(header.OrphansByTargetRoot, StringComparer.OrdinalIgnoreCase);
 
     // ---- lifecycle plumbing ------------------------------------------------------------------------
 
@@ -1508,7 +1565,21 @@ public sealed class RunCoordinator(
 
         /// <summary>Every destination path this run's jobs actually resolved — the deletion pass's
         /// self-write guard.</summary>
-        public HashSet<string> PathsWritten { get; } = new(StringComparer.OrdinalIgnoreCase);
+        public HashSet<string> PathsWritten { get; private set; } = new(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>Hands the accumulated set to the deletion pass and leaves a fresh empty one behind.
+        /// Call under <see cref="Gate"/>.
+        /// <para>A transfer rather than a copy. Every job of this run has settled by the time the
+        /// deletion phase runs, so the set is complete and nothing more will be added — copying it
+        /// duplicated one string per copied file for no reader. The replacement matters anyway: a late
+        /// settle (a barrier that timed out rather than completed) then lands somewhere harmless instead
+        /// of mutating a set the pass is enumerating, which is the same outcome the copy gave.</para></summary>
+        public HashSet<string> TakePathsWritten()
+        {
+            HashSet<string> taken = PathsWritten;
+            PathsWritten = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            return taken;
+        }
 
         public RunStatus Snapshot()
         {
@@ -1579,8 +1650,10 @@ public sealed class RunCoordinator(
         public void ReleaseAfterClose()
         {
             // The unbounded one: one string per file this run copied, ~8-10 MB for a 33k-file run. Its
-            // only consumer is DeleteOrphansAsync, which copies it into its own set before the deletion
-            // pass runs — and the deletion pass finishes before Close is reached.
+            // only consumer is DeleteOrphansAsync, which TAKES it (leaving a fresh empty set here) before
+            // the deletion pass runs — and the deletion pass finishes before Close is reached. So this
+            // is usually already empty; it still runs, because a non-Mirror run never populated it and a
+            // run that closed without a deletion phase never handed it over.
             PathsWritten.Clear();
             PathsWritten.TrimExcess();
 

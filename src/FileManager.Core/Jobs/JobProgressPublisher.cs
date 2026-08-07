@@ -16,7 +16,7 @@ public sealed class JobProgressPublisher(Guid jobId, IEngineEventBus bus, TimePr
     : IProgress<JobProgress>
 {
     /// <summary>Minimum gap between published frames. Matches DryRunStreamHandler's ProgressInterval.
-    /// Internal purely as a test seam (mirrors DryRunStreamHandler.MaxStreamedFiles) — it is not
+    /// Internal purely as a test seam (mirrors DryRunStreamHandler.RecycleWireRecords) — it is not
     /// user-configurable, and deliberately not in EngineConfig, which is not settings-bound.</summary>
     internal TimeSpan Interval { get; init; } = TimeSpan.FromMilliseconds(100);
 

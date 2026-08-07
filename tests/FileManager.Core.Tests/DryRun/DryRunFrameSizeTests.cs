@@ -164,7 +164,7 @@ public sealed class DryRunFrameSizeTests
             new EngineEventBus(NullLogger<EngineEventBus>.Instance), NullMemoryTrimCoordinator.Instance)
         // Sizes are serialized inline, but CollectWithSizes also buffers the frame OBJECTS for the
         // post-hoc swept-count check — recycling would corrupt those (the seam's documented case).
-        { MaxStreamedFiles = 1_000_000, RecycleWireRecords = false };
+        { RecycleWireRecords = false };
 
     private static async Task<List<(IpcResponse Frame, int Bytes)>> CollectWithSizes(
         DryRunStreamHandler handler, Guid profileId)

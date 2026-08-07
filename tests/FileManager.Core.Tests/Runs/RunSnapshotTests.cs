@@ -325,33 +325,44 @@ public sealed class RunSnapshotTests
 
     // ---- truncation: the safety flag -------------------------------------------------------------
 
+    // A plan is truncated by ONE thing now: a destination tree the sweep could not finish walking. The
+    // file-count bound that used to produce the flag is gone — a plan is the work list a run executes,
+    // so a bound that shortened it made a wrong job rather than a small one. These tests reach the flag
+    // the only way that is left, by walking a tree deeper than the scan's depth ceiling.
+
     [Fact]
-    public async Task A_plan_that_hit_its_file_bound_is_marked_truncated_and_names_NO_deletions()
+    public async Task A_plan_whose_sweep_could_not_finish_walking_the_target_is_marked_truncated()
     {
-        using RunPlanHarness h = new("snap-truncated");
+        using RunPlanHarness h = new("snap-truncated", maxScanDepth: 8);
         for (int i = 0; i < 12; i++)
             h.WriteSource($"f{i}.txt", new string('x', i + 1));
         h.WriteTarget("orphan.txt", "orphaned");
+        // One level past the ceiling, so the sweep prunes and reports rather than descending.
+        h.WriteDeepTarget(depth: 9);
 
-        (string dir, PlanState state, _) = await h.PlanAsync(h.MirrorProfile(), maxFiles: 3);
+        (string dir, PlanState state, _) = await h.PlanAsync(h.MirrorProfile());
 
         Assert.True(state.Truncated);
+        Assert.NotNull(state.SweepFaultDetail);
         Assert.True(RunPlanHarness.Header(dir).Truncated);
-        // The survivor set is a prefix, so every "no source writes here" judgement is untrustworthy.
-        // The sweep is suppressed entirely rather than allowed to fabricate deletions — this is the
-        // single most important safety property of the whole feature.
-        Assert.Empty(RunPlanHarness.Deletes(dir));
+        // NOTE the snapshot still NAMES deletions — the fault is only known once the walk is over, so
+        // the entries it did find are already written. The safety property lives one stage later:
+        // MirrorDeletionPass refuses any pass whose plan is truncated, whatever the delete list says.
+        // See the deletion-gate tests, which drive that refusal directly.
+        Assert.Contains(RunPlanHarness.Deletes(dir), d => d.Path.EndsWith("orphan.txt", StringComparison.Ordinal));
     }
 
     [Fact]
     public async Task A_truncated_plan_carries_no_space_projection()
     {
-        using RunPlanHarness h = new("snap-trunc-space");
+        using RunPlanHarness h = new("snap-trunc-space", maxScanDepth: 8);
         for (int i = 0; i < 12; i++)
             h.WriteSource($"f{i}.txt", "x");
+        h.WriteDeepTarget(depth: 9);
 
-        (string dir, _, _) = await h.PlanAsync(h.MirrorProfile(), maxFiles: 2);
+        (string dir, PlanState state, _) = await h.PlanAsync(h.MirrorProfile());
 
+        Assert.True(state.Truncated);
         // Totals over a partial graph would be unsound, and "will it fit" must never be answered
         // optimistically.
         Assert.Null(RunPlanHarness.Header(dir).Space);

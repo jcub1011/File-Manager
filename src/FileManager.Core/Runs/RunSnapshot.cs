@@ -92,6 +92,20 @@ public sealed record RunSnapshotHeader
     public IReadOnlyDictionary<string, int> SweptFilesByTargetRoot { get; init; } =
         new Dictionary<string, int>();
 
+    /// <summary>Orphans under each target root — the NUMERATOR the ratio guard measures against
+    /// <see cref="SweptFilesByTargetRoot"/>.
+    /// <para>Recorded for the same reason as the denominator, plus one of its own: the guard used to
+    /// derive this by iterating the deletion list, which forced the coordinator to materialize every
+    /// orphan before the guard could refuse anything. With no file cap on a plan that list is unbounded,
+    /// so the tally moved into the walk that was already counting the denominator — one dictionary
+    /// increment per orphan, and an O(1) read at the gate.</para>
+    /// <para>Empty for a snapshot written before this existed, in which case the ratio guard finds no
+    /// roots to check. That is why <c>RunCoordinator.SweptByRoot</c> falls back to this dictionary for a
+    /// header with no swept counts: both empty means both stay empty, and a header carrying orphans but
+    /// no survivors reads as 100% orphaned and refuses.</para></summary>
+    public IReadOnlyDictionary<string, int> OrphansByTargetRoot { get; init; } =
+        new Dictionary<string, int>();
+
     /// <summary>Set when the plan does not cover everything it was asked to (the source scan or the
     /// destination sweep hit a bound, or a target root could not be fully walked).
     /// <para><b>Load-bearing for safety.</b> A truncated plan's orphan set is unsound — a file that

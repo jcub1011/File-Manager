@@ -157,10 +157,14 @@ public sealed class DestinationProjector(
     /// <paramref name="destinationIndexBase"/> plus its own file's position across the whole stream,
     /// so the caller appends chunks in receive order and nothing needs re-indexing.</para>
     ///
-    /// <para>A capped sweep is reported by a trailing empty chunk with
-    /// <see cref="DryRunChunk.SweepCapped"/> set — the cap is only known once the walk ends, and a
-    /// marker frame is cheaper than buffering a chunk to back-fill the flag. <c>ScanTruncated</c>
-    /// cannot carry this: the caller ORs that in before the sweep even starts.</para>
+    /// <para><b>The streamed sweep has no entry bound.</b> It used to take the remainder of the plan's
+    /// 500,000-file budget; that budget is gone, because a swept orphan the user was never shown is one
+    /// a Mirror run then refuses to delete — the cap turned "a large target tree" into "this profile
+    /// cannot be mirrored". The BATCHED <see cref="Sweep"/> keeps its <c>maxEntries</c>, which is a
+    /// response-frame limit rather than a policy one. The walk still reports a fault it could not read
+    /// past, on a trailing empty chunk with <see cref="DryRunChunk.SweepFaulted"/> set — that is only
+    /// known once the walk ends, and a marker frame is cheaper than buffering a chunk to back-fill
+    /// the flag.</para>
     ///
     /// <para><b>Ownership contract:</b> a yielded chunk's file/op entries are pooled carriers
     /// (<see cref="SweepCarrierPool"/>), valid only until the consumer requests the NEXT chunk —
@@ -172,7 +176,7 @@ public sealed class DestinationProjector(
     /// so both phases put frames of the same size on the wire.</param>
     public async IAsyncEnumerable<Result<DryRunChunk, string>> SweepStreamAsync(
         Profile profile, SurvivorSet survivors, bool truncated,
-        int maxEntries, int destinationIndexBase, int chunkByteBudget,
+        int destinationIndexBase, int chunkByteBudget,
         DryRunProgressCounters? progress, [EnumeratorCancellation] CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(profile);
@@ -181,7 +185,9 @@ public sealed class DestinationProjector(
         if (truncated)
             yield break;
 
-        SweepBudget budget = new(maxEntries);
+        // Unbounded: TryReserve short-circuits on int.MaxValue, so the walk's per-candidate check costs
+        // a comparison and never touches the shared counter.
+        SweepBudget budget = new(int.MaxValue);
         if (PlanWalk(profile, survivors, budget) is not { } plan)
             yield break;
 
@@ -210,7 +216,7 @@ public sealed class DestinationProjector(
 
         Task producer = Task.Run(
             () => ProduceChunksAsync(
-                plan, channel.Writer, pool, budget, maxEntries, destinationIndexBase, chunkByteBudget, progress,
+                plan, channel.Writer, pool, destinationIndexBase, chunkByteBudget, progress,
                 producerStop.Token),
             CancellationToken.None);
 
@@ -278,8 +284,8 @@ public sealed class DestinationProjector(
     /// <summary>The streamed path's producer: walks, classifies, packs entries into byte-budgeted
     /// chunks with global indices, and completes the channel (with the fault, if it threw).</summary>
     private async Task ProduceChunksAsync(
-        WalkPlan plan, ChannelWriter<DryRunChunk> writer, SweepCarrierPool pool, SweepBudget budget,
-        int maxEntries, int destinationIndexBase, int chunkByteBudget,
+        WalkPlan plan, ChannelWriter<DryRunChunk> writer, SweepCarrierPool pool,
+        int destinationIndexBase, int chunkByteBudget,
         DryRunProgressCounters? progress, CancellationToken ct)
     {
         try
@@ -288,18 +294,10 @@ public sealed class DestinationProjector(
             List<IFileOperationView> ops = pool.RentOpList();
             long bytes = 0;
             int emitted = 0;
-            // The walk's SweepBudget is a best-effort early exit shared by its workers; this serial
-            // emitter is the single writer, so its own count is the authoritative cap.
-            bool capped = false;
 
             foreach (Candidate candidate in EnumerateCandidates(plan, ct))
             {
                 progress?.DestinationDiscovered();
-                if (emitted >= maxEntries)
-                {
-                    capped = true;
-                    break;   // more survived than the budget allows
-                }
 
                 // Rented carriers, not fresh records — every field is (re)assigned because a rented
                 // carrier keeps its previous non-string fields. The location is the (directory,
@@ -346,15 +344,12 @@ public sealed class DestinationProjector(
             if (files.Count > 0)
                 await writer.WriteAsync(new DryRunChunk([], files, [], ops), ct).ConfigureAwait(false);
 
-            bool sweepCapped = capped || budget.Capped;
-            bool sweepFaulted = plan.FaultTracker.WarningCount > 0;
-            if (sweepCapped || sweepFaulted)
+            if (plan.FaultTracker.WarningCount > 0)
                 await writer.WriteAsync(
                     new DryRunChunk(
                         [], [], [], [],
-                        SweepCapped: sweepCapped,
-                        SweepFaulted: sweepFaulted,
-                        SweepFaultDetail: sweepFaulted ? plan.FaultTracker.FirstMessage : null),
+                        SweepFaulted: true,
+                        SweepFaultDetail: plan.FaultTracker.FirstMessage),
                     ct).ConfigureAwait(false);
             writer.Complete();
         }

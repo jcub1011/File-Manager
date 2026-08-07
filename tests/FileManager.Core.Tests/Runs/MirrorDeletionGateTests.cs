@@ -25,6 +25,60 @@ public sealed class MirrorDeletionGateTests
         return (h, dir, orphan);
     }
 
+    /// <summary>Wraps an orphan sequence and counts how many times something walks it, so a test can
+    /// assert the pass streams rather than re-reads. Yields lazily — a pass that enumerated this while
+    /// deciding whether to REFUSE would be caught by <see cref="Enumerations"/> being non-zero on a
+    /// refused pass.</summary>
+    private sealed class CountingOrphans(IEnumerable<RunDeleteItem> inner) : IEnumerable<RunDeleteItem>
+    {
+        public int Enumerations { get; private set; }
+
+        public IEnumerator<RunDeleteItem> GetEnumerator()
+        {
+            Enumerations++;
+            return inner.GetEnumerator();
+        }
+
+        System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();
+    }
+
+    [Fact]
+    public async Task The_pass_walks_the_orphan_sequence_exactly_once()
+    {
+        // The contract that lets RunCoordinator hand over a lazy snapshot reader instead of a
+        // materialized list — the one snapshot consumer that used to build one, before the gate that
+        // might refuse the pass had even run. With no file cap on a plan that list is unbounded, so a
+        // second walk here would either re-read the whole file or force the caller back to a List.
+        using RunPlanHarness h = new("gate-stream-once");
+        h.WriteSource("kept.txt", "kept");
+        for (int i = 0; i < 5; i++)
+            h.WriteTarget($"orphan{i}.txt", "gone");
+        (string dir, _, _) = await h.PlanAsync(h.MirrorProfile());
+
+        CountingOrphans orphans = new(RunPlanHarness.Deletes(dir));
+        MirrorDeletionResult result = await h.Pass.DeleteAsync(h.Request(dir) with { Orphans = orphans });
+
+        Assert.Null(result.AbortReason);
+        Assert.Equal(5, result.Deleted);
+        Assert.Equal(1, orphans.Enumerations);
+    }
+
+    [Fact]
+    public async Task A_refused_pass_never_touches_the_orphan_sequence_at_all()
+    {
+        // Every gate decides from scalars the plan already counted, so a refusal costs no snapshot read.
+        (RunPlanHarness h, string dir, string orphan) = await OneOrphan("gate-stream-refused");
+        using (h)
+        {
+            CountingOrphans orphans = new(RunPlanHarness.Deletes(dir));
+            MirrorDeletionResult result = await h.Pass.DeleteAsync(
+                h.Request(dir, planTruncated: true) with { Orphans = orphans });
+
+            AssertNothingDeleted(h, orphan, result);
+            Assert.Equal(0, orphans.Enumerations);
+        }
+    }
+
     private static void AssertNothingDeleted(RunPlanHarness h, string orphan, MirrorDeletionResult result)
     {
         Assert.Equal(MirrorReconcileOutcome.AbortedBeforeDeleting, result.Outcome);
@@ -193,20 +247,30 @@ public sealed class MirrorDeletionGateTests
     // ---- volume guards ---------------------------------------------------------------------------
 
     [Fact]
-    public async Task Exceeding_the_orphan_COUNT_cap_deletes_NOTHING()
+    public async Task A_large_orphan_COUNT_alone_deletes_normally()
     {
-        (RunPlanHarness h, string dir, string orphan) = await OneOrphan("gate-cap");
-        using (h)
-        {
-            h.UseConfig(h.DeletionConfig with { MirrorMaxOrphans = 0 });
+        // Replaces the orphan-count cap test. There is no absolute count gate any more: the user reads
+        // the exact deletion count on the preview footer and approves that number, so a constant second
+        // opinion only ever refused work someone had already agreed to — while capping executable Mirror
+        // work far below what a plan can describe. The RATIO guard below is what a count cannot replace.
+        using RunPlanHarness h = new("gate-count");
+        h.WriteSource("kept.txt", "kept");
+        List<string> orphans = [];
+        for (int i = 0; i < 40; i++)
+            orphans.Add(h.WriteTarget($"orphan{i}.txt", "gone"));
 
-            MirrorDeletionResult result = await h.Pass.DeleteAsync(h.Request(dir));
+        (string dir, _, _) = await h.PlanAsync(h.MirrorProfile());
 
-            // A cap that removes the first N and abandons the rest is worse than one that refuses and
-            // explains.
-            AssertNothingDeleted(h, orphan, result);
-            Assert.Contains("safety limit", result.AbortReason!, StringComparison.Ordinal);
-        }
+        // A denominator large enough that 40 orphans is a small fraction, so only the count is in play.
+        MirrorDeletionResult result = await h.Pass.DeleteAsync(h.Request(
+            dir, sweptByRoot: new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase)
+            {
+                [h.TargetDir] = 4_000,
+            }));
+
+        Assert.Null(result.AbortReason);
+        Assert.Equal(40, result.Deleted);
+        Assert.All(orphans, o => Assert.False(File.Exists(o), $"{o} should have been removed"));
     }
 
     [Fact]

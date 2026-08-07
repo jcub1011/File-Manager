@@ -31,9 +31,14 @@ public interface IDryRunEngine
 
 /// <summary>One streamed slice of a dry-run report. Indices in the operations are already global
 /// (positions into the fully assembled report lists), so the client simply concatenates chunks in
-/// receive order. <paramref name="ScanTruncated"/> is set once the source scan hit its candidate
-/// safety bound — the handler must OR it into its own truncation flag before running the destination
-/// sweep, since a truncated (prefix-only) survivor set would make every orphan judgement unsound.
+/// receive order.
+/// <para><b>No <c>ScanTruncated</c> / <c>SweepCapped</c> flag, deliberately.</b> Both once reported a
+/// COUNT bound being hit — the streamed engine's 500,000-candidate cap and the sweep's share of it.
+/// Neither bound exists any more (see <c>DryRunEngine</c>'s note above
+/// <c>PipelineBufferCapacity</c>): a streamed plan is the work list that gets executed, so truncating
+/// it produced a wrong job rather than a shorter preview. <see cref="DryRunChunk.SweepFaulted"/>
+/// remains, because a tree that could not be READ is real incompleteness rather than a policy
+/// choice.</para>
 /// <para><b>Pool-ownership invariant (I-POOL-RECYCLE).</b> The element type is the read-only
 /// <see cref="IPhysicalFileView"/>/<see cref="IFileOperationView"/> view, not the concrete record,
 /// because a spilled streamed run backs a chunk with <em>pool-owned mutable carriers</em>
@@ -43,24 +48,19 @@ public interface IDryRunEngine
 /// synchronously before pulling the next). No consumer may retain a chunk's files/ops — or an object
 /// reachable from them — past its own iteration step. Copy out anything you keep (paths, sizes),
 /// exactly as the existing consumers do.</para></summary>
-/// <para><paramref name="SweepCapped"/> is the destination sweep's counterpart, set on a trailing
-/// marker chunk when <c>DestinationProjector.SweepStreamAsync</c> hit its entry bound. It needs its own
-/// flag because <paramref name="ScanTruncated"/> is ORed in by the handler BEFORE the sweep runs (it is
-/// what suppresses the sweep entirely), so it cannot carry a signal the sweep discovers afterwards.</para>
-/// <para><paramref name="SweepFaulted"/> is set on the same trailing marker chunk when the walk itself
+/// <para><paramref name="SweepFaulted"/> is set on a trailing marker chunk when the destination walk
 /// hit a Warning-severity <c>EnumerationFault</c> (the engine's depth-ceiling backstop —
-/// <c>ScanScheduler.ReportDepthCeiling</c> — an unreadable subdirectory, or a worker crash) rather than
-/// its own entry budget. Kept distinct from <paramref name="SweepCapped"/> because the two have
-/// different causes and the handler logs each with its own accurate message; both still fold into the
-/// same overall <c>truncated</c> flag. <paramref name="SweepFaultDetail"/> carries the first such
-/// fault's message (which already names the actual path) for the streamed path's user-facing notice.</para>
+/// <c>ScanScheduler.ReportDepthCeiling</c> — an unreadable subdirectory, or a worker crash). It rides a
+/// marker rather than a data chunk because the fault is only known once the walk ends, and a marker
+/// frame is cheaper than buffering a chunk to back-fill the flag. It is now the ONLY producer of a
+/// truncated plan, and therefore the only thing that can make <c>MirrorDeletionPass</c> refuse on
+/// incompleteness. <paramref name="SweepFaultDetail"/> carries the first such fault's message (which
+/// already names the actual path) for the streamed path's user-facing notice.</para>
 public sealed record DryRunChunk(
     IReadOnlyList<IPhysicalFileView> SourceFiles,
     IReadOnlyList<IPhysicalFileView> DestinationFiles,
     IReadOnlyList<IFileOperationView> SourceOperations,
     IReadOnlyList<IFileOperationView> DestinationOperations,
-    bool ScanTruncated = false,
-    bool SweepCapped = false,
     bool SweepFaulted = false,
     string? SweepFaultDetail = null);
 

@@ -85,13 +85,21 @@ public sealed class DryRunEngine(
     /// separate trade needing its own measurement rather than a side effect of a frame-size fix.</para></summary>
     internal const int SpoolSpillThresholdBytes = 1 * 1024 * 1024;
 
-    /// <summary>Streaming lifts the frame-cap ceiling, but not the good sense of an upper limit. The
-    /// evaluated results (<see cref="ScanAndEvaluateAsync"/>) have to be fully materialized to sort
-    /// by source path before the first chunk, so a pathological scan of millions of files would
-    /// otherwise buffer — and hash — all of them. This bound caps the accepted candidates (and
-    /// therefore the evaluation work), the same way <see cref="MaxReportedFiles"/> bounds the
-    /// batched path. Hitting it marks the report truncated.</summary>
-    internal const int MaxStreamedFiles = 500_000;
+    // THE STREAMED PATH HAS NO CANDIDATE BOUND, DELIBERATELY. It used to carry one (500,000) whose
+    // stated reason was that the evaluated results had to be fully materialized to sort by source path
+    // before the first chunk. That has not been true since the spool landed: SimulateStreamAsync writes
+    // each finding in discovery order and never holds the evaluated set (see its comment), so the memory
+    // the bound was defending is no longer allocated.
+    //
+    // Keeping it was actively harmful, because a streamed plan is not only looked at — it is frozen to a
+    // run snapshot and then EXECUTED. A truncated plan is not a degraded preview, it is a wrong work
+    // list, and MirrorDeletionPass already refuses one outright. So "too many files" silently became
+    // "this profile cannot be mirrored at all".
+    //
+    // What replaces it is not a count but the two resources a count was standing in for: ProfilePlanner
+    // fails a plan that would exhaust memory, and RunSnapshotWriter fails one that would exhaust the
+    // snapshot volume. Both report what actually ran out. The BATCHED path keeps MaxReportedFiles — that
+    // one is a real protocol limit (a single response frame), not a policy choice.
 
     /// <summary>Bound on the scan → evaluation hand-off buffer (see
     /// <see cref="ScanAndEvaluateAsync"/>): big enough that a bursty scan never starves the
@@ -106,10 +114,6 @@ public sealed class DryRunEngine(
     /// <summary>Test seam: production uses <see cref="WireChunkByteBudget"/>; tests shrink it so a
     /// stream splits into several chunks without generating a megabyte of files.</summary>
     internal int ChunkByteBudget { get; init; } = WireChunkByteBudget;
-
-    /// <summary>Test seam: production uses <see cref="MaxStreamedFiles"/>; tests shrink it so the
-    /// candidate cap is reachable without generating half a million files.</summary>
-    internal int MaxScannedCandidates { get; init; } = MaxStreamedFiles;
 
     /// <summary>Test seam: production uses <see cref="MaxReportedFiles"/>; tests shrink it so the
     /// batched file cap is reachable without generating tens of thousands of files.</summary>
@@ -326,7 +330,7 @@ public sealed class DryRunEngine(
         try
         {
             outcome = await ScanAndEvaluateAsync(
-                profile, scopePath, filtersBySourceRoot!, hasTransformers, MaxScannedCandidates, counters,
+                profile, scopePath, filtersBySourceRoot!, hasTransformers, candidateCap: null, counters,
                 progress, (evaluation, token) => spool.WriteAsync(evaluation, token), ct)
                 .ConfigureAwait(false);
         }
@@ -345,13 +349,6 @@ public sealed class DryRunEngine(
             yield return $"scan failed: {outcome.FatalScanError}";
             yield break;
         }
-
-        bool scanTruncated = outcome?.ScanTruncated ?? false;
-        if (scanTruncated)
-            logger.LogWarning(
-                "Dry-run (stream) for profile {ProfileId} hit the {Cap:N0}-candidate safety bound; " +
-                "report truncated — the scan found more",
-                profile.Id, MaxScannedCandidates);
 
         if (spoolError is null)
         {
@@ -373,7 +370,6 @@ public sealed class DryRunEngine(
         // crosses the threshold. Indices are global across chunks (tracked by the accumulator) so the
         // client concatenates the chunks, then sorts them for display.
         StreamAccumulator accumulator = new();
-        bool anyEmitted = false;
         // Manual enumeration (not await foreach): a read-side snapshot fault — truncated length
         // prefix, implausible record, corrupted payload — must become the same single failure item
         // the write side produces, never a torn stream. yield cannot live inside a catch, so the
@@ -406,12 +402,11 @@ public sealed class DryRunEngine(
                 if (accumulator.Bytes >= ChunkByteBudget)
                 {
                     (DryRunChunk chunk, List<IEvaluationView> recyclables) = accumulator.Flush();
-                    yield return Result<DryRunChunk, string>.Success(chunk with { ScanTruncated = scanTruncated });
+                    yield return Result<DryRunChunk, string>.Success(chunk);
                     // I-POOL-RECYCLE: the yield has resumed, so the handler has fully consumed this chunk
                     // (frames serialize synchronously before the next MoveNext) — its carriers are safe to
                     // return. A no-op for original records; recycles carriers for a spilled run.
                     Recycle(recyclables);
-                    anyEmitted = true;
                 }
             }
         }
@@ -423,16 +418,12 @@ public sealed class DryRunEngine(
         if (accumulator.HasData)
         {
             (DryRunChunk chunk, List<IEvaluationView> recyclables) = accumulator.Flush();
-            yield return Result<DryRunChunk, string>.Success(chunk with { ScanTruncated = scanTruncated });
+            yield return Result<DryRunChunk, string>.Success(chunk);
             Recycle(recyclables);
-            anyEmitted = true;
         }
 
-        // Guarantee the truncation signal reaches the handler even when no data chunk carried it
-        // (e.g. every candidate was filtered out) — otherwise the handler would sweep an incomplete
-        // survivor set and could preview bogus Mirror deletions.
-        if (scanTruncated && !anyEmitted)
-            yield return Result<DryRunChunk, string>.Success(new DryRunChunk([], [], [], [], ScanTruncated: true));
+        // No trailing truncation marker: the streamed source phase has no bound left to hit, so there is
+        // no signal a data-less run could fail to carry. The sweep still emits its own fault marker.
 
         DateTimeOffset completedAt = time.GetUtcNow();
         if (logger.IsEnabled(LogLevel.Information))
@@ -477,9 +468,10 @@ public sealed class DryRunEngine(
     /// <item>Fatal fault → the pump cancels the linked token (consumers tear down promptly, the
     /// buffered tail is dropped unevaluated) and the fault comes back as a value. Checked before
     /// cancellation on the way out, so a fault that raced a cancel still wins deterministically.</item>
-    /// <item>File cap (<paramref name="candidateCap"/>) → stop accepting, mark truncated. As before,
-    /// a fatal walk-root fault produced after the cap goes unobserved and the run resolves as
-    /// truncated-success (see ISourceScanner.Scan remarks).</item>
+    /// <item>File cap (<paramref name="candidateCap"/>, null on the streamed path — see the note above
+    /// <c>PipelineBufferCapacity</c>) → stop accepting, mark truncated. As before, a fatal walk-root
+    /// fault produced after the cap goes unobserved and the run resolves as truncated-success (see
+    /// ISourceScanner.Scan remarks).</item>
     /// <item>Cancellation (the caller's token) → OperationCanceledException after both sides have
     /// torn down; the scan iterator's disposal runs the scanner's own cancel → drain → dispose.</item>
     /// <item>An unexpected evaluation exception → cancels the pump (it must not stay blocked on a
@@ -490,7 +482,7 @@ public sealed class DryRunEngine(
         string? scopePath,
         Dictionary<string, CompiledFilterSet> filtersBySourceRoot,
         bool hasTransformers,
-        int candidateCap,
+        int? candidateCap,
         RunCounters counters,
         DryRunProgressCounters? progress,
         Func<FileEvaluation, CancellationToken, ValueTask> sink,
@@ -533,7 +525,7 @@ public sealed class DryRunEngine(
                         continue;
                     }
 
-                    if (accepted >= candidateCap)
+                    if (accepted >= candidateCap)   // never true when the cap is null
                     {
                         scanTruncated = true;
                         return;
