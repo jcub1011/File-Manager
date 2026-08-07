@@ -261,6 +261,17 @@ public sealed class IpcGateway(Func<string?>? serviceExePath = null, TimeProvide
         }
     }
 
+    public Task<Result<RunPlanViewResponse, IpcError>> GetRunPlanViewAsync(
+        GetRunPlanViewRequest request, CancellationToken ct = default) =>
+        RequestAsync<RunPlanViewResponse, RunPlanViewResponse>(request, r => r, ct);
+
+    public Task<Result<DryRunChunkResponse, IpcError>> GetRunPlanPageAsync(
+        GetRunPlanPageRequest request, CancellationToken ct = default) =>
+        // On the SHARED connection, unlike the plan stream: a page is one small unary round trip, so it
+        // cannot leave unread frames on the pipe the way an abandoned stream can, and a fresh connection
+        // per scroll would be far more expensive than the read itself.
+        RequestAsync<DryRunChunkResponse, DryRunChunkResponse>(request, r => r, ct);
+
     public async ValueTask DisposeAsync()
     {
         IpcClient? client = Interlocked.Exchange(ref _client, null);

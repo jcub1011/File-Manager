@@ -79,6 +79,23 @@ public interface IIpcGateway
     Task<Result<DryRunCompletion, IpcError>> GetRunPlanStreamAsync(
         Guid runId, IDryRunChunkSink sink, CancellationToken ct = default);
 
+    /// <summary>Opens a VIEW over one half of a run's plan — a filter applied service-side — and answers
+    /// with a handle to page against and how many rows it holds.
+    /// <para>The counterpart to <see cref="GetRunPlanPageAsync"/>, and what replaces filtering rows the
+    /// client was holding: the search box, the facet bar and the status chips all used to scan every
+    /// resident row, which is affordable only while every row is resident. A filter that selects
+    /// everything comes back with a null handle and the plan's totals, at no scan cost.</para></summary>
+    Task<Result<RunPlanViewResponse, IpcError>> GetRunPlanViewAsync(
+        GetRunPlanViewRequest request, CancellationToken ct = default);
+
+    /// <summary>Reads one WINDOW of a run's plan, in the same chunk shape a preview streams — so the
+    /// caller folds it with the ingest it already has rather than a second one that could disagree.
+    /// <para>Positions count within the view named by <c>ViewId</c> (null = the plan's own order). A
+    /// window past the end comes back empty rather than as an error: a viewport may legally overhang the
+    /// list while a scroll settles.</para></summary>
+    Task<Result<DryRunChunkResponse, IpcError>> GetRunPlanPageAsync(
+        GetRunPlanPageRequest request, CancellationToken ct = default);
+
     /// <summary>Approves a planned run (starts the work) or declines it (closes it, changing nothing).
     /// <para><paramref name="acknowledgeWarnings"/> confirms the blocking warnings the run's
     /// <c>run-planned</c> event listed. Without it an approval of a run whose profile raises any is

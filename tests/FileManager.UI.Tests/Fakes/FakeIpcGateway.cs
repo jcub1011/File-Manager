@@ -213,6 +213,50 @@ internal sealed class FakeIpcGateway : IIpcGateway
     /// <summary>When set, GetRunPlanStreamAsync throws it (unexpected-exception tests).</summary>
     public Exception? RunPlanException { get; set; }
 
+    /// <summary>Pages a paged store will be served, keyed by their first row. A request for a key that
+    /// is not here comes back empty, which is what the real service does past the end of a view.</summary>
+    public Dictionary<int, DryRunChunkResponse> Pages { get; } = [];
+
+    /// <summary>Every page request, in order — so a test can assert what was fetched, and what was NOT
+    /// (an evicted page must not be silently re-fetched during an assertion pass).</summary>
+    public List<GetRunPlanPageRequest> PageRequests { get; } = [];
+
+    /// <summary>What <see cref="GetRunPlanViewAsync"/> answers. Defaults to "no filter, no rows".</summary>
+    public RunPlanViewResponse ViewResult { get; set; } = new() { ViewId = null, RowCount = 0 };
+
+    public List<GetRunPlanViewRequest> ViewRequests { get; } = [];
+
+    /// <summary>When set, every page request awaits this before answering — the seam for asserting what
+    /// a list shows while a page is still in flight, which is the placeholder path.</summary>
+    public TaskCompletionSource? PageGate { get; set; }
+
+    public Task<Result<RunPlanViewResponse, IpcError>> GetRunPlanViewAsync(
+        GetRunPlanViewRequest request, CancellationToken ct = default)
+    {
+        ViewRequests.Add(request);
+        return Task.FromResult(Result<RunPlanViewResponse, IpcError>.Success(ViewResult));
+    }
+
+    public async Task<Result<DryRunChunkResponse, IpcError>> GetRunPlanPageAsync(
+        GetRunPlanPageRequest request, CancellationToken ct = default)
+    {
+        PageRequests.Add(request);
+        if (PageGate is not null)
+        {
+            try
+            {
+                await PageGate.Task.WaitAsync(ct);
+            }
+            catch (OperationCanceledException)
+            {
+                return Result<DryRunChunkResponse, IpcError>.Canceled();
+            }
+        }
+        return Pages.TryGetValue(request.First, out DryRunChunkResponse? page)
+            ? Result<DryRunChunkResponse, IpcError>.Success(page)
+            : Result<DryRunChunkResponse, IpcError>.Success(DryRunColumns.ToChunk([], [], [], [], []));
+    }
+
     public async Task<Result<DryRunCompletion, IpcError>> GetRunPlanStreamAsync(
         Guid runId, IDryRunChunkSink sink, CancellationToken ct = default)
     {
