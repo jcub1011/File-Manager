@@ -1,6 +1,8 @@
+using FileManager.Contracts.DryRun;
 using FileManager.Contracts.Profiles;
 using FileManager.Contracts.Settings;
 using System;
+using System.Collections.Generic;
 using System.Text.Json.Serialization;
 
 namespace FileManager.Contracts.IPC;
@@ -28,6 +30,7 @@ namespace FileManager.Contracts.IPC;
 [JsonDerivedType(typeof(CancelRunRequest), "cancel-run")]
 [JsonDerivedType(typeof(GetRunPlanStreamRequest), "get-run-plan-stream")]
 [JsonDerivedType(typeof(GetRunPlanPageRequest), "get-run-plan-page")]
+[JsonDerivedType(typeof(GetRunPlanViewRequest), "get-run-plan-view")]
 [JsonDerivedType(typeof(GetRunsRequest), "get-runs")]
 [JsonDerivedType(typeof(GetRunDetailRequest), "get-run-detail")]
 [JsonDerivedType(typeof(SetRunPausedRequest), "set-run-paused")]
@@ -197,6 +200,52 @@ public enum RunPlanSide
     Destinations,
 }
 
+/// <summary>Narrows a plan half to the rows matching a filter, and reports how many there are.
+///
+/// <para><b>Why the service filters rather than the client.</b> Search, the facet bar and the status
+/// chips all used to scan the rows the client was holding — which worked only because it held all of
+/// them. A windowed preview holds a page, so a filter it applied itself could only ever narrow the page
+/// on screen, which is not what any of those controls mean. Here the pass runs where the rows are, and
+/// what comes back is a handle plus a count.</para>
+///
+/// <para>The result is an ORDER (positions → rows), stored beside the plan and named by
+/// <see cref="RunPlanViewResponse.ViewId"/>; pages are then requested against it exactly as they are
+/// against the unfiltered default. So a filtered view of a 50-million-row plan costs the client the
+/// handle and nothing else — the ordinals stay on disk.</para>
+///
+/// <para><b>Statuses cross the wire as <see cref="OperationKind"/>s, not as the UI's chip names.</b> The
+/// mapping from a chip to the kinds it covers is a display decision and stays in the client; the service
+/// only does set membership on an enum it already owns. A chip vocabulary here would be a second copy of
+/// that mapping, free to drift.</para>
+///
+/// <para>Every filter is optional and they AND together; an all-null request selects everything and is
+/// answered with the plan's default order, at no scan cost.</para></summary>
+public sealed record GetRunPlanViewRequest : IpcRequest
+{
+    public required Guid RunId { get; init; }
+    public required RunPlanSide Side { get; init; }
+
+    /// <summary>Substring match, case-insensitive, against a row's full path. On the source side it also
+    /// matches a row whose DESTINATIONS contain the term, which is what the Sources tab has always
+    /// done — a file is findable by where it is going, not only by where it is.</summary>
+    public string? Search { get; init; }
+
+    /// <summary>Source roots to keep. Null keeps every root; empty keeps none.</summary>
+    public IReadOnlyList<string>? SourceRoots { get; init; }
+
+    /// <summary>Target roots to keep. On the source side a row survives when ANY of its destinations
+    /// sits under one of these.</summary>
+    public IReadOnlyList<string>? DestinationRoots { get; init; }
+
+    /// <summary>Operation kinds to keep. Null keeps every kind.</summary>
+    public IReadOnlyList<OperationKind>? Kinds { get; init; }
+
+    /// <summary>Source side only: also keep rows whose original does not survive the run (moved or
+    /// deleted after copying). ORed with <see cref="Kinds"/>, because the chip it backs is a disposition
+    /// rather than a kind and the tab treats its chips as alternatives.</summary>
+    public bool IncludeDestructiveDisposition { get; init; }
+}
+
 /// <summary>One WINDOW of a pending run's frozen work list, in the same <c>DryRunChunkResponse</c> shape
 /// the whole-plan stream emits.
 ///
@@ -225,6 +274,13 @@ public sealed record GetRunPlanPageRequest : IpcRequest
     /// <summary>How many rows to return. The service clamps this to what remains and to its own frame
     /// budget, so a client asking for more than fits gets a short page rather than an error.</summary>
     public required int Count { get; init; }
+
+    /// <summary>Which view <see cref="First"/> counts within — a handle from
+    /// <see cref="GetRunPlanViewRequest"/>. Null means the plan's own unfiltered order, which is what a
+    /// preview with no filters active uses and what costs no view build.
+    /// <para>A view whose file has since been swept (the run closed) is treated as "no view" rather than
+    /// as an error, so a stale handle degrades to the full list instead of blanking the panel.</para></summary>
+    public string? ViewId { get; init; }
 }
 /// <summary>Every run the service still knows about, newest first — the authoritative re-seed for a
 /// job-queue view.

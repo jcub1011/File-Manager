@@ -151,6 +151,7 @@ internal static class EngineComposition
         // Streaming handler: IpcServer type-tests the table's values for IIpcStreamingRequestHandler.
         services.AddSingleton<IIpcRequestHandler, GetRunPlanStreamHandler>();
         services.AddSingleton<IIpcRequestHandler, GetRunPlanPageHandler>();
+        services.AddSingleton<IIpcRequestHandler, GetRunPlanViewHandler>();
         services.AddSingleton<IIpcRequestHandler, SetPausedHandler>();
         services.AddSingleton<IIpcRequestHandler, GetRecentJobsHandler>();
         services.AddSingleton<IIpcRequestHandler, GetJobLogHandler>();

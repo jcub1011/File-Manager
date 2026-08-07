@@ -50,7 +50,7 @@ public sealed class GetRunPlanPageHandler(
         read.TryGetValue(out RunSnapshotHeader? header);
 
         int count = Math.Clamp(typed.Count, 0, MaxPageRows);
-        int[] ordinals = ResolveOrdinals(directory, typed.Side, header!, typed.First, count);
+        int[] ordinals = ResolveOrdinals(directory, typed.Side, typed.ViewId, header!, typed.First, count);
 
         // One converter per page. Directory indices are therefore PAGE-LOCAL, which is what the client
         // wants: it folds each page into its own small store and never has to reconcile one page's
@@ -65,13 +65,28 @@ public sealed class GetRunPlanPageHandler(
     private static Task<IpcResponse> Error(string code, string message) =>
         Task.FromResult<IpcResponse>(new ErrorResponse { Code = code, Message = message });
 
-    /// <summary>Display positions → row ordinals. Falls back to the identity mapping (plan order) when
-    /// the half has no order file, which is what a pre-paging snapshot looks like.</summary>
+    /// <summary>Display positions → row ordinals, through the requested view when there is one.
+    ///
+    /// <para>Three layers, each falling through to the next: a FILTERED view file (from
+    /// <c>get-run-plan-view</c>), the half's own unfiltered order file, and finally the identity mapping
+    /// — plan order — which is what a pre-paging snapshot or a failed sidecar write leaves. A view id
+    /// whose file has been swept falls through rather than erroring, so a stale handle degrades to the
+    /// full list instead of blanking the panel.</para></summary>
     private int[] ResolveOrdinals(
-        string directory, RunPlanSide side, RunSnapshotHeader header, int first, int count)
+        string directory, RunPlanSide side, string? viewId, RunSnapshotHeader header, int first, int count)
     {
         if (count <= 0 || first < 0)
             return [];
+
+        if (viewId is { Length: > 0 })
+        {
+            string viewFile = Path.Combine(directory, $"view-{viewId}.ord");
+            if (RunSnapshotOrder.RowCount(viewFile, logger) > 0)
+                return RunSnapshotOrder.ReadRange(viewFile, first, count, logger);
+            logger.LogDebug(
+                "Run snapshot: view \"{ViewId}\" is gone; serving this page from the unfiltered order", viewId);
+        }
+
         string orderFile = Path.Combine(
             directory,
             side == RunPlanSide.Sources

@@ -26,6 +26,7 @@ namespace FileManager.Contracts.IPC;
 [JsonDerivedType(typeof(RelocateProfilesResponse), "relocate-profiles-result")]
 [JsonDerivedType(typeof(RunsResponse), "runs")]
 [JsonDerivedType(typeof(RunDetailResponse), "run-detail")]
+[JsonDerivedType(typeof(RunPlanViewResponse), "run-plan-view")]
 public abstract record IpcResponse;
 
 public sealed record OkResponse : IpcResponse;
@@ -128,6 +129,20 @@ public sealed record RunsResponse : IpcResponse { public required IReadOnlyList<
 /// header. RUN_NOT_FOUND for an unknown id, RUN_PLAN_UNAVAILABLE when there is no readable header —
 /// which includes a run still planning, since the header is written when planning finishes.</summary>
 public sealed record RunDetailResponse : IpcResponse { public required RunDetailDto Detail { get; init; } }
+
+/// <summary>A filtered view over one half of a plan: a handle to page against, and how many rows it
+/// holds. See <see cref="GetRunPlanViewRequest"/> for why the filtering happens service-side.</summary>
+public sealed record RunPlanViewResponse : IpcResponse
+{
+    /// <summary>Pass back as <see cref="GetRunPlanPageRequest.ViewId"/>. Null when the filter selected
+    /// everything, which means "use the plan's own order" — the client does not have to special-case
+    /// that, it just forwards whatever it got.</summary>
+    public string? ViewId { get; init; }
+
+    /// <summary>Rows the view holds. This is what sizes the virtual list, and what the "showing N of M"
+    /// line reports — so it is a real count, not an estimate.</summary>
+    public required int RowCount { get; init; }
+}
 public sealed record JobLogResponse : IpcResponse { public required IReadOnlyList<string> Lines { get; init; } }
 public sealed record SettingsResponse : IpcResponse { public required GlobalSettings Settings { get; init; } }
 /// <summary>Answer to RelocateProfilesRequest: the persisted settings plus what happened to the

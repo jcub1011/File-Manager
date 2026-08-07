@@ -57,6 +57,10 @@ public sealed class IpcRequestTypesTests
             {
                 RunId = id, Side = RunPlanSide.Sources, First = 0, Count = 1,
             },
+            nameof(GetRunPlanViewRequest) => new GetRunPlanViewRequest
+            {
+                RunId = id, Side = RunPlanSide.Sources,
+            },
             nameof(GetRunDetailRequest) => new GetRunDetailRequest { RunId = id },
             nameof(GetRunsRequest) => new GetRunsRequest(),
             nameof(SetRunPausedRequest) => new SetRunPausedRequest { RunId = id, Paused = true },

@@ -29,6 +29,7 @@ public static class IpcRequestTypes
     public const string CancelRun = "cancel-run";
     public const string GetRunPlanStream = "get-run-plan-stream";
     public const string GetRunPlanPage = "get-run-plan-page";
+    public const string GetRunPlanView = "get-run-plan-view";
     public const string GetRuns = "get-runs";
     public const string GetRunDetail = "get-run-detail";
     public const string SetRunPaused = "set-run-paused";
@@ -58,6 +59,7 @@ public static class IpcRequestTypes
         CancelRunRequest => CancelRun,
         GetRunPlanStreamRequest => GetRunPlanStream,
         GetRunPlanPageRequest => GetRunPlanPage,
+        GetRunPlanViewRequest => GetRunPlanView,
         GetRunsRequest => GetRuns,
         GetRunDetailRequest => GetRunDetail,
         SetRunPausedRequest => SetRunPaused,
