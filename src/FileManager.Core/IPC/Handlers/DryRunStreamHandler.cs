@@ -138,16 +138,9 @@ public sealed class DryRunStreamHandler(
                 long lastDestinations = -1;
                 while (true)
                 {
-                    while (!moveNext.IsCompleted)
+                    while (await AsyncIteratorHeartbeat
+                        .WaitForTickAsync(moveNext, ProgressInterval, ct).ConfigureAwait(false))
                     {
-                        // Once ct fires, Task.Delay(…, ct) completes instantly and this poll would spin
-                        // a core until the plan finishes unwinding — just await the advance (it
-                        // observes ct) instead of polling for progress nobody will see.
-                        if (ct.IsCancellationRequested)
-                            break;
-                        await Task.WhenAny(moveNext, Task.Delay(ProgressInterval, ct)).ConfigureAwait(false);
-                        if (moveNext.IsCompleted)
-                            break;
                         if (phase == PlanPhase.Sources && progressCounters.Sources != lastSources)
                         {
                             lastSources = progressCounters.Sources;

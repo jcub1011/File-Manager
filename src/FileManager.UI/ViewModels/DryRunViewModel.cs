@@ -3007,13 +3007,43 @@ public sealed partial class DryRunViewModel : ViewModelBase
     /// a slow share showed one unchanging sentence for minutes, so a wedged walk and a slow one looked
     /// identical. Ignored once a plan is on screen — a late sample must not overwrite the footer's own
     /// state.</para></summary>
-    public void PlanningProgress(long sources, long destinations)
+    /// <param name="stage">The sample's <c>RunPlanStages</c> value, or empty from a service that predates
+    /// it. Worth rendering because the counts alone go quiet twice — while the walk's findings are written
+    /// into the work list, and before the destination sweep has found anything — and a frozen count reads as
+    /// a stalled scan.</param>
+    /// <param name="unreadable">Entries the walk could not read. Said while it happens; the engine also
+    /// warns about it once, at approval time.</param>
+    public void PlanningProgress(long sources, long destinations, string stage = "", long unreadable = 0)
     {
         if (!IsPreviewing)
             return;
-        RunStatusText = destinations > 0
-            ? $"Scanning… {sources:N0} source file(s), {destinations:N0} destination file(s) found"
-            : $"Scanning sources… {sources:N0} file(s) found";
+        string counts = (destinations > 0
+                ? $"{sources:N0} source file(s), {destinations:N0} destination file(s)"
+                : $"{sources:N0} source file(s)")
+            + (unreadable > 0 ? $", {unreadable:N0} unreadable" : "");
+        // The sweep keeps its own caption for its whole duration. Falling back to "Scanning…" at its first
+        // hit — which is what a `when destinations == 0` guard does — tells the user the source scan is
+        // still running for the entire sweep, minutes after it finished. This line is the tab's ONLY status
+        // line, so there is nothing else on screen to correct it.
+        RunStatusText = stage switch
+        {
+            RunPlanStages.Building => $"Building the plan… {counts} found",
+            RunPlanStages.Sweeping => $"Sweeping the destination… {counts} found",
+            _ => destinations > 0 ? $"Scanning… {counts} found" : $"Scanning sources… {counts} found",
+        };
+    }
+
+    /// <summary>A preview parked behind the concurrent-plan limit.
+    ///
+    /// <para>Its own caption because its counters CANNOT move: rendering the queued sample as scan progress
+    /// leaves the tab reading "Scanning sources… 0 file(s) found" for the whole wait, which is the wedged
+    /// look the live counts exist to remove. The engine publishes this as a distinct phase for the same
+    /// reason — see <c>RunCoordinator.WaitingPhase</c>.</para></summary>
+    public void PlanningQueued()
+    {
+        if (!IsPreviewing)
+            return;
+        RunStatusText = "Waiting for another preview to finish…";
     }
 
     /// <summary>Stops the planning scan. Nothing has been touched at this point, so this is free —

@@ -247,6 +247,22 @@
                                             </TextBlock.IsVisible>
                                         </TextBlock>
 
+                                        <!-- What planning is doing when the counts above are not the
+                                             answer: once the walk ends they freeze while the work list
+                                             is written, which from out here looks exactly like a walk
+                                             that has wedged. Hidden while scanning — the source line
+                                             is already saying that. -->
+                                        <TextBlock Classes="caption" Text="{Binding PlanStageText}"
+                                                   Foreground="{DynamicResource Brush.Info}"
+                                                   TextTrimming="CharacterEllipsis">
+                                            <TextBlock.IsVisible>
+                                                <MultiBinding Converter="{x:Static BoolConverters.And}">
+                                                    <Binding Path="IsPlanning" />
+                                                    <Binding Path="HasPlanStageNote" />
+                                                </MultiBinding>
+                                            </TextBlock.IsVisible>
+                                        </TextBlock>
+
                                         <!-- Every other phase's one-liner: queued, the parked plan's
                                              forecast, the executing file counts. -->
                                         <TextBlock Classes="caption" Text="{Binding ProgressText}"

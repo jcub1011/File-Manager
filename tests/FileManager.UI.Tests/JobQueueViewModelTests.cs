@@ -388,6 +388,8 @@ public sealed class JobQueueViewModelTests
         Assert.Equal("Queued behind other previews", row.ProgressText);
     }
 
+    /// <summary>Planning's news is the scan lines, not the one-liner: <c>ProgressText</c> has no planning
+    /// arm, because the row hides it for that phase and shows the lines instead.</summary>
     [Fact]
     public void A_planning_run_reports_its_scan_counts_since_it_has_no_denominator()
     {
@@ -396,9 +398,34 @@ public sealed class JobQueueViewModelTests
         queue.OnRunProgress(Progress(
             Guid.NewGuid(), phase: "Planning", completed: 0, total: 0, scannedSources: 12_345));
 
-        Assert.Contains("12,345 source file(s)", queue.Runs[0].ProgressText);
+        Assert.Contains("12,345 source file(s)", queue.Runs[0].ScanSourcesText);
+        Assert.Equal("", queue.Runs[0].ProgressText);
         Assert.True(queue.Runs[0].IsIndeterminate);
         Assert.True(queue.Runs[0].ShowProgress);
+    }
+
+    /// <summary>The one-liner is re-read when the PHASE changes, not only when a count does.
+    ///
+    /// <para>A run cancelled mid-plan moves straight to Closed with every count still at zero, so nothing
+    /// else raises the property — and the row unhides it at exactly that moment. Without the phase in its
+    /// notify list the binding keeps rendering whatever it last evaluated, which for an executing run is a
+    /// file count that stopped being true when the run ended.</para></summary>
+    [Fact]
+    public void A_run_that_ends_drops_its_progress_line()
+    {
+        JobQueueViewModel queue = new(new FakeIpcGateway());
+        Guid runId = Guid.NewGuid();
+
+        queue.OnRunProgress(Progress(runId, phase: "Executing", completed: 5, total: 20));
+        JobQueueRow row = queue.Runs[0];
+        Assert.Contains("5 of 20", row.ProgressText);
+
+        List<string> raised = [];
+        row.PropertyChanged += (_, e) => raised.Add(e.PropertyName ?? "");
+        queue.OnRunCompleted(Completed(runId, "Cancelled"));
+
+        Assert.Equal("", row.ProgressText);
+        Assert.Contains(nameof(JobQueueRow.ProgressText), raised);
     }
 
     /// <summary>A run parked for approval shows NO bar.
@@ -920,6 +947,90 @@ public sealed class JobQueueViewModelTests
 
         Assert.True(row.HasScannedDestinations);
         Assert.Equal("Scanned 7 at the destination", row.ScanDestinationsText);
+    }
+
+    /// <summary>Entries the walk could not read, beside the count of the ones it could. Only when there are
+    /// any: ", 0 unreadable" on every planning row would train the eye to skip the very words that matter on
+    /// the rare row that has them.</summary>
+    [Fact]
+    public void Unreadable_entries_are_named_beside_the_source_count_and_only_when_there_are_some()
+    {
+        JobQueueViewModel queue = new(new FakeIpcGateway());
+        Guid runId = Guid.NewGuid();
+
+        queue.OnRunProgress(Progress(runId, phase: "Planning", completed: 0, total: 0, scannedSources: 1234));
+        JobQueueRow row = queue.Runs[0];
+        Assert.Equal("Scanned 1,234 source file(s)", row.ScanSourcesText);
+
+        queue.OnRunProgress(Progress(runId, phase: "Planning", completed: 0, total: 0, scannedSources: 1234)
+            with { UnreadableEntries = 3 });
+
+        Assert.Equal("Scanned 1,234 source file(s), 3 unreadable", row.ScanSourcesText);
+    }
+
+    /// <summary>The stage line, which exists for the stretches the counts cannot describe: after the walk,
+    /// where both are frozen while the work list is written, and throughout the destination sweep, whose own
+    /// count is just as capable of freezing on a share that stops answering. Silent while scanning — the
+    /// source line already says that — and silent for a service too old to report a stage, which falls back
+    /// to what it always did.</summary>
+    [Fact]
+    public void The_stage_line_speaks_only_when_the_counts_cannot()
+    {
+        JobQueueViewModel queue = new(new FakeIpcGateway());
+        Guid runId = Guid.NewGuid();
+        RunProgressEvent planning = Progress(
+            runId, phase: "Planning", completed: 0, total: 0, scannedSources: 1234);
+
+        queue.OnRunProgress(planning with { PlanStage = RunPlanStages.Scanning });
+        JobQueueRow row = queue.Runs[0];
+        Assert.False(row.HasPlanStageNote);
+
+        queue.OnRunProgress(planning with { PlanStage = RunPlanStages.Building });
+        Assert.True(row.HasPlanStageNote);
+        Assert.Equal("Building the plan…", row.PlanStageText);
+
+        // Announced, nothing found yet: the destination line is still hidden, so this is the only thing
+        // that would say the sweep had begun.
+        queue.OnRunProgress(planning with { PlanStage = RunPlanStages.Sweeping });
+        Assert.Equal("Sweeping the destination…", row.PlanStageText);
+
+        // And it STAYS once the sweep starts finding things. Handing over to the destination count here
+        // would leave a stalled sweep as three frozen numbers with nothing naming the live one — the same
+        // failure the stage line exists to answer, one stage along.
+        queue.OnRunProgress(planning with { PlanStage = RunPlanStages.Sweeping, ScannedDestinations = 7 });
+        Assert.True(row.HasPlanStageNote);
+        Assert.Equal("Sweeping the destination…", row.PlanStageText);
+
+        // A service that predates the stage: unchanged behaviour, no empty line.
+        queue.OnRunProgress(planning);
+        Assert.False(row.HasPlanStageNote);
+    }
+
+    /// <summary>The reconcile that runs every couple of seconds re-seeds a row from <c>get-runs</c>, which
+    /// carries no scan figures at all — so it must leave the live ones alone. Clobbering them here would
+    /// undo the progress this window exists to show, twice a second.</summary>
+    [Fact]
+    public async Task A_reconcile_does_not_clear_the_live_planning_figures()
+    {
+        Guid runId = Guid.NewGuid();
+        FakeIpcGateway gateway = new()
+        {
+            RunsResult = new List<RunSummaryDto>
+            {
+                Summary(runId) with { Phase = "Planning", Outcome = "None" },
+            },
+        };
+        JobQueueViewModel queue = new(gateway);
+        queue.OnRunProgress(Progress(runId, phase: "Planning", completed: 0, total: 0, scannedSources: 1234)
+            with { ScannedDestinations = 7, UnreadableEntries = 3, PlanStage = RunPlanStages.Sweeping });
+
+        await queue.ReconcileAsync();
+
+        JobQueueRow row = queue.Runs[0];
+        Assert.Equal(1234, row.ScannedSources);
+        Assert.Equal(7, row.ScannedDestinations);
+        Assert.Equal(3, row.UnreadableEntries);
+        Assert.Equal(RunPlanStages.Sweeping, row.PlanStage);
     }
 
     // ── The summary pane ────────────────────────────────────────────────────────────────────────────

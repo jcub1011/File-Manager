@@ -53,7 +53,7 @@ public sealed partial class JobQueueRow : ObservableObject
     [NotifyPropertyChangedFor(nameof(StatusText), nameof(StatusIconKey), nameof(StatusColorKey),
         nameof(IsPausable), nameof(IsCancellable), nameof(IsAwaitingApproval), nameof(IsFinished),
         nameof(ShowProgress), nameof(IsIndeterminate), nameof(IsPlanning), nameof(HasByteProgress),
-        nameof(ProgressFraction))]
+        nameof(ProgressFraction), nameof(ProgressText))]
     public partial string Phase { get; set; } = nameof(RunPhaseNames.Planning);
 
     [ObservableProperty]
@@ -96,13 +96,25 @@ public sealed partial class JobQueueRow : ObservableObject
 
     /// <summary>Live scan counts while planning; the only figures a plan has before it has a denominator.</summary>
     [ObservableProperty]
-    [NotifyPropertyChangedFor(nameof(ProgressText), nameof(ScanSourcesText))]
+    [NotifyPropertyChangedFor(nameof(ScanSourcesText))]
     public partial long ScannedSources { get; set; }
 
     [ObservableProperty]
-    [NotifyPropertyChangedFor(nameof(ProgressText), nameof(ScanDestinationsText),
-        nameof(HasScannedDestinations))]
+    [NotifyPropertyChangedFor(nameof(ScanDestinationsText), nameof(HasScannedDestinations))]
     public partial long ScannedDestinations { get; set; }
+
+    /// <summary>Entries under the sources the walk could not read. Shown beside the source count while it is
+    /// happening; the engine also warns about it once, at approval time.</summary>
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(ScanSourcesText))]
+    public partial long UnreadableEntries { get; set; }
+
+    /// <summary>Which part of planning the scan counts were taken in — a <c>RunPlanStages</c> value, or empty
+    /// from a service that predates it (which reads as "no stage" and leaves the counts to speak for
+    /// themselves).</summary>
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(PlanStageText), nameof(HasPlanStageNote))]
+    public partial string PlanStage { get; set; } = "";
 
     /// <summary>What the plan says it will do, once it is planned. Drives the awaiting-approval summary.</summary>
     [ObservableProperty]
@@ -305,16 +317,16 @@ public sealed partial class JobQueueRow : ObservableObject
         }
     }
 
-    /// <summary>The counts line, which says something different in every phase — a planning run has no
-    /// denominator, a parked one has only a forecast, and a running one has both.</summary>
+    /// <summary>The counts line for every phase that has ONE — a parked run has only a forecast, a running
+    /// one has both halves of a fraction.
+    ///
+    /// <para>Empty while planning, deliberately: that phase's news is the three scan lines below, which the
+    /// row shows instead of this one (see <see cref="ScanSourcesText"/>). A planning arm here would be a
+    /// second copy of that logic rendered nowhere — and a copy free to drift, which the one it replaced
+    /// had already done.</para></summary>
     public string ProgressText => Phase switch
     {
         nameof(RunPhaseNames.Waiting) => "Queued behind other previews",
-        nameof(RunPhaseNames.Planning) => ScannedDestinations > 0
-            ? $"Scanned {ScannedSources:N0} source file(s), {ScannedDestinations:N0} at the destination"
-            : ScannedSources > 0
-                ? $"Scanned {ScannedSources:N0} source file(s)"
-                : "Starting the scan…",
         nameof(RunPhaseNames.AwaitingApproval) => PlannedSummary,
         nameof(RunPhaseNames.Executing) => Total > 0
             ? $"{Completed:N0} of {Total:N0} file(s)" + (Deleted > 0 ? $", {Deleted:N0} removed" : "")
@@ -325,18 +337,42 @@ public sealed partial class JobQueueRow : ObservableObject
     /// <summary>The source-scan line, and its destination counterpart below — the two figures a run in
     /// <see cref="IsPlanning"/> has, on separate lines.
     ///
-    /// <para>Beside <see cref="ProgressText"/> rather than replacing its planning arm: that property is the
-    /// whole-row one-liner and stays correct for every phase, but it packs both counts into one sentence
-    /// that ran past the width of a list pane once the pane was half a window wide. Two lines also let the
-    /// destination count DISAPPEAR rather than read zero — most profiles never sweep their destination, and
-    /// "0 at the destination" invites the reader to wonder what went wrong there.</para></summary>
-    public string ScanSourcesText => ScannedSources > 0
+    /// <para>Separate lines rather than <see cref="ProgressText"/>'s one-liner, which is why that property
+    /// has no planning arm left: packing both counts into one sentence ran past the width of a list pane
+    /// once the pane was half a window wide. Two lines also let the destination count DISAPPEAR rather than
+    /// read zero — most profiles never sweep their destination, and "0 at the destination" invites the
+    /// reader to wonder what went wrong there.</para></summary>
+    public string ScanSourcesText => ScannedSources > 0 || UnreadableEntries > 0
         ? $"Scanned {ScannedSources:N0} source file(s)"
+            + (UnreadableEntries > 0 ? $", {UnreadableEntries:N0} unreadable" : "")
         : "Starting the scan…";
 
     public bool HasScannedDestinations => ScannedDestinations > 0;
 
     public string ScanDestinationsText => $"Scanned {ScannedDestinations:N0} at the destination";
+
+    /// <summary>What planning is doing when the counts above are not the answer — the third line of a
+    /// planning row, and empty (hidden) whenever they are.
+    ///
+    /// <para>Two cases, and they are the two the counts cannot express. Once the walk finishes, its findings
+    /// are written into the run's work list with BOTH counts frozen at their final values, which from the
+    /// outside is indistinguishable from a walk that has wedged — the very complaint the counts were added to
+    /// answer, one stage along. And the destination sweep's own count is no better: a sweep over a share that
+    /// stops answering finds a handful of files and then sits, leaving three frozen numbers and nothing to
+    /// say which of them is the one still being worked on. So the sweep keeps this line for its whole
+    /// duration rather than handing over to the destination count at the first hit.</para>
+    ///
+    /// <para>Empty for <c>Scanning</c>: the source line is already saying it, and a row that repeats itself
+    /// is a row nobody reads. Empty too for a service too old to report a stage, which falls back to exactly
+    /// the behaviour it had before.</para></summary>
+    public string PlanStageText => PlanStage switch
+    {
+        RunPlanStages.Building => "Building the plan…",
+        RunPlanStages.Sweeping => "Sweeping the destination…",
+        _ => "",
+    };
+
+    public bool HasPlanStageNote => PlanStageText.Length > 0;
 
     private string PlannedSummary
     {
@@ -703,6 +739,8 @@ public sealed partial class JobQueueViewModel(IIpcGateway gateway, TimeProvider?
         row.Deleted = evt.Deleted;
         row.ScannedSources = evt.ScannedSources;
         row.ScannedDestinations = evt.ScannedDestinations;
+        row.UnreadableEntries = evt.UnreadableEntries;
+        row.PlanStage = evt.PlanStage;
         TrimAndFlag();
         // The selected run just changed phase into one that HAS a plan, so the summary pane's earlier
         // "no plan yet" answer is now stale. Cheap to re-ask: it reads one small header.

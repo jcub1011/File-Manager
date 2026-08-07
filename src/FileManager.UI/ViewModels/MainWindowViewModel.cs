@@ -666,8 +666,17 @@ public sealed partial class MainWindowViewModel : ViewModelBase
                 // progress the user never sees — and planning is precisely when they are waiting.
                 // A literal because RunPhase is engine-internal: the UI reaches the service over IPC and
                 // the phase crosses it as a string, which is the contract RunProgressEvent.Phase documents.
-                if (runProgress.Phase == "Planning")
-                    DryRun.PlanningProgress(runProgress.ScannedSources, runProgress.ScannedDestinations);
+                //
+                // Waiting is a third case, not a spelling of Planning: a run queued behind the concurrent-
+                // plan limit publishes it, and its counters cannot move while it is parked. Routed to the
+                // activity panel it became "Running: 0 of 0 file(s)…" for a run that has not started, and
+                // the tab it belonged on sat frozen on its opening caption for the length of the wait.
+                if (runProgress.Phase == "Waiting")
+                    DryRun.PlanningQueued();
+                else if (runProgress.Phase == "Planning")
+                    DryRun.PlanningProgress(
+                        runProgress.ScannedSources, runProgress.ScannedDestinations,
+                        runProgress.PlanStage, runProgress.UnreadableEntries);
                 else
                     Activity.ShowNotice(
                         $"Running: {runProgress.Completed} of {runProgress.Total} file(s)"

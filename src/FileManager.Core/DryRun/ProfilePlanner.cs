@@ -359,3 +359,36 @@ internal static class AsyncIteratorTeardown
         }
     }
 }
+
+/// <summary>The other half of that same dance: the poll that keeps a chunk stream's consumer publishing
+/// while an advance is pending.
+///
+/// <para>Necessary because the planner's ENTIRE source walk happens inside the FIRST
+/// <c>MoveNextAsync</c> — scan and evaluate are fused and every finding is spooled before a chunk exists
+/// — so a consumer that only acts between advances says nothing at all for the longest part of a run.
+/// The shared counters are live throughout; this is what gives a consumer somewhere to read them.</para>
+///
+/// <para>Only the wait is shared, not the sampling: one consumer publishes to an event bus and the other
+/// <c>yield return</c>s into its own stream, and a yield cannot cross into a callback. The wait is the
+/// half that was subtle enough to be worth having one copy of.</para></summary>
+internal static class AsyncIteratorHeartbeat
+{
+    /// <summary>Waits up to <paramref name="interval"/> for <paramref name="advance"/>. True when the
+    /// caller should take a sample; false once the advance has completed or the token has fired — at
+    /// which point the caller must fall through to awaiting the advance itself.
+    ///
+    /// <para>The token check is not redundant with the delay: once <paramref name="ct"/> fires,
+    /// <c>Task.Delay(…, ct)</c> completes instantly and a caller that kept polling would spin a core
+    /// until the plan finished unwinding, sampling progress nobody will ever see.</para></summary>
+    public static async ValueTask<bool> WaitForTickAsync(
+        Task<bool> advance, TimeSpan interval, CancellationToken ct)
+    {
+        if (advance.IsCompleted || ct.IsCancellationRequested)
+            return false;
+        // Real time, exactly as the pause poll and the drain loop are: this is a display heartbeat and
+        // nothing is decided from it, so pinning it to an injected clock would only make the behaviour
+        // vanish under a FakeTimeProvider.
+        await Task.WhenAny(advance, Task.Delay(interval, ct)).ConfigureAwait(false);
+        return !advance.IsCompleted && !ct.IsCancellationRequested;
+    }
+}

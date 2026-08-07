@@ -110,6 +110,52 @@ public sealed class JobQueueWindowSmokeTests(HeadlessSessionFixture headless)
         }, CancellationToken.None);
     }
 
+    /// <summary>A planning row with all three of its caption lines realized at once — the source count, the
+    /// destination count, and the stage note. Each is gated separately and the third was added last, so this
+    /// is the shape where a mis-bound converter or a stale compiled binding would surface.</summary>
+    [Fact]
+    public async Task A_planning_row_lays_out_its_scan_lines_and_its_stage_note()
+    {
+        await headless.Session.DispatchAsync(async () =>
+        {
+            Guid runId = Guid.NewGuid();
+            FakeIpcGateway gateway = new()
+            {
+                RunsResult = new List<RunSummaryDto> { Run("Planning", planned: 0, succeeded: 0, runId: runId) },
+            };
+            JobQueueViewModel vm = new(gateway);
+            await vm.ReconcileAsync();
+
+            // A sweep in progress: the state in which all three lines are visible together — both counts
+            // on screen and the stage note naming the one still moving. Deliberately a state the
+            // coordinator can actually reach: Building is only ever published for source-phase chunks,
+            // at which point the destination count is still zero.
+            vm.OnRunProgress(new RunProgressEvent
+            {
+                AtUtc = DateTimeOffset.UnixEpoch,
+                RunId = runId,
+                Phase = "Planning",
+                Completed = 0,
+                Total = 0,
+                Deleted = 0,
+                ScannedSources = 33_120,
+                ScannedDestinations = 12_004,
+                UnreadableEntries = 7,
+                PlanStage = RunPlanStages.Sweeping,
+            });
+            JobQueueRow row = vm.Runs[0];
+            Assert.True(row.IsPlanning);
+            Assert.True(row.HasScannedDestinations);
+            Assert.True(row.HasPlanStageNote);
+
+            Window window = new JobQueueWindow { DataContext = vm };
+            window.Show();
+            window.Measure(new Avalonia.Size(1040, 640));
+            window.Arrange(new Avalonia.Rect(0, 0, 1040, 640));
+            window.Close();
+        }, CancellationToken.None);
+    }
+
     /// <summary>The summary pane with a plan on screen — the branch that carries almost all the new markup:
     /// the chip strip, the shared storage panel under a twice-re-pointed DataContext, the source/target
     /// lists, the read-only settings grid, and the footer's Approve arm.</summary>

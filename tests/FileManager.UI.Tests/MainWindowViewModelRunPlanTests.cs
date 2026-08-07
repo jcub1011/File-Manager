@@ -231,6 +231,62 @@ public sealed class MainWindowViewModelRunPlanTests
         Assert.DoesNotContain("12,345", shell.Activity.Notice ?? "", StringComparison.Ordinal);
     }
 
+    /// <summary>The stage and the unreadable count reach the tab too, not just the two totals.
+    ///
+    /// <para>The stage is what stops the caption reading as a stall: once the walk ends, its findings are
+    /// written into the work list with both counts frozen at their final values, and a caption still saying
+    /// "scanning sources… 12,345 found" describes something that is no longer happening.</para></summary>
+    [Fact]
+    public async Task The_planning_stage_and_unreadable_count_reach_the_tabs_caption()
+    {
+        (MainWindowViewModel shell, FakeIpcGateway gateway) = NewShell();
+        Guid runId = await StartPreviewAsync(shell, gateway);
+
+        shell.HandleEngineEvent(new RunProgressEvent
+        {
+            AtUtc = DateTimeOffset.UnixEpoch,
+            RunId = runId,
+            Phase = "Planning",
+            Completed = 0,
+            Total = 0,
+            Deleted = 0,
+            ScannedSources = 12_345,
+            UnreadableEntries = 7,
+            PlanStage = RunPlanStages.Building,
+        });
+
+        Assert.StartsWith("Building the plan…", shell.DryRun.RunStatusText, StringComparison.Ordinal);
+        Assert.Contains("12,345", shell.DryRun.RunStatusText, StringComparison.Ordinal);
+        Assert.Contains("7 unreadable", shell.DryRun.RunStatusText, StringComparison.Ordinal);
+    }
+
+    /// <summary>A preview queued behind the concurrent-plan limit says so on the tab.
+    ///
+    /// <para>The coordinator publishes that sample under its own phase string, and its counters cannot move
+    /// while the run is parked. Routed as execution progress it became "Running: 0 of 0 file(s)…" in a panel
+    /// that is closed until a run is approved, while the tab the user IS looking at sat on the caption it
+    /// opened with — a scan apparently stuck at zero, for as long as the run ahead took to plan.</para></summary>
+    [Fact]
+    public async Task A_preview_queued_behind_the_plan_limit_says_so_on_the_tab()
+    {
+        (MainWindowViewModel shell, FakeIpcGateway gateway) = NewShell();
+        Guid runId = await StartPreviewAsync(shell, gateway);
+
+        shell.HandleEngineEvent(new RunProgressEvent
+        {
+            AtUtc = DateTimeOffset.UnixEpoch,
+            RunId = runId,
+            Phase = "Waiting",
+            Completed = 0,
+            Total = 0,
+            Deleted = 0,
+            PlanStage = RunPlanStages.Scanning,
+        });
+
+        Assert.Equal("Waiting for another preview to finish…", shell.DryRun.RunStatusText);
+        Assert.DoesNotContain("Running", shell.Activity.Notice ?? "", StringComparison.Ordinal);
+    }
+
     [Fact]
     public async Task Execution_progress_still_goes_to_the_activity_panel()
     {

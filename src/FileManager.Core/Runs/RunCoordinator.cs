@@ -15,6 +15,7 @@ using Microsoft.Extensions.Logging;
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
@@ -82,6 +83,15 @@ public sealed class RunCoordinator(
     /// becoming the scan's bottleneck.</summary>
     private static readonly TimeSpan PlanProgressInterval = TimeSpan.FromMilliseconds(100);
 
+    /// <summary>How long a planning stage may stay silent while its counters do not move.
+    ///
+    /// <para>A sample that repeats the last one is noise at the poll rate, but total silence is worse: the
+    /// counts freeze for the WHOLE of the Building stage, and a client that opens the queue window or
+    /// reconciles during it is seeded from <c>get-runs</c>, which carries no scan figures at all. With
+    /// nothing republished it reads "starting the scan" until the run is planned — the exact complaint the
+    /// live counts were added to answer. Two seconds is quiet without being mute.</para></summary>
+    private static readonly TimeSpan PlanRepublishInterval = TimeSpan.FromSeconds(2);
+
     private readonly ConcurrentDictionary<Guid, RunState> _runs = new();
     private readonly CancellationTokenSource _shutdown = new();
 
@@ -122,7 +132,7 @@ public sealed class RunCoordinator(
         // reply — a client learns the run exists no later than it learns its id.
         //
         // The counters are zero, which is the honest picture: the run exists and has looked at nothing.
-        PublishPlanningProgress(run, new DryRunProgressCounters());
+        PublishPlanningProgress(run, new DryRunProgressCounters(), RunPlanStages.Scanning);
 
         // Planning runs detached so the IPC caller is not held behind a scan (§8 rule 5). The token here is
         // None deliberately — cancelling a Task.Run's token only prevents the delegate from being
@@ -282,6 +292,14 @@ public sealed class RunCoordinator(
     {
         if (!_runs.TryGetValue(runId, out RunState? run))
             return $"no run with id {runId}";
+        // BEFORE the token is fired, not after, and that ordering is load-bearing. Firing first leaves a
+        // window in which the cancelled task has already unwound and reached its close — where it reads this
+        // very flag to decide whether it was cancelled or whether it FAILED — while this method has not set
+        // it yet, so the run closes as PlanFailed and the user is told their own cancel was an error. The
+        // window is microseconds and a real walk takes far longer than that to unwind, which is why it never
+        // showed; a planner that stops instantly loses the race about half the time.
+        lock (run.Gate)
+            run.Cancelled = true;
         // Null once the run has closed — ReleaseAfterClose disposes it. Cancelling an already-closed run is
         // a normal race (the queue's Cancel button against a run that just finished), not an error, so the
         // rest of this method still runs harmlessly and reports success.
@@ -301,8 +319,6 @@ public sealed class RunCoordinator(
         // Work not yet started need not happen. Work already in flight is never interrupted
         // (I-ATOMIC-JOB) — the drain loop waits for it, and the deletion phase is skipped.
         int dropped = queue.DropRun(runId);
-        lock (run.Gate)
-            run.Cancelled = true;
         logger.LogInformation("Run {RunId} cancelled; dropped {Dropped} pending payload(s)", runId, dropped);
 
         // A run already PARKED for approval has nobody left to notice the cancel: PlanAsync has returned,
@@ -545,7 +561,10 @@ public sealed class RunCoordinator(
             {
                 lock (run.Gate)
                     run.WaitingToPlan = true;
-                PublishPlanningProgress(run, counters);   // so the wait is visible, not silent
+                // So the wait is visible, not silent. This is now the ONLY deliberately quiet window left in
+                // planning: while parked here the counters cannot move, and the row reports Waiting rather
+                // than a scan stuck at zero, which is the honest picture.
+                PublishPlanningProgress(run, counters, RunPlanStages.Scanning);
                 await _planSlots.WaitAsync(linked.Token).ConfigureAwait(false);
                 lock (run.Gate)
                     run.WaitingToPlan = false;
@@ -553,38 +572,140 @@ public sealed class RunCoordinator(
             slotHeld = true;
 
             using RunSnapshotWriter writer = new(directory, logger);
-            // Seeded with a real timestamp, never left at 0: GetElapsedTime(0) reads as machine uptime,
-            // which would make the interval below meaningless.
-            long lastProgress = time.GetTimestamp();
-            await foreach (Result<PlanChunk, string> chunk in
-                planner.PlanAsync(run.Profile, run.ScopePath, state, counters, linked.Token)
-                    .ConfigureAwait(false))
+            // Real time, not the injected clock, and for the same reason the poll heartbeat below is: the
+            // two intervals gate the same samples, so a run driven by a FakeTimeProvider would otherwise
+            // have a throttle that never elapses and a heartbeat that always does — every between-chunk
+            // sample suppressed for the life of the run. Nothing is DECIDED from this; it only spaces a
+            // display feed. Seeded with a real timestamp, never left at 0: GetElapsedTime(0) reads as
+            // machine uptime, which would make both intervals meaningless.
+            long lastProgress = Stopwatch.GetTimestamp();
+            // What the last published sample SAID. Seeded to the zero pair Begin has already announced, so
+            // the first sample this loop emits is one that actually moved — a scan that has found nothing
+            // yet re-states nothing.
+            long lastSources = 0, lastDestinations = 0, lastSkipped = 0;
+            // Which part of planning the counters should be read as. Derived from the chunks themselves: a
+            // Sources chunk cannot exist until the walk has finished (see below), and the planner announces
+            // the sweep with a zero-entry marker.
+            string stage = RunPlanStages.Scanning, lastStage = RunPlanStages.Scanning;
+
+            // Publishes a sample only when it would SAY something new — with a floor, because "nothing new"
+            // is not the same as "nothing worth saying". Three gates:
+            //
+            // A count that has not moved is worth little to a reader already watching, so a stalled phase
+            // goes quiet rather than repeating itself ten times a second at every connected client. Quiet,
+            // not mute: a reader who was NOT already watching has nothing at all — get-runs carries no scan
+            // figures — so an unchanged sample is republished once per PlanRepublishInterval. That window
+            // is what bounds how long a queue opened during the Building stage, whose counts are frozen by
+            // construction, can read "starting the scan". It also heals the zeroed scan fields an execution
+            // progress sample (SetPaused's) writes over a planning row.
+            //
+            // Between chunks the shorter elapsed check bounds a tree that yields hundreds of small ones. A
+            // STAGE change bypasses both time gates — it is exactly the news the counters cannot carry, and
+            // it arrives precisely when they have stopped moving.
+            void SampleProgress(bool throttleByTime)
             {
-                if (chunk.TryGetError(out string? error))
+                bool stageChanged = stage != lastStage;
+                bool moved = counters.Sources != lastSources
+                    || counters.Destinations != lastDestinations
+                    || counters.Skipped != lastSkipped;
+                TimeSpan since = Stopwatch.GetElapsedTime(lastProgress);
+                if (!stageChanged && !moved && since < PlanRepublishInterval)
+                    return;
+                if (throttleByTime && !stageChanged && since < PlanProgressInterval)
+                    return;
+                (lastSources, lastDestinations, lastSkipped, lastStage) =
+                    (counters.Sources, counters.Destinations, counters.Skipped, stage);
+                lastProgress = Stopwatch.GetTimestamp();
+                PublishPlanningProgress(run, counters, stage);
+            }
+
+            // The plan's own cancellation authority over the enumerator, cancelled only if this loop is left
+            // with an advance still in flight. Distinct from `linked` deliberately: the teardown helper
+            // CANCELS what it is handed, and `linked` still has to survive the snapshot completion below and
+            // the disposal ordering on the failure path, which is the one ordering here that has ever been
+            // fragile.
+            using CancellationTokenSource planCts = CancellationTokenSource.CreateLinkedTokenSource(linked.Token);
+
+            // Driven through an explicit enumerator rather than `await foreach`, for one reason: the
+            // planner's ENTIRE source walk happens inside the FIRST MoveNextAsync — the engine fuses scan
+            // and evaluate and spools every finding before a chunk exists — so a foreach publishes nothing
+            // at all for the longest part of a run, and the queue row read "starting the scan" for minutes
+            // over a slow share. The counters are already live throughout (the scan pump and the sweep's
+            // walkers increment them); this samples them WHILE the advance is pending. The same dance, for
+            // the same reason, as DryRunStreamHandler — and, because it runs on the run's own task, a
+            // planning sample can never land after the run-planned event that follows this loop.
+            await using (IAsyncEnumerator<Result<PlanChunk, string>> chunks = planner
+                .PlanAsync(run.Profile, run.ScopePath, state, counters, planCts.Token)
+                .GetAsyncEnumerator(planCts.Token))
+            {
+                Task<bool> advance = chunks.MoveNextAsync().AsTask();
+                try
                 {
-                    failure = error;
-                    break;
+                    while (true)
+                    {
+                        // Unthrottled by the between-chunk gate: the heartbeat's own delay IS the throttle
+                        // here, and applying the shorter one on top would only ever suppress a sample the
+                        // poll had already spaced correctly.
+                        while (await AsyncIteratorHeartbeat
+                            .WaitForTickAsync(advance, PlanProgressInterval, linked.Token)
+                            .ConfigureAwait(false))
+                            SampleProgress(throttleByTime: false);
+
+                        // Propagates plan faults and cancellation exactly as the foreach did.
+                        if (!await advance.ConfigureAwait(false))
+                            break;
+                        Result<PlanChunk, string> chunk = chunks.Current;
+
+                        if (chunk.TryGetError(out string? error))
+                        {
+                            failure = error;
+                            break;
+                        }
+                        chunk.TryGetValue(out PlanChunk planned);
+                        // A chunk from the source phase is proof the walk is over: the engine cannot produce
+                        // one until its scan has completed and it is replaying what it found. That makes this
+                        // the exact moment the two scan counts freeze — and the reason the stage has to be
+                        // published at all, since from the counters alone that is indistinguishable from a
+                        // walk that has wedged. The sweep announces itself with its own zero-entry marker.
+                        stage = planned.Phase == PlanPhase.Destinations
+                            ? RunPlanStages.Sweeping
+                            : RunPlanStages.Building;
+                        writer.Consume(planned, run.Profile);
+                        // Between chunks, never mid-chunk: the writer has just consumed a complete chunk, so
+                        // this is a point at which the snapshot on disk is coherent and the enumerator holds
+                        // no half-read directory. Pausing inside the planner would mean holding scan-scheduler
+                        // slots and directory handles open for as long as the user cared to wait.
+                        if (runPause.IsRunPaused(run.RunId))
+                        {
+                            PublishPlanningProgress(run, counters, stage);   // say so before going quiet
+                            await WaitWhileRunPausedAsync(run, linked.Token).ConfigureAwait(false);
+                        }
+                        // Still sampled between chunks as well as during an advance: the destination sweep
+                        // STREAMS, so its advances complete too fast for the poll above to see, and its
+                        // counts would otherwise only ever be published once the sweep was over.
+                        SampleProgress(throttleByTime: true);
+
+                        advance = chunks.MoveNextAsync().AsTask();
+                    }
                 }
-                chunk.TryGetValue(out PlanChunk planned);
-                writer.Consume(planned, run.Profile);
-                // Between chunks, never mid-chunk: the writer has just consumed a complete chunk, so this
-                // is a point at which the snapshot on disk is coherent and the enumerator holds no
-                // half-read directory. Pausing inside the planner would mean holding scan-scheduler slots
-                // and directory handles open for as long as the user cared to wait.
-                if (runPause.IsRunPaused(run.RunId))
+                finally
                 {
-                    PublishPlanningProgress(run, counters);   // say so before going quiet
-                    await WaitWhileRunPausedAsync(run, linked.Token).ConfigureAwait(false);
-                }
-                // Live scan counts, so a multi-minute preview is distinguishable from a wedged one. Chunks
-                // already arrive in batches, and the interval bounds it again for a tree of small chunks;
-                // the event is lossy by contract, so a dropped sample costs nothing.
-                if (time.GetElapsedTime(lastProgress) >= PlanProgressInterval)
-                {
-                    lastProgress = time.GetTimestamp();
-                    PublishPlanningProgress(run, counters);
+                    // Ordered before the await-using's dispose: it must never run against an in-flight
+                    // MoveNextAsync. Unreachable on every normal path here — each break above falls into the
+                    // await that consumes the advance — so this is a completed-task no-op that cancels
+                    // nothing. Kept because it is the one copy of this teardown, shared with ProfilePlanner
+                    // and DryRunStreamHandler, and because "unreachable" is a property of the loop body that
+                    // an edit could quietly take away.
+                    await AsyncIteratorTeardown.ObserveAbandonedAdvanceAsync(advance, planCts, logger)
+                        .ConfigureAwait(false);
                 }
             }
+
+            // One last sample, unthrottled: a sweep's closing chunks routinely all arrive inside a single
+            // throttle window, and the time gate would then swallow the counts they carried — leaving the
+            // row settled on a figure short of what was actually found, for as long as the plan sits waiting
+            // to be approved. Still change-gated, so a plan that ended on a published count adds nothing.
+            SampleProgress(throttleByTime: false);
 
             if (failure is null && writer.Failure is { } writeFailure)
                 failure = writeFailure;
@@ -1156,7 +1277,10 @@ public sealed class RunCoordinator(
     /// <summary>A progress sample from the PLANNING phase, where the copy counters are all still zero and
     /// the scan counts are the only live figures — there is no denominator yet, because computing one is
     /// what planning is doing.</summary>
-    private void PublishPlanningProgress(RunState run, DryRunProgressCounters counters)
+    /// <param name="stage">Which part of planning this sample describes, from <see cref="RunPlanStages"/>.
+    /// Carried because the counts alone cannot distinguish the stretch where the walk is over and its
+    /// findings are being written — both frozen — from a walk that has wedged.</param>
+    private void PublishPlanningProgress(RunState run, DryRunProgressCounters counters, string stage)
     {
         bool paused = runPause.IsRunPaused(run.RunId);
         bool waiting;
@@ -1180,6 +1304,10 @@ public sealed class RunCoordinator(
             Deleted = 0,
             ScannedSources = counters.Sources,
             ScannedDestinations = counters.Destinations,
+            // Said live as well as in the approval-time warning: a tree the walk is failing to read is worth
+            // knowing about while it is being walked, not only once it is too late to stop it.
+            UnreadableEntries = counters.Skipped,
+            PlanStage = stage,
             Paused = paused,
         });
     }

@@ -89,7 +89,11 @@ internal sealed class RunPlanHarness : IDisposable
     public string TargetDir { get; }
     public string TrashBin { get; }
     public EnginePaths Paths { get; }
-    public ProfilePlanner Planner { get; }
+    /// <summary>The planning pipeline the coordinator drives. Real by default — planning over a real temp
+    /// filesystem is the point of this harness — but settable, so a test about the coordinator's OWN loop
+    /// (its progress sampling, its cancellation) can substitute a planner whose timing it controls. Set it
+    /// before <see cref="Coordinator"/>, which caches. Note that <see cref="PlanAsync"/> uses this too.</summary>
+    public IProfilePlanner Planner { get; set; }
     public FaultyTrashService Trash { get; }
     public FaultyJobJournal Journal { get; }
     public FaultyReconcileAuditLog Audit { get; }

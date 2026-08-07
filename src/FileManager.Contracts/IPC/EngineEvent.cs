@@ -186,12 +186,56 @@ public sealed record RunProgressEvent : EngineEvent
     /// zero for a profile that does not scan its destination, which is most of them.</summary>
     public long ScannedDestinations { get; init; }
 
+    /// <summary>Entries the source walk could not read — an ACL-denied or locked subdirectory, downgraded
+    /// from fatal to a warning by the scanner so its siblings are still walked.
+    /// <para>The engine already says this once, as a warning at approval time, because the resulting plan
+    /// LOOKS complete while real source files sit behind the fault. Said here as well because a tree the
+    /// walk is failing to read is worth knowing about WHILE it is being walked — on a disconnecting share
+    /// the count climbs alongside the scan, and waiting until the end to mention it means the user spent
+    /// the whole scan believing it was going fine.</para>
+    /// <para>Zero from a service that predates this member, which reads as "none", and zero is also the
+    /// honest answer for the overwhelming majority of runs.</para></summary>
+    public long UnreadableEntries { get; init; }
+
+    /// <summary>Which part of planning this sample was taken in — one of <see cref="RunPlanStages"/> — or
+    /// empty from a service that predates this member.
+    ///
+    /// <para><b>Why this cannot be inferred client-side.</b> Planning is not one walk. The source scan is
+    /// followed by a stretch where the engine replays what it found into the run's snapshot, during which
+    /// BOTH counts above are frozen at their final values, and then by the destination sweep. A client
+    /// watching only the counters cannot tell that frozen stretch from a scan that has wedged — which is
+    /// the same complaint the counters themselves were added to answer, one layer along.</para>
+    ///
+    /// <para>A string, for the reason <see cref="Phase"/> is one: adding a stage must not be a breaking
+    /// wire change. Empty means "old service", and a client falls back to showing the counts alone.</para></summary>
+    public string PlanStage { get; init; } = "";
+
     /// <summary>Whether this run is individually paused (<see cref="SetRunPausedRequest"/>), independent
     /// of the global engine pause.
     /// <para>Carried on the progress sample rather than as an event of its own so a paused run keeps
     /// saying so: the counters below stop moving while paused, and without this flag a paused run and a
     /// wedged one are indistinguishable — the same reason the scan counts exist.</para></summary>
     public bool Paused { get; init; }
+}
+
+/// <summary>The values <see cref="RunProgressEvent.PlanStage"/> takes.
+///
+/// <para>Declared here, in the contract, rather than duplicated on either side of the wire the way the UI
+/// has to duplicate the run PHASE names: those come from an engine-internal enum the UI may not reference
+/// (§1 rule 3), so a copy is unavoidable. This vocabulary is the wire's own, so there is one definition and
+/// both ends switch on a symbol.</para></summary>
+public static class RunPlanStages
+{
+    /// <summary>Walking the sources. <see cref="RunProgressEvent.ScannedSources"/> is climbing.</summary>
+    public const string Scanning = "Scanning";
+
+    /// <summary>The walk is over and its findings are being written into the run's work list. Both scan
+    /// counts are frozen at their final values, and nothing else says so.</summary>
+    public const string Building = "Building";
+
+    /// <summary>Walking the destination, looking for what is there that the sources do not account for.
+    /// <see cref="RunProgressEvent.ScannedDestinations"/> is climbing.</summary>
+    public const string Sweeping = "Sweeping";
 }
 
 /// <summary>A run reached its terminal state. The only authoritative statement of what a run did.</summary>

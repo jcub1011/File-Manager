@@ -168,6 +168,20 @@
                     <TextBlock Classes="caption" Text="{Binding SelectedRun.ScanSourcesText}" />
                     <TextBlock Classes="caption" Text="{Binding SelectedRun.ScanDestinationsText}"
                                IsVisible="{Binding SelectedRun.HasScannedDestinations}" />
+                    <!-- The stretch where both counts are frozen because the walk is over and the work
+                         list is being written — see PlanStageText. Gated on IsPlanning as well, exactly
+                         as the queue row's copy is: a run cancelled mid-plan never writes a snapshot
+                         header, so HasNoPlanYet above stays true and no further sample arrives to clear
+                         the stage — leaving this line claiming a plan is still being built minutes after
+                         the run ended. -->
+                    <TextBlock Classes="caption" Text="{Binding SelectedRun.PlanStageText}">
+                        <TextBlock.IsVisible>
+                            <MultiBinding Converter="{x:Static BoolConverters.And}">
+                                <Binding Path="SelectedRun.IsPlanning" />
+                                <Binding Path="SelectedRun.HasPlanStageNote" />
+                            </MultiBinding>
+                        </TextBlock.IsVisible>
+                    </TextBlock>
                 </StackPanel>
 
                 <Border Classes="infoBar danger" IsVisible="{Binding Summary.ErrorText, Converter={x:Static ObjectConverters.IsNotNull}}">
