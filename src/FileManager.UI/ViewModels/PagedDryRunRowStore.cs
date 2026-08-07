@@ -68,8 +68,16 @@ public sealed class PagedDryRunRowStore
     private readonly HashSet<int> _inFlight = [];
     private readonly CancellationTokenSource _closed = new();
 
+    private readonly string? _sourceCommonRoot;
+    private readonly string? _destinationCommonRoot;
+
+    /// <param name="sourceCommonRoot">The folder every source path is shown relative to, for the WHOLE
+    /// plan — derived by the caller from the plan's roots, not from any page. A page store left to work
+    /// it out from its own rows would produce a deeper root that changed as the user scrolled; see
+    /// <see cref="DryRunRowStore.UseCommonRoots"/>.</param>
     public PagedDryRunRowStore(
-        IIpcGateway gateway, Guid runId, RunPlanSide side, string? viewId, int rowCount)
+        IIpcGateway gateway, Guid runId, RunPlanSide side, string? viewId, int rowCount,
+        string? sourceCommonRoot = null, string? destinationCommonRoot = null)
     {
         ArgumentNullException.ThrowIfNull(gateway);
         _gateway = gateway;
@@ -77,6 +85,8 @@ public sealed class PagedDryRunRowStore
         _side = side;
         _viewId = viewId;
         RowCount = Math.Max(0, rowCount);
+        _sourceCommonRoot = sourceCommonRoot;
+        _destinationCommonRoot = destinationCommonRoot;
     }
 
     /// <summary>Rows in the view. Known up front from the view response, which is what lets a virtual
@@ -184,6 +194,10 @@ public sealed class PagedDryRunRowStore
             DryRunRowStore store = DryRunRowStore.CreateForIngest();
             store.OnChunk(chunk!);
             store.Complete();
+            // AFTER Complete, which is what derives them from the page's own rows — and a page can only
+            // see its own, so the plan-wide values have to replace them or every path on screen would be
+            // relative to a root that shifted between pages.
+            store.UseCommonRoots(_sourceCommonRoot, _destinationCommonRoot);
             Insert(page, store);
             PageArrived?.Invoke(this, (first, PageRows));
         }

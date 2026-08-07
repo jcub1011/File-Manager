@@ -108,6 +108,32 @@ public sealed class PagedDryRunRowStoreTests
     }
 
     [Fact]
+    public async Task Every_page_reports_the_PLANS_common_root_not_its_own()
+    {
+        // A page sees only its own rows, so left to itself it derives a much deeper common root than the
+        // plan's — and paths are displayed relative to it, so the whole list would re-base as the user
+        // scrolled. Each page under this fixture holds files from one directory, which is exactly the
+        // shape that makes a per-page root wrong.
+        FakeIpcGateway gateway = new();
+        for (int first = 0; first < 2_048; first += PagedDryRunRowStore.PageRows)
+            gateway.Pages[first] = Page(first, PagedDryRunRowStore.PageRows);
+        PagedDryRunRowStore store = new(
+            gateway, Guid.NewGuid(), RunPlanSide.Sources, null, 2_048,
+            sourceCommonRoot: @"C:\plan-wide");
+
+        store.TryGetRow(0, out _, out _);
+        store.TryGetRow(1_600, out _, out _);
+        await WaitUntilAsync(
+            () => store.TryGetRow(0, out _, out _) && store.TryGetRow(1_600, out _, out _),
+            "two far-apart pages");
+
+        Assert.True(store.TryGetRow(0, out DryRunRowStore firstPage, out _));
+        Assert.True(store.TryGetRow(1_600, out DryRunRowStore laterPage, out _));
+        Assert.Equal(@"C:\plan-wide", firstPage.SourceCommonRoot);
+        Assert.Equal(@"C:\plan-wide", laterPage.SourceCommonRoot);
+    }
+
+    [Fact]
     public void An_unloaded_row_reports_a_miss_instead_of_blocking()
     {
         // The indexer behind this runs on the UI thread during layout, so a miss has to answer

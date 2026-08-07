@@ -110,6 +110,22 @@ public sealed class DryRunRowStore : IDryRunChunkSink
     /// <summary>The destination-side counterpart of <see cref="SourceCommonRoot"/>.</summary>
     public string? DestinationCommonRoot { get; private set; }
 
+    /// <summary>Replaces the common roots this store derived from its own rows.
+    ///
+    /// <para><b>For a PAGE store, whose rows are a window rather than the whole plan.</b> Both roots are
+    /// a property of every row in a view, and a page can only see its own — so a page holding files from
+    /// one directory would compute a much deeper root than the plan's, and every path on screen would be
+    /// shown relative to something that shifted as the user scrolled. The paged store therefore computes
+    /// the roots once, from the plan's facet keys, and stamps them here.</para>
+    ///
+    /// <para>Only meaningful after <see cref="Complete"/>, which is where the derived values are set;
+    /// calling it before would simply be overwritten.</para></summary>
+    public void UseCommonRoots(string? source, string? destination)
+    {
+        SourceCommonRoot = source;
+        DestinationCommonRoot = destination;
+    }
+
     // Blast-radius banner numbers, folded during Complete so nothing re-walks the columns for them.
     public int OverwriteCount { get; private set; }
     public int RenameCount { get; private set; }
