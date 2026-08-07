@@ -66,11 +66,25 @@ internal sealed class RunSnapshotWriter : IDisposable
     private FileStream? _destinations;
     private string? _failure;
 
+    // The paging sidecars, built as the display halves stream past. Both are best-effort: their absence
+    // costs the preview a windowed read (it falls back to a scan) or its ordering (it falls back to plan
+    // order), never correctness of the work list — which is why neither writes to _failure.
+    private readonly RunSnapshotBlockIndex.Builder _sourceBlocks = new();
+    private readonly RunSnapshotBlockIndex.Builder _destinationBlocks = new();
+    private readonly RunSnapshotBlockIndex.Builder _deleteBlocks = new();
+    private readonly RunSnapshotOrder.Builder _sourceOrder;
+    private readonly RunSnapshotOrder.Builder _destinationOrder;
+
     public RunSnapshotWriter(string runDirectory, ILogger logger, long diskReserveBytes)
     {
         _directory = runDirectory;
         _logger = logger;
         _diskReserveBytes = diskReserveBytes;
+        // The run's own directory doubles as the sort's scratch space: it is on the volume already sized
+        // for the snapshot, and it is deleted wholesale when the run closes, so a crashed plan cannot
+        // leave run files behind anywhere else.
+        _sourceOrder = new RunSnapshotOrder.Builder(runDirectory, "src", logger);
+        _destinationOrder = new RunSnapshotOrder.Builder(runDirectory, "dst", logger);
         try
         {
             Directory.CreateDirectory(runDirectory);
@@ -203,8 +217,24 @@ internal sealed class RunSnapshotWriter : IDisposable
     /// and the deletion pass reads it from the header in O(1).</para></summary>
     public IReadOnlyDictionary<string, int> OrphansByTargetRoot => _orphansByTargetRoot;
 
+    /// <summary>The Preview tab's facet and status aggregates, folded over the whole plan. See
+    /// <see cref="RunSnapshotHeader.SourceRowsByRoot"/> for why the header carries them: a windowed
+    /// client holds a page at a time and cannot compute a whole-plan total for itself.</summary>
+    public IReadOnlyDictionary<string, int> SourceRowsByRoot => _sourceRowsByRoot;
+
+    public IReadOnlyDictionary<string, int> DestinationRowsByRoot => _destinationRowsByRoot;
+
+    public int UntouchedCount { get; private set; }
+
+    public int ProcessedCount { get; private set; }
+
     private readonly Dictionary<string, int> _sweptByTargetRoot = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, int> _orphansByTargetRoot = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, int> _sourceRowsByRoot = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, int> _destinationRowsByRoot = new(StringComparer.OrdinalIgnoreCase);
+
+    private static void Bump(Dictionary<string, int> counts, string key) =>
+        counts[key] = counts.GetValueOrDefault(key) + 1;
 
     private void CountSwept(string targetRoot) =>
         _sweptByTargetRoot[targetRoot] = _sweptByTargetRoot.GetValueOrDefault(targetRoot) + 1;
@@ -266,6 +296,9 @@ internal sealed class RunSnapshotWriter : IDisposable
         {
             IPhysicalFileView file = slice.SourceFiles[i];
             IFileOperationView? op = i < slice.SourceOperations.Count ? slice.SourceOperations[i] : null;
+            // Before the write, so the offset is where this row STARTS.
+            _sourceBlocks.Row(_sources?.Position ?? 0);
+            _sourceOrder.Row(file.Path, file.Root);
             Write(_sources, RunSnapshotJsonContext.Default.RunSourceItem, new RunSourceItem
             {
                 Path = file.Path,
@@ -277,6 +310,16 @@ internal sealed class RunSnapshotWriter : IDisposable
                 Detail = op?.Detail,
             });
             SourceCount++;
+            // The Preview tab's facet and status counts, under the SAME rules DryRunRowStore applied
+            // when it folded them client-side (a file with no operation reads as Processed). Two
+            // surfaces showing the same totals from different sources must not disagree.
+            Bump(_sourceRowsByRoot, file.Root);
+            switch (op?.Kind ?? OperationKind.Processed)
+            {
+                case OperationKind.SkippedByFilter or OperationKind.SkippedUnchanged: UntouchedCount++; break;
+                case OperationKind.Processed: ProcessedCount++; break;
+                default: break;
+            }
             // A disposal that is DESTRUCTIVE — the original does not survive the run. KeepSource is the
             // only non-destructive action, and a null disposition means the file does not process at all
             // (filtered, or already identical), which is what keeps a skipped file out of this count.
@@ -340,6 +383,10 @@ internal sealed class RunSnapshotWriter : IDisposable
                 continue;
             }
             IPhysicalFileView file = slice.DestinationFiles[local];
+            // The delete half is the SECOND segment of the destination side's single display index
+            // space — see RunSnapshotOrder.Builder.SecondSegmentRow.
+            _deleteBlocks.Row(_deletes?.Position ?? 0);
+            _destinationOrder.SecondSegmentRow(file.Path, file.Root);
             Write(_deletes, RunSnapshotJsonContext.Default.RunDeleteItem, new RunDeleteItem
             {
                 Path = file.Path,
@@ -351,6 +398,9 @@ internal sealed class RunSnapshotWriter : IDisposable
             DeleteBytes += file.Length;
             CountSwept(file.Root);
             CountOrphan(file.Root);
+            // An orphan is a destination ROW as well as a deletion, so it belongs in the facet count
+            // alongside the projection rows — the Destinations tab shows both.
+            Bump(_destinationRowsByRoot, file.Root);
         }
 
         // Per chunk, not per row: the counter is what paces the sample, and a chunk boundary is a point
@@ -386,6 +436,8 @@ internal sealed class RunSnapshotWriter : IDisposable
             }
         }
 
+        _destinationBlocks.Row(_destinations?.Position ?? 0);
+        _destinationOrder.Row(op.Path, op.Root);
         Write(_destinations, RunSnapshotJsonContext.Default.RunDestinationItem, new RunDestinationItem
         {
             Path = op.Path,
@@ -398,8 +450,51 @@ internal sealed class RunSnapshotWriter : IDisposable
             SubjectLastWriteUtc = subjectWritten,
         });
         DestinationCount++;
+        Bump(_destinationRowsByRoot, op.Root);
         if (DescribesExistingFile(op.Kind))
             CountSwept(op.Root);
+    }
+
+    /// <summary>Builds the header from everything this writer tallied during the walk, plus the few
+    /// facts only the caller knows (which run, which profile, when, and how the plan ended).
+    ///
+    /// <para><b>Here rather than at the call site, because there were two call sites and they drifted.</b>
+    /// The coordinator and the test harness each constructed a header field by field, so every count
+    /// added to this writer had to be remembered in both — and the moment one was not, the tests were
+    /// asserting against a header the production path would have filled in. Nineteen of the header's
+    /// fields come from this object; the caller supplies five.</para></summary>
+    public RunSnapshotHeader Header(
+        Guid runId, Profile profile, string? scopePath, DateTimeOffset plannedAt, PlanState state)
+    {
+        ArgumentNullException.ThrowIfNull(state);
+        return new RunSnapshotHeader
+        {
+            RunId = runId,
+            Profile = profile,
+            ScopePath = scopePath,
+            // The same instant reported to clients as RunSummaryDto.PlannedAtUtc, not a second call: a
+            // client measures a stored preview's staleness against that value, and the snapshot is what
+            // it is measuring the age OF.
+            PlannedAtUtc = plannedAt,
+            CopyItemCount = CopyCount,
+            DeleteItemCount = DeleteCount,
+            CopyBytes = CopyBytes,
+            DeleteBytes = DeleteBytes,
+            SourceItemCount = SourceCount,
+            DestinationItemCount = DestinationCount,
+            OverwriteCount = OverwriteCount,
+            RenameCount = RenameCount,
+            DisposalCount = DisposalCount,
+            SweptFilesByTargetRoot = SweptByTargetRoot,
+            OrphansByTargetRoot = OrphansByTargetRoot,
+            SourceRowsByRoot = SourceRowsByRoot,
+            DestinationRowsByRoot = DestinationRowsByRoot,
+            UntouchedCount = UntouchedCount,
+            ProcessedCount = ProcessedCount,
+            Truncated = state.Truncated,
+            SweepFaultDetail = state.SweepFaultDetail,
+            Space = state.Space,
+        };
     }
 
     /// <summary>Flushes the item files and writes the header. Call once, after the plan stream has
@@ -414,6 +509,15 @@ internal sealed class RunSnapshotWriter : IDisposable
             _deletes!.Flush(flushToDisk: false);
             _sources!.Flush(flushToDisk: false);
             _destinations!.Flush(flushToDisk: false);
+
+            // Sidecars BEFORE the header, and best-effort. The header's presence is what marks the
+            // snapshot complete and executable, so it must not appear until everything a reader may
+            // find is settled — but a sidecar that could not be written is a degraded VIEW of a sound
+            // plan (a scan instead of a seek, plan order instead of sorted), so it is logged and the run
+            // continues. The preview handles all four being absent, which is also what it sees for a
+            // snapshot written before paging existed.
+            WriteSidecars();
+
             byte[] json = JsonSerializer.SerializeToUtf8Bytes(header, RunSnapshotJsonContext.Default.RunSnapshotHeader);
             string path = Path.Combine(_directory, RunSnapshotPaths.HeaderFileName);
             using FileStream stream = new(path, FileMode.Create, FileAccess.Write, FileShare.Read);
@@ -425,6 +529,27 @@ internal sealed class RunSnapshotWriter : IDisposable
         {
             _logger.LogError(ex, "Could not complete the run snapshot at {Directory}", _directory);
             return $"could not write the run snapshot header: {ex.Message}";
+        }
+    }
+
+    /// <summary>Writes the four paging sidecars, logging rather than failing. See the call site for why
+    /// a sidecar failure is not a plan failure.</summary>
+    private void WriteSidecars()
+    {
+        Emit("source block index", _sourceBlocks.Write(In(RunSnapshotPaths.SourcesIndexFileName)));
+        Emit("destination block index", _destinationBlocks.Write(In(RunSnapshotPaths.DestinationsIndexFileName)));
+        Emit("delete block index", _deleteBlocks.Write(In(RunSnapshotPaths.DeletesIndexFileName)));
+        Emit("source order", _sourceOrder.Write(In(RunSnapshotPaths.SourcesOrderFileName)));
+        Emit("destination order", _destinationOrder.Write(In(RunSnapshotPaths.DestinationsOrderFileName)));
+
+        string In(string name) => Path.Combine(_directory, name);
+
+        void Emit(string what, string? error)
+        {
+            if (error is not null)
+                _logger.LogWarning(
+                    "Run snapshot at {Directory}: the {What} could not be written ({Error}); the preview " +
+                    "falls back to an unindexed read", _directory, what, error);
         }
     }
 
@@ -448,6 +573,10 @@ internal sealed class RunSnapshotWriter : IDisposable
 
     public void Dispose()
     {
+        // Before the streams: a plan abandoned mid-walk (cancelled, failed) never reached Complete, so
+        // this is the only thing that removes its spilled sort runs.
+        _sourceOrder.Dispose();
+        _destinationOrder.Dispose();
         _copies?.Dispose();
         _deletes?.Dispose();
         _sources?.Dispose();
@@ -468,6 +597,15 @@ internal static class RunSnapshotPaths
     public const string DeletesFileName = "deletes.ndjsonl";
     public const string SourcesFileName = "sources.ndjsonl";
     public const string DestinationsFileName = "destinations.ndjsonl";
+
+    // Paging sidecars for the two DISPLAY halves. ".idx" is ordinal → byte offset (every 512th row);
+    // ".ord" is display position → ordinal. Neither exists for a snapshot written before paging, and
+    // both are optional at read time — see RunSnapshotBlockIndex and RunSnapshotOrder.
+    public const string SourcesIndexFileName = "sources.idx";
+    public const string DestinationsIndexFileName = "destinations.idx";
+    public const string DeletesIndexFileName = "deletes.idx";
+    public const string SourcesOrderFileName = "sources.ord";
+    public const string DestinationsOrderFileName = "destinations.ord";
 
     public static string DirectoryFor(EnginePaths paths, Guid runId) =>
         Path.Combine(paths.RunsDirectory, runId.ToString("N"));
@@ -512,6 +650,146 @@ internal static class RunSnapshotReader
     public static IEnumerable<RunSourceItem> ReadSources(string runDirectory, ILogger logger) =>
         Read(Path.Combine(runDirectory, RunSnapshotPaths.SourcesFileName),
             RunSnapshotJsonContext.Default.RunSourceItem, logger);
+
+    /// <summary>Reads specific ROWS by ordinal, seeking to each one's block rather than scanning to it.
+    ///
+    /// <para>This is the read half of paging: <paramref name="index"/> gives the byte offset of every
+    /// 512th row, so reaching row 4,000,000 costs a seek plus at most 511 line skips instead of four
+    /// million deserializations. Without it a windowed preview would be slower than the whole-file read
+    /// it replaced.</para>
+    ///
+    /// <para><paramref name="ordinals"/> need not be contiguous or sorted — a sorted view hands them in
+    /// display order, which is scattered across the file by construction. They ARE grouped by block
+    /// internally so a page whose rows share a block pays one seek for all of them, which is the common
+    /// case: the order file sorts by relative path, and files in one directory were written
+    /// together.</para>
+    ///
+    /// <para>Returns rows in the order asked for, with a null for any ordinal that could not be read.
+    /// A null is a hole in the page, never an exception: one unreadable row must not blank a
+    /// preview.</para></summary>
+    public static T?[] ReadByOrdinal<T>(
+        string path, RunSnapshotBlockIndex.Index index, IReadOnlyList<int> ordinals,
+        JsonTypeInfo<T> typeInfo, ILogger logger)
+        where T : class
+    {
+        T?[] rows = new T?[ordinals.Count];
+        if (ordinals.Count == 0 || !File.Exists(path))
+            return rows;
+
+        // Group the requested positions by the block they live in, then walk the blocks in file order:
+        // one seek and one forward pass per block, however the caller shuffled the ordinals.
+        Dictionary<long, List<int>> byBlock = [];
+        for (int i = 0; i < ordinals.Count; i++)
+        {
+            long block = ordinals[i] / RunSnapshotBlockIndex.BlockRows;
+            (byBlock.TryGetValue(block, out List<int>? slots) ? slots : byBlock[block] = []).Add(i);
+        }
+
+        try
+        {
+            using FileStream stream = new(path, FileMode.Open, FileAccess.Read, FileShare.Read, 64 * 1024);
+            List<long> blocks = [.. byBlock.Keys];
+            blocks.Sort();   // file order, so the seeks only ever go forward
+            foreach (long block in blocks)
+            {
+                List<int> slots = byBlock[block];
+                (long offset, int _) = index.Locate(block * RunSnapshotBlockIndex.BlockRows);
+                stream.Seek(offset, SeekOrigin.Begin);
+
+                // Wanted rows within this block, by their offset from its first row, so the forward scan
+                // can stop as soon as the last one is in hand.
+                Dictionary<int, List<int>> wanted = [];
+                int furthest = -1;
+                foreach (int slot in slots)
+                {
+                    int within = (int)(ordinals[slot] % RunSnapshotBlockIndex.BlockRows);
+                    (wanted.TryGetValue(within, out List<int>? at) ? at : wanted[within] = []).Add(slot);
+                    furthest = Math.Max(furthest, within);
+                }
+
+                using StreamLineReader lines = new(stream);
+                for (int within = 0; within <= furthest; within++)
+                {
+                    if (!lines.TryNextLine(out ReadOnlySpan<byte> line))
+                        break;
+                    if (!wanted.TryGetValue(within, out List<int>? slotsHere))
+                        continue;   // a row between two wanted ones: skipped without deserializing
+                    T? item = Decode(line, typeInfo, path, logger);
+                    foreach (int slot in slotsHere)
+                        rows[slot] = item;
+                }
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            logger.LogWarning(ex, "Run snapshot: could not read a page of \"{Path}\"", path);
+        }
+        return rows;
+    }
+
+    /// <summary>The unindexed fallback for <see cref="ReadByOrdinal{T}"/>: one sequential pass over the
+    /// file, keeping the rows whose position was asked for.
+    ///
+    /// <para>Linear in the FILE rather than in the page, which is exactly the cost the block index
+    /// exists to remove. It is kept because the alternative is refusing to show a plan that is perfectly
+    /// sound — a snapshot written before paging existed, or one whose sidecar write failed, has no
+    /// index and must still be viewable.</para></summary>
+    public static T?[] ScanByOrdinal<T>(
+        string path, IReadOnlyList<int> ordinals, JsonTypeInfo<T> typeInfo, ILogger logger)
+        where T : class
+    {
+        T?[] rows = new T?[ordinals.Count];
+        if (ordinals.Count == 0 || !File.Exists(path))
+            return rows;
+
+        Dictionary<int, List<int>> wanted = [];
+        int furthest = -1;
+        for (int i = 0; i < ordinals.Count; i++)
+        {
+            (wanted.TryGetValue(ordinals[i], out List<int>? slots) ? slots : wanted[ordinals[i]] = []).Add(i);
+            furthest = Math.Max(furthest, ordinals[i]);
+        }
+
+        try
+        {
+            using FileStream stream = new(path, FileMode.Open, FileAccess.Read, FileShare.Read, 64 * 1024);
+            using StreamLineReader lines = new(stream);
+            for (int ordinal = 0; ordinal <= furthest; ordinal++)
+            {
+                if (!lines.TryNextLine(out ReadOnlySpan<byte> line))
+                    break;
+                if (!wanted.TryGetValue(ordinal, out List<int>? slotsHere))
+                    continue;
+                T? item = Decode(line, typeInfo, path, logger);
+                foreach (int slot in slotsHere)
+                    rows[slot] = item;
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            logger.LogWarning(ex, "Run snapshot: could not scan \"{Path}\" for a page", path);
+        }
+        return rows;
+    }
+
+    private static T? Decode<T>(ReadOnlySpan<byte> line, JsonTypeInfo<T> typeInfo, string path, ILogger logger)
+        where T : class
+    {
+        try
+        {
+            if (!NdjsonFrame.TryDecode(line, out ReadOnlySpan<byte> json, out string? reason))
+            {
+                logger.LogWarning("Run snapshot: skipping a malformed row of \"{Path}\": {Reason}", path, reason);
+                return null;
+            }
+            return JsonSerializer.Deserialize(json, typeInfo);
+        }
+        catch (Exception ex) when (ex is JsonException or ArgumentException)
+        {
+            logger.LogWarning(ex, "Run snapshot: skipping an unreadable row of \"{Path}\"", path);
+            return null;
+        }
+    }
 
     /// <summary>The plan's destination projection. A missing file yields nothing, which is the correct
     /// reading of a snapshot written before this half existed.</summary>

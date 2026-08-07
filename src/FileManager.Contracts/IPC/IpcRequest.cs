@@ -27,6 +27,7 @@ namespace FileManager.Contracts.IPC;
 [JsonDerivedType(typeof(ApproveRunRequest), "approve-run")]
 [JsonDerivedType(typeof(CancelRunRequest), "cancel-run")]
 [JsonDerivedType(typeof(GetRunPlanStreamRequest), "get-run-plan-stream")]
+[JsonDerivedType(typeof(GetRunPlanPageRequest), "get-run-plan-page")]
 [JsonDerivedType(typeof(GetRunsRequest), "get-runs")]
 [JsonDerivedType(typeof(GetRunDetailRequest), "get-run-detail")]
 [JsonDerivedType(typeof(SetRunPausedRequest), "set-run-paused")]
@@ -182,6 +183,48 @@ public sealed record CancelRunRequest : IpcRequest
 public sealed record GetRunPlanStreamRequest : IpcRequest
 {
     public required Guid RunId { get; init; }
+}
+
+/// <summary>Which half of a plan a page comes from. The two are separate index spaces: a source position
+/// and a destination position of the same number name unrelated rows.</summary>
+public enum RunPlanSide
+{
+    /// <summary>Every file the plan LOOKED at — <c>sources.ndjsonl</c>.</summary>
+    Sources,
+
+    /// <summary>Every destination the plan projected, then every orphan it named — the concatenation of
+    /// <c>destinations.ndjsonl</c> and <c>deletes.ndjsonl</c>, which the client sees as one list.</summary>
+    Destinations,
+}
+
+/// <summary>One WINDOW of a pending run's frozen work list, in the same <c>DryRunChunkResponse</c> shape
+/// the whole-plan stream emits.
+///
+/// <para><b>Why a window.</b> <see cref="GetRunPlanStreamRequest"/> replays the entire plan, and the
+/// client used to keep every row of it: ~72 MB of retained rows at 500,000 files plus a ~147 MB
+/// transient sort, both linear. That was affordable only while the plan itself was capped at 500,000,
+/// and the cap is gone — a plan is the work list a run executes, so bounding it produced a wrong job.
+/// A page request holds the client to a viewport instead, whatever the plan's size.</para>
+///
+/// <para><see cref="First"/> is a DISPLAY position, not a row ordinal: the service resolves it through
+/// the plan's order file, so the client never learns how the rows are laid out on disk and never sorts
+/// anything. Positions past the end return an empty page rather than an error — a viewport may legally
+/// overhang the list while a scroll settles.</para>
+///
+/// <para>Same error vocabulary as the stream: <c>RUN_NOT_FOUND</c> for an unknown id,
+/// <c>RUN_PLAN_UNAVAILABLE</c> when the run has no readable header (which includes a run still
+/// planning).</para></summary>
+public sealed record GetRunPlanPageRequest : IpcRequest
+{
+    public required Guid RunId { get; init; }
+    public required RunPlanSide Side { get; init; }
+
+    /// <summary>First display position wanted, counting from 0.</summary>
+    public required int First { get; init; }
+
+    /// <summary>How many rows to return. The service clamps this to what remains and to its own frame
+    /// budget, so a client asking for more than fits gets a short page rather than an error.</summary>
+    public required int Count { get; init; }
 }
 /// <summary>Every run the service still knows about, newest first — the authoritative re-seed for a
 /// job-queue view.

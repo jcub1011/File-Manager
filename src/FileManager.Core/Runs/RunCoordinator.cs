@@ -745,30 +745,8 @@ public sealed class RunCoordinator(
                 run.PlanTruncated = state.Truncated;
                 run.SweepFaultDetail = state.SweepFaultDetail;
                 run.UnreadableSourceEntries = (int)Math.Min(int.MaxValue, counters.Skipped);
-                Result completed = writer.Complete(new RunSnapshotHeader
-                {
-                    RunId = run.RunId,
-                    Profile = run.Profile,
-                    ScopePath = run.ScopePath,
-                    // The same instant reported to clients as RunSummaryDto.PlannedAtUtc, not a second
-                    // call: a client measures a stored preview's staleness against that value, and the
-                    // snapshot is what it is measuring the age OF.
-                    PlannedAtUtc = plannedAt.Value,
-                    CopyItemCount = writer.CopyCount,
-                    DeleteItemCount = writer.DeleteCount,
-                    CopyBytes = writer.CopyBytes,
-                    DeleteBytes = writer.DeleteBytes,
-                    SourceItemCount = writer.SourceCount,
-                    DestinationItemCount = writer.DestinationCount,
-                    OverwriteCount = writer.OverwriteCount,
-                    RenameCount = writer.RenameCount,
-                    DisposalCount = writer.DisposalCount,
-                    SweptFilesByTargetRoot = writer.SweptByTargetRoot,
-                    OrphansByTargetRoot = writer.OrphansByTargetRoot,
-                    Truncated = state.Truncated,
-                    SweepFaultDetail = state.SweepFaultDetail,
-                    Space = state.Space,
-                });
+                Result completed = writer.Complete(
+                    writer.Header(run.RunId, run.Profile, run.ScopePath, plannedAt.Value, state));
                 completed.TryGetError(out failure);
             }
         }

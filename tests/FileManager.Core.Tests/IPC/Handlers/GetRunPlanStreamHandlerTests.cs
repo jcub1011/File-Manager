@@ -292,22 +292,4 @@ public sealed class GetRunPlanStreamHandlerTests
         Assert.Equal("RUN_NOT_FOUND", Assert.IsType<ErrorResponse>(Assert.Single(responses)).Code);
     }
 
-    /// <summary>Answers with one run's snapshot directory and nothing else — the only thing the handler
-    /// asks a coordinator for.</summary>
-    private sealed class SingleSnapshotCoordinator(Guid runId, string directory) : IRunCoordinator
-    {
-        public string? SnapshotDirectory(Guid id) => id == runId ? directory : null;
-
-        public Result<RunHandle, string> Begin(Profile profile, string? scopePath) => "not used";
-        public Result Approve(Guid id, bool approve, bool acknowledgeWarnings = false) => Result.Success();
-        public Result Cancel(Guid id) => Result.Success();
-        public Result Discard(Guid id) => Result.Success();
-        public RunStatus? GetStatus(Guid id) => null;
-        public void Settled(Guid id, JobCompletion? completion) { }
-        public Profile? PlannedProfile(Guid id) => null;
-        public void Coalesced(Guid id) { }
-        public IReadOnlyList<RunSummaryDto> ListRuns() => [];
-        public Result SetPaused(Guid id, bool paused) => Result.Success();
-        public Task StopAsync() => Task.CompletedTask;
-    }
 }

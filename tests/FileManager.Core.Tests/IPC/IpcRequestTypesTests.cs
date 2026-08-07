@@ -53,6 +53,10 @@ public sealed class IpcRequestTypesTests
             nameof(ApproveRunRequest) => new ApproveRunRequest { RunId = id, Approve = true },
             nameof(CancelRunRequest) => new CancelRunRequest { RunId = id },
             nameof(GetRunPlanStreamRequest) => new GetRunPlanStreamRequest { RunId = id },
+            nameof(GetRunPlanPageRequest) => new GetRunPlanPageRequest
+            {
+                RunId = id, Side = RunPlanSide.Sources, First = 0, Count = 1,
+            },
             nameof(GetRunDetailRequest) => new GetRunDetailRequest { RunId = id },
             nameof(GetRunsRequest) => new GetRunsRequest(),
             nameof(SetRunPausedRequest) => new SetRunPausedRequest { RunId = id, Paused = true },

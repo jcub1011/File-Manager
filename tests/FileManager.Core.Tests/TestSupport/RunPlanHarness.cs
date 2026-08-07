@@ -388,26 +388,11 @@ internal sealed class RunPlanHarness : IDisposable
             writer.Consume(planned, profile);
         }
 
-        Result completion = writer.Complete(new RunSnapshotHeader
-        {
-            RunId = id,
-            Profile = profile,
-            ScopePath = scopePath,
-            PlannedAtUtc = DateTimeOffset.UnixEpoch,
-            CopyItemCount = writer.CopyCount,
-            DeleteItemCount = writer.DeleteCount,
-            CopyBytes = writer.CopyBytes,
-            DeleteBytes = writer.DeleteBytes,
-            SourceItemCount = writer.SourceCount,
-            DestinationItemCount = writer.DestinationCount,
-            OverwriteCount = writer.OverwriteCount,
-            RenameCount = writer.RenameCount,
-            DisposalCount = writer.DisposalCount,
-            SweptFilesByTargetRoot = writer.SweptByTargetRoot,
-            Truncated = state.Truncated,
-            SweepFaultDetail = state.SweepFaultDetail,
-            Space = state.Space,
-        });
+        // Through the writer's own factory, NOT a header built field by field here. This used to be a
+        // second construction site, and it silently fell behind every count the writer gained — so the
+        // tests were asserting against a header the production path would have filled in differently.
+        Result completion = writer.Complete(
+            writer.Header(id, profile, scopePath, DateTimeOffset.UnixEpoch, state));
         return (directory, state, completion);
     }
 

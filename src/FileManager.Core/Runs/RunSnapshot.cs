@@ -79,6 +79,34 @@ public sealed record RunSnapshotHeader
 
     public int DisposalCount { get; init; }
 
+    /// <summary>The Preview tab's aggregates over the WHOLE plan: its facet counts (rows per root, one
+    /// entry per source and target root), its status-filter counts, and the folder each panel shows its
+    /// paths relative to.
+    ///
+    /// <para><b>Why the header carries them.</b> The client used to fold all of this itself while walking
+    /// the rows it had just ingested, which was affordable only because it ingested every row. A windowed
+    /// preview holds a page at a time, so an aggregate over the whole plan is no longer something it can
+    /// compute — and a facet bar that only counted the rows currently on screen would be worse than
+    /// none. Folded during the plan's own walk they cost a dictionary increment per row.</para>
+    ///
+    /// <para>All empty or zero for a snapshot written before they existed, which reads as "no facets, no
+    /// status counts" — the same honest absence <see cref="SourceItemCount"/> documents.</para></summary>
+    public IReadOnlyDictionary<string, int> SourceRowsByRoot { get; init; } = new Dictionary<string, int>();
+
+    public IReadOnlyDictionary<string, int> DestinationRowsByRoot { get; init; } = new Dictionary<string, int>();
+
+    /// <summary>Sources the plan will not act on — filtered out, or already identical.</summary>
+    public int UntouchedCount { get; init; }
+
+    /// <summary>Sources the plan will copy.</summary>
+    public int ProcessedCount { get; init; }
+
+    // NO common-root fields. The folder each panel shows its paths relative to is derived from the ROOTS
+    // — and the client already has every root, as the keys of the two dictionaries above. Deriving it
+    // there costs O(roots), which is a handful, and keeps one implementation of the rule
+    // (DryRunPaths.CommonRoot, which lives in the UI and cannot be referenced from here) instead of a
+    // second one that could disagree about UNC shares or drive-spanning sets.
+
     /// <summary>Pre-existing files the destination sweep classified under each target root — survivors
     /// and orphans together. The denominator for <c>MirrorDeletionPass</c>'s ratio guard.
     /// <para>Recorded here because the sweep is the only place it can be counted: it sees each
