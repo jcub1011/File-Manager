@@ -1,5 +1,16 @@
 # Dry-run preview: memory optimization plan
 
+> **SUPERSEDED (2026-08-07) — this is now a historical record.** Everything below optimizes a preview that
+> holds the whole plan. It no longer does: it opens the plan as a handle and reads a window
+> (`docs/dry-run-paging-next-steps.md`). Retained heap went 72.1 MB at 500,000 rows → **17.7 MB, and flat**
+> — 19.6 MB at five million.
+>
+> The API this document is written against is largely gone: `ApplyReport`, both `ComputeLoad`s,
+> `DryRunSort`, `DryRunRowList<T>` and the engine's `MaxStreamedFiles` cap. Read it for the reasoning that
+> still applies — the columnar store, the interning, the directory-table wire contract and the handle rows
+> all survive, and a PAGE is folded by exactly the ingest described here. Do not read it for the shape of
+> the code.
+
 > **Status: IMPLEMENTED (2026-07-15).** All three optimizations landed (lazy display
 > strings; root interning, later subsumed by #3; the directory-table wire contract with
 > IPC protocol v2). Measured at the 500k-file cap via the retained-heap probes in

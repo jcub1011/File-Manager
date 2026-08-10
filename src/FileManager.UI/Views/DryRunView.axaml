@@ -469,9 +469,11 @@
                                 </Flyout>
                             </Button.Flyout>
                         </Button>
-                        <ToggleButton Grid.Column="2" Content="Tree view" IsChecked="{Binding Sources.ShowTree}"
-                                      FontSize="12" Margin="8,0,0,0" VerticalAlignment="Stretch"
-                                      ToolTip.Tip="Group the files into a navigable directory tree" />
+                        <!-- No tree toggle: the forest needs the directory structure of the WHOLE view,
+                             which a paged client does not have — it holds a window. Restoring it needs a
+                             service verb serving children per directory; see
+                             docs/dry-run-paging-next-steps.md. Removed rather than disabled, because a
+                             control that can never do anything is worse than its absence. -->
                     </Grid>
 
                     <!-- common root the listed paths are shown relative to (trimmed, full path in tooltip) -->
@@ -481,7 +483,6 @@
                                ToolTip.Tip="{Binding Sources.CommonRoot}" />
 
                     <ListBox Grid.Row="3" Classes="rows" ItemsSource="{Binding Sources.VisibleRows}"
-                             IsVisible="{Binding !Sources.ShowTree}"
                              SelectionMode="Single" ScrollViewer.HorizontalScrollBarVisibility="Disabled">
                         <ListBox.ItemTemplate>
                             <DataTemplate x:DataType="vm:DryRunFileRow">
@@ -522,27 +523,8 @@
                         </ListBox.ItemTemplate>
                     </ListBox>
 
-                    <!-- The tree grid is hosted in a ContentControl (not a plain IsVisible toggle) so it
-                         is created only while a forest is present and destroyed the moment the tree is
-                         toggled off: TreeSource goes null, the ContentPresenter drops the TreeDataGrid,
-                         and the control's realized rows / element-recycle pool — which root the whole
-                         forest of nodes and would otherwise stack across toggles — go with it. A fresh
-                         grid is built when the tree is turned back on. -->
-                    <ContentControl Grid.Row="3" IsVisible="{Binding Sources.ShowTree}"
-                                    Content="{Binding Sources.TreeSource}">
-                        <ContentControl.ContentTemplate>
-                            <!-- ITreeDataGridSource, not the closed generic: the DataContext is a
-                                 HierarchicalTreeDataGridSource<DryRunTreeNode>, which XAML cannot name,
-                                 and the non-generic interface is exactly what TreeDataGrid.Source takes.
-                                 Enough for a compiled pass-through binding of the DataContext. -->
-                            <DataTemplate x:DataType="ITreeDataGridSource">
-                                <TreeDataGrid Classes="rows" Source="{Binding}" />
-                            </DataTemplate>
-                        </ContentControl.ContentTemplate>
-                    </ContentControl>
-
-                    <!-- Loading overlay: shown while a large rebuild (tree build / filter pass) runs
-                         on the thread pool — the view beneath is empty or stale until it publishes. -->
+                    <!-- Loading overlay: shown while the service builds a filtered view over a large
+                         plan — the list beneath still shows the previous filter's rows until it lands. -->
                     <Panel Grid.Row="3" IsVisible="{Binding Sources.IsRebuilding}">
                         <Border Background="{DynamicResource Brush.Window.Background}" Opacity="0.6" />
                         <StackPanel Spacing="10" MinWidth="220" VerticalAlignment="Center" HorizontalAlignment="Center">
@@ -612,9 +594,7 @@
                                 </Flyout>
                             </Button.Flyout>
                         </Button>
-                        <ToggleButton Grid.Column="2" Content="Tree view" IsChecked="{Binding Destinations.ShowTree}"
-                                      FontSize="12" Margin="8,0,0,0" VerticalAlignment="Stretch"
-                                      ToolTip.Tip="Group the resulting files into a navigable directory tree" />
+                        <!-- No tree toggle — see the Sources tab above. -->
                     </Grid>
 
                     <!-- common root the listed paths are shown relative to (trimmed, full path in tooltip) -->
@@ -624,7 +604,6 @@
                                ToolTip.Tip="{Binding Destinations.CommonRoot}" />
 
                     <ListBox Grid.Row="3" Classes="rows" ItemsSource="{Binding Destinations.VisibleRows}"
-                             IsVisible="{Binding !Destinations.ShowTree}"
                              SelectionMode="Single" ScrollViewer.HorizontalScrollBarVisibility="Disabled">
                         <ListBox.ItemTemplate>
                             <DataTemplate x:DataType="vm:DryRunDestinationRow">
@@ -667,24 +646,7 @@
                         </ListBox.ItemTemplate>
                     </ListBox>
 
-                    <!-- Hosted in a ContentControl so the grid is created/destroyed with the forest —
-                         see the Sources tab above for why (releasing the TreeDataGrid's realized rows
-                         on toggle-off instead of stranding them). -->
-                    <ContentControl Grid.Row="3" IsVisible="{Binding Destinations.ShowTree}"
-                                    Content="{Binding Destinations.TreeSource}">
-                        <ContentControl.ContentTemplate>
-                            <!-- ITreeDataGridSource, not the closed generic: the DataContext is a
-                                 HierarchicalTreeDataGridSource<DryRunTreeNode>, which XAML cannot name,
-                                 and the non-generic interface is exactly what TreeDataGrid.Source takes.
-                                 Enough for a compiled pass-through binding of the DataContext. -->
-                            <DataTemplate x:DataType="ITreeDataGridSource">
-                                <TreeDataGrid Classes="rows" Source="{Binding}" />
-                            </DataTemplate>
-                        </ContentControl.ContentTemplate>
-                    </ContentControl>
-
-                    <!-- Loading overlay: shown while a large rebuild (tree build / filter pass) runs
-                         on the thread pool — the view beneath is empty or stale until it publishes. -->
+                    <!-- Loading overlay — see the Sources tab above. -->
                     <Panel Grid.Row="3" IsVisible="{Binding Destinations.IsRebuilding}">
                         <Border Background="{DynamicResource Brush.Window.Background}" Opacity="0.6" />
                         <StackPanel Spacing="10" MinWidth="220" VerticalAlignment="Center" HorizontalAlignment="Center">

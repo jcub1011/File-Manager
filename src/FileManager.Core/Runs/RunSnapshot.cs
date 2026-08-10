@@ -101,6 +101,15 @@ public sealed record RunSnapshotHeader
     /// <summary>Sources the plan will copy.</summary>
     public int ProcessedCount { get; init; }
 
+    /// <summary>Destination operations tallied by kind, orphans included — the Destinations tab's status
+    /// chips over the whole plan.
+    /// <para>By <see cref="OperationKind"/> and not by the tab's four chip names, deliberately: the chip a
+    /// kind belongs to is a display decision (<c>DestinationKindMap.Map</c> folds Rename into New and
+    /// three kinds into Untouched) and a chip vocabulary here would be a second copy of that mapping, free
+    /// to drift from the one the rows themselves render through.</para></summary>
+    public IReadOnlyDictionary<OperationKind, int> DestinationRowsByKind { get; init; } =
+        new Dictionary<OperationKind, int>();
+
     // NO common-root fields. The folder each panel shows its paths relative to is derived from the ROOTS
     // — and the client already has every root, as the keys of the two dictionaries above. Deriving it
     // there costs O(roots), which is a handful, and keeps one implementation of the rule
@@ -235,6 +244,20 @@ public sealed record RunSourceItem
     /// <summary>Display string carried through verbatim: the deciding filter rule, or the unchanged
     /// reason.</summary>
     public string? Detail { get; init; }
+
+    /// <summary>An <c>OperationKindMask</c> over the kinds this file's DESTINATION operations take; zero
+    /// when it has none.
+    ///
+    /// <para><b>Here because a page of this file cannot see the destination half.</b> The Sources tab
+    /// shows one rolled-up glyph per row for what happens at the target — New, Overwrite, Rename, Skip —
+    /// and derived it by walking the row's destination operations, which a windowed client does not have.
+    /// Folded during the plan's own walk it costs one OR per operation.</para>
+    ///
+    /// <para>Zero on a snapshot written before this existed, which reads as "no destinations recorded"
+    /// and renders as no glyph — the same honest absence <see cref="RunSnapshotHeader.SourceItemCount"/>
+    /// documents. Which of the kinds to SHOW stays a client decision; this is the set, not the
+    /// choice.</para></summary>
+    public int TargetKinds { get; init; }
 }
 
 /// <summary>One destination path the plan projected, and what it projected for it: where a copy lands,
@@ -274,6 +297,16 @@ public sealed record RunDestinationItem
     /// <summary>Display string carried through verbatim: the existing file's mtime, the suffixed rename
     /// name, or the unchanged reason.</summary>
     public string? Detail { get; init; }
+
+    /// <summary>The resulting file's byte size: the incoming content for a write, or the existing file for
+    /// an untouched entry.
+    ///
+    /// <para><b>Recorded because a page cannot derive it.</b> For a write the number belongs to the SOURCE
+    /// file, and a window onto the destination half does not contain the source half — so a client reading
+    /// one page would show every New row as 0 B. Folded during the plan's walk, where the source is right
+    /// there. Zero on a snapshot written before this existed, the same honest absence
+    /// <see cref="RunSnapshotHeader.SourceItemCount"/> documents.</para></summary>
+    public long SizeBytes { get; init; }
 
     /// <summary>The pre-existing file this destination acts on, when there is one — its own path, which
     /// for a rename is NOT <see cref="Path"/> (the rename's path is the suffixed new name, its subject is

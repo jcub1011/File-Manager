@@ -38,25 +38,29 @@ public sealed class DryRunRowStore : IDryRunChunkSink
     private string[] _dirPaths = [];
 
     // ── Source-file columns, indexed 0..SourceCount ──────────────────────────────────────────────
-    private readonly ColumnBuffer<int> _srcDir = new();
-    private readonly ColumnBuffer<int> _srcRootDir = new();
-    private readonly ColumnBuffer<string> _srcName = new();
-    private readonly ColumnBuffer<long> _srcSize = new();
+    private readonly ColumnBuffer<int> _srcDir;
+    private readonly ColumnBuffer<int> _srcRootDir;
+    private readonly ColumnBuffer<string> _srcName;
+    private readonly ColumnBuffer<long> _srcSize;
     // 0 means "no source operation seen for this file yet"; otherwise (byte)(kind + 1). The sentinel
     // is what makes "first operation for a duplicate SourceIndex wins" expressible without a second
     // column, and keeps the no-operation default (Processed) distinguishable from a real Processed.
-    private readonly ColumnBuffer<byte> _srcKind = new();
+    private readonly ColumnBuffer<byte> _srcKind;
     // (byte)(OnSuccessAction + 1); 0 means null — the file does not process.
-    private readonly ColumnBuffer<byte> _srcDisposition = new();
-    private readonly ColumnBuffer<int> _srcDetail = new();
+    private readonly ColumnBuffer<byte> _srcDisposition;
+    private readonly ColumnBuffer<int> _srcDetail;
+    // An OperationKindMask over this file's destination operations, or 0. Only a PAGE carries it: a whole
+    // plan has the operations themselves and reads the row's CSR range instead. See
+    // DryRunFileRow.PrimaryTargetKind for the fallback that ties the two together.
+    private readonly ColumnBuffer<int> _srcTargetKinds;
 
     // ── Destination-operation columns, indexed by STORAGE index (arrival order) ──────────────────
-    private readonly ColumnBuffer<int> _opDir = new();
-    private readonly ColumnBuffer<int> _opRootDir = new();
-    private readonly ColumnBuffer<string> _opName = new();
-    private readonly ColumnBuffer<byte> _opKind = new();
-    private readonly ColumnBuffer<int> _opDetail = new();
-    private readonly ColumnBuffer<long> _opSize = new();
+    private readonly ColumnBuffer<int> _opDir;
+    private readonly ColumnBuffer<int> _opRootDir;
+    private readonly ColumnBuffer<string> _opName;
+    private readonly ColumnBuffer<byte> _opKind;
+    private readonly ColumnBuffer<int> _opDetail;
+    private readonly ColumnBuffer<long> _opSize;
 
     // Dropped by Complete once they have done their work — see the field-by-field notes there.
     private ColumnBuffer<int>? _opSource;
@@ -84,11 +88,28 @@ public sealed class DryRunRowStore : IDryRunChunkSink
 
     // Construction goes through CreateForIngest / FromReport / Empty so the drop-after-Complete
     // columns are always allocated together with the rest.
-    private DryRunRowStore()
+    /// <param name="segmentShift">Sizes every column's segment. A PAGE store knows exactly how many rows
+    /// it will hold, and sizing segments for an open-ended stream instead would leave most of each column
+    /// empty — which the paged cache multiplies by the number of pages it keeps resident.</param>
+    private DryRunRowStore(int segmentShift)
     {
-        _opSource = new ColumnBuffer<int>();
-        _opSubject = new ColumnBuffer<int>();
-        _destFileLength = new ColumnBuffer<long>();
+        _srcDir = new(segmentShift);
+        _srcRootDir = new(segmentShift);
+        _srcName = new(segmentShift);
+        _srcSize = new(segmentShift);
+        _srcKind = new(segmentShift);
+        _srcDisposition = new(segmentShift);
+        _srcDetail = new(segmentShift);
+        _srcTargetKinds = new(segmentShift);
+        _opDir = new(segmentShift);
+        _opRootDir = new(segmentShift);
+        _opName = new(segmentShift);
+        _opKind = new(segmentShift);
+        _opDetail = new(segmentShift);
+        _opSize = new(segmentShift);
+        _opSource = new ColumnBuffer<int>(segmentShift);
+        _opSubject = new ColumnBuffer<int>(segmentShift);
+        _destFileLength = new ColumnBuffer<long>(segmentShift);
     }
 
     public bool IsCompleted { get; private set; }
@@ -159,6 +180,7 @@ public sealed class DryRunRowStore : IDryRunChunkSink
             _srcKind.Add(0);
             _srcDisposition.Add(0);
             _srcDetail.Add(-1);
+            _srcTargetKinds.Add(0);
         }
 
         // Only their lengths matter — a destination operation's size is the pre-existing file it
@@ -202,16 +224,18 @@ public sealed class DryRunRowStore : IDryRunChunkSink
             // Resolved to an id NOW, while the chunk's strings are still valid — a deferred op must not
             // hold a reference into a chunk the sink contract says is dead after OnChunk returns.
             DetailId(ops.Detail[index]),
+            ops.TargetKinds[index],
             defer);
 
-    private void ApplySourceOperation(int i, OperationKind kind, OnSuccessAction? disposition, int detailId, bool defer)
+    private void ApplySourceOperation(
+        int i, OperationKind kind, OnSuccessAction? disposition, int detailId, int targetKinds, bool defer)
     {
         if (i < 0)
             return;
         if (i >= _srcKind.Count)
         {
             if (defer)
-                (_deferredSourceOps ??= []).Add(new DeferredSourceOp(i, kind, disposition, detailId));
+                (_deferredSourceOps ??= []).Add(new DeferredSourceOp(i, kind, disposition, detailId, targetKinds));
             return;   // still out of range after every file is in: a producer bug, dropped
         }
         if (_srcKind[i] != 0)
@@ -219,13 +243,15 @@ public sealed class DryRunRowStore : IDryRunChunkSink
         _srcKind[i] = (byte)(kind + 1);
         _srcDisposition[i] = disposition is { } d ? (byte)(d + 1) : (byte)0;
         _srcDetail[i] = detailId;
+        _srcTargetKinds[i] = targetKinds;
     }
 
     /// <summary>A source operation that outran its file, held until <see cref="Complete"/> replays it.
     /// Values are copied out rather than referencing the chunk, which is not valid after
     /// <see cref="OnChunk"/> returns; the detail is already an id into <c>_details</c>, so nothing here
     /// pins a wire string.</summary>
-    private readonly record struct DeferredSourceOp(int SourceIndex, OperationKind Kind, OnSuccessAction? Disposition, int DetailId);
+    private readonly record struct DeferredSourceOp(
+        int SourceIndex, OperationKind Kind, OnSuccessAction? Disposition, int DetailId, int TargetKinds);
 
     /// <summary>Deduplicates a file name against everything already ingested. A destination
     /// operation's name is almost always its source file's (a copy preserves the name), and names
@@ -267,7 +293,7 @@ public sealed class DryRunRowStore : IDryRunChunkSink
         if (_deferredSourceOps is { } deferred)
         {
             foreach (DeferredSourceOp op in deferred)
-                ApplySourceOperation(op.SourceIndex, op.Kind, op.Disposition, op.DetailId, defer: false);
+                ApplySourceOperation(op.SourceIndex, op.Kind, op.Disposition, op.DetailId, op.TargetKinds, defer: false);
             _deferredSourceOps = null;
         }
 
@@ -402,6 +428,12 @@ public sealed class DryRunRowStore : IDryRunChunkSink
         _srcDisposition[index] is not 0
         && (OnSuccessAction)(_srcDisposition[index] - 1) != OnSuccessAction.KeepSource;
 
+    /// <summary>An <see cref="OperationKindMask"/> over this file's destination operations, as the plan
+    /// recorded it — <c>0</c> when the producer did not record one, which includes every whole-plan
+    /// stream. Read only when the row's CSR range is empty; see
+    /// <see cref="DryRunFileRow.PrimaryTargetKind"/>.</summary>
+    public int SourceTargetKinds(int index) => _srcTargetKinds[index];
+
     public int TargetStart(int index) => _targetOffset[index];
     public int TargetEnd(int index) => _targetOffset[index + 1];
 
@@ -422,13 +454,17 @@ public sealed class DryRunRowStore : IDryRunChunkSink
 
     private static DryRunRowStore CreateEmpty()
     {
-        DryRunRowStore store = new();
+        DryRunRowStore store = new(1);   // never filled; the smallest segments there are
         store.Complete();
         return store;
     }
 
     /// <summary>Creates a store ready for ingest.</summary>
-    public static DryRunRowStore CreateForIngest() => new();
+    /// <param name="expectedRows">How many rows this store will hold, when that is known — which it is
+    /// for a PAGE, and is not for a stream whose length arrives with the terminator. Sizes the columns'
+    /// segments; see <see cref="ColumnBuffer{T}"/> for why an oversized segment is expensive per page.</param>
+    public static DryRunRowStore CreateForIngest(int expectedRows = 0) =>
+        new(expectedRows > 0 ? ColumnBuffer<int>.ShiftFor(expectedRows) : ColumnBuffer<int>.DefaultSegmentShift);
 
     /// <summary>Builds a completed store from an already-assembled report — the entry point for
     /// tests, the benchmarks, and the legacy single-frame path. It runs the report through the same
@@ -441,6 +477,46 @@ public sealed class DryRunRowStore : IDryRunChunkSink
         store.OnChunk(DryRunColumns.ToChunk(
             report.Directories, report.SourceFiles, report.DestinationFiles,
             report.SourceOperations, report.DestinationOperations));
+        store.Complete();
+        return store;
+    }
+
+    /// <summary>The name a placeholder row renders while its page is in flight.</summary>
+    public const string PlaceholderName = "…";
+
+    /// <summary>A completed store of <paramref name="rows"/> blank rows — what a paged list hands back
+    /// for a position whose page has not arrived.
+    ///
+    /// <para><b>Why a real store and not <see cref="Empty"/>.</b> A row handle is a
+    /// <c>(store, index)</c> pair whose accessors index columns directly, so a placeholder has to be a
+    /// row that exists. Building it through the ordinary ingest means it answers every accessor the way
+    /// any other row does — no null checks leak into the row types, and no "is this a placeholder"
+    /// branch appears on a path that runs per realized row.</para>
+    ///
+    /// <para><b>Why more than one row.</b> Handles are values: two placeholders built at the same index
+    /// are <c>Equals</c>, and the bound list's <c>IndexOf</c> — which is what ListBox selection runs
+    /// through — would then answer with the first of them. Sizing this to a page and indexing it
+    /// modulo that keeps every placeholder in a viewport distinct while the whole thing stays one small
+    /// allocation, made once.</para>
+    ///
+    /// <para>Each row carries a blank directory and no destination operations, so it renders as a name
+    /// and nothing else: no folder, no size, no status glyph.</para></summary>
+    public static DryRunRowStore CreatePlaceholder(int rows)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(rows);
+        DryRunChunkResponse chunk = new();
+        chunk.DirectoryName.Add("");
+        chunk.DirectoryParentIndex.Add(-1);
+        for (int i = 0; i < rows; i++)
+        {
+            chunk.SourceFiles.Add(0, PlaceholderName, 0, 0, default, false);
+            // No-source destination ops, so a Destinations placeholder is `~position` — the same shape
+            // a real paged destination row has, since a page's ops never name a source.
+            chunk.DestinationOperations.Add(
+                0, PlaceholderName, 0, OperationKind.Unknown, -1, -1, null, null);
+        }
+        DryRunRowStore store = CreateForIngest(rows);
+        store.OnChunk(chunk);
         store.Complete();
         return store;
     }

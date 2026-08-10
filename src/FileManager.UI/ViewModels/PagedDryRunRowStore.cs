@@ -191,7 +191,7 @@ public sealed class PagedDryRunRowStore
             }
             result.TryGetValue(out DryRunChunkResponse? chunk);
 
-            DryRunRowStore store = DryRunRowStore.CreateForIngest();
+            DryRunRowStore store = DryRunRowStore.CreateForIngest(PageRows);
             store.OnChunk(chunk!);
             store.Complete();
             // AFTER Complete, which is what derives them from the page's own rows — and a page can only

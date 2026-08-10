@@ -178,7 +178,9 @@ public sealed class DryRunViewSmokeTests(HeadlessSessionFixture headless)
             FakeIpcGateway gateway = new();
             DryRunViewModel vm = new(gateway, searchDebounce: TimeSpan.Zero);
             vm.SetProfile(Guid.NewGuid(), "P");
-            // One source fanned out to several nested targets → one grouped row of wrapping chips.
+            // One source fanned out to several nested targets, each its own row now that the destination
+            // half is paged per operation. The layout question is the same one it always was: deep target
+            // paths must ellipsize in the middle rather than clip or push the size column off the row.
             var srcOps = new List<DryRunOperation>
                 { SrcOp(0, @"C:\src\reports\annual-summary.docx", @"C:\src", OperationKind.Processed, OnSuccessAction.KeepSource) };
             var dstOps = new List<DryRunOperation>
@@ -194,9 +196,10 @@ public sealed class DryRunViewSmokeTests(HeadlessSessionFixture headless)
             var (window, _) = ShowView(vm);
             try
             {
-                DryRunDestinationRow row = Assert.Single(vm.Destinations.VisibleRows);
-                Assert.True(row.HasSource);
-                Assert.Equal(3, row.Destinations.Count);
+                Assert.Equal(3, vm.Destinations.VisibleRows.Count);
+                Assert.All(
+                    vm.Destinations.VisibleRows,
+                    r => Assert.Equal("annual-summary.docx", r.Primary.FileName));
                 Assert.NotNull(window.Content);
             }
             finally { window.Close(); }
@@ -240,50 +243,9 @@ public sealed class DryRunViewSmokeTests(HeadlessSessionFixture headless)
         }, CancellationToken.None);
     }
 
-    [Fact]
-    public async Task Sources_tree_view_loads_and_lays_out()
-    {
-        await headless.Session.DispatchAsync(async () =>
-        {
-            var (vm, gateway) = PopulatedViewModel();
-            // RunAsync hops to the thread pool for report preparation, so blocking the dispatcher
-            // thread with GetResult() here would deadlock — await it instead.
-            await RunPlans.PreviewAsync(vm, gateway);
-            vm.Sources.ShowTree = true;               // build the forest before showing so the TreeView realizes
-
-            var (window, _) = ShowView(vm);           // no throw ⇒ TreeDataTemplate + pills + VSP + IsExpanded binding valid
-            try
-            {
-                Assert.NotEmpty(vm.Sources.Tree);
-                DryRunTreeNode dir = vm.Sources.Tree.First(n => n.IsDirectory && n.HasChildren);
-                dir.IsExpanded = !dir.IsExpanded;     // expansion is the control's job; flipping must not throw
-                Assert.NotNull(window.Content);
-            }
-            finally { window.Close(); }
-        }, CancellationToken.None);
-    }
-
-    [Fact]
-    public async Task Destinations_tree_view_loads_and_lays_out()
-    {
-        await headless.Session.DispatchAsync(async () =>
-        {
-            var (vm, gateway) = PopulatedViewModel();
-            // RunAsync hops to the thread pool for report preparation, so blocking the dispatcher
-            // thread with GetResult() here would deadlock — await it instead.
-            await RunPlans.PreviewAsync(vm, gateway);
-            vm.Destinations.ShowTree = true;
-
-            var (window, _) = ShowView(vm);
-            try
-            {
-                Assert.NotEmpty(vm.Destinations.Tree);
-                DryRunTreeNode node = vm.Destinations.Tree.First();
-                Assert.NotEmpty(node.Pills);          // rolled-up new/overwritten/untouched/deleted pills render
-            }
-            finally { window.Close(); }
-        }, CancellationToken.None);
-    }
+    // The two tree-view smoke tests are gone with the tree itself. A forest needs the directory
+    // structure of the WHOLE view, which a paged preview does not have — see
+    // docs/dry-run-paging-next-steps.md for the service verb that would bring it back.
 
     [Fact]
     public async Task Panels_lay_out_side_by_side_in_a_narrow_window()

@@ -236,6 +236,82 @@ public sealed class RunSnapshotPagingTests
     }
 
     [Fact]
+    public async Task Every_source_records_the_KINDS_its_destinations_take()
+    {
+        // The Sources tab shows one rolled-up glyph per row for what happens at the target, and it used to
+        // derive that by walking the row's destination operations. A page of sources.ndjsonl does not
+        // contain them — they are the other half — so the plan records the SET of kinds per source while
+        // it can still see both. A set and not a chosen glyph: which one wins is a display decision, and
+        // it stays in the client beside the icons it picks between.
+        using RunPlanHarness h = new("page-target-kinds");
+        h.WriteSource("fresh.txt", "new content");
+        h.WriteSource("clobber.txt", "new content");
+        h.WriteTarget("clobber.txt", "old content");   // a real overwrite
+
+        (string dir, _, _) = await h.PlanAsync(h.MirrorProfile());
+        List<RunSourceItem> sources = RunPlanHarness.Sources(dir);
+
+        RunSourceItem fresh = sources.Single(s => s.Path.EndsWith("fresh.txt", StringComparison.Ordinal));
+        RunSourceItem clobber = sources.Single(s => s.Path.EndsWith("clobber.txt", StringComparison.Ordinal));
+        Assert.True(OperationKindMask.Has(fresh.TargetKinds, OperationKind.New));
+        Assert.False(OperationKindMask.Has(fresh.TargetKinds, OperationKind.Overwrite));
+        Assert.True(OperationKindMask.Has(clobber.TargetKinds, OperationKind.Overwrite));
+
+        // And the mask agrees with the destination rows it summarizes — the property that would break
+        // silently if the fold ever drifted from the walk that writes those rows.
+        List<RunDestinationItem> destinations = RunPlanHarness.Destinations(dir);
+        for (int ordinal = 0; ordinal < sources.Count; ordinal++)
+        {
+            int expected = 0;
+            foreach (RunDestinationItem d in destinations.Where(d => d.SourceOrdinal == ordinal))
+                expected |= OperationKindMask.Bit(d.Kind);
+            Assert.Equal(expected, sources[ordinal].TargetKinds);
+        }
+    }
+
+    [Fact]
+    public async Task A_destination_row_records_the_size_the_resulting_file_will_have()
+    {
+        // For a write the size belongs to the SOURCE file, and a page of the destination half cannot reach
+        // it — so without this every New row in the preview would read 0 B.
+        using RunPlanHarness h = new("page-destination-size");
+        h.WriteSource("fresh.txt", "twelve chars");
+
+        (string dir, _, _) = await h.PlanAsync(h.MirrorProfile());
+        RunSourceItem source = Assert.Single(RunPlanHarness.Sources(dir));
+        RunDestinationItem destination = Assert.Single(RunPlanHarness.Destinations(dir));
+
+        Assert.Equal(OperationKind.New, destination.Kind);
+        Assert.Null(destination.SubjectPath);            // nothing is there yet …
+        Assert.Equal(source.SizeBytes, destination.SizeBytes);   // … and the size is what will be written
+    }
+
+    [Fact]
+    public async Task The_header_tallies_destination_rows_by_KIND()
+    {
+        // The Destinations tab's four status chips, over the whole plan. By kind rather than by chip name:
+        // the fold from one to the other (Rename reads as New, three kinds read as Untouched) is a display
+        // decision, and a chip vocabulary here would be a second copy of it, free to drift from the one
+        // the rows themselves render through.
+        using RunPlanHarness h = new("page-kind-totals");
+        h.WriteSource("fresh.txt", "a");
+        h.WriteSource("clobber.txt", "b");
+        h.WriteTarget("clobber.txt", "old");
+        h.WriteTarget("orphan.txt", "gone");
+
+        (string dir, _, _) = await h.PlanAsync(h.MirrorProfile());
+        RunSnapshotHeader header = RunPlanHarness.Header(dir);
+
+        Assert.Equal(1, header.DestinationRowsByKind.GetValueOrDefault(OperationKind.New));
+        Assert.Equal(1, header.DestinationRowsByKind.GetValueOrDefault(OperationKind.Overwrite));
+        Assert.Equal(1, header.DestinationRowsByKind.GetValueOrDefault(OperationKind.Deleted));
+        // Every destination row is counted exactly once, orphans included — the tab shows both halves.
+        Assert.Equal(
+            RunPlanHarness.Destinations(dir).Count + RunPlanHarness.Deletes(dir).Count,
+            header.DestinationRowsByKind.Values.Sum());
+    }
+
+    [Fact]
     public async Task A_snapshot_with_no_sidecars_reads_as_no_order_rather_than_an_error()
     {
         // What a snapshot written before paging existed looks like, and what a failed sidecar write

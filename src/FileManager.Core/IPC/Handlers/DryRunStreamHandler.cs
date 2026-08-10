@@ -319,9 +319,16 @@ public sealed class DryRunStreamHandler(
         public DryRunChunkResponse Convert(DryRunChunk slice) =>
             Convert(slice.SourceFiles, slice.DestinationFiles, slice.SourceOperations, slice.DestinationOperations);
 
+        /// <param name="sourceTargetKinds">Parallel to <paramref name="sourceOps"/>: the
+        /// <c>OperationKindMask</c> of each source's destination operations, or null to write zeroes.
+        /// <para>A parameter rather than a field on <c>IFileOperationView</c> because only the snapshot
+        /// PAGE path has this to say — the live plan builds a source op before it has projected anything,
+        /// and widening the engine's operation view for a display aggregate the engine never computes
+        /// would put the field somewhere nothing could fill it.</para></param>
         public DryRunChunkResponse Convert(
             IReadOnlyList<IPhysicalFileView> sourceFiles, IReadOnlyList<IPhysicalFileView> destinationFiles,
-            IReadOnlyList<IFileOperationView> sourceOps, IReadOnlyList<IFileOperationView> destinationOps)
+            IReadOnlyList<IFileOperationView> sourceOps, IReadOnlyList<IFileOperationView> destinationOps,
+            IReadOnlyList<int>? sourceTargetKinds = null)
         {
             // Reuse the previous response's column buffers first — the caller has provably finished
             // with it (this converter is called once per chunk, after the previous frame went out).
@@ -334,10 +341,14 @@ public sealed class DryRunStreamHandler(
                 ConvertFile(f, response.SourceFiles);
             foreach (IPhysicalFileView f in destinationFiles)
                 ConvertFile(f, response.DestinationFiles);
-            foreach (IFileOperationView o in sourceOps)
-                ConvertOp(o, response.SourceOperations);
+            for (int i = 0; i < sourceOps.Count; i++)
+            {
+                ConvertOp(
+                    sourceOps[i], response.SourceOperations,
+                    sourceTargetKinds is not null && i < sourceTargetKinds.Count ? sourceTargetKinds[i] : 0);
+            }
             foreach (IFileOperationView o in destinationOps)
-                ConvertOp(o, response.DestinationOperations);
+                ConvertOp(o, response.DestinationOperations, targetKinds: 0);
 
             // The directory slice is a fresh list per chunk either way: FlushNew hands over ownership
             // of the entries first referenced here, and they are few (one per new directory, not one
@@ -387,7 +398,7 @@ public sealed class DryRunStreamHandler(
             columns.Add(dirIndex, fileName, rootDirIndex, f.Length, f.LastWritten, f.IsReparsePoint);
         }
 
-        private void ConvertOp(IFileOperationView o, DryRunOperationColumns columns)
+        private void ConvertOp(IFileOperationView o, DryRunOperationColumns columns, int targetKinds)
         {
             (int DirIndex, string FileName, int RootDirIndex, string Root) hit;
             // Same fast path as ConvertFile — sweep ops carry the identical (directory, name) pair
@@ -404,7 +415,7 @@ public sealed class DryRunStreamHandler(
             }
             columns.Add(
                 hit.DirIndex, hit.FileName, hit.RootDirIndex, o.Kind,
-                o.SourceIndex, o.SubjectIndex, o.SourceDisposition, o.Detail);
+                o.SourceIndex, o.SubjectIndex, o.SourceDisposition, o.Detail, targetKinds);
         }
     }
 }

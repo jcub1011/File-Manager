@@ -2,6 +2,7 @@ using System.Collections;
 using FileManager.Contracts.DryRun;
 using FileManager.Contracts.IPC;
 using FileManager.Contracts.Profiles;
+using FileManager.UI.Tests.TestData;
 using FileManager.UI.ViewModels;
 
 namespace FileManager.UI.Tests;
@@ -221,22 +222,21 @@ public sealed class DryRunRowStoreTests
     // ── The bound list ───────────────────────────────────────────────────────────────────────────
 
     [Fact]
-    public void The_bound_row_list_is_an_IList()
+    public async Task The_bound_row_list_is_an_IList()
     {
         // Load-bearing, and easy to lose by accident. Avalonia's ItemsSourceView uses IList for
-        // indexed access and otherwise copies the whole source into a list — which would materialize
-        // every handle up front and undo the point of the store. Before the columnar change this held
-        // only because the bound instance happened to be a List<T>.
-        DryRunSourcesTab tab = new(TimeSpan.Zero);
-        tab.Load(TwoFileStore());
+        // indexed access and otherwise copies the whole source into a list — which for a PAGED list
+        // would try to materialize every row of a plan that deliberately is not resident, i.e. exactly
+        // the failure the design exists to prevent.
+        var (viewModel, _, _) = await RunPlans.OpenAsync(TwoFileReport());
 
-        Assert.IsAssignableFrom<IList>(tab.VisibleRows);
-        IList list = (IList)tab.VisibleRows;
+        Assert.IsAssignableFrom<IList>(viewModel.Sources.VisibleRows);
+        IList list = (IList)viewModel.Sources.VisibleRows;
         Assert.Equal(2, list.Count);
 
         // IndexOf has to survive re-materialization: the row it is handed is a different instance
         // from the one the list would produce for that position.
-        DryRunFileRow row = tab.VisibleRows[1];
+        DryRunFileRow row = viewModel.Sources.VisibleRows[1];
         Assert.Equal(1, list.IndexOf(row));
         Assert.True(list.Contains(row));
         Assert.Equal(-1, list.IndexOf(new DryRunFileRow(DryRunRowStore.Empty, 0)));
@@ -258,7 +258,9 @@ public sealed class DryRunRowStoreTests
     /// is what adds its directory to the table, so snapshotting <c>_dirs.Entries</c> inline would
     /// capture the table as of that member's position in the initializer and leave later records
     /// pointing past its end.</remarks>
-    private DryRunRowStore TwoFileStore()
+    private DryRunRowStore TwoFileStore() => DryRunRowStore.FromReport(TwoFileReport());
+
+    private DryRunReport TwoFileReport()
     {
         DryRunFile a = Pf(@"C:\s\a.txt", @"C:\s", 1);
         DryRunFile b = Pf(@"C:\s\b.txt", @"C:\s", 2);
@@ -266,7 +268,7 @@ public sealed class DryRunRowStoreTests
         DryRunOperation bSrc = Op(@"C:\s\b.txt", @"C:\s", OperationKind.Processed, sourceIndex: 1, disposition: OnSuccessAction.KeepSource);
         DryRunOperation aDst = Op(@"C:\t\a.txt", @"C:\t", OperationKind.New, sourceIndex: 0);
         DryRunOperation bDst = Op(@"C:\t\b.txt", @"C:\t", OperationKind.New, sourceIndex: 1);
-        return DryRunRowStore.FromReport(new DryRunReport
+        return new DryRunReport
         {
             ProfileId = Guid.Empty,
             GeneratedAt = DateTimeOffset.UnixEpoch,
@@ -275,6 +277,6 @@ public sealed class DryRunRowStoreTests
             DestinationFiles = [],
             SourceOperations = [aSrc, bSrc],
             DestinationOperations = [aDst, bDst],
-        });
+        };
     }
 }

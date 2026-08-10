@@ -1,6 +1,7 @@
 using FileManager.Contracts.DryRun;
 using FileManager.Contracts.Profiles;
 using System;
+using System.Collections.Generic;
 
 namespace FileManager.Contracts.IPC;
 
@@ -137,4 +138,45 @@ public sealed record RunDetailDto(
     int CopyItemCount, long CopyBytes, int DeleteItemCount, long DeleteBytes,
     int SourceItemCount, int DestinationItemCount,
     int OverwriteCount, int RenameCount, int DisposalCount,
-    bool Truncated, string? SweepFaultDetail, SpaceProjection? Space);
+    bool Truncated, string? SweepFaultDetail, SpaceProjection? Space)
+{
+    /// <summary>The Preview tab's whole-plan aggregates, or null for a snapshot that recorded none.
+    /// <para>An init property rather than a seventeenth positional member: every caller that only wants
+    /// the blast-radius numbers keeps compiling, and the preview's own concerns stay visibly grouped
+    /// rather than trailing the run summary's.</para></summary>
+    public RunPlanPreviewAggregates? Preview { get; init; }
+}
+
+/// <summary>What a WINDOWED preview cannot count for itself: the facet keys and their row counts, and the
+/// status totals, over the whole plan.
+///
+/// <para>The client used to fold all of this while walking the rows it had just ingested, which was
+/// affordable only because it ingested every row. A preview that holds a page at a time cannot — and a
+/// facet bar counting only the rows on screen would be worse than none. These are folded during the plan's
+/// own walk (<c>RunSnapshotStore</c>) and read out of the header in O(1).</para>
+///
+/// <para><b>No common root.</b> It is derived from the facet keys below, client-side, by the one
+/// implementation of that rule (<c>DryRunPaths.CommonRoot</c>, which lives in the UI and cannot be
+/// referenced from the service) — a second copy here would be free to disagree about UNC shares or
+/// drive-spanning sets.</para></summary>
+public sealed record RunPlanPreviewAggregates
+{
+    /// <summary>Source rows per Source root — the Sources tab's source facet.</summary>
+    public IReadOnlyDictionary<string, int> SourceRowsByRoot { get; init; } = new Dictionary<string, int>();
+
+    /// <summary>Destination operations per Target root, orphans included — both tabs' destination
+    /// facet.</summary>
+    public IReadOnlyDictionary<string, int> DestinationRowsByRoot { get; init; } = new Dictionary<string, int>();
+
+    /// <summary>Destination operations per kind. By kind and not by chip name: which chip a kind belongs
+    /// to is a display decision and stays in the client, beside the mapping the rows themselves render
+    /// through.</summary>
+    public IReadOnlyDictionary<OperationKind, int> DestinationRowsByKind { get; init; } =
+        new Dictionary<OperationKind, int>();
+
+    /// <summary>Sources the plan will not act on — filtered out, or already identical.</summary>
+    public int UntouchedCount { get; init; }
+
+    /// <summary>Sources the plan will copy.</summary>
+    public int ProcessedCount { get; init; }
+}

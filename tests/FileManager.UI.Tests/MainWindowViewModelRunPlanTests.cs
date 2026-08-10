@@ -1,3 +1,4 @@
+using FileManager.Contracts.DryRun;
 using FileManager.Contracts.IPC;
 using FileManager.Contracts.Primitives;
 using FileManager.Contracts.Profiles;
@@ -30,9 +31,39 @@ public sealed class MainWindowViewModelRunPlanTests
 
     private static ProfileListItem Row() => new(ProfileId, "Backup", true, "Manual");
 
+    /// <summary>A two-row plan for the preview to open. These tests are about the window's routing rather
+    /// than about rows, so the smallest plan that produces a visible preview is the right one — but it has
+    /// to exist, because a plan with nothing in it is a case the shell answers itself.</summary>
+    private static DryRunReport PlanRows()
+    {
+        DryRunDirectoryTableBuilder dirs = new();
+        DryRunFile a = dirs.Convert(new PhysicalFile { Path = @"C:\in\a.txt", Root = @"C:\in", Length = 1, LastWritten = DateTimeOffset.UnixEpoch });
+        DryRunFile b = dirs.Convert(new PhysicalFile { Path = @"C:\in\b.txt", Root = @"C:\in", Length = 2, LastWritten = DateTimeOffset.UnixEpoch });
+        DryRunOperation aSrc = dirs.Convert(new VirtualFileOperation { Path = @"C:\in\a.txt", Root = @"C:\in", Kind = OperationKind.Processed, SourceIndex = 0, SubjectIndex = -1, SourceDisposition = OnSuccessAction.KeepSource });
+        DryRunOperation bSrc = dirs.Convert(new VirtualFileOperation { Path = @"C:\in\b.txt", Root = @"C:\in", Kind = OperationKind.Processed, SourceIndex = 1, SubjectIndex = -1, SourceDisposition = OnSuccessAction.KeepSource });
+        DryRunOperation aDst = dirs.Convert(new VirtualFileOperation { Path = @"D:\out\a.txt", Root = @"D:\out", Kind = OperationKind.New, SourceIndex = 0, SubjectIndex = -1 });
+        DryRunOperation bDst = dirs.Convert(new VirtualFileOperation { Path = @"D:\out\b.txt", Root = @"D:\out", Kind = OperationKind.New, SourceIndex = 1, SubjectIndex = -1 });
+        return new DryRunReport
+        {
+            ProfileId = ProfileId,
+            GeneratedAt = DateTimeOffset.UnixEpoch,
+            Directories = dirs.Entries.ToList(),
+            SourceFiles = [a, b],
+            DestinationFiles = [],
+            SourceOperations = [aSrc, bSrc],
+            DestinationOperations = [aDst, bDst],
+        };
+    }
+
     private static (MainWindowViewModel Shell, FakeIpcGateway Gateway) NewShell(Profile? profile = null)
     {
-        FakeIpcGateway gateway = new() { GetResult = profile ?? MirrorProfile() };
+        FakeIpcGateway gateway = new()
+        {
+            GetResult = profile ?? MirrorProfile(),
+            // A plan for the preview to open. The shell never learns the run id until the engine event
+            // arrives, so the gateway serves this for whichever run it is asked about.
+            DryRunResult = PlanRows(),
+        };
         MainWindowViewModel shell = new(
             gateway, new FakeFolderPicker(), new FakeLogFolder(), new FakeDryRunItemActions(),
             clientSettingsPath: Path.Combine(Path.GetTempPath(), "fm-client-" + Guid.NewGuid().ToString("N") + ".json"));
@@ -67,7 +98,7 @@ public sealed class MainWindowViewModelRunPlanTests
 
         // Read back from the RUN's snapshot, not re-planned: a fresh scan would produce a different list
         // from the one approving executes, which would defeat the entire point of showing it.
-        Assert.Equal(runId, Assert.Single(gateway.RunPlanStreamCalls));
+        Assert.Equal(runId, Assert.Single(gateway.RunPlanOpenCalls));
         Assert.Equal(runId, shell.DryRun.PendingRunId);
         Assert.Equal(3, shell.DryRun.PlannedCopies);
         Assert.Equal(2, shell.DryRun.PlannedDeletes);
@@ -162,7 +193,7 @@ public sealed class MainWindowViewModelRunPlanTests
         await Task.Delay(50);
 
         Assert.Equal(second, shell.DryRun.PendingRunId);
-        Assert.Equal(second, Assert.Single(gateway.RunPlanStreamCalls));
+        Assert.Equal(second, Assert.Single(gateway.RunPlanOpenCalls));
     }
 
     // ---- the plan that arrives before its own reply ------------------------------------------------
@@ -185,7 +216,7 @@ public sealed class MainWindowViewModelRunPlanTests
         await WaitUntilAsync(() => shell.DryRun.PendingRunId is not null);
 
         Assert.Equal(runId, shell.DryRun.PendingRunId);
-        Assert.Equal(runId, Assert.Single(gateway.RunPlanStreamCalls));
+        Assert.Equal(runId, Assert.Single(gateway.RunPlanOpenCalls));
     }
 
     [Fact]
@@ -200,7 +231,7 @@ public sealed class MainWindowViewModelRunPlanTests
         await Task.Delay(50);
 
         Assert.Null(shell.DryRun.PendingRunId);
-        Assert.Empty(gateway.RunPlanStreamCalls);
+        Assert.Empty(gateway.RunPlanOpenCalls);
         Assert.NotEqual(theirs, ours);
     }
 
@@ -322,7 +353,7 @@ public sealed class MainWindowViewModelRunPlanTests
         // on disk that nothing will ever answer for.
         Assert.Equal((runId, false), gateway.ApproveRunCalls[0]);
         Assert.Null(shell.DryRun.PendingRunId);
-        Assert.Empty(gateway.RunPlanStreamCalls);
+        Assert.Empty(gateway.RunPlanOpenCalls);
         Assert.Contains("Nothing to do", shell.Activity.Notice);
         // And on the tab the preview just navigated to: the activity panel is closed until a run is
         // approved, so a notice that lives only there is one the user never sees.
@@ -341,7 +372,7 @@ public sealed class MainWindowViewModelRunPlanTests
 
         // The coordinator already closed the run, so there is nothing to answer and nothing to show.
         Assert.Empty(gateway.ApproveRunCalls);
-        Assert.Empty(gateway.RunPlanStreamCalls);
+        Assert.Empty(gateway.RunPlanOpenCalls);
         Assert.Contains("unreadable", shell.DryRun.ErrorMessage);
         Assert.Null(shell.DryRun.PendingRunId);
         Assert.False(shell.DryRun.IsPreviewing);
@@ -359,7 +390,7 @@ public sealed class MainWindowViewModelRunPlanTests
         // The bus is a broadcast. Showing — let alone offering to approve — a run this user never started
         // would be this window authorising someone else's file deletions.
         Assert.Empty(gateway.ApproveRunCalls);
-        Assert.Empty(gateway.RunPlanStreamCalls);
+        Assert.Empty(gateway.RunPlanOpenCalls);
         Assert.Null(shell.DryRun.PendingRunId);
     }
 
@@ -474,7 +505,7 @@ public sealed class MainWindowViewModelRunPlanTests
         await WaitUntilAsync(() => shell.DryRun.PendingRunId is not null);
 
         Assert.Equal(runId, shell.DryRun.PendingRunId);
-        Assert.Equal(2, gateway.RunPlanStreamCalls.Count(id => id == runId));
+        Assert.Equal(2, gateway.RunPlanOpenCalls.Count(id => id == runId));
         Assert.True(shell.DryRun.HasReport);
         Assert.Empty(gateway.DiscardRunCalls);
     }

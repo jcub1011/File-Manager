@@ -228,10 +228,16 @@ internal sealed class RunSnapshotWriter : IDisposable
 
     public int ProcessedCount { get; private set; }
 
+    /// <summary>Destination operations by kind, orphans included. See
+    /// <see cref="RunSnapshotHeader.DestinationRowsByKind"/> for why this is by kind and not by the
+    /// Destinations tab's chip names.</summary>
+    public IReadOnlyDictionary<OperationKind, int> DestinationRowsByKind => _destinationRowsByKind;
+
     private readonly Dictionary<string, int> _sweptByTargetRoot = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, int> _orphansByTargetRoot = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, int> _sourceRowsByRoot = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, int> _destinationRowsByRoot = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<OperationKind, int> _destinationRowsByKind = [];
 
     private static void Bump(Dictionary<string, int> counts, string key) =>
         counts[key] = counts.GetValueOrDefault(key) + 1;
@@ -288,6 +294,25 @@ internal sealed class RunSnapshotWriter : IDisposable
 
         DryRunChunk slice = chunk.Chunk;
 
+        // What each of this chunk's sources does at its targets, folded BEFORE the sources are written
+        // because that is when the answer has to be on hand. The Sources tab shows one rolled-up glyph per
+        // row for this, and used to derive it by walking the row's destination operations — which a
+        // windowed client cannot do, since a page of sources.ndjsonl never sees the destination half.
+        //
+        // op.SourceIndex is the plan's GLOBAL source ordinal (see WriteDestination), so it resolves against
+        // this chunk by subtracting SourceBase. An op naming a source outside this chunk is skipped rather
+        // than deferred: it would need an unbounded pending map, and the cost of missing one is a row with
+        // no target glyph — which is exactly what a pre-existing snapshot renders as anyway. Orphans carry
+        // -1 and contribute nothing, correctly: nothing sources them.
+        int[]? targetKinds = null;
+        foreach (IFileOperationView op in slice.DestinationOperations)
+        {
+            int local = op.SourceIndex - chunk.SourceBase;
+            if ((uint)local >= (uint)slice.SourceFiles.Count)
+                continue;
+            (targetKinds ??= new int[slice.SourceFiles.Count])[local] |= OperationKindMask.Bit(op.Kind);
+        }
+
         // The display source list: EVERY scanned file, whatever the plan decided about it, in plan order —
         // so an item's ordinal is the source index the plan assigned it and a destination row can name it.
         // Driven off the files rather than the operations because the files are the row set: a file whose
@@ -308,6 +333,7 @@ internal sealed class RunSnapshotWriter : IDisposable
                 Kind = op?.Kind ?? OperationKind.Unknown,
                 Disposition = op?.SourceDisposition,
                 Detail = op?.Detail,
+                TargetKinds = targetKinds is null ? 0 : targetKinds[i],
             });
             SourceCount++;
             // The Preview tab's facet and status counts, under the SAME rules DryRunRowStore applied
@@ -364,6 +390,10 @@ internal sealed class RunSnapshotWriter : IDisposable
                 case OperationKind.Rename: RenameCount++; break;
                 default: break;
             }
+            // The Destinations tab's status chips, over the whole plan and by KIND — the tab folds these
+            // into its four chips itself. Counted over every operation for the same reason the two above
+            // are: the blast radius is what the plan decided, not what the display half managed to record.
+            _destinationRowsByKind[op.Kind] = _destinationRowsByKind.GetValueOrDefault(op.Kind) + 1;
 
             if (op.Kind != OperationKind.Deleted)
             {
@@ -436,6 +466,15 @@ internal sealed class RunSnapshotWriter : IDisposable
             }
         }
 
+        // The resulting file's size. For a write that is the INCOMING content's — the source file's, which
+        // only this pass can see, because a page of the destination half never contains the source half.
+        // Falls back to the pre-existing file for an untouched entry, and to 0 when neither resolves in
+        // this chunk (which renders as "0 B", the same as a genuinely empty file).
+        long size = subjectSize ?? 0;
+        int localSource = ordinal - chunk.SourceBase;
+        if ((uint)localSource < (uint)slice.SourceFiles.Count)
+            size = slice.SourceFiles[localSource].Length;
+
         _destinationBlocks.Row(_destinations?.Position ?? 0);
         _destinationOrder.Row(op.Path, op.Root);
         Write(_destinations, RunSnapshotJsonContext.Default.RunDestinationItem, new RunDestinationItem
@@ -445,6 +484,7 @@ internal sealed class RunSnapshotWriter : IDisposable
             Kind = op.Kind,
             SourceOrdinal = ordinal,
             Detail = op.Detail,
+            SizeBytes = size,
             SubjectPath = subjectPath,
             SubjectSizeBytes = subjectSize,
             SubjectLastWriteUtc = subjectWritten,
@@ -491,6 +531,7 @@ internal sealed class RunSnapshotWriter : IDisposable
             DestinationRowsByRoot = DestinationRowsByRoot,
             UntouchedCount = UntouchedCount,
             ProcessedCount = ProcessedCount,
+            DestinationRowsByKind = DestinationRowsByKind,
             Truncated = state.Truncated,
             SweepFaultDetail = state.SweepFaultDetail,
             Space = state.Space,

@@ -221,15 +221,23 @@ public sealed class PagedDryRunRowStoreTests
         // user has already scrolled past.
         (PagedDryRunRowStore store, _) = NewStore(5_000);
         PagedDryRunRowList<string> list = ListOver(store);
+        // Locked, and snapshotted before asserting: one read prefetches its neighbours, so pages keep
+        // landing — on a pool thread, since a test host has no synchronization context — while the
+        // assertions below run. Enumerating the live list races the handler that is still appending to it.
         List<NotifyCollectionChangedEventArgs> changes = [];
-        list.CollectionChanged += (_, e) => changes.Add(e);
+        object gate = new();
+        list.CollectionChanged += (_, e) => { lock (gate) changes.Add(e); };
 
         _ = list[0];   // a miss, which starts the fetch
-        await WaitUntilAsync(() => changes.Count > 0, "the first page to land");
+        await WaitUntilAsync(() => { lock (gate) return changes.Count > 0; }, "the first page to land");
 
-        Assert.NotEmpty(changes);
-        Assert.All(changes, e => Assert.Equal(NotifyCollectionChangedAction.Replace, e.Action));
-        Assert.Contains(changes, e => e.NewStartingIndex == 0);
+        NotifyCollectionChangedEventArgs[] observed;
+        lock (gate)
+            observed = [.. changes];
+
+        Assert.NotEmpty(observed);
+        Assert.All(observed, e => Assert.Equal(NotifyCollectionChangedAction.Replace, e.Action));
+        Assert.Contains(observed, e => e.NewStartingIndex == 0);
         Assert.Equal("row-000000.txt", list[0]);
     }
 
@@ -239,12 +247,14 @@ public sealed class PagedDryRunRowStoreTests
         (PagedDryRunRowStore store, _) = NewStore(5_000);
         PagedDryRunRowList<string> list = ListOver(store);
         List<NotifyCollectionChangedEventArgs> changes = [];
-        list.CollectionChanged += (_, e) => changes.Add(e);
+        object gate = new();
+        list.CollectionChanged += (_, e) => { lock (gate) changes.Add(e); };
 
         list.Detach();
         _ = list[2_000];
         await WaitUntilAsync(() => store.ResidentPages > 0, "the page to land regardless");
 
-        Assert.Empty(changes);
+        lock (gate)
+            Assert.Empty(changes);
     }
 }

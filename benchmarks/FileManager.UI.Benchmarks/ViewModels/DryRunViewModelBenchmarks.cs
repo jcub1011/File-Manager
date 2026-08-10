@@ -6,173 +6,139 @@ using FileManager.UI.ViewModels;
 
 namespace FileManager.UI.Benchmarks.ViewModels;
 
-/// <summary>Measures <see cref="DryRunViewModel.ApplyReport"/> — the UI-thread aggregation that runs
-/// once per dry run under the physical-files + operations model: it builds a <c>SourceIndex</c> lookup
-/// over the destination operations, projects every source file into a row (pairing it with its source
-/// operation and gathering its target rows from that lookup), projects every destination operation 1:1
-/// into a destination row, runs a handful of O(n) count passes for the blast-radius banner, then hands
-/// both row lists to the two tabs' <c>Load</c>. The report is built once in setup; the measured call is
-/// pure aggregation. The gateway/folder-picker are never touched by ApplyReport, so null suffices —
-/// this isolates the aggregation from IPC.</summary>
+/// <summary>Measures what the preview actually pays per PAGE — folding one <c>DryRunChunkResponse</c>
+/// into a <see cref="DryRunRowStore"/> and completing it — plus the cost of materializing the row
+/// handles a viewport renders from it.
+///
+/// <para><b>What this replaced, and why.</b> It used to measure <c>ApplyReport</c> and
+/// <c>PrepareReport</c>: the client ingesting an entire plan and sorting both halves of it, recorded at
+/// 500,000 files as 838 ms / 149,709 KB and 557 ms / 71,783 KB. Neither call exists now. The service
+/// sorts where the rows are and answers a window, so the client's per-plan cost is a header read and its
+/// per-page cost is what follows — bounded by <see cref="PagedDryRunRowStore.PageRows"/> however large
+/// the plan is, which is the whole point and also why there is no longer a <c>FileCount</c>
+/// parameter.</para>
+///
+/// <para>The gateway is never touched here, so null suffices: this isolates the fold from IPC.</para></summary>
 [MemoryDiagnoser]
 public class DryRunViewModelBenchmarks
 {
-    private DryRunViewModel _viewModel = null!;
-    private DryRunViewModel _populated = null!;
-    private DryRunReport _report = null!;
-    private DryRunRowStore _store = null!;
-    private DryRunCompletion _completion = null!;
+    private DryRunChunkResponse _sourcePage = null!;
+    private DryRunChunkResponse _destinationPage = null!;
+    private DryRunRowStore _residentPage = null!;
 
-    /// <summary>Source files to aggregate. 500k was the engine's streamed-path cap before plans became
-    /// unbounded; it is kept as the top point because every recorded measurement is against it, but it
-    /// is no longer a ceiling — the UI's cost here is linear in the row count, which is what
-    /// <c>docs/dry-run-ui-memory-next-steps.md</c> is about.</summary>
-    [Params(1_000, 10_000, 50_000, 500_000)]
-    public int FileCount { get; set; }
+    /// <summary>Rows per page. The service's block size is the only value the app ever uses; the smaller
+    /// points are there to show the fold is linear in the page and carries no fixed cliff.</summary>
+    [Params(64, 512)]
+    public int PageRows { get; set; }
 
     [GlobalSetup]
     public void Setup()
     {
-        _viewModel = new DryRunViewModel(gateway: null!);
-        _report = BuildReport(FileCount);
-        _completion = new DryRunCompletion(_report.GeneratedAt, _report.Truncated, _report.Space);
-        _store = DryRunRowStore.FromReport(_report);
-        _populated = new DryRunViewModel(gateway: null!);
-        _populated.ApplyReport(_report);
+        _sourcePage = BuildSourcePage(PageRows);
+        _destinationPage = BuildDestinationPage(PageRows);
+        _residentPage = Fold(_sourcePage);
     }
 
-    /// <summary>The whole cost of turning a finished run into a populated preview: fold the records
-    /// into the columnar store, then sort and count both tabs. Directly comparable to the figure this
-    /// replaced (500k: 1,139 ms / 462 MB allocated), when the same call projected the report into two
-    /// full sets of row objects instead.</summary>
+    /// <summary>One source page folded and completed — what the app pays each time a fetch lands while
+    /// the user scrolls, and the figure that has to stay flat as plans grow.</summary>
     [Benchmark]
-    public void ApplyReport() => _viewModel.ApplyReport(_report);
+    public object FoldSourcePage() => Fold(_sourcePage);
 
-    /// <summary>Ingest alone — what the app pays incrementally, one chunk at a time, while the run is
-    /// still streaming. Splitting it out from <see cref="PrepareReport"/> is what shows whether a
-    /// regression landed in the fold or in the sorts.</summary>
+    /// <summary>The destination half, whose rows are all no-source ops — a different path through
+    /// <c>Complete</c>'s CSR grouping (nothing groups), so worth its own number.</summary>
     [Benchmark]
-    public object IngestReport() => DryRunRowStore.FromReport(_report);
+    public object FoldDestinationPage() => Fold(_destinationPage);
 
-    /// <summary>The post-ingest preparation alone — the sorts, counts and facets. This is what
-    /// <c>RunAsync</c> still runs on the thread pool once the stream ends; everything before it has
-    /// already happened frame by frame.</summary>
+    /// <summary>Reading every row of a resident page the way the bound list does: a handle per indexer
+    /// access, and the display strings a template pulls off it. This is the per-frame cost of scrolling,
+    /// and it is what the lazy display-string design exists to keep small.</summary>
     [Benchmark]
-    public object PrepareReport() => DryRunViewModel.PrepareReport(_store, _completion);   // object: the record is internal, benchmark methods must be public
-
-    /// <summary>A status-chip select and its deselect on a populated preview — the coalesced
-    /// rebuilds that used to freeze the UI. Both passes run per invocation so every invocation does
-    /// identical work: one real filter pass plus the deselect's no-filter fast path (alternating a
-    /// single toggle per invocation would blend a real and a near-free pass bimodally).</summary>
-    [Benchmark]
-    public async Task ToggleStatusFilter()
+    public int RealizeResidentRows()
     {
-        DryRunStatusFilter chip = _populated.Sources.StatusFilters[0];
-        chip.IsSelected = true;
-        await _populated.Sources.PendingRebuild;
-        chip.IsSelected = false;
-        await _populated.Sources.PendingRebuild;
+        int length = 0;
+        for (int i = 0; i < _residentPage.SourceCount; i++)
+        {
+            DryRunFileRow row = new(_residentPage, i);
+            length += row.FileName.Length + row.ParentDisplay.Length + row.SizeText.Length;
+        }
+        return length;
     }
 
-    /// <summary>Spreads files across the three source dispositions with a mix of destination operation
-    /// kinds so every projection and count pass in ApplyReport does real work: processed rows fan out to
-    /// two targets (one an overwrite/rename every few rows) and carry a destructive source disposition,
-    /// so the Overwrite/Rename/Disposal counts and the SourceIndex lookup are all non-trivial. Every
-    /// destination operation references its source file by index, exactly as the engine emits it.</summary>
-    private static DryRunReport BuildReport(int fileCount)
+    private static DryRunRowStore Fold(DryRunChunkResponse page)
+    {
+        DryRunRowStore store = DryRunRowStore.CreateForIngest();
+        store.OnChunk(page);
+        store.Complete();
+        return store;
+    }
+
+    /// <summary>A page in the shape <c>GetRunPlanPageHandler.SourcePage</c> emits: one file and one
+    /// operation per row, the operation naming its file by PAGE-LOCAL index, and each carrying the mask
+    /// of kinds its destinations take. Realistic deep paths (~100 chars, 20 files per leaf directory), so
+    /// the directory-table fold does the work a real page makes it do.</summary>
+    private static DryRunChunkResponse BuildSourcePage(int rows)
     {
         DryRunDirectoryTableBuilder dirs = new();
-        var sourceFiles = new List<DryRunFile>(fileCount);
-        var sourceOps = new List<DryRunOperation>(fileCount);
-        var destinationFiles = new List<DryRunFile>();
-        var destinationOps = new List<DryRunOperation>();
-
-        for (int i = 0; i < fileCount; i++)
+        List<DryRunFile> files = [];
+        List<DryRunOperation> ops = [];
+        for (int i = 0; i < rows; i++)
         {
-            string source = $@"C:\src\dir-{i % 64}\file-{i}.dat";
-            sourceFiles.Add(dirs.Convert(new PhysicalFile
+            int leaf = i / 20;
+            string path = $@"C:\media-archive\projects\project-{leaf % 500:D3}\assets\renders\batch-{leaf / 500:D4}\render-output-{i:D7}.png";
+            files.Add(dirs.Convert(new PhysicalFile
             {
-                Path = source,
-                Root = @"C:\src",
-                Length = i,
-                LastWritten = DateTimeOffset.UnixEpoch,
+                Path = path, Root = SourceRoot, Length = i, LastWritten = DateTimeOffset.UnixEpoch,
             }));
-
-            switch (i % 3)
+            DryRunOperation op = dirs.Convert(new VirtualFileOperation
             {
-                case 0:   // Processed with two targets — the rows the count passes iterate.
-                    sourceOps.Add(dirs.Convert(new VirtualFileOperation
-                    {
-                        Path = source,
-                        Root = @"C:\src",
-                        Kind = OperationKind.Processed,
-                        SourceIndex = i,
-                        SourceDisposition = i % 6 == 0 ? OnSuccessAction.MoveToTrash : OnSuccessAction.KeepSource,
-                    }));
-
-                    string firstTarget = $@"C:\dst\file-{i}.dat";
-                    if (i % 4 == 0)
-                    {
-                        int subject = destinationFiles.Count;
-                        destinationFiles.Add(dirs.Convert(new PhysicalFile { Path = firstTarget, Root = @"C:\dst", Length = i, LastWritten = DateTimeOffset.UnixEpoch }));
-                        destinationOps.Add(dirs.Convert(new VirtualFileOperation { Path = firstTarget, Root = @"C:\dst", Kind = OperationKind.Overwrite, SourceIndex = i, SubjectIndex = subject, Detail = "existing file" }));
-                    }
-                    else
-                    {
-                        destinationOps.Add(dirs.Convert(new VirtualFileOperation { Path = firstTarget, Root = @"C:\dst", Kind = OperationKind.New, SourceIndex = i }));
-                    }
-
-                    if (i % 5 == 0)
-                    {
-                        // A conflict rename: the suffixed new file plus the kept-original Untouched op.
-                        string original = $@"C:\dst2\file-{i}.dat";
-                        int subject = destinationFiles.Count;
-                        destinationFiles.Add(dirs.Convert(new PhysicalFile { Path = original, Root = @"C:\dst2", Length = i, LastWritten = DateTimeOffset.UnixEpoch }));
-                        destinationOps.Add(dirs.Convert(new VirtualFileOperation { Path = $@"C:\dst2\file-{i} (1).dat", Root = @"C:\dst2", Kind = OperationKind.Rename, SourceIndex = i, Detail = "renamed to avoid a conflict" }));
-                        destinationOps.Add(dirs.Convert(new VirtualFileOperation { Path = original, Root = @"C:\dst2", Kind = OperationKind.Untouched, SubjectIndex = subject, Detail = "kept" }));
-                    }
-                    else
-                    {
-                        destinationOps.Add(dirs.Convert(new VirtualFileOperation { Path = $@"C:\dst2\file-{i}.dat", Root = @"C:\dst2", Kind = OperationKind.New, SourceIndex = i }));
-                    }
-                    break;
-
-                case 1:
-                    sourceOps.Add(dirs.Convert(new VirtualFileOperation
-                    {
-                        Path = source,
-                        Root = @"C:\src",
-                        Kind = OperationKind.SkippedByFilter,
-                        SourceIndex = i,
-                        Detail = "exclude *.tmp",
-                    }));
-                    break;
-
-                default:
-                    sourceOps.Add(dirs.Convert(new VirtualFileOperation
-                    {
-                        Path = source,
-                        Root = @"C:\src",
-                        Kind = OperationKind.SkippedUnchanged,
-                        SourceIndex = i,
-                    }));
-                    string unchanged = $@"C:\dst\file-{i}.dat";
-                    int unchangedSubject = destinationFiles.Count;
-                    destinationFiles.Add(dirs.Convert(new PhysicalFile { Path = unchanged, Root = @"C:\dst", Length = i, LastWritten = DateTimeOffset.UnixEpoch }));
-                    destinationOps.Add(dirs.Convert(new VirtualFileOperation { Path = unchanged, Root = @"C:\dst", Kind = OperationKind.SkipUnchanged, SourceIndex = i, SubjectIndex = unchangedSubject, Detail = "identical content (SHA-256)" }));
-                    break;
-            }
+                Path = path,
+                Root = SourceRoot,
+                Kind = i % 3 == 0 ? OperationKind.Processed : OperationKind.SkippedUnchanged,
+                SourceIndex = files.Count - 1,
+                SubjectIndex = -1,
+                SourceDisposition = i % 6 == 0 ? OnSuccessAction.MoveToTrash : OnSuccessAction.KeepSource,
+                Detail = i % 3 == 0 ? null : "identical content (SHA-256)",
+            });
+            op.TargetKinds = OperationKindMask.Bit(i % 4 == 0 ? OperationKind.Overwrite : OperationKind.New);
+            ops.Add(op);
         }
-
-        return new DryRunReport
-        {
-            ProfileId = Guid.NewGuid(),
-            GeneratedAt = DateTimeOffset.UtcNow,
-            Directories = dirs.Entries.ToList(),
-            SourceFiles = sourceFiles,
-            DestinationFiles = destinationFiles,
-            SourceOperations = sourceOps,
-            DestinationOperations = destinationOps,
-        };
+        return DryRunColumns.ToChunk(dirs.Entries.ToList(), files, [], ops, []);
     }
+
+    /// <summary>A page in the shape <c>GetRunPlanPageHandler.DestinationPage</c> emits: one operation per
+    /// row, none of them naming a source, and a subject file for the ones that act on something already
+    /// there.</summary>
+    private static DryRunChunkResponse BuildDestinationPage(int rows)
+    {
+        DryRunDirectoryTableBuilder dirs = new();
+        List<DryRunFile> files = [];
+        List<DryRunOperation> ops = [];
+        for (int i = 0; i < rows; i++)
+        {
+            int leaf = i / 20;
+            string path = $@"D:\backup\media-archive\projects\project-{leaf % 500:D3}\assets\renders\batch-{leaf / 500:D4}\render-output-{i:D7}.png";
+            int subject = -1;
+            if (i % 4 == 0)
+            {
+                files.Add(dirs.Convert(new PhysicalFile
+                {
+                    Path = path, Root = TargetRoot, Length = i, LastWritten = DateTimeOffset.UnixEpoch,
+                }));
+                subject = files.Count - 1;
+            }
+            ops.Add(dirs.Convert(new VirtualFileOperation
+            {
+                Path = path,
+                Root = TargetRoot,
+                Kind = i % 4 == 0 ? OperationKind.Overwrite : OperationKind.New,
+                SourceIndex = -1,
+                SubjectIndex = subject,
+                Detail = i % 4 == 0 ? "existing file" : null,
+            }));
+        }
+        return DryRunColumns.ToChunk(dirs.Entries.ToList(), [], files, [], ops);
+    }
+
+    private const string SourceRoot = @"C:\media-archive\projects";
+    private const string TargetRoot = @"D:\backup\media-archive\projects";
 }

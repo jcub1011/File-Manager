@@ -34,7 +34,19 @@ internal sealed class FakeIpcGateway : IIpcGateway
     /// there is no dry-run request left on this seam, and <see cref="RunPlanResults"/> is where this is
     /// replayed from. Kept because a whole <c>DryRunReport</c> is still the readable way to describe an
     /// expected set of rows.</summary>
-    public Result<DryRunReport, IpcError> DryRunResult { get; set; } =
+    public Result<DryRunReport, IpcError> DryRunResult
+    {
+        get => _dryRunResult;
+        set { _dryRunResult = value; DryRunResultSet = true; }
+    }
+
+    /// <summary>Whether a test scripted a plan at all. The paged verbs serve one only when it did:
+    /// otherwise <see cref="Pages"/> and <see cref="ViewResult"/> are in charge (the paging-machinery
+    /// tests script individual pages), and run detail keeps answering "still planning", which is what the
+    /// job-queue tests are about.</summary>
+    public bool DryRunResultSet { get; private set; }
+
+    private Result<DryRunReport, IpcError> _dryRunResult =
         new DryRunReport
         {
             ProfileId = Guid.Empty,
@@ -226,15 +238,99 @@ internal sealed class FakeIpcGateway : IIpcGateway
 
     public List<GetRunPlanViewRequest> ViewRequests { get; } = [];
 
+    /// <summary>Run ids whose plan the preview OPENED, one entry per open.
+    ///
+    /// <para>Replaces the old <see cref="RunPlanStreamCalls"/> as the evidence that the rows on screen came
+    /// from a particular RUN's snapshot rather than from a fresh scan. Recorded on the unfiltered
+    /// source-side view request, which is what opening a plan issues exactly once; a later filter change
+    /// carries a filter and does not count as an open.</para></summary>
+    public List<Guid> RunPlanOpenCalls { get; } = [];
+
     /// <summary>When set, every page request awaits this before answering — the seam for asserting what
     /// a list shows while a page is still in flight, which is the placeholder path.</summary>
     public TaskCompletionSource? PageGate { get; set; }
 
-    public Task<Result<RunPlanViewResponse, IpcError>> GetRunPlanViewAsync(
+    /// <summary>When set, <see cref="GetRunPlanViewAsync"/> answers with this instead of consulting the
+    /// served plan — for the error and no-such-view paths.</summary>
+    public Result<RunPlanViewResponse, IpcError>? ViewError { get; set; }
+
+    /// <summary>Synthesizes a page on demand instead of looking one up.
+    /// <para>For the plan sizes a fixture cannot afford to build: proving a preview's cost is flat
+    /// between a 500,000-row plan and a five-million-row one means never materializing either, which is
+    /// the same reason the preview itself does not.</para></summary>
+    public Func<GetRunPlanPageRequest, DryRunChunkResponse>? PageFactory { get; set; }
+
+    /// <summary>Runs whose whole plan is being served from a <see cref="FakePlanService"/>: header
+    /// aggregates, filtered views and pages, all derived from one report. See <see cref="ServePlan"/>.</summary>
+    private readonly Dictionary<Guid, FakePlanService> _plans = [];
+
+    /// <summary>Puts a whole plan behind the three paged verbs, the way the service puts a run's frozen
+    /// snapshot behind them. This is what a view-model test wants: it describes the plan, and the tab
+    /// reads it through the same calls the app makes.
+    ///
+    /// <para>Also scripts <c>get-run-detail</c>, because the preview opens by reading the header — the
+    /// facet keys and status totals a windowed client cannot count for itself.</para></summary>
+    public FakePlanService ServePlan(Guid runId, DryRunReport plan, Profile? profile = null)
+    {
+        FakePlanService service = new(plan);
+        _plans[runId] = service;
+        RunDetailResults[runId] = service.Detail(runId, profile ?? TestData.ProfileFactory.Sample());
+        return service;
+    }
+
+    /// <summary>The plan any run gets when nothing was served for it specifically, derived from
+    /// <see cref="DryRunResult"/>.
+    ///
+    /// <para>Needed because the shell's own tests never learn the run id until the engine event arrives —
+    /// they script "this is the plan" and let <c>MainWindowViewModel</c> route it. Built once per report
+    /// so repeated calls for the same run answer from the same order and view table.</para></summary>
+    private FakePlanService? Fallback(Guid runId)
+    {
+        if (_plans.TryGetValue(runId, out FakePlanService? served))
+            return served;
+        if (!DryRunResultSet || !DryRunResult.TryGetValue(out DryRunReport? plan))
+            return null;
+        if (!ReferenceEquals(plan, _fallbackFor))
+        {
+            _fallbackFor = plan;
+            _fallback = new FakePlanService(plan);
+        }
+        return _fallback;
+    }
+
+    private DryRunReport? _fallbackFor;
+    private FakePlanService? _fallback;
+
+    /// <summary>When set, every view request awaits this before answering — the seam for asserting what
+    /// happens WHILE a filter is being built service-side (the loading overlay, and a load that
+    /// supersedes a rebuild still in flight).</summary>
+    public TaskCompletionSource? ViewGate { get; set; }
+
+    public async Task<Result<RunPlanViewResponse, IpcError>> GetRunPlanViewAsync(
         GetRunPlanViewRequest request, CancellationToken ct = default)
     {
         ViewRequests.Add(request);
-        return Task.FromResult(Result<RunPlanViewResponse, IpcError>.Success(ViewResult));
+        if (request.Side == RunPlanSide.Sources
+            && request.Search is null && request.SourceRoots is null && request.DestinationRoots is null
+            && request.Kinds is null && !request.IncludeDestructiveDisposition)
+        {
+            RunPlanOpenCalls.Add(request.RunId);
+        }
+        if (ViewGate is not null)
+        {
+            try
+            {
+                await ViewGate.Task.WaitAsync(ct);
+            }
+            catch (OperationCanceledException)
+            {
+                return Result<RunPlanViewResponse, IpcError>.Canceled();
+            }
+        }
+        if (ViewError is { } scripted)
+            return scripted;
+        return Result<RunPlanViewResponse, IpcError>.Success(
+            Pages.Count == 0 && Fallback(request.RunId) is { } plan ? plan.View(request) : ViewResult);
     }
 
     public async Task<Result<DryRunChunkResponse, IpcError>> GetRunPlanPageAsync(
@@ -252,6 +348,10 @@ internal sealed class FakeIpcGateway : IIpcGateway
                 return Result<DryRunChunkResponse, IpcError>.Canceled();
             }
         }
+        if (PageFactory is { } factory)
+            return Result<DryRunChunkResponse, IpcError>.Success(factory(request));
+        if (Pages.Count == 0 && Fallback(request.RunId) is { } plan)
+            return Result<DryRunChunkResponse, IpcError>.Success(plan.Page(request));
         return Pages.TryGetValue(request.First, out DryRunChunkResponse? page)
             ? Result<DryRunChunkResponse, IpcError>.Success(page)
             : Result<DryRunChunkResponse, IpcError>.Success(DryRunColumns.ToChunk([], [], [], [], []));
@@ -348,8 +448,18 @@ internal sealed class FakeIpcGateway : IIpcGateway
 
     /// <summary>Defaults to the answer a run still PLANNING really gets, so a test that does not care
     /// about the summary pane is not made to build a whole Profile to stay quiet.</summary>
-    public Result<RunDetailDto, IpcError> RunDetailResult { get; set; } =
+    /// <summary>An explicit override. Left unset, run detail is derived from whatever plan is being
+    /// served (see <see cref="Fallback"/>); setting it — including to the "still planning" answer below —
+    /// takes precedence, which is what the job-queue tests want.</summary>
+    public Result<RunDetailDto, IpcError> RunDetailResult
+    {
+        get => _runDetailResult;
+        set { _runDetailResult = value; _runDetailResultSet = true; }
+    }
+
+    private Result<RunDetailDto, IpcError> _runDetailResult =
         new IpcError("RUN_PLAN_UNAVAILABLE", "the run has no plan snapshot yet");
+    private bool _runDetailResultSet;
 
     /// <summary>Held per run id, so a test can leave one fetch in flight and prove the next selection
     /// cancels it — the same recipe <see cref="JobLogGates"/> uses.</summary>
@@ -359,6 +469,21 @@ internal sealed class FakeIpcGateway : IIpcGateway
         Guid runId, CancellationToken ct = default)
     {
         GetRunDetailCalls.Add(runId);
+        // The preview's FIRST call is this one, so the plan-level gate and exception belong here too: a
+        // test holding a preview mid-open, or making one fault, scripts them and means this.
+        if (RunPlanException is not null)
+            throw RunPlanException;
+        if (RunPlanGate is not null)
+        {
+            try
+            {
+                await RunPlanGate.Task.WaitAsync(ct);
+            }
+            catch (OperationCanceledException)
+            {
+                return Result<RunDetailDto, IpcError>.Canceled();
+            }
+        }
         if (RunDetailGates.TryGetValue(runId, out TaskCompletionSource? gate))
         {
             try
@@ -370,7 +495,17 @@ internal sealed class FakeIpcGateway : IIpcGateway
                 return Result<RunDetailDto, IpcError>.Canceled();   // mirror the real gateway
             }
         }
-        return RunDetailResults.TryGetValue(runId, out var scripted) ? scripted : RunDetailResult;
+        if (RunDetailResults.TryGetValue(runId, out var scripted))
+            return scripted;
+        if (_runDetailResultSet)
+            return RunDetailResult;
+        // A refused plan is refused here now: the preview opens by reading the header, so an error
+        // scripted onto DryRunResult has to surface from this call rather than from a stream.
+        if (DryRunResultSet && DryRunResult.TryGetError(out IpcError? planError))
+            return planError;
+        if (Fallback(runId) is { } plan)
+            return plan.Detail(runId, GetResult.TryGetValue(out Profile? profile) ? profile : TestData.ProfileFactory.Sample());
+        return RunDetailResult;
     }
 
     public async Task<Result<bool, IpcError>> SetPausedAsync(bool paused, CancellationToken ct = default)

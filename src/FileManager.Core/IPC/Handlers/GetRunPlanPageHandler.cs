@@ -115,7 +115,12 @@ public sealed class GetRunPlanPageHandler(
     }
 
     /// <summary>Builds the source half of a page. Each row carries its own operation, so the client's
-    /// per-source grouping resolves entirely within the page.</summary>
+    /// per-source grouping resolves entirely within the page.
+    ///
+    /// <para>A source's DESTINATION operations are not here and cannot be — they live in the other half,
+    /// which this page does not read. What the row needs from them is the set of kinds they take, for the
+    /// single rolled-up target glyph, and the plan recorded that per source as
+    /// <see cref="RunSourceItem.TargetKinds"/> precisely so a window does not have to go looking.</para></summary>
     private DryRunChunkResponse SourcePage(
         string directory, int[] ordinals, DryRunStreamHandler.WireChunkConverter converter)
     {
@@ -125,6 +130,7 @@ public sealed class GetRunPlanPageHandler(
 
         List<PhysicalFile> files = [];
         List<VirtualFileOperation> ops = [];
+        List<int> targetKinds = [];
         foreach (RunSourceItem? item in items)
         {
             if (item is null)
@@ -147,8 +153,9 @@ public sealed class GetRunPlanPageHandler(
                 SourceDisposition = item.Disposition,
                 Detail = item.Detail,
             });
+            targetKinds.Add(item.TargetKinds);
         }
-        return converter.Convert(files, [], ops, []);
+        return converter.Convert(files, [], ops, [], targetKinds);
     }
 
     /// <summary>Builds the destination half of a page. The two files behind it are one index space to
@@ -198,27 +205,25 @@ public sealed class GetRunPlanPageHandler(
         {
             if (item is null)
                 return;
-            // A row whose subject is null names a path that does not exist yet (New, or a rename's new
-            // name): it contributes an operation and no file, exactly as the full replay does.
-            int subject = -1;
-            if (item.SubjectPath is { } subjectPath)
+            // Every row gets a file, and its LENGTH is the point: the client derives a destination's shown
+            // size from this slot, and for a write the size belongs to the source file — which this page
+            // does not contain, so the snapshot recorded it. A row with no pre-existing file stands in for
+            // itself here (the store reads this slot only for the size), so a New row shows the incoming
+            // content's size rather than 0 B.
+            files.Add(new PhysicalFile
             {
-                files.Add(new PhysicalFile
-                {
-                    Path = subjectPath,
-                    Root = item.TargetRoot,
-                    Length = item.SubjectSizeBytes ?? 0,
-                    LastWritten = item.SubjectLastWriteUtc ?? default,
-                });
-                subject = files.Count - 1;
-            }
+                Path = item.SubjectPath ?? item.Path,
+                Root = item.TargetRoot,
+                Length = item.SizeBytes,
+                LastWritten = item.SubjectLastWriteUtc ?? default,
+            });
             ops.Add(new VirtualFileOperation
             {
                 Path = item.Path,
                 Root = item.TargetRoot,
                 Kind = item.Kind,
                 SourceIndex = -1,   // see the summary: the plan's source ordinal is not page-local
-                SubjectIndex = subject,
+                SubjectIndex = files.Count - 1,
                 Detail = item.Detail,
             });
         }

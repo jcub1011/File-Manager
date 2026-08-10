@@ -145,11 +145,9 @@ public sealed class DryRunViewModelTests
             Truncated = truncated,
         };
 
-    /// <summary>A store holding source files only (no destination operations) — the shape the
-    /// tab-level filter/search/rebuild tests need. Rows are no longer objects a test can construct
-    /// directly: they are handles into a <see cref="DryRunRowStore"/>, so a test that used to build a
-    /// <c>List&lt;DryRunFileRow&gt;</c> builds one of these instead.</summary>
-    private DryRunRowStore SourceStore(params (string Name, OperationKind Kind, OnSuccessAction? Disposition)[] files)
+    /// <summary>A plan of source files only (no destination operations) — the shape the filter, search
+    /// and rebuild-lifecycle tests need.</summary>
+    private DryRunReport SourceReport(params (string Name, OperationKind Kind, OnSuccessAction? Disposition)[] files)
     {
         List<DryRunFile> sourceFiles = [];
         List<DryRunOperation> sourceOps = [];
@@ -159,13 +157,13 @@ public sealed class DryRunViewModelTests
             sourceFiles.Add(Pf($@"C:\s\{name}", @"C:\s"));
             sourceOps.Add(SrcOp(i, $@"C:\s\{name}", @"C:\s", kind, disposition));
         }
-        return DryRunRowStore.FromReport(Report(Guid.NewGuid(), sourceFiles, sourceOps, [], []));
+        return Report(Guid.NewGuid(), sourceFiles, sourceOps, [], []);
     }
 
-    /// <summary>Enough rows to cross <c>DryRunRebuild.SyncThreshold</c>, so rebuilds hop to the thread
-    /// pool exactly as they do for a real large report. Even indices are processed, odd are
-    /// filter-skipped.</summary>
-    private DryRunRowStore ManyRows(int count)
+    /// <summary>Enough rows to cross <c>DryRunRebuild.SyncThreshold</c>, so a filter change is treated as
+    /// slow enough to explain — the same distinction a real large plan draws. Even indices are processed,
+    /// odd are filter-skipped.</summary>
+    private DryRunReport ManyRowsReport(int count)
     {
         var files = new (string, OperationKind, OnSuccessAction?)[count];
         for (int i = 0; i < count; i++)
@@ -174,7 +172,7 @@ public sealed class DryRunViewModelTests
                 ? ($"file-{i:D6}.txt", OperationKind.Processed, OnSuccessAction.KeepSource)
                 : ($"file-{i:D6}.txt", OperationKind.SkippedByFilter, (OnSuccessAction?)null);
         }
-        return SourceStore(files);
+        return SourceReport(files);
     }
 
     // fresh.txt: new write (KeepSource). clobber.txt: overwrites one target + renames around another
@@ -280,23 +278,24 @@ public sealed class DryRunViewModelTests
     [Fact]
     public async Task A_conflict_rename_keeps_the_original_as_a_destination_only_untouched_row()
     {
-        // The kept-around original is emitted by the server as a destination op with SourceIndex == -1,
-        // so it must NOT appear among the source file's target rows — clobber shows exactly its real
-        // targets (Overwrite + Rename), and the kept original surfaces only in the Destinations view.
+        // The kept-around original is emitted by the server as a destination op with SourceIndex == -1, so
+        // it is a row of the Destinations half and of nothing else. On the Sources side clobber rolls its
+        // real targets (Overwrite + Rename) up into the one glyph the row shows — read from the mask the
+        // plan recorded per source, because a page of sources.ndjsonl never sees the destination half.
         var (viewModel, gateway) = NewViewModel();
         gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value);
         await RunPlans.PreviewAsync(viewModel, gateway);
 
         DryRunFileRow clobber = viewModel.Sources.VisibleRows.Single(r => r.SourcePath.EndsWith("clobber.txt"));
-        Assert.Equal(2, clobber.Targets.Count);
-        Assert.Contains(clobber.Targets, t => t.IsOverwrite);
-        Assert.Contains(clobber.Targets, t => t.IsRename);
-        Assert.DoesNotContain(clobber.Targets, t => t.Path == @"C:\t2\clobber.txt");   // the kept original is not a target
+        Assert.True(clobber.HasTargetKind);
+        // Overwrite outranks Rename, so that is the glyph shown — and the kept original, which is not
+        // clobber's target at all, contributes nothing to it.
+        Assert.Equal("IconOverwrite", clobber.PrimaryKindIconKey);
 
         DryRunDestinationRow kept = viewModel.Destinations.VisibleRows
-            .Single(r => !r.HasSource && r.Primary.TargetPath == @"C:\t2\clobber.txt");
+            .Single(r => r.Primary.TargetPath == @"C:\t2\clobber.txt");
         Assert.True(kept.Primary.IsUntouched);
-        Assert.False(kept.HasSource);   // SourceIndex == -1
+        Assert.False(kept.HasSource);   // every paged destination row stands on its own
     }
 
     [Fact]
@@ -405,54 +404,12 @@ public sealed class DryRunViewModelTests
         Assert.Equal(new[] { "one", "two", "z" }, details);
     }
 
-    [Fact]
-    public async Task Large_report_parallel_projection_preserves_stable_ordering()
-    {
-        // Above DryRunRebuild.SyncThreshold (5,000) PrepareReport projects and sorts on the thread pool
-        // (parallel row build, parallel key fill, concurrent tab loads). This drives that path and pins
-        // the invariant it must uphold: keys sort ascending and rows equal on key keep report order.
-        // Every row's key is just its file name (all under one root); three names give three big tie
-        // groups, and each op's detail carries its report index so stable order = strictly increasing.
-        const int n = 6_000;
-        string[] names = ["a.txt", "b.txt", "c.txt"];
-        var sourceFiles = new List<DryRunFile>(n);
-        var sourceOps = new List<DryRunOperation>(n);
-        var destinationOps = new List<DryRunOperation>(n);
-        for (int i = 0; i < n; i++)
-        {
-            string src = $@"C:\src\{names[i % 3]}";
-            string dst = $@"D:\dst\{names[i % 3]}";
-            sourceFiles.Add(Pf(src, @"C:\src"));
-            sourceOps.Add(SrcOp(i, src, @"C:\src", OperationKind.Processed, OnSuccessAction.KeepSource, detail: i.ToString()));
-            destinationOps.Add(DstOp(OperationKind.New, dst, @"D:\dst", sourceIndex: i, detail: i.ToString()));
-        }
-        var (viewModel, gateway) = NewViewModel();
-        gateway.DryRunResult = Report(viewModel.ProfileId!.Value, sourceFiles, sourceOps, [], destinationOps);
-
-        await RunPlans.PreviewAsync(viewModel, gateway);
-
-        AssertStableByName(viewModel.Sources.VisibleRows.Select(r => (r.FileName, r.DecidingFilter!)).ToList());
-        AssertStableByName(viewModel.Destinations.VisibleRows.Select(r => (r.FileName, r.Primary.Detail!)).ToList());
-
-        // Keys ascending, and within each equal-key group the report-index marker strictly increases —
-        // the tertiary original-index tiebreak the (unstable) Array.Sort depends on.
-        static void AssertStableByName(List<(string Name, string Marker)> rows)
-        {
-            Assert.Equal(n, rows.Count);
-            Assert.Equal(rows.Select(r => r.Name).OrderBy(x => x, StringComparer.OrdinalIgnoreCase).ToList(),
-                rows.Select(r => r.Name).ToList());
-            string current = "";
-            int last = -1;
-            foreach ((string name, string marker) in rows)
-            {
-                if (name != current) { current = name; last = -1; }
-                int index = int.Parse(marker);
-                Assert.True(index > last, $"stable order violated within '{name}': {index} after {last}");
-                last = index;
-            }
-        }
-    }
-
+    // The order rows come out in is no longer decided here. It is decided by the ONE comparator that can
+    // decide it — RunSnapshotOrder's, over the rows as they stream past during planning — and pinned by
+    // RunSnapshotPagingTests, which asserts that paging a half end to end reproduces exactly that order.
+    // The client reads a window of it and sorts nothing, so a client-side test of a 6,000-row sort would
+    // now be asserting against a fixture rather than against the app. What still belongs here is that the
+    // two tabs LINE UP, which Sources_and_destinations_share_relative_path_ordering covers.
     // Builds a report of plain new-writes: one source file + one New destination op per write.
     private DryRunReport WritesReport(Guid profileId, params (string Src, string SrcRoot, string Dst, string DstRoot)[] writes)
     {
@@ -489,9 +446,15 @@ public sealed class DryRunViewModelTests
     }
 
     [Fact]
-    public async Task Replicated_file_collapses_to_one_row_listing_each_destination()
+    public async Task Replicated_file_shows_one_row_per_resulting_destination()
     {
-        // One source fanned out to three targets → a single grouped row, not three rows.
+        // One source fanned out to three targets → three rows, one per resulting path.
+        //
+        // It used to collapse into one grouped row listing all three, and that could not survive paging:
+        // the destination half's index space is per OPERATION — that is what the order file and the block
+        // index are built over — so a page holds operations, and a fan-out group could straddle a page
+        // boundary with no way to reunite it. The whole-plan counts are unaffected: they were always over
+        // the individual destinations rather than over the collapsed row.
         var (viewModel, gateway) = NewViewModel();
         gateway.DryRunResult = Report(viewModel.ProfileId!.Value,
             sourceFiles: [Pf(@"C:\s\report.docx", @"C:\s")],
@@ -505,13 +468,14 @@ public sealed class DryRunViewModelTests
             ]);
         await RunPlans.PreviewAsync(viewModel, gateway);
 
-        DryRunDestinationRow row = Assert.Single(viewModel.Destinations.VisibleRows);
-        Assert.True(row.HasSource);
-        Assert.Equal(@"C:\s\report.docx", row.SourcePath);
-        Assert.Equal(3, row.Destinations.Count);
-        Assert.Equal(2, row.Destinations.Count(d => d.IsNew));
-        Assert.Equal(1, row.Destinations.Count(d => d.IsOverwritten));
-        // Counts remain over the individual destinations, not the collapsed row.
+        Assert.Equal(3, viewModel.Destinations.VisibleRows.Count);
+        Assert.All(viewModel.Destinations.VisibleRows, r => Assert.Equal("report.docx", r.Primary.FileName));
+        Assert.Equal(
+            [@"C:\a\report.docx", @"C:\b\report.docx", @"C:\c\report.docx"],
+            viewModel.Destinations.VisibleRows.Select(r => r.Primary.TargetPath).Order().ToList());
+        Assert.Equal(2, viewModel.Destinations.VisibleRows.Count(r => r.Primary.IsNew));
+        Assert.Equal(1, viewModel.Destinations.VisibleRows.Count(r => r.Primary.IsOverwritten));
+        // And the whole-plan counts are what they always were.
         Assert.Equal(2, viewModel.Destinations.NewCount);
         Assert.Equal(1, viewModel.Destinations.OverwrittenCount);
     }
@@ -558,6 +522,7 @@ public sealed class DryRunViewModelTests
 
         // Keep only C:\t2 — only clobber.txt lands there.
         viewModel.Sources.DestinationFacets.Single(f => f.Key == @"C:\t").IsSelected = false;
+        await RunPlans.SettleAsync(viewModel);
         DryRunFileRow row = Assert.Single(viewModel.Sources.VisibleRows);
         Assert.EndsWith("clobber.txt", row.SourcePath);
     }
@@ -571,6 +536,7 @@ public sealed class DryRunViewModelTests
 
         Assert.True(viewModel.Destinations.ShowDestinationFacet);
         viewModel.Destinations.DestinationFacets.Single(f => f.Key == @"C:\t").IsSelected = false;
+        await RunPlans.SettleAsync(viewModel);
         Assert.All(viewModel.Destinations.VisibleRows.SelectMany(r => r.Destinations),
             e => Assert.Equal(@"C:\t2", e.TargetRoot));
     }
@@ -588,18 +554,79 @@ public sealed class DryRunViewModelTests
 
         // Deleted → only clobber.txt (the one trashed source).
         viewModel.Sources.StatusFilters.Single(f => f.Key == "deleted").IsSelected = true;
+        await RunPlans.SettleAsync(viewModel);
         Assert.True(viewModel.Sources.AnyStatusSelected);
         Assert.EndsWith("clobber.txt", Assert.Single(viewModel.Sources.VisibleRows).SourcePath);
 
         // Untouched → the filtered-out + unchanged files (junk.tmp + same.txt).
         viewModel.Sources.StatusFilters.Single(f => f.Key == "deleted").IsSelected = false;
         viewModel.Sources.StatusFilters.Single(f => f.Key == "untouched").IsSelected = true;
+        await RunPlans.SettleAsync(viewModel);
         Assert.Equal(2, viewModel.Sources.VisibleRows.Count);
         Assert.All(viewModel.Sources.VisibleRows, r => Assert.True(r.IsUntouched));
 
         // A view filter never changes the whole-run summary counts.
         Assert.Equal(1, viewModel.Sources.DeletedCount);
         Assert.Equal(2, viewModel.Sources.UntouchedCount);
+    }
+
+    [Fact]
+    public async Task Each_status_chip_asks_the_service_for_the_kinds_it_stands_for()
+    {
+        // The chip → OperationKind mapping is the client's half of the filter contract: the service does
+        // set membership on an enum it owns and never learns what a chip is. Asserting the REQUEST rather
+        // than the resulting rows is the point — a mapping that drifted would still return plausible rows,
+        // just the wrong ones, and only the request shows which.
+        var (viewModel, gateway) = NewViewModel();
+        gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value);
+        await RunPlans.PreviewAsync(viewModel, gateway);
+
+        // Untouched, on the source side, is the two SKIPPED kinds.
+        gateway.ViewRequests.Clear();
+        viewModel.Sources.StatusFilters.Single(f => f.Key == "untouched").IsSelected = true;
+        await RunPlans.SettleAsync(viewModel);
+        GetRunPlanViewRequest sources = Assert.Single(gateway.ViewRequests);
+        Assert.Equal(
+            [OperationKind.SkippedByFilter, OperationKind.SkippedUnchanged],
+            sources.Kinds!.Order().ToList());
+        Assert.False(sources.IncludeDestructiveDisposition);
+
+        // Deleted is NOT a kind — it is a destructive source disposition — so it rides as its own flag,
+        // ORed with the kinds, because the tab treats its chips as alternatives.
+        gateway.ViewRequests.Clear();
+        viewModel.Sources.StatusFilters.Single(f => f.Key == "untouched").IsSelected = false;
+        viewModel.Sources.StatusFilters.Single(f => f.Key == "deleted").IsSelected = true;
+        await RunPlans.SettleAsync(viewModel);
+        GetRunPlanViewRequest deleted = gateway.ViewRequests[^1];
+        Assert.True(deleted.IncludeDestructiveDisposition);
+        Assert.Empty(deleted.Kinds!);   // empty keeps nothing on its own; the flag ORs the rows back in
+
+        // On the destination side every chip IS a set of kinds, and New covers a conflict rename too:
+        // the server already split that into a new file at the suffixed path plus the kept original.
+        gateway.ViewRequests.Clear();
+        viewModel.Destinations.StatusFilters.Single(f => f.Key == "new").IsSelected = true;
+        await RunPlans.SettleAsync(viewModel);
+        GetRunPlanViewRequest destinations = Assert.Single(gateway.ViewRequests);
+        Assert.Equal(RunPlanSide.Destinations, destinations.Side);
+        Assert.Equal([OperationKind.New, OperationKind.Rename], destinations.Kinds!.Order().ToList());
+    }
+
+    [Fact]
+    public async Task Deselecting_every_facet_keeps_nothing_rather_than_everything()
+    {
+        // A filter the user can express: null means "keep every root", an EMPTY list means "keep none".
+        // Widening the second back to the first would show exactly the rows they just excluded.
+        var (viewModel, gateway) = NewViewModel();
+        gateway.DryRunResult = MultiSourceReport(viewModel.ProfileId!.Value);
+        await RunPlans.PreviewAsync(viewModel, gateway);
+
+        gateway.ViewRequests.Clear();
+        foreach (DryRunFacetRow facet in viewModel.Sources.SourceFacets)
+            facet.IsSelected = false;
+        await RunPlans.SettleAsync(viewModel);
+
+        Assert.Empty(gateway.ViewRequests[^1].SourceRoots!);
+        Assert.Empty(viewModel.Sources.VisibleRows);
     }
 
     [Fact]
@@ -613,6 +640,7 @@ public sealed class DryRunViewModelTests
         // both-statuses row shows once, not twice).
         viewModel.Sources.StatusFilters.Single(f => f.Key == "processed").IsSelected = true;
         viewModel.Sources.StatusFilters.Single(f => f.Key == "deleted").IsSelected = true;
+        await RunPlans.SettleAsync(viewModel);
         var names = viewModel.Sources.VisibleRows.Select(r => r.FileName).ToList();
         Assert.Equal(2, names.Count);
         Assert.Contains("fresh.txt", names);
@@ -620,6 +648,7 @@ public sealed class DryRunViewModelTests
 
         // The clear command drops every selection and shows everything again.
         viewModel.Sources.ClearStatusFiltersCommand.Execute(null);
+        await RunPlans.SettleAsync(viewModel);
         Assert.False(viewModel.Sources.AnyStatusSelected);
         Assert.All(viewModel.Sources.StatusFilters, f => Assert.False(f.IsSelected));
         Assert.Equal(4, viewModel.Sources.VisibleRows.Count);
@@ -635,6 +664,7 @@ public sealed class DryRunViewModelTests
         // New only: keeps fresh.txt and clobber.txt's rename target, dropping clobber's Overwrite
         // entry and the untouched rows entirely.
         viewModel.Destinations.StatusFilters.Single(f => f.Key == "new").IsSelected = true;
+        await RunPlans.SettleAsync(viewModel);
         var entries = viewModel.Destinations.VisibleRows.SelectMany(r => r.Destinations).ToList();
         Assert.NotEmpty(entries);
         Assert.All(entries, e => Assert.True(e.IsNew));
@@ -655,6 +685,7 @@ public sealed class DryRunViewModelTests
         // Processed matches fresh + clobber; the search AND-restricts it to fresh.
         viewModel.Sources.StatusFilters.Single(f => f.Key == "processed").IsSelected = true;
         viewModel.Sources.SearchText = "fresh";
+        await RunPlans.SettleAsync(viewModel);
         Assert.EndsWith("fresh.txt", Assert.Single(viewModel.Sources.VisibleRows).SourcePath);
     }
 
@@ -670,6 +701,7 @@ public sealed class DryRunViewModelTests
         Assert.All(viewModel.Sources.SourceFacets, f => Assert.True(f.IsSelected));
 
         viewModel.Sources.SourceFacets.Single(f => f.Key == @"C:\a").IsSelected = false;
+        await RunPlans.SettleAsync(viewModel);
         Assert.All(viewModel.Sources.VisibleRows, r => Assert.Equal(@"C:\b", r.SourceRoot));
         // A view filter never changes the whole-run banner.
         Assert.Equal(4, viewModel.TotalFiles);
@@ -694,12 +726,15 @@ public sealed class DryRunViewModelTests
         await RunPlans.PreviewAsync(viewModel, gateway);
 
         viewModel.Sources.SearchText = "fresh";
+        await RunPlans.SettleAsync(viewModel);
         Assert.EndsWith("fresh.txt", Assert.Single(viewModel.Sources.VisibleRows).SourcePath);
 
         viewModel.Sources.SearchText = @"t2\clobber";   // only clobber has a t2 target
+        await RunPlans.SettleAsync(viewModel);
         Assert.EndsWith("clobber.txt", Assert.Single(viewModel.Sources.VisibleRows).SourcePath);
 
         viewModel.Sources.SearchText = "";
+        await RunPlans.SettleAsync(viewModel);
         Assert.Equal(4, viewModel.Sources.VisibleRows.Count);
     }
 
@@ -721,306 +756,6 @@ public sealed class DryRunViewModelTests
         destinationFiles: [],
         destinationOps: []);
 
-    [Fact]
-    public async Task Sources_tree_starts_at_the_common_root_and_rolls_up_pills()
-    {
-        var (viewModel, gateway) = NewViewModel();
-        gateway.DryRunResult = NestedSourcesReport(viewModel.ProfileId!.Value);
-        await RunPlans.PreviewAsync(viewModel, gateway);
-
-        viewModel.Sources.ShowTree = true;
-
-        // Top level is "sub" (under C:\proj), not the "C:" drive — no click-through.
-        DryRunTreeNode sub = Assert.Single(viewModel.Sources.Tree);
-        Assert.Equal("sub", sub.Name);
-        Assert.True(sub.IsDirectory);
-        Assert.True(sub.IsExpanded);
-        Assert.Equal(@"C:\proj\sub", sub.FullPath);   // FullPath stays absolute for the tooltip
-        Assert.Contains(sub.Pills, p => p.Tip == "untouched" && p.CountText == "1");
-        Assert.Contains(sub.Pills, p => p.Tip == "processed" && p.CountText == "2");
-        Assert.Contains(sub.Pills, p => p.Tip == "deleted" && p.CountText == "1");
-    }
-
-    [Fact]
-    public async Task Tree_collapses_top_level_when_first_expansion_reveals_too_many_rows()
-    {
-        // One top-level folder holding more direct files than the limit → expanding it would flood the
-        // view, so the tree opens collapsed (chevron shown, nothing expanded).
-        const int n = DryRunTreeNode.AutoExpandChildLimit + 1;
-        var sourceFiles = new List<DryRunFile>(n);
-        var sourceOps = new List<DryRunOperation>(n);
-        for (int i = 0; i < n; i++)
-        {
-            string path = $@"C:\r\big\file-{i}.txt";
-            sourceFiles.Add(Pf(path, @"C:\r"));
-            sourceOps.Add(SrcOp(i, path, @"C:\r", OperationKind.Processed, OnSuccessAction.KeepSource));
-        }
-        var (viewModel, gateway) = NewViewModel();
-        gateway.DryRunResult = Report(viewModel.ProfileId!.Value, sourceFiles, sourceOps, [], []);
-        await RunPlans.PreviewAsync(viewModel, gateway);
-
-        viewModel.Sources.ShowTree = true;
-        await viewModel.Sources.PendingRebuild;
-
-        DryRunTreeNode top = Assert.Single(viewModel.Sources.Tree);
-        Assert.Equal("big", top.Name);
-        Assert.True(top.HasChildren);
-        Assert.False(top.IsExpanded);
-    }
-
-    [Fact]
-    public async Task Tree_stays_expanded_when_many_rows_collapse_to_few_distinct_names()
-    {
-        // One top-level folder holding more direct rows than the limit, but only 3 distinct file names.
-        // Rows sharing a name collapse to one leaf on expand, so the first expansion reveals just 3 rows —
-        // the heuristic counts distinct names, not raw rows, so the tree still auto-expands.
-        const int n = DryRunTreeNode.AutoExpandChildLimit + 1;
-        var sourceFiles = new List<DryRunFile>(n);
-        var sourceOps = new List<DryRunOperation>(n);
-        for (int i = 0; i < n; i++)
-        {
-            string path = $@"C:\r\big\file-{i % 3}.txt";   // only 3 distinct names in the folder
-            sourceFiles.Add(Pf(path, @"C:\r"));
-            sourceOps.Add(SrcOp(i, path, @"C:\r", OperationKind.Processed, OnSuccessAction.KeepSource));
-        }
-        var (viewModel, gateway) = NewViewModel();
-        gateway.DryRunResult = Report(viewModel.ProfileId!.Value, sourceFiles, sourceOps, [], []);
-        await RunPlans.PreviewAsync(viewModel, gateway);
-
-        viewModel.Sources.ShowTree = true;
-        await viewModel.Sources.PendingRebuild;
-
-        DryRunTreeNode top = Assert.Single(viewModel.Sources.Tree);
-        Assert.Equal("big", top.Name);
-        Assert.True(top.HasChildren);
-        Assert.True(top.IsExpanded);   // 3 distinct names ≤ limit → auto-expands despite the row count
-    }
-
-    [Fact]
-    public async Task Tree_stays_expanded_for_a_deep_tree_with_few_top_level_children()
-    {
-        // A single top-level folder with only 3 immediate subfolders — deep, and well over the limit in
-        // TOTAL files, but only 3 top-level children. The threshold counts the top level's own children,
-        // not the whole subtree, so it still auto-expands; the deeper subfolders stay collapsed.
-        const int n = DryRunTreeNode.AutoExpandChildLimit + 50;   // total files > limit
-        var sourceFiles = new List<DryRunFile>(n);
-        var sourceOps = new List<DryRunOperation>(n);
-        for (int i = 0; i < n; i++)
-        {
-            string path = $@"C:\r\a\s{i % 3}\file-{i}.txt";
-            sourceFiles.Add(Pf(path, @"C:\r"));
-            sourceOps.Add(SrcOp(i, path, @"C:\r", OperationKind.Processed, OnSuccessAction.KeepSource));
-        }
-        var (viewModel, gateway) = NewViewModel();
-        gateway.DryRunResult = Report(viewModel.ProfileId!.Value, sourceFiles, sourceOps, [], []);
-        await RunPlans.PreviewAsync(viewModel, gateway);
-
-        viewModel.Sources.ShowTree = true;
-        await viewModel.Sources.PendingRebuild;
-
-        DryRunTreeNode top = Assert.Single(viewModel.Sources.Tree);
-        Assert.Equal("a", top.Name);
-        Assert.True(top.IsExpanded);   // only 3 top-level children → auto-expands despite the file count
-
-        // The three subfolders are revealed but themselves collapsed — depth doesn't auto-expand.
-        var subfolders = top.Children.Where(c => c.IsDirectory).ToList();
-        Assert.Equal(3, subfolders.Count);
-        Assert.All(subfolders, s => Assert.False(s.IsExpanded));
-    }
-
-    [Fact]
-    public async Task Tree_materializes_file_leaves_lazily_on_expand()
-    {
-        // The forest is built with directory nodes + rolled-up pills only; a directory's file leaves are
-        // not created until its Children are read (the user expands it). This keeps ~1 node per file off
-        // the heap for collapsed subtrees.
-        var (viewModel, gateway) = NewViewModel();
-        gateway.DryRunResult = NestedSourcesReport(viewModel.ProfileId!.Value);
-        await RunPlans.PreviewAsync(viewModel, gateway);
-        viewModel.Sources.ShowTree = true;
-
-        DryRunTreeNode sub = Assert.Single(viewModel.Sources.Tree);
-        Assert.True(sub.HasChildren);          // chevron shows without the leaves existing
-        Assert.True(sub.LeavesPending);        // …and they do not exist yet
-        Assert.Contains(sub.Pills, p => p.Tip == "processed" && p.CountText == "2");   // dir totals are ready
-
-        IReadOnlyList<DryRunTreeNode> children = sub.Children;   // expanding materializes the leaves
-        Assert.False(sub.LeavesPending);
-        Assert.Equal(new[] { "one.txt", "three.txt", "two.tmp" }, children.Select(c => c.Name));  // files, alpha
-        Assert.All(children, c => Assert.False(c.IsDirectory));
-        Assert.Same(children, sub.Children);   // stable reference — the grid won't rebuild child rows
-    }
-
-    [Fact]
-    public async Task Folder_context_menu_commands_drive_expansion_through_the_source()
-    {
-        // A single top-level folder "a" with three subfolders, each holding a file: "a" auto-expands
-        // (few top-level children) while the subfolders start collapsed. Exercises the folder
-        // right-click commands, which the view binds from the tree cell's context menu.
-        var (viewModel, gateway) = NewViewModel();
-        gateway.DryRunResult = Report(viewModel.ProfileId!.Value,
-            sourceFiles:
-            [
-                Pf(@"C:\r\a\s0\f0.txt", @"C:\r"),
-                Pf(@"C:\r\a\s1\f1.txt", @"C:\r"),
-                Pf(@"C:\r\a\s2\f2.txt", @"C:\r"),
-            ],
-            sourceOps:
-            [
-                SrcOp(0, @"C:\r\a\s0\f0.txt", @"C:\r", OperationKind.Processed, OnSuccessAction.KeepSource),
-                SrcOp(1, @"C:\r\a\s1\f1.txt", @"C:\r", OperationKind.Processed, OnSuccessAction.KeepSource),
-                SrcOp(2, @"C:\r\a\s2\f2.txt", @"C:\r", OperationKind.Processed, OnSuccessAction.KeepSource),
-            ],
-            destinationFiles: [], destinationOps: []);
-        await RunPlans.PreviewAsync(viewModel, gateway);
-
-        viewModel.Sources.ShowTree = true;
-        await viewModel.Sources.PendingRebuild;
-        Assert.NotNull(viewModel.Sources.TreeSource);   // BuildSource attached the source to the controller
-
-        DryRunTreeNode top = Assert.Single(viewModel.Sources.Tree);
-        var subfolders = top.Children.Where(c => c.IsDirectory).ToList();
-        Assert.Equal(3, subfolders.Count);
-        Assert.True(top.IsExpanded);                           // auto-expanded top level
-        Assert.All(subfolders, s => Assert.False(s.IsExpanded));
-
-        // Open Folder and All Nested Folders → the whole subtree under "a" expands (source API,
-        // viewport-independent — the subfolders were never realized).
-        top.OpenFolderRecursiveCommand.Execute(null);
-        Assert.True(top.IsExpanded);
-        Assert.All(subfolders, s => Assert.True(s.IsExpanded));
-
-        // Close All Folders → every folder in the tree collapses.
-        top.CloseAllCommand.Execute(null);
-        Assert.False(top.IsExpanded);
-        Assert.All(subfolders, s => Assert.False(s.IsExpanded));
-
-        // Expand All Folders → every folder in the tree expands.
-        top.ExpandAllCommand.Execute(null);
-        Assert.True(top.IsExpanded);
-        Assert.All(subfolders, s => Assert.True(s.IsExpanded));
-
-        // Single Open/Close affect only the target folder, not its siblings.
-        DryRunTreeNode one = subfolders[0];
-        one.CloseFolderCommand.Execute(null);
-        Assert.False(one.IsExpanded);
-        Assert.True(subfolders[1].IsExpanded);
-        one.OpenFolderCommand.Execute(null);
-        Assert.True(one.IsExpanded);
-    }
-
-    [Fact]
-    public async Task Toggle_expand_collapse_all_flips_the_whole_subtree_by_current_state()
-    {
-        // Same shape as above: "a" auto-expands, its three subfolders start collapsed. The Ctrl+Enter
-        // keyboard toggle (ToggleExpandCollapseAll) expands the whole subtree when the folder is
-        // collapsed and collapses it when open — driving off the folder's own IsExpanded.
-        var (viewModel, gateway) = NewViewModel();
-        gateway.DryRunResult = Report(viewModel.ProfileId!.Value,
-            sourceFiles:
-            [
-                Pf(@"C:\r\a\s0\f0.txt", @"C:\r"),
-                Pf(@"C:\r\a\s1\f1.txt", @"C:\r"),
-                Pf(@"C:\r\a\s2\f2.txt", @"C:\r"),
-            ],
-            sourceOps:
-            [
-                SrcOp(0, @"C:\r\a\s0\f0.txt", @"C:\r", OperationKind.Processed, OnSuccessAction.KeepSource),
-                SrcOp(1, @"C:\r\a\s1\f1.txt", @"C:\r", OperationKind.Processed, OnSuccessAction.KeepSource),
-                SrcOp(2, @"C:\r\a\s2\f2.txt", @"C:\r", OperationKind.Processed, OnSuccessAction.KeepSource),
-            ],
-            destinationFiles: [], destinationOps: []);
-        await RunPlans.PreviewAsync(viewModel, gateway);
-
-        viewModel.Sources.ShowTree = true;
-        await viewModel.Sources.PendingRebuild;
-
-        DryRunTreeNode top = Assert.Single(viewModel.Sources.Tree);
-        var subfolders = top.Children.Where(c => c.IsDirectory).ToList();
-        Assert.True(top.IsExpanded);   // auto-expanded, subfolders collapsed
-
-        // Open → toggle collapses the whole subtree (the folder itself and every descendant).
-        top.ToggleExpandCollapseAllCommand.Execute(null);
-        Assert.False(top.IsExpanded);
-        Assert.All(subfolders, s => Assert.False(s.IsExpanded));
-
-        // Collapsed → toggle expands the whole subtree.
-        top.ToggleExpandCollapseAllCommand.Execute(null);
-        Assert.True(top.IsExpanded);
-        Assert.All(subfolders, s => Assert.True(s.IsExpanded));
-
-        // Regression: after expand-all then collapse-all, re-opening ONLY the top folder must show the
-        // subfolders collapsed — the collapse must reset the descendants, not leave them flagged open.
-        top.ToggleExpandCollapseAllCommand.Execute(null);   // collapse the whole subtree again
-        Assert.False(top.IsExpanded);
-        Assert.All(subfolders, s => Assert.False(s.IsExpanded));
-
-        top.OpenFolderCommand.Execute(null);                 // single open of just the top folder
-        Assert.True(top.IsExpanded);
-        Assert.All(subfolders, s => Assert.False(s.IsExpanded));   // subfolders stay collapsed
-    }
-
-    [Fact]
-    public async Task Lazy_leaves_merge_duplicate_names_with_summed_counts()
-    {
-        // Two rows at the same resulting path collapse to one leaf whose counts sum — the same dedup the
-        // eager build did inline, now reproduced when leaves are built on expand.
-        var (viewModel, gateway) = NewViewModel();
-        gateway.DryRunResult = Report(viewModel.ProfileId!.Value,
-            sourceFiles:
-            [
-                Pf(@"C:\p\sub\dup.txt", @"C:\p"),
-                Pf(@"C:\p\sub\dup.txt", @"C:\p"),
-                Pf(@"C:\p\sub\z.txt", @"C:\p"),
-            ],
-            sourceOps:
-            [
-                SrcOp(0, @"C:\p\sub\dup.txt", @"C:\p", OperationKind.Processed, OnSuccessAction.KeepSource),
-                SrcOp(1, @"C:\p\sub\dup.txt", @"C:\p", OperationKind.Processed, OnSuccessAction.KeepSource),
-                SrcOp(2, @"C:\p\sub\z.txt", @"C:\p", OperationKind.Processed, OnSuccessAction.KeepSource),
-            ],
-            destinationFiles: [], destinationOps: []);
-        await RunPlans.PreviewAsync(viewModel, gateway);
-        viewModel.Sources.ShowTree = true;
-
-        DryRunTreeNode sub = Assert.Single(viewModel.Sources.Tree);
-        var children = sub.Children;
-        Assert.Equal(new[] { "dup.txt", "z.txt" }, children.Select(c => c.Name));   // dup merged into one leaf
-        DryRunTreeNode dup = children.Single(c => c.Name == "dup.txt");
-        Assert.Contains(dup.Pills, p => p.Tip == "processed" && p.CountText == "2");
-    }
-
-    [Fact]
-    public async Task Snapshotting_expansion_does_not_materialize_leaves()
-    {
-        // CollectExpanded runs on every filter keystroke to preserve expand state. It must walk the
-        // internal subdirectory structure, never force lazy leaf materialization.
-        var (viewModel, gateway) = NewViewModel();
-        gateway.DryRunResult = Report(viewModel.ProfileId!.Value,
-            sourceFiles:
-            [
-                Pf(@"C:\p\sub\top.txt", @"C:\p"),
-                Pf(@"C:\p\sub\deep\a.txt", @"C:\p"),
-                Pf(@"C:\p\sub\deep\b.txt", @"C:\p"),
-            ],
-            sourceOps:
-            [
-                SrcOp(0, @"C:\p\sub\top.txt", @"C:\p", OperationKind.Processed, OnSuccessAction.KeepSource),
-                SrcOp(1, @"C:\p\sub\deep\a.txt", @"C:\p", OperationKind.Processed, OnSuccessAction.KeepSource),
-                SrcOp(2, @"C:\p\sub\deep\b.txt", @"C:\p", OperationKind.Processed, OnSuccessAction.KeepSource),
-            ],
-            destinationFiles: [], destinationOps: []);
-        await RunPlans.PreviewAsync(viewModel, gateway);
-        viewModel.Sources.ShowTree = true;
-
-        DryRunTreeNode sub = Assert.Single(viewModel.Sources.Tree);
-        Assert.True(sub.LeavesPending);   // sub's direct file (top.txt) is deferred
-
-        DryRunTreeNode.CollectExpanded(viewModel.Sources.Tree);   // what a filter keystroke snapshots
-
-        Assert.True(sub.LeavesPending);   // the snapshot did not build any leaves
-    }
-
     // Destinations nested one level under a single target root.
     private DryRunReport NestedDestinationsReport(Guid profileId) => Report(profileId,
         sourceFiles:
@@ -1040,44 +775,6 @@ public sealed class DryRunViewModelTests
             DstOp(OperationKind.Overwrite, @"C:\out\sub\clob.txt", @"C:\out", sourceIndex: 1, subjectIndex: 0),
             DstOp(OperationKind.Untouched, @"C:\out\sub\keep.txt", @"C:\out", subjectIndex: 1),
         ]);
-
-    [Fact]
-    public async Task Destinations_tree_starts_at_the_common_root_and_rolls_up_pills()
-    {
-        var (viewModel, gateway) = NewViewModel();
-        gateway.DryRunResult = NestedDestinationsReport(viewModel.ProfileId!.Value);
-        await RunPlans.PreviewAsync(viewModel, gateway);
-
-        viewModel.Destinations.ShowTree = true;
-
-        DryRunTreeNode sub = Assert.Single(viewModel.Destinations.Tree);
-        Assert.Equal("sub", sub.Name);
-        Assert.Equal(@"C:\out\sub", sub.FullPath);
-        Assert.Contains(sub.Pills, p => p.Tip == "new" && p.CountText == "1");
-        Assert.Contains(sub.Pills, p => p.Tip == "overwritten" && p.CountText == "1");
-        Assert.Contains(sub.Pills, p => p.Tip == "untouched" && p.CountText == "1");
-    }
-
-    [Fact]
-    public async Task Tree_reconstructs_UNC_paths_when_roots_span_shares()
-    {
-        // Two unrelated UNC shares → no common root, so the tree falls back to splitting the raw
-        // absolute path. The leading "\\" must survive that split/rejoin (regression: it was dropped,
-        // yielding "srv1\share" tooltips instead of "\\srv1\share").
-        var (viewModel, gateway) = NewViewModel();
-        gateway.DryRunResult = WritesReport(viewModel.ProfileId!.Value,
-            (@"\\srv1\share\a.txt", @"\\srv1\share", @"\\dst\out\a.txt", @"\\dst\out"),
-            (@"\\srv2\other\b.txt", @"\\srv2\other", @"\\dst\out\b.txt", @"\\dst\out"));
-        await RunPlans.PreviewAsync(viewModel, gateway);
-
-        Assert.Null(viewModel.Sources.CommonRoot);   // unrelated shares span no shared prefix
-        viewModel.Sources.ShowTree = true;
-
-        DryRunTreeNode srv1 = viewModel.Sources.Tree.Single(n => n.Name == "srv1");
-        Assert.Equal(@"\\srv1", srv1.FullPath);
-        DryRunTreeNode share = srv1.Children.Single(n => n.Name == "share");
-        Assert.Equal(@"\\srv1\share", share.FullPath);
-    }
 
     [Fact]
     public async Task Common_root_is_the_single_source_directory()
@@ -1117,43 +814,6 @@ public sealed class DryRunViewModelTests
         DryRunFileRow row = viewModel.Sources.VisibleRows.First();
         Assert.Equal(@"sub\", row.ParentDisplay);
         Assert.Equal("one.txt", row.FileName);
-    }
-
-    [Fact]
-    public async Task Report_defaults_to_list_view_in_both_tabs()
-    {
-        var (viewModel, gateway) = NewViewModel();
-        gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value);
-        await RunPlans.PreviewAsync(viewModel, gateway);
-
-        Assert.False(viewModel.Sources.ShowTree);
-        Assert.Empty(viewModel.Sources.Tree);
-        Assert.False(viewModel.Destinations.ShowTree);
-        Assert.Empty(viewModel.Destinations.Tree);
-    }
-
-    [Fact]
-    public async Task Re_running_a_dry_run_releases_the_previous_tree_forest()
-    {
-        // Regression: Load() forces ShowTree=false under the _applying guard, so the ShowTree setter
-        // won't clear a forest built by a prior run. Without an explicit Tree reset the previous
-        // report's entire forest (up to the streamed cap) would stay retained until the next manual
-        // toggle — the exact retained memory the optimization work set out to eliminate.
-        var (viewModel, gateway) = NewViewModel();
-        gateway.DryRunResult = NestedSourcesReport(viewModel.ProfileId!.Value);
-        await RunPlans.PreviewAsync(viewModel, gateway);
-
-        viewModel.Sources.ShowTree = true;
-        Assert.NotEmpty(viewModel.Sources.Tree);
-        Assert.NotNull(viewModel.Sources.TreeSource);
-
-        // A second run applies a fresh report without the user toggling the tree off first.
-        gateway.DryRunResult = NestedSourcesReport(viewModel.ProfileId!.Value);
-        await RunPlans.PreviewAsync(viewModel, gateway);
-
-        Assert.False(viewModel.Sources.ShowTree);
-        Assert.Empty(viewModel.Sources.Tree);
-        Assert.Null(viewModel.Sources.TreeSource);
     }
 
     [Fact]
@@ -1215,31 +875,6 @@ public sealed class DryRunViewModelTests
     }
 
     [Fact]
-    public async Task Re_running_after_a_tree_toggle_replaces_the_grid_source()
-    {
-        // Regression for the tree-view memory leak: OnTreeChanged now disposes the previous
-        // HierarchicalTreeDataGridSource when the forest is replaced (its realized row cache and
-        // per-node IsExpanded subscriptions otherwise strand the whole old forest, so each toggle +
-        // re-run stacked another forest on the heap). Headless there's no control to root the leak, so
-        // this pins the observable contract and exercises the realize → re-run → dispose path: no throw
-        // from the dispose ordering, and the previous source is gone after the next run.
-        var (viewModel, gateway) = NewViewModel();
-        gateway.DryRunResult = NestedSourcesReport(viewModel.ProfileId!.Value);
-        await RunPlans.PreviewAsync(viewModel, gateway);
-
-        viewModel.Sources.ShowTree = true;
-        await viewModel.Sources.PendingRebuild;
-        var previous = viewModel.Sources.TreeSource;
-        Assert.NotNull(previous);
-        _ = previous.Rows.Count;   // realize the row cache the leak used to strand
-
-        gateway.DryRunResult = NestedSourcesReport(viewModel.ProfileId!.Value);
-        await RunPlans.PreviewAsync(viewModel, gateway);
-
-        Assert.Null(viewModel.Sources.TreeSource);   // list-view default; the prior source was released
-    }
-
-    [Fact]
     public async Task Truncated_report_surfaces_a_notice_mentioning_deletions_are_hidden()
     {
         var (viewModel, gateway) = NewViewModel();
@@ -1297,7 +932,7 @@ public sealed class DryRunViewModelTests
     }
 
     [Fact]
-    public async Task A_preview_streams_the_plan_of_the_run_it_was_given()
+    public async Task A_preview_opens_the_plan_of_the_run_it_was_given()
     {
         var (viewModel, gateway) = NewViewModel();
         gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value);
@@ -1305,8 +940,11 @@ public sealed class DryRunViewModelTests
         Guid runId = await RunPlans.PreviewAsync(viewModel, gateway);
 
         // The rows come from the RUN's frozen snapshot, not from a fresh simulation — that is the whole
-        // point, and it is why the gateway has no dry-run method left to reach for.
-        Assert.Equal(runId, Assert.Single(gateway.RunPlanStreamCalls));
+        // point, and it is why the gateway has no dry-run method left to reach for. Every call the preview
+        // makes is scoped to that run: its header, and a view over each half.
+        Assert.Equal(runId, Assert.Single(gateway.RunPlanOpenCalls));
+        Assert.Equal(runId, Assert.Single(gateway.GetRunDetailCalls));
+        Assert.All(gateway.ViewRequests, r => Assert.Equal(runId, r.RunId));
     }
 
     [Fact]
@@ -1323,10 +961,10 @@ public sealed class DryRunViewModelTests
 
         await RunPlans.PreviewAsync(viewModel, gateway);
 
-        // The phase transitions: the planning caption from the moment Preview is pressed, the building
-        // caption once the plan has streamed, and empty once the rows are up.
+        // The phase transitions: the planning caption from the moment Preview is pressed, the opening
+        // caption while the run's header and views are read, and empty once the rows are up.
         Assert.Equal("Working out what this will do…", observed.First());
-        Assert.Contains("Building the lists…", observed);
+        Assert.Contains("Opening the plan…", observed);
         Assert.Equal("", viewModel.RunStatusText);
         Assert.False(viewModel.IsPreviewing);
     }
@@ -1389,17 +1027,24 @@ public sealed class DryRunViewModelTests
     }
 
     [Fact]
-    public async Task Every_source_row_in_a_plan_replay_lists_where_its_content_goes()
+    public async Task Every_source_row_in_a_plan_replay_says_what_happens_at_its_target()
     {
-        // A source row whose Targets are empty renders as a file the run will read and no statement about
-        // what it does with it.
+        // A source page carries no destination operations — they are the other half of the plan, and a
+        // window onto one half does not read the other. What the row needs is the KIND, and the plan
+        // recorded that per source as a mask so the glyph survives without the operations.
         var (viewModel, gateway) = NewViewModel();
         gateway.DryRunResult = AdditivePlanReplay(files: 1);
 
         await RunPlans.PreviewAsync(viewModel, gateway, copies: 1);
 
         DryRunFileRow row = Assert.Single(viewModel.Sources.VisibleRows);
-        Assert.Equal(@"D:\d\file-0.txt", Assert.Single(row.Targets).Path);
+        Assert.True(row.HasTargetKind);
+        Assert.Equal("IconAdd", row.PrimaryKindIconKey);   // a plain new write
+
+        // And the destination it lands at is a row of the Destinations half.
+        Assert.Equal(
+            @"D:\d\file-0.txt",
+            Assert.Single(viewModel.Destinations.VisibleRows).Primary.TargetPath);
     }
 
     // ── The approval footer ─────────────────────────────────────────────────────────────────────
@@ -1730,8 +1375,9 @@ public sealed class DryRunViewModelTests
         await RunPlans.PreviewAsync(viewModel, gateway);
 
         Assert.Equal("1.5 KB", Assert.Single(viewModel.Sources.VisibleRows).SizeText);
-        var entry = viewModel.Destinations.VisibleRows.SelectMany(r => r.Destinations).Single();
-        Assert.Equal("1.5 KB", entry.SizeText);   // the incoming content size
+        // A New destination names a path nothing is at yet, so its size is the incoming content's — which
+        // a destination page carries as the operation's own size rather than a subject file's.
+        Assert.Equal("1.5 KB", Assert.Single(viewModel.Destinations.VisibleRows).Primary.SizeText);
     }
 
     [Fact]
@@ -1943,48 +1589,34 @@ public sealed class DryRunViewModelTests
     }
 
     [Fact]
-    public async Task Tree_expansion_persists_across_a_search_driven_rebuild()
-    {
-        var (viewModel, gateway) = NewViewModel();   // searchDebounce == Zero → rebuilds are synchronous
-        gateway.DryRunResult = DeepSourcesReport(viewModel.ProfileId!.Value);
-        await RunPlans.PreviewAsync(viewModel, gateway);
-
-        viewModel.Sources.ShowTree = true;
-
-        DryRunTreeNode sub = Assert.Single(viewModel.Sources.Tree);   // top-level "sub", auto-expanded
-        DryRunTreeNode deep = sub.Children.Single(n => n.Name == "deep");
-        Assert.False(deep.IsExpanded);   // interior nodes start collapsed
-        deep.IsExpanded = true;
-
-        // A search term that still matches the deep node's files forces a rebuild of the forest.
-        viewModel.Sources.SearchText = "txt";
-
-        DryRunTreeNode subAfter = Assert.Single(viewModel.Sources.Tree);
-        DryRunTreeNode deepAfter = subAfter.Children.Single(n => n.Name == "deep");
-        Assert.True(deepAfter.IsExpanded);   // expansion (keyed by FullPath) survived the rebuild
-    }
-
-    [Fact]
     public async Task Nonzero_debounce_coalesces_rapid_search_changes_to_the_final_term()
     {
-        var tab = new DryRunSourcesTab(TimeSpan.FromMilliseconds(60));
-        tab.Load(SourceStore(
-            ("alpha.txt", OperationKind.Processed, OnSuccessAction.KeepSource),
-            ("beta.txt", OperationKind.Processed, OnSuccessAction.KeepSource),
-            ("gamma.txt", OperationKind.Processed, OnSuccessAction.KeepSource)));
+        FakeIpcGateway gateway = new()
+        {
+            DryRunResult = SourceReport(
+                ("alpha.txt", OperationKind.Processed, OnSuccessAction.KeepSource),
+                ("beta.txt", OperationKind.Processed, OnSuccessAction.KeepSource),
+                ("gamma.txt", OperationKind.Processed, OnSuccessAction.KeepSource)),
+        };
+        DryRunViewModel viewModel = new(gateway, searchDebounce: TimeSpan.FromMilliseconds(60));
+        viewModel.SetProfile(Guid.NewGuid(), "P");
+        await RunPlans.PreviewAsync(viewModel, gateway);
+        DryRunSourcesTab tab = viewModel.Sources;
         Assert.Equal(3, tab.VisibleRows.Count);
 
         tab.SearchText = "alpha";
         tab.SearchText = "beta";
         tab.SearchText = "gamma";
 
-        // The debounce delays the rebuild, so the intermediate terms have not been applied yet.
+        // The debounce delays the request, so no intermediate term has reached the service yet.
+        Assert.Empty(gateway.ViewRequests.Where(r => r.Search is not null));
         Assert.Equal(3, tab.VisibleRows.Count);
 
-        // After the window lapses exactly one rebuild lands, reflecting only the final term.
-        await WaitUntilAsync(() =>
-            tab.VisibleRows.Count == 1 && tab.VisibleRows[0].SourcePath.EndsWith("gamma.txt"));
+        // After the window lapses exactly one view is built, for the final term only.
+        await WaitUntilAsync(() => tab.VisibleRows.Count == 1);
+        await RunPlans.SettleAsync(viewModel);
 
+        Assert.Equal("gamma", Assert.Single(gateway.ViewRequests.Where(r => r.Search is not null)).Search);
         DryRunFileRow only = Assert.Single(tab.VisibleRows);
         Assert.EndsWith("gamma.txt", only.SourcePath);
     }
@@ -1992,8 +1624,8 @@ public sealed class DryRunViewModelTests
     [Fact]
     public async Task Rapid_filter_toggles_on_a_large_report_coalesce_to_the_latest_state()
     {
-        var tab = new DryRunSourcesTab(TimeSpan.Zero);
-        tab.Load(ManyRows(6_000));
+        var (viewModel, _, _) = await RunPlans.OpenAsync(ManyRowsReport(6_000));
+        DryRunSourcesTab tab = viewModel.Sources;
         Assert.Equal(6_000, tab.VisibleRows.Count);
 
         // Click chips in quick succession; each toggle supersedes the rebuild before it, so only
@@ -2002,22 +1634,28 @@ public sealed class DryRunViewModelTests
         tab.StatusFilters.Single(f => f.Key == "processed").IsSelected = false;
         tab.StatusFilters.Single(f => f.Key == "untouched").IsSelected = true;
         await tab.PendingRebuild;
+        await RunPlans.SettleAsync(viewModel);
 
         Assert.Equal(3_000, tab.VisibleRows.Count);
-        Assert.All(tab.VisibleRows, r => Assert.True(r.IsUntouched));
+        Assert.All(tab.VisibleRows.Take(20), r => Assert.True(r.IsUntouched));
     }
 
     [Fact]
-    public async Task Loading_a_new_report_supersedes_an_in_flight_rebuild()
+    public async Task Loading_a_new_plan_supersedes_an_in_flight_rebuild()
     {
-        var tab = new DryRunSourcesTab(TimeSpan.Zero);
-        tab.Load(ManyRows(100_000));   // large enough that the rebuild is still computing below
+        var (viewModel, gateway, _) = await RunPlans.OpenAsync(ManyRowsReport(6_000));
+        DryRunSourcesTab tab = viewModel.Sources;
 
-        // Kick off a background rebuild, then load a replacement report while it is in flight —
-        // the load cancels it, and the superseded rebuild must never publish the old rows.
+        // Hold the service mid-filter, then load a replacement plan while it is in flight. The load
+        // cancels the rebuild, and the superseded rebuild must never publish against the old plan.
+        gateway.ViewGate = new TaskCompletionSource();
         tab.StatusFilters.Single(f => f.Key == "processed").IsSelected = true;
         Task superseded = tab.PendingRebuild;
-        tab.Load(SourceStore(("alpha.txt", OperationKind.Processed, OnSuccessAction.KeepSource)));
+
+        gateway.DryRunResult = SourceReport(("alpha.txt", OperationKind.Processed, OnSuccessAction.KeepSource));
+        gateway.ViewGate = null;
+        await RunPlans.PreviewAsync(viewModel, gateway);
+        gateway.ViewGate?.SetResult();
         await superseded;
 
         DryRunFileRow only = Assert.Single(tab.VisibleRows);
@@ -2027,14 +1665,18 @@ public sealed class DryRunViewModelTests
     [Fact]
     public async Task Large_rebuilds_flag_IsRebuilding_until_they_publish()
     {
-        var tab = new DryRunSourcesTab(TimeSpan.Zero);
-        tab.Load(ManyRows(6_000));
+        var (viewModel, gateway, _) = await RunPlans.OpenAsync(ManyRowsReport(6_000));
+        DryRunSourcesTab tab = viewModel.Sources;
         Assert.False(tab.IsRebuilding);
 
-        // The flag is set synchronously before the rebuild hops to the thread pool, and cleared by
-        // the publish — the window the view's loading overlay is visible for.
+        // The flag is set synchronously, before the view request goes out, and cleared by the publish —
+        // the window the view's loading overlay is visible for. Gated so that window is observable at
+        // all: against an instant fake the whole rebuild would finish inside the property setter.
+        gateway.ViewGate = new TaskCompletionSource();
         tab.StatusFilters.Single(f => f.Key == "untouched").IsSelected = true;
         Assert.True(tab.IsRebuilding);
+
+        gateway.ViewGate.SetResult();
         await tab.PendingRebuild;
         Assert.False(tab.IsRebuilding);
     }
@@ -2046,20 +1688,29 @@ public sealed class DryRunViewModelTests
         gateway.DryRunResult = SampleReport(viewModel.ProfileId!.Value);
         await RunPlans.PreviewAsync(viewModel, gateway);
 
-        // Under the sync threshold the rebuild completes in the same dispatcher frame — the
-        // loading overlay must never flicker for small reports.
+        // Under the threshold there is nothing slow to explain, so the overlay must never flicker.
         viewModel.Sources.StatusFilters.Single(f => f.Key == "deleted").IsSelected = true;
         Assert.False(viewModel.Sources.IsRebuilding);
+        await RunPlans.SettleAsync(viewModel);
         Assert.Single(viewModel.Sources.VisibleRows);
     }
 
     [Fact]
-    public void Prepare_report_honours_cancellation()
+    public async Task A_view_the_service_cannot_build_leaves_the_current_rows_alone()
     {
-        DryRunRowStore store = DryRunRowStore.FromReport(SampleReport(Guid.NewGuid()));
-        DryRunCompletion completion = new(DateTimeOffset.UnixEpoch, Truncated: false, Space: null);
-        Assert.Throws<OperationCanceledException>(
-            () => DryRunViewModel.PrepareReport(store, completion, new CancellationToken(canceled: true)));
+        // A failed filter is not a reason to blank the panel: what is on screen is still a truthful view
+        // of the plan, and the next keystroke retries anyway.
+        var (viewModel, gateway, _) = await RunPlans.OpenAsync(SampleReport(Guid.NewGuid()));
+        DryRunSourcesTab tab = viewModel.Sources;
+        int before = tab.VisibleRows.Count;
+
+        gateway.ViewError = new IpcError("RUN_NOT_FOUND", "the run is gone");
+        tab.SearchText = "fresh";
+        await tab.PendingRebuild;
+
+        Assert.Equal(before, tab.VisibleRows.Count);
+        Assert.False(tab.IsRebuilding);
+        Assert.Null(viewModel.ErrorMessage);   // a banner would blame the user for typing
     }
 
     private static async Task WaitUntilAsync(Func<bool> condition, int timeoutMs = 2000)

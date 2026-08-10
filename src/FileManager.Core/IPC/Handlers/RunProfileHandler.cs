@@ -220,7 +220,21 @@ public sealed class GetRunDetailHandler(IRunCoordinator runs) : IIpcRequestHandl
         header.CopyItemCount, header.CopyBytes, header.DeleteItemCount, header.DeleteBytes,
         header.SourceItemCount, header.DestinationItemCount,
         header.OverwriteCount, header.RenameCount, header.DisposalCount,
-        header.Truncated, header.SweepFaultDetail, header.Space);
+        header.Truncated, header.SweepFaultDetail, header.Space)
+    {
+        // The preview's whole-plan aggregates ride the same header read. This is the only route they take
+        // to a client: they are not on run-planned, which is a lossy broadcast, and a preview that
+        // RESTORES replays a stored event — so an event-borne copy would report whatever was true when it
+        // was captured rather than what the snapshot says now.
+        Preview = new RunPlanPreviewAggregates
+        {
+            SourceRowsByRoot = header.SourceRowsByRoot,
+            DestinationRowsByRoot = header.DestinationRowsByRoot,
+            DestinationRowsByKind = header.DestinationRowsByKind,
+            UntouchedCount = header.UntouchedCount,
+            ProcessedCount = header.ProcessedCount,
+        },
+    };
 }
 
 /// <summary>Handles set-run-paused: holds or releases ONE run, independently of the global engine pause.

@@ -127,6 +127,16 @@ public sealed class DryRunOperation : IEquatable<DryRunOperation>
     /// deciding filter rule, or the unchanged reason.</summary>
     public string? Detail { get; set; }
 
+    /// <summary>Source ops only: an <see cref="OperationKindMask"/> over the kinds this source's
+    /// DESTINATION operations take. Zero when the source has none, and zero on every destination op.
+    ///
+    /// <para><b>Why a mask and not the resulting glyph.</b> A paged Sources tab reads one window of
+    /// <c>sources.ndjsonl</c> and never sees the destination half, so the row's "what happens at the
+    /// target" icon has nothing to read. The set of kinds is a fact the plan already knows; which one of
+    /// them to show is a display decision, and it stays in the client — the same reason statuses cross
+    /// the wire as <see cref="OperationKind"/> rather than as the UI's chip names.</para></summary>
+    public int TargetKinds { get; set; }
+
     public bool Equals(DryRunOperation? other) =>
         other is not null
         && DirIndex == other.DirIndex
@@ -136,12 +146,31 @@ public sealed class DryRunOperation : IEquatable<DryRunOperation>
         && SourceIndex == other.SourceIndex
         && SubjectIndex == other.SubjectIndex
         && SourceDisposition == other.SourceDisposition
-        && Detail == other.Detail;
+        && Detail == other.Detail
+        && TargetKinds == other.TargetKinds;
 
     public override bool Equals(object? obj) => Equals(obj as DryRunOperation);
 
     public override int GetHashCode() =>
-        HashCode.Combine(DirIndex, FileName, RootDirIndex, Kind, SourceIndex, SubjectIndex, SourceDisposition, Detail);
+        HashCode.Combine(
+            HashCode.Combine(DirIndex, FileName, RootDirIndex, Kind, SourceIndex, SubjectIndex, SourceDisposition, Detail),
+            TargetKinds);
+}
+
+/// <summary>A set of <see cref="OperationKind"/>s packed into an <c>int</c>, one bit per member.
+///
+/// <para>Exists so a source row can carry the kinds of its destination operations without carrying the
+/// operations. Eleven members fit an int with room to spare; a twelfth would too. Bit zero is
+/// <see cref="OperationKind.Processed"/>, so an all-zero mask unambiguously means "no destinations" —
+/// which is also what a snapshot written before this existed reads as, the same honest absence
+/// <c>RunSnapshotHeader.SourceItemCount</c> documents.</para></summary>
+public static class OperationKindMask
+{
+    /// <summary>The single-bit mask for one kind.</summary>
+    public static int Bit(OperationKind kind) => 1 << (int)kind;
+
+    /// <summary>Whether <paramref name="mask"/> contains <paramref name="kind"/>.</summary>
+    public static bool Has(int mask, OperationKind kind) => (mask & Bit(kind)) != 0;
 }
 
 /// <summary>Read-only view of a discovered file's fields, implemented by both the immutable

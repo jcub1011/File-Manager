@@ -262,6 +262,43 @@
 > materialize strings the store has not already interned. Same drift caveat as before, same mitigation
 > (reader in Contracts beside the types, differential conformance test, enum exhaustiveness).
 
+> **Status: ANSWERED by paging, 2026-08-07. Read this note before the brief below it.**
+>
+> The brief asks how to shave the remaining ~72 MB of a resident preview. That question is closed, because
+> the preview is no longer resident. `DryRunViewModel` now opens a run's plan as a HANDLE and reads a
+> window of it (`get-run-plan-view` / `get-run-plan-page`); the rows live on the service, and the client
+> keeps `PagedDryRunRowStore.MaxResidentPages` pages per tab.
+>
+> **Measured, by `DryRunViewModelMemoryTests`:**
+>
+> | | Retained with a preview open |
+> |---|---:|
+> | Whole-plan ingest, 500k rows (the figure this brief is about) | 72.1 MB |
+> | Paged, 500k rows | **17.7 MB** |
+> | Paged, 5,000,000 rows | **19.6 MB** |
+>
+> The second number is the one that matters, and it is not a 4× saving — it is a change of kind. Retained
+> heap no longer tracks the plan's size at all: a ten-fold larger plan costs 1.9 MB more, which is the
+> facet keys and the chip counts, not rows. The ~147 MB transient sort is gone outright, along with the
+> `ComputeLoad` passes that produced it — the service decides the order during the plan's own walk
+> (`RunSnapshotOrder`) and the client sorts nothing.
+>
+> **What this does to the questions below.** Question 1 ("is 72 MB a problem?") is moot at 17.7 MB flat.
+> Question 2's breakdown described a store holding every row; a page store holds 512. Candidate A (the
+> UTF-8 name blob) was worth ~22 MB against 72 MB retained — against ~17 MB total, of which names are a
+> fraction of a fraction, it is not worth the UTF-8/UTF-16 ordering hazard. **Treat A as rejected.**
+> Candidate C (the transient sort key array) no longer exists client-side.
+>
+> One finding from that list did land, from an unexpected direction: `ColumnBuffer`'s 8192-element
+> segments were sized for a store of unknown length, and a page holds 512 rows — 94% of every column
+> empty, multiplied by the resident page count. Sizing segments to the page took the paged figure from
+> 76.7 MB to 17.7 MB. That is most of the saving above, and nothing in the brief predicted it.
+>
+> Still open and NOT answered here: the shipped exe's real process footprint (Question 1's three
+> numbers). Those need a human — see the end of `docs/dry-run-paging-next-steps.md`.
+
+---
+
 > **Status: RESEARCH BRIEF, not a plan.** Nothing here is approved work. The deliverable is a
 > recommendation with numbers behind it — including "stop here", which is a legitimate and
 > possibly correct answer. Written 2026-08-03, immediately after the columnar pass landed.

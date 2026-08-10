@@ -103,7 +103,7 @@ public sealed partial record DryRunFileRow(DryRunRowStore Store, int Index) : ID
     // DryRunTreeNode so the shared file menu markup binds the same command names on either type.
     // These are computed get-only properties — NOT [ObservableProperty]/[RelayCommand] fields and
     // NOT cached in a field — so they never join this record's value equality (a cached command per
-    // instance would break the presorted-rows dedup in DryRunRebuild.SameRows / the `with` copies).
+    // instance would break row-handle equality, which ListBox selection and container recycling rest on).
     // A command is allocated only when the menu is opened; Open File / reveal grey out via a live
     // disk check evaluated when the right-click realizes the command.
     public IRelayCommand CopyPathCommand => new RelayCommand(() => Actions?.CopyText(SourcePath));
@@ -134,28 +134,26 @@ public sealed partial record DryRunFileRow(DryRunRowStore Store, int Index) : ID
     /// <summary>The single operation-kind pill shown in place of the (dropped) nested target list —
     /// the most consequential of this file's target operations. Null when the file has no targets.
     /// One pass over the row's CSR range, tracking the best kind seen, rather than the four
-    /// <c>Any</c> scans it replaced: this runs per realized row while the user scrolls.</summary>
+    /// <c>Any</c> scans it replaced: this runs per realized row while the user scrolls.
+    ///
+    /// <para><b>A PAGE has no destination half,</b> so its rows have an empty CSR range and fall back to
+    /// the mask the plan recorded per source (<c>RunSourceItem.TargetKinds</c>). The ranking below is the
+    /// same either way and lives only here — the service ships the SET of kinds and never a choice among
+    /// them, so the two paths cannot disagree about which glyph wins.</para></summary>
     private OperationKind? PrimaryTargetKind
     {
         get
         {
             int start = Store.TargetStart(Index), end = Store.TargetEnd(Index);
             if (start == end)
-                return null;
+                return FromMask(Store.SourceTargetKinds(Index));
             // Descending consequence: an Overwrite anywhere wins outright, so the scan can stop.
             OperationKind best = OperationKind.Unknown;
             int bestRank = 0;
             for (int p = start; p < end; p++)
             {
                 OperationKind kind = Store.OpKind(p);
-                int rank = kind switch
-                {
-                    OperationKind.Overwrite => 4,
-                    OperationKind.Rename => 3,
-                    OperationKind.New => 2,
-                    OperationKind.SkipConflict or OperationKind.SkipUnchanged => 1,
-                    _ => 0,
-                };
+                int rank = Rank(kind);
                 if (rank <= bestRank)
                     continue;
                 bestRank = rank;
@@ -166,6 +164,38 @@ public sealed partial record DryRunFileRow(DryRunRowStore Store, int Index) : ID
             }
             return best;
         }
+    }
+
+    private static int Rank(OperationKind kind) => kind switch
+    {
+        OperationKind.Overwrite => 4,
+        OperationKind.Rename => 3,
+        OperationKind.New => 2,
+        OperationKind.SkipConflict or OperationKind.SkipUnchanged => 1,
+        _ => 0,
+    };
+
+    /// <summary>The same choice the CSR walk makes, over a recorded kind set instead of the operations.
+    /// A zero mask means the plan recorded none — which is both "this file has no destinations" and "this
+    /// snapshot predates the mask", and renders identically as no glyph.
+    ///
+    /// <para>Probed in descending <see cref="Rank"/> order rather than iterated, so it allocates nothing
+    /// and stops at the first hit: this runs per realized row while the user scrolls a paged list.</para></summary>
+    private static OperationKind? FromMask(int mask)
+    {
+        if (mask == 0)
+            return null;
+        if (OperationKindMask.Has(mask, OperationKind.Overwrite))
+            return OperationKind.Overwrite;
+        if (OperationKindMask.Has(mask, OperationKind.Rename))
+            return OperationKind.Rename;
+        if (OperationKindMask.Has(mask, OperationKind.New))
+            return OperationKind.New;
+        // Both skip kinds present as SkipConflict, matching the CSR walk's rank-1 fold.
+        if (OperationKindMask.Has(mask, OperationKind.SkipConflict)
+            || OperationKindMask.Has(mask, OperationKind.SkipUnchanged))
+            return OperationKind.SkipConflict;
+        return OperationKind.Unknown;
     }
 
     public bool HasTargetKind => PrimaryTargetKind is not null;
@@ -1208,55 +1238,16 @@ public sealed partial class DryRunStatusFilter : ViewModelBase
     [ObservableProperty] public partial bool IsSelected { get; set; }
 }
 
-/// <summary>Ordering shared by both tabs so a file sits in the same position in the Sources and
-/// Destinations lists — otherwise the differing root prefixes (e.g. <c>C:\src\…</c> vs
-/// <c>D:\dst\…</c>) scatter the same logical file to different rows and defeat side-by-side
-/// comparison. The key is the path relative to its root; rows are ordered by that, then by root.</summary>
-internal static class DryRunSort
-{
-    /// <summary>The key for a (directory, file name) pair — identical ordering to relativizing the
-    /// joined absolute path, but <c>GetRelativePath</c> runs once per distinct (directory, root)
-    /// instead of once per row: callers pass a per-rebuild cache and rows sharing a directory reuse
-    /// its relativized form.</summary>
-    public static string RelativeKey(
-        string dirPath, string fileName, string? root,
-        Dictionary<(string DirPath, string? Root), string> relDirCache)
-    {
-        if (string.IsNullOrEmpty(root))
-            return System.IO.Path.Join(dirPath, fileName);
-        if (!relDirCache.TryGetValue((dirPath, root), out string? relDir))
-            relDirCache[(dirPath, root)] = relDir = System.IO.Path.GetRelativePath(root, dirPath);
-        // "." — the file sits in the root itself, so the key is just the name (Join would prepend ".\").
-        return relDir == "." ? fileName : System.IO.Path.Join(relDir, fileName);
-    }
-}
-
 internal static class DryRunRebuild
 {
-    /// <summary>Row count above which a tab's rebuild (filter + optional forest build) hops to the
-    /// thread pool. At or below it the rebuild completes synchronously — small reports keep their
-    /// immediate click-to-result semantics (and the unit tests their synchronous asserts) while
-    /// large reports never block the UI thread.</summary>
+    /// <summary>Plan size above which a filter change is worth an explaining overlay. A view build is a
+    /// pass over the half's rows, so below this it is imperceptible and the list simply swaps; above it
+    /// the user is waiting on the service and should be told.
+    ///
+    /// <para>It used to mean "hop to the thread pool", back when the filter pass ran here. The number is
+    /// the same and so is the judgement it encodes — small plans keep their immediate
+    /// click-to-result semantics, and the unit tests their synchronous asserts.</para></summary>
     public const int SyncThreshold = 5_000;
-
-    /// <summary>Whether two key arrays describe the same rows in the same order. A rebuild whose
-    /// output is unchanged republishes the SAME bound list instance, so the ItemsControl (and its
-    /// scroll position / selection) is left alone. Rows are keys now, not objects, so this is an int
-    /// compare rather than the reference compare it replaced — and the common no-filter case hands
-    /// back the very same array, which <see cref="ReferenceEquals"/> settles in one step.</summary>
-    public static bool SameKeys(int[] a, int[] b)
-    {
-        if (ReferenceEquals(a, b))
-            return true;
-        if (a.Length != b.Length)
-            return false;
-        for (int i = 0; i < a.Length; i++)
-        {
-            if (a[i] != b[i])
-                return false;
-        }
-        return true;
-    }
 }
 
 /// <summary>The cancel-and-coalesce lifecycle shared by both tabs: at most one rebuild is current,
@@ -1323,12 +1314,17 @@ internal static class DryRunFacets
     }
 
     /// <summary>The selected keys to keep, or null when the facet is empty or everything is selected
-    /// (the common case, which skips the per-row check entirely).</summary>
-    public static HashSet<string>? SelectedKeys(IReadOnlyList<DryRunFacetRow> facets)
+    /// (the common case, which skips the check entirely).
+    ///
+    /// <para><b>Null and empty mean different things and both are reachable.</b> Null is "keep every
+    /// root"; an EMPTY list is "keep none", which is what deselecting every facet expresses — widening
+    /// that back to everything would show the user exactly the rows they just excluded. The service
+    /// reads it the same way.</para></summary>
+    public static IReadOnlyList<string>? SelectedKeyList(IReadOnlyList<DryRunFacetRow> facets)
     {
         if (facets.Count == 0 || facets.All(f => f.IsSelected))
             return null;
-        return facets.Where(f => f.IsSelected).Select(f => f.Key).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        return facets.Where(f => f.IsSelected).Select(f => f.Key).ToList();
     }
 }
 
@@ -1336,30 +1332,36 @@ internal static class DryRunFacets
 //  Tabs.
 // ─────────────────────────────────────────────────────────────────────────────────────────────
 
-/// <summary>The Sources tab: every scanned source file, filterable by source and by destination,
-/// as a flat list or a rolled-up path tree. Summary counts (Untouched / Processed / Deleted) always
-/// reflect the whole run.</summary>
+/// <summary>The Sources tab: every scanned source file, filterable by source root, by destination root,
+/// by status and by search term — all of it applied service-side, over the whole plan. Summary counts
+/// (Untouched / Processed / Deleted) always reflect the whole run, never the filtered view.</summary>
 public sealed partial class DryRunSourcesTab : ViewModelBase
 {
-    private static readonly IReadOnlyList<TreePillSpec> TreeSpecs =
-    [
-        new("untouched", "untouched", "IconUntouched", "Brush.Info"),
-        new("processed", "processed", "IconCheckmark", "Brush.Success"),
-        new("deleted", "deleted", "IconTrash", "Brush.Danger"),
-    ];
+    /// <summary>Rendered for a position whose page is still in flight. One store, made once and shared
+    /// by every tab instance — see <see cref="DryRunRowStore.CreatePlaceholder"/> for why it holds a
+    /// page's worth of rows rather than one.</summary>
+    private static readonly DryRunRowStore PlaceholderStore =
+        DryRunRowStore.CreatePlaceholder(PagedDryRunRowStore.PageRows);
 
     private readonly TimeSpan _searchDebounce;
     private readonly DryRunRebuildGate _rebuildGate = new();
     private bool _applying;
-    // Rows are source-file indices into _store, not objects: the whole retained cost of a 500k-row
-    // preview is these two int arrays (4 MB) plus the store itself. _all is presorted by DryRunSort at
-    // load and never mutated after; _visible is an order-preserving subset of it (the same array
-    // instance when no filter is active).
-    private DryRunRowStore _store = DryRunRowStore.Empty;
-    private int[] _all = [];
-    private int[] _visible = [];
 
-    /// <summary>Clipboard/shell actions for the row + tree right-click menus (null in headless tests).</summary>
+    // The open plan, as a handle rather than as rows. Nothing here is proportional to the plan's size:
+    // the rows live on the service and arrive a page at a time, which is what lets a preview of a
+    // five-million-file plan cost the same as one of five hundred.
+    private IIpcGateway? _gateway;
+    private Guid _runId;
+    private string? _planSourceRoot;
+    private string? _planDestinationRoot;
+    /// <summary>Rows in the UNFILTERED plan half — what decides whether a rebuild is slow enough to
+    /// deserve the overlay, the same judgement <see cref="DryRunRebuild.SyncThreshold"/> used to make
+    /// against the resident row count.</summary>
+    private int _planRowCount;
+    private PagedDryRunRowStore? _paged;
+    private PagedDryRunRowList<DryRunFileRow>? _rowList;
+
+    /// <summary>Clipboard/shell actions for the row right-click menu (null in headless tests).</summary>
     private readonly IDryRunItemActions? _actions;
 
     public DryRunSourcesTab(TimeSpan searchDebounce, IDryRunItemActions? actions = null)
@@ -1368,16 +1370,33 @@ public sealed partial class DryRunSourcesTab : ViewModelBase
         _actions = actions;
     }
 
-    /// <summary>Wraps a set of source-file indices as the bound row list. The handles are built per
-    /// indexer access, so this costs the array and nothing else.</summary>
-    private DryRunRowList<DryRunFileRow> RowsFor(int[] keys)
+    /// <summary>Opens a window onto one view of the plan half and wraps it as the bound list. Costs the
+    /// handle: no page is fetched until the list is asked for a row.</summary>
+    private PagedDryRunRowList<DryRunFileRow> BindPaged(string? viewId, int rowCount)
     {
-        DryRunRowStore store = _store;
+        PagedDryRunRowStore store = new(
+            _gateway!, _runId, RunPlanSide.Sources, viewId, rowCount,
+            _planSourceRoot, _planDestinationRoot);
         IDryRunItemActions? actions = _actions;
-        return new DryRunRowList<DryRunFileRow>(
-            keys,
-            i => new DryRunFileRow(store, keys[i]) { Actions = actions },
-            static r => r.Index);
+        PagedDryRunRowList<DryRunFileRow> list = new(
+            store,
+            (page, within, _) => new DryRunFileRow(page, within) { Actions = actions },
+            static position => new DryRunFileRow(
+                PlaceholderStore, position & (PagedDryRunRowStore.PageRows - 1)));
+        _paged = store;
+        _rowList = list;
+        return list;
+    }
+
+    /// <summary>Drops the current view: the store abandons its pages and anything in flight, and the
+    /// list stops listening. Both matter — a fetch for a superseded view must not land in the list that
+    /// replaced it, and a list left subscribed keeps its store alive through the event.</summary>
+    private void ReleaseRows()
+    {
+        _rowList?.Detach();
+        _paged?.Close();
+        _rowList = null;
+        _paged = null;
     }
 
     /// <summary>The in-flight (or last completed) rebuild. Rebuilds over
@@ -1390,25 +1409,10 @@ public sealed partial class DryRunSourcesTab : ViewModelBase
     /// there is a visible delay to explain.</summary>
     [ObservableProperty] public partial bool IsRebuilding { get; private set; }
 
+    // The bound list. A PagedDryRunRowList: as many positions as the view has rows, each materialized
+    // from whichever page is resident, or as a placeholder while that page is on its way.
     [ObservableProperty] public partial IReadOnlyList<DryRunFileRow> VisibleRows { get; private set; } = [];
-    [ObservableProperty] public partial IReadOnlyList<DryRunTreeNode> Tree { get; private set; } = [];
 
-    /// <summary>The TreeDataGrid source the view binds to, rebuilt from <see cref="Tree"/> whenever the
-    /// forest changes (null while empty so the grid shows nothing).</summary>
-    [ObservableProperty] public partial HierarchicalTreeDataGridSource<DryRunTreeNode>? TreeSource { get; private set; }
-
-    partial void OnTreeChanged(IReadOnlyList<DryRunTreeNode> value)
-    {
-        // Dispose the previous grid source after the new value has propagated to the bound
-        // TreeDataGrid. HierarchicalTreeDataGridSource owns a realized HierarchicalRows cache whose
-        // per-row wrappers subscribe to each node's IsExpanded — never disposing it lets the control's
-        // realization keep the whole old forest alive, so every tree toggle (and every re-run after
-        // one) stacks another forest on the heap. Assign first, dispose second, so the grid never
-        // briefly binds to a disposed source.
-        HierarchicalTreeDataGridSource<DryRunTreeNode>? previous = TreeSource;
-        TreeSource = value.Count == 0 ? null : DryRunTreeNode.BuildSource(value);
-        previous?.Dispose();
-    }
     [ObservableProperty]
     [NotifyPropertyChangedFor(nameof(ActiveFilterCount), nameof(FilterLabel))]
     public partial IReadOnlyList<DryRunFacetRow> SourceFacets { get; private set; } = [];
@@ -1422,7 +1426,6 @@ public sealed partial class DryRunSourcesTab : ViewModelBase
     [NotifyPropertyChangedFor(nameof(ShowAnyFacet))]
     public partial bool ShowDestinationFacet { get; private set; }
     [ObservableProperty] public partial string SearchText { get; set; } = "";
-    [ObservableProperty] public partial bool ShowTree { get; set; }
 
     /// <summary>Whether this tab has any facet filter to offer — gates the toolbar's Filter button.</summary>
     public bool ShowAnyFacet => ShowSourceFacet || ShowDestinationFacet;
@@ -1437,8 +1440,9 @@ public sealed partial class DryRunSourcesTab : ViewModelBase
     public string FilterLabel => ActiveFilterCount > 0 ? $"Filter ({ActiveFilterCount})" : "Filter";
 
     /// <summary>The folder every displayed source path is shown relative to (null when the sources
-    /// span drives, so full paths are shown). Surfaced to the user by <see cref="CommonRootDisplay"/>
-    /// and used to root the tree.</summary>
+    /// span drives, so full paths are shown). Surfaced to the user by <see cref="CommonRootDisplay"/>.
+    /// <para>Derived from the plan's facet keys, not from any page: a page holds one directory's worth of
+    /// rows, so a root computed from its own contents would shift as the user scrolled.</para></summary>
     [ObservableProperty]
     [NotifyPropertyChangedFor(nameof(CommonRootDisplay))]
     public partial string? CommonRoot { get; private set; }
@@ -1458,112 +1462,41 @@ public sealed partial class DryRunSourcesTab : ViewModelBase
     /// <summary>Whether any status chip is selected — drives the clear (✕) button's visibility.</summary>
     public bool AnyStatusSelected => StatusFilters.Any(f => f.IsSelected);
 
-    /// <summary>Everything <see cref="Load(LoadData)"/> assigns, precomputed by
-    /// <see cref="ComputeLoad"/> — pure data, safe to build off the UI thread.</summary>
+    /// <summary>Everything <see cref="Load(LoadData)"/> assigns: a handle to page against plus the
+    /// whole-plan aggregates, all of it read from the run's snapshot header in O(1).
+    ///
+    /// <para>There is no row data here and no sort. Both used to be computed by a <c>ComputeLoad</c> pass
+    /// over every ingested row — ~147 MB of transient sort keys at 500,000 files, and linear in a plan
+    /// size that is no longer bounded. The service sorts where the rows are and answers a window.</para></summary>
     internal sealed record LoadData(
-        DryRunRowStore Store,
-        int[] SortedKeys,
-        string? CommonRoot,
+        IIpcGateway Gateway,
+        Guid RunId,
+        string? ViewId,
+        int RowCount,
+        string? SourceCommonRoot,
+        string? DestinationCommonRoot,
         int UntouchedCount,
         int ProcessedCount,
         int DeletedCount,
-        Dictionary<string, int> SourceRootCounts,
-        Dictionary<string, int> DestinationRootCounts);
+        IReadOnlyDictionary<string, int> SourceRootCounts,
+        IReadOnlyDictionary<string, int> DestinationRootCounts);
 
-    /// <summary>The pure, thread-safe half of loading: one pass for the status and facet counts,
-    /// then the single sort the tab ever pays. The sort key is fixed per row (path relative to its
-    /// root), so sorting once here makes every later rebuild a linear order-preserving filter.
-    /// Reads the store's columns directly — no row object is built for any of it.</summary>
-    internal static LoadData ComputeLoad(DryRunRowStore store, CancellationToken ct = default)
-    {
-        ArgumentNullException.ThrowIfNull(store);
-        string? commonRoot = store.SourceCommonRoot;
-        int untouched = 0, processed = 0, deleted = 0;
-        Dictionary<string, int> sourceCounts = new(StringComparer.OrdinalIgnoreCase);
-        Dictionary<string, int> destinationCounts = new(StringComparer.OrdinalIgnoreCase);
-        List<string> rowRoots = [];   // reused per row; a file fans out to a handful of targets
-        int n = store.SourceCount;
-        for (int i = 0; i < n; i++)
-        {
-            if ((i & 0x3FFF) == 0) ct.ThrowIfCancellationRequested();
-            OperationKind kind = store.SourceKind(i);
-            if (kind is OperationKind.SkippedByFilter or OperationKind.SkippedUnchanged) untouched++;
-            if (kind is OperationKind.Processed) processed++;
-            if (store.IsSourceDisposalDestructive(i)) deleted++;
-
-            string sourceRoot = store.SourceRoot(i);
-            sourceCounts[sourceRoot] = sourceCounts.GetValueOrDefault(sourceRoot) + 1;
-
-            // The facet counts rows, so a file fanning out twice to the same root counts once.
-            rowRoots.Clear();
-            int end = store.TargetEnd(i);
-            for (int p = store.TargetStart(i); p < end; p++)
-            {
-                string root = store.OpRoot(p);
-                if (rowRoots.Contains(root, StringComparer.OrdinalIgnoreCase))
-                    continue;
-                rowRoots.Add(root);
-                destinationCounts[root] = destinationCounts.GetValueOrDefault(root) + 1;
-            }
-        }
-        ct.ThrowIfCancellationRequested();
-
-        // Order by path-relative-to-root (then root, then original position) so a file lines up with
-        // the same file in the Destinations tab. Keys are computed once per row up front, then an index
-        // array is sorted — no per-comparison Path.Join, no per-row tuple, no OrderBy buffering. The
-        // final original-index tiebreak keeps the sort stable (Array.Sort is not), matching the prior
-        // LINQ OrderBy/ThenBy so rows equal on key+root keep report order.
-        string[] keys = new string[n];
-        if (n <= DryRunRebuild.SyncThreshold)
-        {
-            Dictionary<(string, string?), string> relDirCache = [];
-            for (int j = 0; j < n; j++)
-                keys[j] = DryRunSort.RelativeKey(store.SourceDirPath(j), store.SourceFileName(j), store.SourceRoot(j), relDirCache);
-        }
-        else
-        {
-            // Each partition owns a lock-free relDir cache (a shared ConcurrentDictionary would add
-            // per-lookup sync); GetRelativePath is pure, so identical keys result regardless of split.
-            Parallel.For(0, n, new ParallelOptions { CancellationToken = ct },
-                () => new Dictionary<(string, string?), string>(),
-                (j, _, cache) =>
-                {
-                    keys[j] = DryRunSort.RelativeKey(store.SourceDirPath(j), store.SourceFileName(j), store.SourceRoot(j), cache);
-                    return cache;
-                },
-                _ => { });
-        }
-        ct.ThrowIfCancellationRequested();
-        int[] order = new int[n];
-        for (int j = 0; j < n; j++)
-            order[j] = j;
-        Array.Sort(order, (a, b) =>
-        {
-            int c = string.Compare(keys[a], keys[b], StringComparison.OrdinalIgnoreCase);
-            if (c != 0) return c;
-            c = string.Compare(store.SourceRoot(a), store.SourceRoot(b), StringComparison.OrdinalIgnoreCase);
-            return c != 0 ? c : a.CompareTo(b);
-        });
-        ct.ThrowIfCancellationRequested();
-        // `order` IS the presorted row set: position → source index. The sort keys die with this frame.
-        return new(store, order, commonRoot, untouched, processed, deleted, sourceCounts, destinationCounts);
-    }
-
-    /// <summary>Convenience for callers holding a store (tests); the app path computes off-thread via
-    /// <see cref="DryRunViewModel.PrepareReport"/> and calls <see cref="Load(LoadData)"/>.</summary>
-    public void Load(DryRunRowStore store) => Load(ComputeLoad(store));
-
-    /// <summary>The UI-thread half of loading: assigns the precomputed data to the bound
-    /// properties. A fresh load has no active filters and the rows arrive presorted, so the whole
-    /// set IS the visible list — no rebuild.</summary>
+    /// <summary>Points the tab at a plan half. A fresh load has no active filters, so the view handle is
+    /// the unfiltered one the caller already opened — no rebuild, and no page fetched until the list is
+    /// scrolled.</summary>
     internal void Load(LoadData data)
     {
-        _rebuildGate.Cancel();   // a rebuild racing this load must not publish the old report's rows
+        ArgumentNullException.ThrowIfNull(data);
+        _rebuildGate.Cancel();   // a rebuild racing this load must not publish the old plan's rows
         IsRebuilding = false;    // the cancelled rebuild has no successor to clear the overlay
         _applying = true;
-        _store = data.Store;
-        _all = data.SortedKeys;
-        CommonRoot = data.CommonRoot;
+        ReleaseRows();
+        _gateway = data.Gateway;
+        _runId = data.RunId;
+        _planRowCount = data.RowCount;
+        _planSourceRoot = data.SourceCommonRoot;
+        _planDestinationRoot = data.DestinationCommonRoot;
+        CommonRoot = data.SourceCommonRoot;
         UntouchedCount = data.UntouchedCount;
         ProcessedCount = data.ProcessedCount;
         DeletedCount = data.DeletedCount;
@@ -1575,29 +1508,25 @@ public sealed partial class DryRunSourcesTab : ViewModelBase
         ShowDestinationFacet = DestinationFacets.Count > 0;
 
         SearchText = "";
-        ShowTree = false;
-        Tree = [];   // mirror Clear(): the _applying guard stops the ShowTree setter from clearing a
-                     // previously-built forest, which would otherwise stay retained until the next toggle.
         _applying = false;
-        _visible = data.SortedKeys;
-        VisibleRows = RowsFor(_visible);
+        VisibleRows = BindPaged(data.ViewId, data.RowCount);
     }
 
     public void Clear()
     {
-        _rebuildGate.Cancel();   // a rebuild racing this clear must not publish the old report's rows
+        _rebuildGate.Cancel();   // a rebuild racing this clear must not publish the old plan's rows
         IsRebuilding = false;    // the cancelled rebuild has no successor to clear the overlay
         _applying = true;
-        _store = DryRunRowStore.Empty;   // drops the whole preview's columns
-        _all = [];
-        _visible = [];
+        ReleaseRows();           // drops every resident page and abandons anything in flight
+        _gateway = null;
+        _runId = default;
+        _planRowCount = 0;
+        _planSourceRoot = _planDestinationRoot = null;
         VisibleRows = [];
-        Tree = [];
         CommonRoot = null;
         SourceFacets = DestinationFacets = [];
         ShowSourceFacet = ShowDestinationFacet = false;
         SearchText = "";
-        ShowTree = false;
         UntouchedCount = ProcessedCount = DeletedCount = 0;
         StatusFilters = [];
         OnPropertyChanged(nameof(AnyStatusSelected));
@@ -1625,6 +1554,31 @@ public sealed partial class DryRunSourcesTab : ViewModelBase
         return keys.Count == 0 ? null : keys;
     }
 
+    /// <summary>The selected chips as the service's own vocabulary. Null keeps every kind; an EMPTY list
+    /// keeps none, which is a filter the user can express by selecting only Deleted.
+    ///
+    /// <para>The Deleted chip is not a kind — it is a destructive source disposition — so it rides as its
+    /// own flag, ORed with the kinds rather than intersected, because the tab treats its chips as
+    /// alternatives. This mapping is the client's half of the contract; the service does set membership
+    /// on an enum it already owns and never learns what a chip is.</para></summary>
+    private IReadOnlyList<OperationKind>? SelectedKinds(out bool includeDestructiveDisposition)
+    {
+        includeDestructiveDisposition = false;
+        if (SelectedStatusKeys() is not { } keys)
+            return null;
+        List<OperationKind> kinds = [];
+        if (keys.Contains("untouched"))
+        {
+            kinds.Add(OperationKind.SkippedByFilter);
+            kinds.Add(OperationKind.SkippedUnchanged);
+        }
+        if (keys.Contains("processed"))
+            kinds.Add(OperationKind.Processed);
+        if (keys.Contains("deleted"))
+            includeDestructiveDisposition = true;
+        return kinds;
+    }
+
     [RelayCommand]
     private void ClearStatusFilters()
     {
@@ -1639,20 +1593,6 @@ public sealed partial class DryRunSourcesTab : ViewModelBase
     {
         if (_applying) return;
         RequestRebuild(debounce: true);
-    }
-
-    partial void OnShowTreeChanged(bool value)
-    {
-        if (_applying) return;
-        if (!value)
-        {
-            // Release the forest immediately and leave VisibleRows untouched (keeps the list's
-            // scroll position). An in-flight rebuild still publishes its filter result but skips
-            // its tree publish — RebuildAsync re-checks ShowTree.
-            Tree = [];
-            return;
-        }
-        RequestRebuild(debounce: false);
     }
 
     private void OnFacetChanged(object? sender, PropertyChangedEventArgs e)
@@ -1684,11 +1624,15 @@ public sealed partial class DryRunSourcesTab : ViewModelBase
         PendingRebuild = RebuildAsync(debounce ? _searchDebounce : TimeSpan.Zero, _rebuildGate.Supersede());
     }
 
-    /// <summary>One rebuild: snapshot the filter state on the UI thread, compute the visible rows
-    /// (and forest) — synchronously for small reports, on the thread pool past
-    /// <see cref="DryRunRebuild.SyncThreshold"/> — then publish back on the UI thread. Cancel and
-    /// the pre-publish token check both happen on the UI thread, so a superseded rebuild can never
-    /// publish after its successor.</summary>
+    /// <summary>One rebuild: snapshot the filter state on the UI thread, ask the service for a VIEW over
+    /// the rows that match it, then publish a window onto that view back on the UI thread.
+    ///
+    /// <para><b>The filter pass moved; the lifecycle did not.</b> The debounce, the supersede gate and
+    /// the publish sequencing below are unchanged, and deliberately so — they are what stops a stale
+    /// keystroke from overwriting a newer one, and that is true wherever the filtering happens. What
+    /// changed is the middle: a pass over the resident rows only ever meant anything while every row was
+    /// resident, so the search box, the facet bar and the status chips now run where the rows are and
+    /// come back as a handle plus a count.</para></summary>
     private async Task RebuildAsync(TimeSpan delay, CancellationToken ct)
     {
         try
@@ -1696,54 +1640,53 @@ public sealed partial class DryRunSourcesTab : ViewModelBase
             if (delay > TimeSpan.Zero)
                 await Task.Delay(delay, ct);
 
-            RebuildInput input = new(
-                string.IsNullOrWhiteSpace(SearchText) ? null : SearchText.Trim(),
-                DryRunFacets.SelectedKeys(SourceFacets),
-                DryRunFacets.SelectedKeys(DestinationFacets),
-                SelectedStatusKeys(),
-                ShowTree,
-                CommonRoot,
-                _store,
-                _all,
-                _visible,
-                ShowTree && Tree.Count > 0 ? DryRunTreeNode.CollectExpanded(Tree) : null,
-                _actions);
+            if (_gateway is not { } gateway)
+                return;   // nothing loaded; a filter change on an empty tab has nothing to ask about
 
-            RebuildResult result;
-            if (input.All.Length <= DryRunRebuild.SyncThreshold)
+            GetRunPlanViewRequest request = new()
             {
-                result = ComputeRebuild(input, ct);
-            }
-            else
-            {
+                RunId = _runId,
+                Side = RunPlanSide.Sources,
+                Search = string.IsNullOrWhiteSpace(SearchText) ? null : SearchText.Trim(),
+                SourceRoots = DryRunFacets.SelectedKeyList(SourceFacets),
+                DestinationRoots = DryRunFacets.SelectedKeyList(DestinationFacets),
+                Kinds = SelectedKinds(out bool destructive),
+                IncludeDestructiveDisposition = destructive,
+            };
+
+            // The overlay is judged on the PLAN's size, not on the round trip: a view build is a pass
+            // over the half's rows, so it is imperceptible on a small plan and seconds on a huge one —
+            // the same distinction the old threshold drew over the resident row count.
+            if (_planRowCount > DryRunRebuild.SyncThreshold)
                 IsRebuilding = true;   // cleared by whichever current rebuild publishes (or by Load/Clear)
-                result = await Task.Run(() => ComputeRebuild(input, ct), ct);
+
+            Result<RunPlanViewResponse, IpcError> result =
+                await gateway.GetRunPlanViewAsync(request, ct).ConfigureAwait(true);
+            if (result.IsCanceled)
+                return;
+            if (result.TryGetError(out IpcError? error))
+            {
+                // A view that cannot be built leaves the current rows on screen rather than blanking the
+                // panel: the previous filter's result is still a truthful view of the plan, and the next
+                // keystroke retries anyway.
+                Log.Warning(
+                    "Filtering the Sources tab of run {RunId} failed: {Code} {Message}",
+                    _runId, error.Code, error.Message);
+                _rebuildGate.TryPublish(ct, () => IsRebuilding = false);
+                return;
             }
+            result.TryGetValue(out RunPlanViewResponse? view);
 
             // The gate makes cancel-vs-publish atomic, so a superseded rebuild can never publish
             // after its successor.
             _rebuildGate.TryPublish(ct, () =>
             {
                 IsRebuilding = false;
-                // Republish the bound list only when the visible set actually changed, so an
-                // unchanged rebuild leaves the ListBox's scroll position and selection alone. (The
-                // old code got this by republishing the same List instance; keys are value-compared
-                // now, so the decision has to be explicit.)
-                if (!DryRunRebuild.SameKeys(result.Visible, _visible))
-                {
-                    _visible = result.Visible;
-                    VisibleRows = RowsFor(_visible);
-                }
-                if (input.ShowTree && ShowTree)
-                {
-                    IReadOnlyList<DryRunTreeNode> forest = result.Forest!;
-                    // The forest baked in an expansion snapshot taken before the (possibly long)
-                    // off-thread build — re-apply the live tree's state so expand/collapse the user
-                    // did meanwhile survives the swap.
-                    if (Tree.Count > 0)
-                        DryRunTreeNode.ApplyExpanded(forest, DryRunTreeNode.CollectExpanded(Tree));
-                    Tree = forest;
-                }
+                // Always a fresh list: the rows are a window onto a DIFFERENT view now, so there is no
+                // scroll position worth preserving — position 40 of the filtered list is not the row
+                // that was at position 40 of the previous one.
+                ReleaseRows();
+                VisibleRows = BindPaged(view!.ViewId, view.RowCount);
             });
         }
         catch (OperationCanceledException) { /* superseded by a newer filter/search change */ }
@@ -1754,109 +1697,6 @@ public sealed partial class DryRunSourcesTab : ViewModelBase
             _rebuildGate.TryPublish(ct, () => IsRebuilding = false);   // only if still the current rebuild
         }
     }
-
-    private sealed record RebuildInput(
-        string? Term,
-        HashSet<string>? SourceRoots,
-        HashSet<string>? DestinationRoots,
-        HashSet<string>? StatusKeys,
-        bool ShowTree,
-        string? CommonRoot,
-        DryRunRowStore Store,
-        int[] All,
-        int[] CurrentVisible,
-        IReadOnlySet<string>? ExpandedPaths,
-        IDryRunItemActions? Actions);
-
-    private sealed record RebuildResult(int[] Visible, IReadOnlyList<DryRunTreeNode>? Forest);
-
-    /// <summary>Pure: filters the presorted rows (order-preserving — the sort was paid once at
-    /// load) and, in tree mode, builds the forest. Runs on the thread pool for large reports, so it
-    /// touches nothing but its snapshot. Every predicate reads the store's columns directly, so a
-    /// filter pass over 500k rows allocates one int array and no row objects at all.</summary>
-    private static RebuildResult ComputeRebuild(RebuildInput input, CancellationToken ct)
-    {
-        DryRunRowStore store = input.Store;
-        int[] visible;
-        if (input.Term is null && input.SourceRoots is null && input.DestinationRoots is null && input.StatusKeys is null)
-        {
-            visible = input.All;   // no filter active — the presorted whole set IS the view
-        }
-        else
-        {
-            int[] kept = new int[input.All.Length];
-            int count = 0;
-            for (int i = 0; i < input.All.Length; i++)
-            {
-                if ((i & 0x3FFF) == 0) ct.ThrowIfCancellationRequested();
-                int key = input.All[i];
-                if (input.SourceRoots is not null && !input.SourceRoots.Contains(store.SourceRoot(key)))
-                    continue;
-                if (input.DestinationRoots is HashSet<string> destinations && !HasTargetUnder(store, key, destinations))
-                    continue;
-                if (input.StatusKeys is HashSet<string> statuses && !MatchesStatus(store, key, statuses))
-                    continue;
-                if (input.Term is string term && !Matches(store, key, term))
-                    continue;
-                kept[count++] = key;
-            }
-            visible = count == kept.Length ? kept : kept[..count];
-            if (DryRunRebuild.SameKeys(visible, input.CurrentVisible))
-                visible = input.CurrentVisible;
-        }
-        ct.ThrowIfCancellationRequested();
-        return new(visible, input.ShowTree ? BuildTree(store, visible, input.CommonRoot, input.ExpandedPaths, input.Actions) : null);
-
-        static bool HasTargetUnder(DryRunRowStore store, int key, IReadOnlySet<string> roots)
-        {
-            int end = store.TargetEnd(key);
-            for (int p = store.TargetStart(key); p < end; p++)
-            {
-                if (roots.Contains(store.OpRoot(p)))
-                    return true;
-            }
-            return false;
-        }
-
-        static bool MatchesStatus(DryRunRowStore store, int key, HashSet<string> statuses)
-        {
-            OperationKind kind = store.SourceKind(key);
-            return (statuses.Contains("untouched") && kind is OperationKind.SkippedByFilter or OperationKind.SkippedUnchanged)
-                || (statuses.Contains("processed") && kind is OperationKind.Processed)
-                || (statuses.Contains("deleted") && store.IsSourceDisposalDestructive(key));
-        }
-
-        static bool Matches(DryRunRowStore store, int key, string term)
-        {
-            if (DryRunPaths.PathContains(store.SourceDirPath(key), store.SourceFileName(key), term))
-                return true;
-            int end = store.TargetEnd(key);
-            for (int p = store.TargetStart(key); p < end; p++)
-            {
-                if (DryRunPaths.PathContains(store.OpDirPath(p), store.OpFileName(p), term))
-                    return true;
-            }
-            return false;
-        }
-    }
-
-    /// <summary>Builds the forest over source-file <em>indices</em> rather than row objects: the
-    /// per-directory buckets <c>BuildForest</c> retains for its lazy leaf factories then cost 4 bytes
-    /// a file instead of a row reference plus the row.</summary>
-    private static IReadOnlyList<DryRunTreeNode> BuildTree(
-        DryRunRowStore store, int[] keys, string? commonRoot, IReadOnlySet<string>? expandedPaths,
-        IDryRunItemActions? actions) =>
-        DryRunTreeNode.BuildForest(keys, store.SourceDirPath, store.SourceFileName, i =>
-        {
-            List<(string, int)> cats = [];
-            OperationKind kind = store.SourceKind(i);
-            if (kind is OperationKind.SkippedByFilter or OperationKind.SkippedUnchanged) cats.Add(("untouched", 1));
-            if (kind is OperationKind.Processed) cats.Add(("processed", 1));
-            if (store.IsSourceDisposalDestructive(i)) cats.Add(("deleted", 1));
-            return cats;
-            // A prior forest (expandedPaths non-null) → restore its expansion; the very first build
-            // → null so BuildForest's top-level auto-expand heuristic applies.
-        }, TreeSpecs, commonRoot, expandedPaths, store.SourceSize, actions);
 }
 
 /// <summary>The Destinations tab: the resulting destination structure — files a run would add
@@ -1864,50 +1704,26 @@ public sealed partial class DryRunSourcesTab : ViewModelBase
 /// filterable by source and by destination, as a flat list or a rolled-up path tree.</summary>
 public sealed partial class DryRunDestinationsTab : ViewModelBase
 {
-    private static readonly IReadOnlyList<TreePillSpec> TreeSpecs =
-    [
-        new("untouched", "untouched", "IconUntouched", "Brush.Info"),
-        new("new", "new", "IconAdd", "Brush.Success"),
-        new("overwritten", "overwritten", "IconOverwrite", "Brush.Warning"),
-        new("deleted", "deleted", "IconTrash", "Brush.Danger"),
-        new("unknown", "unknown", "IconQuestion", "Brush.Muted"),
-    ];
-
-    private const string NoSourceKey = "[From Destination]";
+    /// <summary>Rendered for a position whose page is still in flight. Shared with the Sources tab's
+    /// placeholder store — its rows carry both a blank source file and a blank no-source destination
+    /// operation, so either tab's row type resolves against it.</summary>
+    private static readonly DryRunRowStore PlaceholderStore =
+        DryRunRowStore.CreatePlaceholder(PagedDryRunRowStore.PageRows);
 
     private readonly TimeSpan _searchDebounce;
     private readonly DryRunRebuildGate _rebuildGate = new();
     private bool _applying;
-    // Rows are store keys: a source-file index for a grouped row, ~position for a destination
-    // operation with no originating source. _all is presorted by DryRunSort at load and never mutated
-    // after; _visible is an order-preserving subset, which unlike the Sources tab can also carry a
-    // per-row slice of surviving destinations (this tab filters at the entry level).
-    private DryRunRowStore _store = DryRunRowStore.Empty;
-    private int[] _all = [];
-    private VisibleRowSet _visible = VisibleRowSet.Empty;
 
-    /// <summary>The rows a rebuild published: their keys, plus — when an entry-level filter kept only
-    /// part of some fan-out — a CSR of the destination positions that survived.</summary>
-    private sealed record VisibleRowSet(int[] Keys, int[]? SliceStarts, int[]? SlicePositions)
-    {
-        public static readonly VisibleRowSet Empty = new([], null, null);
+    // The open plan, as a handle rather than as rows — see the Sources tab for the reasoning.
+    private IIpcGateway? _gateway;
+    private Guid _runId;
+    private string? _planSourceRoot;
+    private string? _planDestinationRoot;
+    private int _planRowCount;
+    private PagedDryRunRowStore? _paged;
+    private PagedDryRunRowList<DryRunDestinationRow>? _rowList;
 
-        /// <summary>Whether this set shows exactly what <paramref name="other"/> shows. Slices are
-        /// built fresh per rebuild, so they are compared elementwise rather than by reference.</summary>
-        public bool Same(VisibleRowSet other)
-        {
-            if (ReferenceEquals(this, other))
-                return true;
-            if (!DryRunRebuild.SameKeys(Keys, other.Keys))
-                return false;
-            if (SlicePositions is null || other.SlicePositions is null)
-                return SlicePositions is null && other.SlicePositions is null;
-            return DryRunRebuild.SameKeys(SliceStarts!, other.SliceStarts!)
-                && DryRunRebuild.SameKeys(SlicePositions, other.SlicePositions);
-        }
-    }
-
-    /// <summary>Clipboard/shell actions for the row + tree right-click menus (null in headless tests).</summary>
+    /// <summary>Clipboard/shell actions for the row right-click menu (null in headless tests).</summary>
     private readonly IDryRunItemActions? _actions;
 
     public DryRunDestinationsTab(TimeSpan searchDebounce, IDryRunItemActions? actions = null)
@@ -1916,20 +1732,37 @@ public sealed partial class DryRunDestinationsTab : ViewModelBase
         _actions = actions;
     }
 
-    /// <summary>Wraps a visible set as the bound row list — handles built per indexer access.</summary>
-    private DryRunRowList<DryRunDestinationRow> RowsFor(VisibleRowSet rows)
+    /// <summary>Opens a window onto one view of the destination half and wraps it as the bound list.
+    ///
+    /// <para><b>One row per destination path, not per source.</b> A page's operations never name a source
+    /// (<c>GetRunPlanPageHandler.DestinationPage</c> sets <c>SourceIndex = -1</c>), so every row is a
+    /// no-source row — <c>~position</c> — and a source that replicates to three targets is three rows
+    /// rather than one row with three entries. That is forced rather than chosen: the view's index space
+    /// is per operation, and a fan-out group cannot straddle a page boundary. It also makes the row
+    /// count the page store sizes itself by exactly the count the view reports.</para></summary>
+    private PagedDryRunRowList<DryRunDestinationRow> BindPaged(string? viewId, int rowCount)
     {
-        DryRunRowStore store = _store;
+        PagedDryRunRowStore store = new(
+            _gateway!, _runId, RunPlanSide.Destinations, viewId, rowCount,
+            _planSourceRoot, _planDestinationRoot);
         IDryRunItemActions? actions = _actions;
-        int[] keys = rows.Keys;
-        int[]? starts = rows.SliceStarts;
-        int[]? positions = rows.SlicePositions;
-        return new DryRunRowList<DryRunDestinationRow>(
-            keys,
-            positions is null
-                ? i => new DryRunDestinationRow(store, keys[i]) { Actions = actions }
-                : i => new DryRunDestinationRow(store, keys[i], positions, starts![i], starts[i + 1]) { Actions = actions },
-            static r => r.Key);
+        PagedDryRunRowList<DryRunDestinationRow> list = new(
+            store,
+            (page, within, _) => new DryRunDestinationRow(page, ~within) { Actions = actions },
+            static position => new DryRunDestinationRow(
+                PlaceholderStore, ~(position & (PagedDryRunRowStore.PageRows - 1))));
+        _paged = store;
+        _rowList = list;
+        return list;
+    }
+
+    /// <summary>Drops the current view — see <c>DryRunSourcesTab.ReleaseRows</c>.</summary>
+    private void ReleaseRows()
+    {
+        _rowList?.Detach();
+        _paged?.Close();
+        _rowList = null;
+        _paged = null;
     }
 
     /// <summary>The in-flight (or last completed) rebuild. Rebuilds over
@@ -1943,24 +1776,12 @@ public sealed partial class DryRunDestinationsTab : ViewModelBase
     [ObservableProperty] public partial bool IsRebuilding { get; private set; }
 
     [ObservableProperty] public partial IReadOnlyList<DryRunDestinationRow> VisibleRows { get; private set; } = [];
-    [ObservableProperty] public partial IReadOnlyList<DryRunTreeNode> Tree { get; private set; } = [];
 
-    /// <summary>The TreeDataGrid source the view binds to, rebuilt from <see cref="Tree"/> whenever the
-    /// forest changes (null while empty so the grid shows nothing).</summary>
-    [ObservableProperty] public partial HierarchicalTreeDataGridSource<DryRunTreeNode>? TreeSource { get; private set; }
-
-    partial void OnTreeChanged(IReadOnlyList<DryRunTreeNode> value)
-    {
-        // Dispose the previous grid source after the new value has propagated to the bound
-        // TreeDataGrid. HierarchicalTreeDataGridSource owns a realized HierarchicalRows cache whose
-        // per-row wrappers subscribe to each node's IsExpanded — never disposing it lets the control's
-        // realization keep the whole old forest alive, so every tree toggle (and every re-run after
-        // one) stacks another forest on the heap. Assign first, dispose second, so the grid never
-        // briefly binds to a disposed source.
-        HierarchicalTreeDataGridSource<DryRunTreeNode>? previous = TreeSource;
-        TreeSource = value.Count == 0 ? null : DryRunTreeNode.BuildSource(value);
-        previous?.Dispose();
-    }
+    /// <summary>Always empty, and always hidden: <c>RunSnapshotView.KeepDestinations</c> filters the
+    /// destination half by target root, kind and search only — a destination row's SOURCE root is not
+    /// something it can select on, so a facet offering it would list roots that no filter honours.
+    /// Kept as a property because the view binds it; see the paging handoff for the follow-up that would
+    /// restore it (a source-ordinal → root map built alongside the view).</summary>
     [ObservableProperty]
     [NotifyPropertyChangedFor(nameof(ActiveFilterCount), nameof(FilterLabel))]
     public partial IReadOnlyList<DryRunFacetRow> SourceFacets { get; private set; } = [];
@@ -1974,7 +1795,6 @@ public sealed partial class DryRunDestinationsTab : ViewModelBase
     [NotifyPropertyChangedFor(nameof(ShowAnyFacet))]
     public partial bool ShowDestinationFacet { get; private set; }
     [ObservableProperty] public partial string SearchText { get; set; } = "";
-    [ObservableProperty] public partial bool ShowTree { get; set; }
 
     /// <summary>Whether this tab has any facet filter to offer — gates the toolbar's Filter button.</summary>
     public bool ShowAnyFacet => ShowSourceFacet || ShowDestinationFacet;
@@ -2009,180 +1829,93 @@ public sealed partial class DryRunDestinationsTab : ViewModelBase
     /// <summary>Whether any status chip is selected — drives the clear (✕) button's visibility.</summary>
     public bool AnyStatusSelected => StatusFilters.Any(f => f.IsSelected);
 
-    /// <summary>Everything <see cref="Load(LoadData)"/> assigns, precomputed by
-    /// <see cref="ComputeLoad"/> — pure data, safe to build off the UI thread.</summary>
+    /// <summary>Everything <see cref="Load(LoadData)"/> assigns: a handle to page against plus the
+    /// whole-plan aggregates. See <c>DryRunSourcesTab.LoadData</c> for why there is no row data here.</summary>
     internal sealed record LoadData(
-        DryRunRowStore Store,
-        int[] SortedKeys,
-        string? CommonRoot,
+        IIpcGateway Gateway,
+        Guid RunId,
+        string? ViewId,
+        int RowCount,
+        string? SourceCommonRoot,
+        string? DestinationCommonRoot,
         int UntouchedCount,
         int NewCount,
         int OverwrittenCount,
         int DeletedCount,
-        Dictionary<string, int> SourceRootCounts,
-        Dictionary<string, int> DestinationRootCounts);
+        IReadOnlyDictionary<string, int> DestinationRootCounts);
 
-    /// <summary>The pure, thread-safe half of loading: one pass for the status and facet counts,
-    /// then the single sort the tab ever pays. The sort key is fixed per row (the source's — or for
-    /// no-source rows the sole entry's — path relative to its root; entry filtering can't change
-    /// it), so sorting once here makes every later rebuild a linear order-preserving filter.</summary>
-    internal static LoadData ComputeLoad(DryRunRowStore store, CancellationToken ct = default)
+    /// <summary>Folds the plan's per-kind destination totals into this tab's four chips.
+    ///
+    /// <para>The service tallies by <see cref="OperationKind"/> and stops there; which chip a kind
+    /// belongs to is a display decision, and it is made HERE — through the same
+    /// <see cref="DestinationKindMap"/> the rows themselves render through, so a chip's count and the
+    /// glyphs on the rows it selects can never disagree about what a kind means.</para></summary>
+    internal static (int Untouched, int New, int Overwritten, int Deleted) ChipCounts(
+        IReadOnlyDictionary<OperationKind, int> byKind)
     {
-        ArgumentNullException.ThrowIfNull(store);
-        string? commonRoot = store.DestinationCommonRoot;
-
-        // The row set: one row per source file that produced destination operations, then one per
-        // operation with no originating source (a Mirror orphan, a kept-around conflict original, a
-        // pre-existing untouched file). The store's CSR already has both groups contiguous.
-        List<int> keyList = new(store.SourceCount);
-        for (int i = 0; i < store.SourceCount; i++)
-        {
-            if (store.TargetStart(i) != store.TargetEnd(i))
-                keyList.Add(i);
-        }
-        for (int p = store.NoSourceStart; p < store.OperationCount; p++)
-            keyList.Add(~p);
-        int[] rowKeys = [.. keyList];
-
+        ArgumentNullException.ThrowIfNull(byKind);
         int untouched = 0, added = 0, overwritten = 0, deleted = 0;
-        Dictionary<string, int> sourceCounts = new(StringComparer.OrdinalIgnoreCase);
-        Dictionary<string, int> destinationCounts = new(StringComparer.OrdinalIgnoreCase);
-        List<string> rowRoots = [];   // reused per row
-        for (int i = 0; i < rowKeys.Length; i++)
+        foreach ((OperationKind kind, int count) in byKind)
         {
-            if ((i & 0x3FFF) == 0) ct.ThrowIfCancellationRequested();
-            int key = rowKeys[i];
-            string sourceKey = key >= 0 ? store.SourceRoot(key) : NoSourceKey;
-            sourceCounts[sourceKey] = sourceCounts.GetValueOrDefault(sourceKey) + 1;
-            rowRoots.Clear();
-            (int start, int end) = EntryRange(store, key);
-            for (int p = start; p < end; p++)
+            switch (DestinationKindMap.Map(kind))
             {
-                // Counts are over the individual destination entries (one per resulting path), not
-                // the grouped rows, so replicating one file to N targets still counts as N.
-                switch (DestinationKindMap.Map(store.OpKind(p)))
-                {
-                    case DestinationRowKind.Untouched: untouched++; break;
-                    case DestinationRowKind.New: added++; break;
-                    case DestinationRowKind.Overwritten: overwritten++; break;
-                    case DestinationRowKind.Deleted: deleted++; break;
-                    default: break;
-                }
-                string root = store.OpRoot(p);
-                if (rowRoots.Contains(root, StringComparer.OrdinalIgnoreCase))
-                    continue;   // the facet counts rows, so dedupe roots per row
-                rowRoots.Add(root);
-                destinationCounts[root] = destinationCounts.GetValueOrDefault(root) + 1;
+                case DestinationRowKind.Untouched: untouched += count; break;
+                case DestinationRowKind.New: added += count; break;
+                case DestinationRowKind.Overwritten: overwritten += count; break;
+                case DestinationRowKind.Deleted: deleted += count; break;
+                default: break;
             }
         }
-        ct.ThrowIfCancellationRequested();
-
-        // Order by the source file's relative path (grouped rows) or the destination's (no-source
-        // rows) so the preview stays comparable to the Sources tab. Keys are computed once per row up
-        // front, then an index array is sorted (key → root → original position); the final index
-        // tiebreak keeps Array.Sort stable, matching the prior LINQ OrderBy/ThenBy.
-        int n = rowKeys.Length;
-        string[] keys = new string[n];
-        if (n <= DryRunRebuild.SyncThreshold)
-        {
-            Dictionary<(string, string?), string> relDirCache = [];
-            for (int j = 0; j < n; j++)
-                keys[j] = SortKey(store, rowKeys[j], relDirCache);
-        }
-        else
-        {
-            // Each partition owns a lock-free relDir cache; GetRelativePath is pure so the split can't
-            // change any key.
-            Parallel.For(0, n, new ParallelOptions { CancellationToken = ct },
-                () => new Dictionary<(string, string?), string>(),
-                (j, _, cache) =>
-                {
-                    keys[j] = SortKey(store, rowKeys[j], cache);
-                    return cache;
-                },
-                _ => { });
-        }
-        ct.ThrowIfCancellationRequested();
-        int[] order = new int[n];
-        for (int j = 0; j < n; j++)
-            order[j] = j;
-        Array.Sort(order, (a, b) =>
-        {
-            int c = string.Compare(keys[a], keys[b], StringComparison.OrdinalIgnoreCase);
-            if (c != 0) return c;
-            c = string.Compare(RootOf(store, rowKeys[a]), RootOf(store, rowKeys[b]), StringComparison.OrdinalIgnoreCase);
-            return c != 0 ? c : a.CompareTo(b);
-        });
-        int[] sorted = new int[n];
-        for (int j = 0; j < n; j++)
-            sorted[j] = rowKeys[order[j]];
-        ct.ThrowIfCancellationRequested();
-        return new(store, sorted, commonRoot, untouched, added, overwritten, deleted, sourceCounts, destinationCounts);
-
-        static string SortKey(DryRunRowStore store, int key, Dictionary<(string, string?), string> cache) =>
-            key >= 0
-                ? DryRunSort.RelativeKey(store.SourceDirPath(key), store.SourceFileName(key), store.SourceRoot(key), cache)
-                : DryRunSort.RelativeKey(store.OpDirPath(~key), store.OpFileName(~key), store.OpRoot(~key), cache);
-
-        static string RootOf(DryRunRowStore store, int key) =>
-            key >= 0 ? store.SourceRoot(key) : store.OpRoot(~key);
+        return (untouched, added, overwritten, deleted);
     }
 
-    /// <summary>The store CSR range of a row's destination operations — a source file's fan-out, or
-    /// the single operation of a no-source row.</summary>
-    private static (int Start, int End) EntryRange(DryRunRowStore store, int key) =>
-        key >= 0 ? (store.TargetStart(key), store.TargetEnd(key)) : (~key, ~key + 1);
-
-    /// <summary>Convenience for callers holding a store (tests); the app path computes off-thread via
-    /// <see cref="DryRunViewModel.PrepareReport"/> and calls <see cref="Load(LoadData)"/>.</summary>
-    public void Load(DryRunRowStore store) => Load(ComputeLoad(store));
-
-    /// <summary>The UI-thread half of loading: assigns the precomputed data to the bound
-    /// properties. A fresh load has no active filters and the rows arrive presorted, so the whole
-    /// set IS the visible list — no rebuild.</summary>
+    /// <summary>Points the tab at the plan's destination half — see <c>DryRunSourcesTab.Load</c>.</summary>
     internal void Load(LoadData data)
     {
-        _rebuildGate.Cancel();   // a rebuild racing this load must not publish the old report's rows
+        ArgumentNullException.ThrowIfNull(data);
+        _rebuildGate.Cancel();   // a rebuild racing this load must not publish the old plan's rows
         IsRebuilding = false;    // the cancelled rebuild has no successor to clear the overlay
         _applying = true;
-        _store = data.Store;
-        _all = data.SortedKeys;
-        CommonRoot = data.CommonRoot;
+        ReleaseRows();
+        _gateway = data.Gateway;
+        _runId = data.RunId;
+        _planRowCount = data.RowCount;
+        _planSourceRoot = data.SourceCommonRoot;
+        _planDestinationRoot = data.DestinationCommonRoot;
+        CommonRoot = data.DestinationCommonRoot;
         UntouchedCount = data.UntouchedCount;
         NewCount = data.NewCount;
         OverwrittenCount = data.OverwrittenCount;
         DeletedCount = data.DeletedCount;
         StatusFilters = BuildStatusFilters();
 
-        SourceFacets = DryRunFacets.Build(data.SourceRootCounts, OnFacetChanged);
-        ShowSourceFacet = SourceFacets.Count > 0;
+        // No source facet: the service cannot filter the destination half by source root, so offering
+        // one would list values that nothing honours. See SourceFacets.
+        SourceFacets = [];
+        ShowSourceFacet = false;
         DestinationFacets = DryRunFacets.Build(data.DestinationRootCounts, OnFacetChanged);
         ShowDestinationFacet = DestinationFacets.Count > 0;
 
         SearchText = "";
-        ShowTree = false;
-        Tree = [];   // mirror Clear(): the _applying guard stops the ShowTree setter from clearing a
-                     // previously-built forest, which would otherwise stay retained until the next toggle.
         _applying = false;
-        _visible = new VisibleRowSet(data.SortedKeys, null, null);
-        VisibleRows = RowsFor(_visible);
+        VisibleRows = BindPaged(data.ViewId, data.RowCount);
     }
 
     public void Clear()
     {
-        _rebuildGate.Cancel();   // a rebuild racing this clear must not publish the old report's rows
+        _rebuildGate.Cancel();   // a rebuild racing this clear must not publish the old plan's rows
         IsRebuilding = false;    // the cancelled rebuild has no successor to clear the overlay
         _applying = true;
-        _store = DryRunRowStore.Empty;   // drops the whole preview's columns
-        _all = [];
-        _visible = VisibleRowSet.Empty;
+        ReleaseRows();           // drops every resident page and abandons anything in flight
+        _gateway = null;
+        _runId = default;
+        _planRowCount = 0;
+        _planSourceRoot = _planDestinationRoot = null;
         VisibleRows = [];
-        Tree = [];
         CommonRoot = null;
         SourceFacets = DestinationFacets = [];
         ShowSourceFacet = ShowDestinationFacet = false;
         SearchText = "";
-        ShowTree = false;
         UntouchedCount = NewCount = OverwrittenCount = DeletedCount = 0;
         StatusFilters = [];
         OnPropertyChanged(nameof(AnyStatusSelected));
@@ -2211,16 +1944,37 @@ public sealed partial class DryRunDestinationsTab : ViewModelBase
         return keys.Count == 0 ? null : keys;
     }
 
-    /// <summary>The status-chip key a destination entry filters under (mirrors the summary vocabulary);
-    /// Unknown entries carry no summary chip, so they never survive an active status filter.</summary>
-    private static string StatusKey(DestinationRowKind kind) => kind switch
+    /// <summary>The selected chips as the service's own vocabulary. Null keeps every kind; an EMPTY list
+    /// keeps none, which is what deselecting everything means.
+    ///
+    /// <para>Every chip on this tab IS a set of kinds — unlike the Sources tab, whose Deleted chip is a
+    /// source disposition and needs its own flag. The fold below is the inverse of
+    /// <see cref="DestinationKindMap.Map"/>, and lives here for the same reason that one does: the
+    /// service does set membership on an enum it owns and never learns what a chip is.</para></summary>
+    private IReadOnlyList<OperationKind>? SelectedKinds()
     {
-        DestinationRowKind.Untouched => "untouched",
-        DestinationRowKind.New => "new",
-        DestinationRowKind.Overwritten => "overwritten",
-        DestinationRowKind.Deleted => "deleted",
-        _ => "unknown",
-    };
+        if (SelectedStatusKeys() is not { } keys)
+            return null;
+        List<OperationKind> kinds = [];
+        if (keys.Contains("untouched"))
+        {
+            kinds.Add(OperationKind.SkipConflict);
+            kinds.Add(OperationKind.SkipUnchanged);
+            kinds.Add(OperationKind.Untouched);
+        }
+        if (keys.Contains("new"))
+        {
+            // A conflict rename writes a new file at a suffixed path, so it reads as New on this tab —
+            // the server already split it from the Untouched original it sits beside.
+            kinds.Add(OperationKind.New);
+            kinds.Add(OperationKind.Rename);
+        }
+        if (keys.Contains("overwritten"))
+            kinds.Add(OperationKind.Overwrite);
+        if (keys.Contains("deleted"))
+            kinds.Add(OperationKind.Deleted);
+        return kinds;
+    }
 
     [RelayCommand]
     private void ClearStatusFilters()
@@ -2236,20 +1990,6 @@ public sealed partial class DryRunDestinationsTab : ViewModelBase
     {
         if (_applying) return;
         RequestRebuild(debounce: true);
-    }
-
-    partial void OnShowTreeChanged(bool value)
-    {
-        if (_applying) return;
-        if (!value)
-        {
-            // Release the forest immediately and leave VisibleRows untouched (keeps the list's
-            // scroll position). An in-flight rebuild still publishes its filter result but skips
-            // its tree publish — RebuildAsync re-checks ShowTree.
-            Tree = [];
-            return;
-        }
-        RequestRebuild(debounce: false);
     }
 
     private void OnFacetChanged(object? sender, PropertyChangedEventArgs e)
@@ -2274,18 +2014,16 @@ public sealed partial class DryRunDestinationsTab : ViewModelBase
     }
 
     /// <summary>Schedules a rebuild, superseding any rebuild pending or in flight — rapid filter
-    /// clicks coalesce and only the latest publishes. Search changes debounce; filter and tree
-    /// toggles rebuild immediately.</summary>
+    /// clicks coalesce and only the latest publishes. Search changes debounce; facet and chip toggles
+    /// rebuild immediately.</summary>
     private void RequestRebuild(bool debounce)
     {
         PendingRebuild = RebuildAsync(debounce ? _searchDebounce : TimeSpan.Zero, _rebuildGate.Supersede());
     }
 
-    /// <summary>One rebuild: snapshot the filter state on the UI thread, compute the visible rows
-    /// (and forest) — synchronously for small reports, on the thread pool past
-    /// <see cref="DryRunRebuild.SyncThreshold"/> — then publish back on the UI thread. Cancel and
-    /// the pre-publish token check both happen on the UI thread, so a superseded rebuild can never
-    /// publish after its successor.</summary>
+    /// <summary>One rebuild — see <c>DryRunSourcesTab.RebuildAsync</c>, of which this is the destination
+    /// half. Same debounce, same supersede gate, same publish sequencing; a different side and no
+    /// source-root filter, which this half of the plan cannot express.</summary>
     private async Task RebuildAsync(TimeSpan delay, CancellationToken ct)
     {
         try
@@ -2293,180 +2031,47 @@ public sealed partial class DryRunDestinationsTab : ViewModelBase
             if (delay > TimeSpan.Zero)
                 await Task.Delay(delay, ct);
 
-            RebuildInput input = new(
-                string.IsNullOrWhiteSpace(SearchText) ? null : SearchText.Trim(),
-                DryRunFacets.SelectedKeys(SourceFacets),
-                DryRunFacets.SelectedKeys(DestinationFacets),
-                SelectedStatusKeys(),
-                ShowTree,
-                CommonRoot,
-                _store,
-                _all,
-                _visible,
-                ShowTree && Tree.Count > 0 ? DryRunTreeNode.CollectExpanded(Tree) : null,
-                _actions);
+            if (_gateway is not { } gateway)
+                return;   // nothing loaded
 
-            RebuildResult result;
-            if (input.All.Length <= DryRunRebuild.SyncThreshold)
+            GetRunPlanViewRequest request = new()
             {
-                result = ComputeRebuild(input, ct);
-            }
-            else
-            {
+                RunId = _runId,
+                Side = RunPlanSide.Destinations,
+                Search = string.IsNullOrWhiteSpace(SearchText) ? null : SearchText.Trim(),
+                DestinationRoots = DryRunFacets.SelectedKeyList(DestinationFacets),
+                Kinds = SelectedKinds(),
+            };
+
+            if (_planRowCount > DryRunRebuild.SyncThreshold)
                 IsRebuilding = true;   // cleared by whichever current rebuild publishes (or by Load/Clear)
-                result = await Task.Run(() => ComputeRebuild(input, ct), ct);
-            }
 
-            // The gate makes cancel-vs-publish atomic, so a superseded rebuild can never publish
-            // after its successor.
+            Result<RunPlanViewResponse, IpcError> result =
+                await gateway.GetRunPlanViewAsync(request, ct).ConfigureAwait(true);
+            if (result.IsCanceled)
+                return;
+            if (result.TryGetError(out IpcError? error))
+            {
+                Log.Warning(
+                    "Filtering the Destinations tab of run {RunId} failed: {Code} {Message}",
+                    _runId, error.Code, error.Message);
+                _rebuildGate.TryPublish(ct, () => IsRebuilding = false);
+                return;
+            }
+            result.TryGetValue(out RunPlanViewResponse? view);
+
             _rebuildGate.TryPublish(ct, () =>
             {
                 IsRebuilding = false;
-                // Republish the bound list only when the visible set actually changed, so an
-                // unchanged rebuild leaves the ListBox's scroll position and selection alone. Entry
-                // slices count as part of "changed": the same rows showing different destinations is
-                // a different view.
-                if (!result.Visible.Same(_visible))
-                {
-                    _visible = result.Visible;
-                    VisibleRows = RowsFor(_visible);
-                }
-                if (input.ShowTree && ShowTree)
-                {
-                    IReadOnlyList<DryRunTreeNode> forest = result.Forest!;
-                    // The forest baked in an expansion snapshot taken before the (possibly long)
-                    // off-thread build — re-apply the live tree's state so expand/collapse the user
-                    // did meanwhile survives the swap.
-                    if (Tree.Count > 0)
-                        DryRunTreeNode.ApplyExpanded(forest, DryRunTreeNode.CollectExpanded(Tree));
-                    Tree = forest;
-                }
+                ReleaseRows();
+                VisibleRows = BindPaged(view!.ViewId, view.RowCount);
             });
         }
         catch (OperationCanceledException) { /* superseded by a newer filter/search change */ }
         catch (Exception ex)
         {
-            // Last resort: a rebuild fault becomes a logged error rather than an unobserved task fault.
             Log.Error(ex, "Failed to rebuild the Destinations tab");
             _rebuildGate.TryPublish(ct, () => IsRebuilding = false);   // only if still the current rebuild
-        }
-    }
-
-    private sealed record RebuildInput(
-        string? Term,
-        HashSet<string>? SourceRoots,
-        HashSet<string>? DestinationRoots,
-        HashSet<string>? StatusKeys,
-        bool ShowTree,
-        string? CommonRoot,
-        DryRunRowStore Store,
-        int[] All,
-        VisibleRowSet CurrentVisible,
-        IReadOnlySet<string>? ExpandedPaths,
-        IDryRunItemActions? Actions);
-
-    private sealed record RebuildResult(VisibleRowSet Visible, IReadOnlyList<DryRunTreeNode>? Forest);
-
-    /// <summary>Pure: filters the presorted rows (order-preserving — the sort was paid once at
-    /// load) and, in tree mode, builds the forest. Runs on the thread pool for large reports, so it
-    /// touches nothing but its snapshot.</summary>
-    private static RebuildResult ComputeRebuild(RebuildInput input, CancellationToken ct)
-    {
-        DryRunRowStore store = input.Store;
-        VisibleRowSet visible;
-        if (input.Term is null && input.SourceRoots is null && input.DestinationRoots is null && input.StatusKeys is null)
-        {
-            visible = new VisibleRowSet(input.All, null, null);   // no filter — the presorted whole set IS the view
-        }
-        else
-        {
-            // Filter at the destination-entry level and drop rows left with nothing, so a grouped row
-            // shows only the destinations that survived the destination-facet / status / search filters.
-            // The source facet applies to the whole row; a search hit on the source path keeps all entries.
-            // The survivors are collected as a CSR of store positions rather than as rebuilt rows — the
-            // shape that lets a filtered view cost two int arrays instead of a row object per hit.
-            List<int> keptKeys = [];
-            List<int> starts = [0];
-            List<int> positions = [];
-            bool anySliced = false;
-            for (int i = 0; i < input.All.Length; i++)
-            {
-                if ((i & 0x3FFF) == 0) ct.ThrowIfCancellationRequested();
-                int key = input.All[i];
-                if (input.SourceRoots is not null
-                    && !input.SourceRoots.Contains(key >= 0 ? store.SourceRoot(key) : NoSourceKey))
-                    continue;
-
-                // A search hit on the source path keeps every destination; otherwise each entry is
-                // tested individually.
-                bool sourceMatches = input.Term is null
-                    || (key >= 0 && DryRunPaths.PathContains(store.SourceDirPath(key), store.SourceFileName(key), input.Term));
-
-                (int start, int end) = EntryRange(store, key);
-                int before = positions.Count;
-                for (int p = start; p < end; p++)
-                {
-                    if (input.DestinationRoots is HashSet<string> destinations && !destinations.Contains(store.OpRoot(p)))
-                        continue;
-                    if (input.StatusKeys is HashSet<string> statuses
-                        && !statuses.Contains(StatusKey(DestinationKindMap.Map(store.OpKind(p)))))
-                        continue;
-                    if (!sourceMatches && !DryRunPaths.PathContains(store.OpDirPath(p), store.OpFileName(p), input.Term!))
-                        continue;
-                    positions.Add(p);
-                }
-                int kept = positions.Count - before;
-                if (kept == 0)
-                    continue;   // every destination filtered out — the row disappears with them
-                anySliced |= kept != end - start;
-                keptKeys.Add(key);
-                starts.Add(positions.Count);
-            }
-            // Whole rows only → drop the slice entirely, so the common case stores just the keys and
-            // rows read their range straight off the store.
-            visible = anySliced
-                ? new VisibleRowSet([.. keptKeys], [.. starts], [.. positions])
-                : new VisibleRowSet([.. keptKeys], null, null);
-            if (visible.Same(input.CurrentVisible))
-                visible = input.CurrentVisible;
-        }
-        ct.ThrowIfCancellationRequested();
-        return new(visible, input.ShowTree ? BuildTree(store, visible, input.CommonRoot, input.ExpandedPaths, input.Actions) : null);
-    }
-
-    /// <summary>Builds the forest over destination CSR <em>positions</em> rather than entry objects —
-    /// one leaf per resulting path, the tree is per-file and unchanged.</summary>
-    private static IReadOnlyList<DryRunTreeNode> BuildTree(
-        DryRunRowStore store, VisibleRowSet rows, string? commonRoot, IReadOnlySet<string>? expandedPaths,
-        IDryRunItemActions? actions) =>
-        DryRunTreeNode.BuildForest(EntryPositions(store, rows), store.OpDirPath, store.OpFileName, p =>
-        {
-            string kind = DestinationKindMap.Map(store.OpKind(p)) switch
-            {
-                DestinationRowKind.Untouched => "untouched",
-                DestinationRowKind.New => "new",
-                DestinationRowKind.Overwritten => "overwritten",
-                DestinationRowKind.Deleted => "deleted",
-                _ => "unknown",
-            };
-            return new[] { (kind, 1) };
-        }, TreeSpecs, commonRoot, expandedPaths, store.OpSize, actions);
-
-    /// <summary>Every destination position the visible rows show, flattened.</summary>
-    private static IEnumerable<int> EntryPositions(DryRunRowStore store, VisibleRowSet rows)
-    {
-        if (rows.SlicePositions is { } positions)
-            return positions;
-        return Flatten();
-
-        IEnumerable<int> Flatten()
-        {
-            foreach (int key in rows.Keys)
-            {
-                (int start, int end) = EntryRange(store, key);
-                for (int p = start; p < end; p++)
-                    yield return p;
-            }
         }
     }
 }
@@ -3094,12 +2699,18 @@ public sealed partial class DryRunViewModel : ViewModelBase
             EmptyStateText = emptyState;
     }
 
-    /// <summary>Streams a planned run's frozen work list into the view and raises the approval footer.
+    /// <summary>Opens a planned run's frozen work list in the view and raises the approval footer.
     ///
     /// <para>This is the whole point of the two-phase run: the rows below are read back from the run's
     /// snapshot, not re-planned, so what is listed is exactly what <see cref="ApproveRunCommand"/> will
-    /// execute. The frames are the same ones a preview always streamed, which is why the ingest path
-    /// below — store, meter, off-thread prepare, epoch guard — is unchanged.</para>
+    /// execute.</para>
+    ///
+    /// <para><b>Three O(1) calls, and no rows.</b> This used to stream the entire plan into a
+    /// <c>DryRunRowStore</c> and sort both halves of it before showing anything — affordable only while a
+    /// plan was capped at 500,000 files, and the cap is gone because a bounded plan was a WRONG job
+    /// rather than a smaller one. What it does instead: read the snapshot header for the whole-plan
+    /// aggregates a windowed client cannot count for itself, open an unfiltered view over each half, and
+    /// bind a window onto each. Everything here is independent of how large the plan is.</para>
     ///
     /// <para>The caller owns the decision to be here: a failed plan, or one with nothing to do, is
     /// answered by the shell and never reaches this method.</para></summary>
@@ -3111,80 +2722,79 @@ public sealed partial class DryRunViewModel : ViewModelBase
         // preview bumps it again, and the guard before ApplyPrepared drops this plan's rows if so.
         int epoch = _reportEpoch;
         IsPreviewing = true;
-        PlanningRunId = null;   // the scan is done; from here the wait is this method's own ingest
-        // Claims the stage between "planning" and "on screen", so a discard arriving mid-stream has
+        PlanningRunId = null;   // the scan is done; from here the wait is this method's own open
+        // Claims the stage between "planning" and "on screen", so a discard arriving mid-open has
         // something to match against — see ForgetDiscardedRun.
         _loadingRunId = planned.RunId;
-        // Baseline for the churn figures on the two samples below — taken after BeginPlanning's clear so
-        // it measures this preview only, not the previous one's teardown.
+        // Baseline for the churn figure on the sample below — taken after BeginPlanning's clear so it
+        // measures this preview only, not the previous one's teardown.
         long allocatedBefore = UiMemoryLog.AllocatedSnapshot();
 
         try
         {
-            // The plan streams straight into its store: chunks fold into columns as they arrive and
-            // are dropped, so the assembled report — which used to be live alongside the rows being
-            // projected out of it — never exists here at all.
-            DryRunRowStore store = DryRunRowStore.CreateForIngest();
-            // Only wrapped when the log will actually take the line — the meter is cheap but it is pure
-            // diagnostics, so the un-instrumented path stays the un-instrumented path.
-            DryRunIngestMeter? meter = Log.IsEnabled(Serilog.Events.LogEventLevel.Information)
-                ? new DryRunIngestMeter(store)
-                : null;
-            long streamAllocatedBefore = UiMemoryLog.AllocatedSnapshot();
-            var run = await _gateway.GetRunPlanStreamAsync(
-                planned.RunId, meter ?? (IDryRunChunkSink)store, ct);
-            meter?.Log(UiMemoryLog.AllocatedSnapshot() - streamAllocatedBefore);
-            if (run.IsCanceled)
+            RunStatusText = "Opening the plan…";
+
+            // 1. The header: the facet keys and their counts, and the status totals. Folded during the
+            //    plan's own walk and read back in O(1) — a preview holding a page at a time cannot
+            //    compute a whole-plan aggregate, and a facet bar counting only the rows on screen would
+            //    be worse than none.
+            Result<RunDetailDto, IpcError> detailResult =
+                await _gateway.GetRunDetailAsync(planned.RunId, ct).ConfigureAwait(true);
+            if (detailResult.IsCanceled)
             {
                 Log.Debug("Preview of run {RunId} cancelled by the user", planned.RunId);
                 ErrorMessage = "Preview cancelled.";
                 return;
             }
-            // Discarded from the job queue while this was streaming. The failure below would be real —
-            // the run genuinely is gone — but reporting it as one blames the user for their own action,
-            // so ForgetDiscardedRun has already said what happened.
+            if (_loadingRunId != planned.RunId)
+                return;   // discarded from the job queue meanwhile; ForgetDiscardedRun already said so
+            if (detailResult.TryGetError(out IpcError? detailError))
+            {
+                ErrorMessage = PreviewFailure(detailError);
+                return;
+            }
+            detailResult.TryGetValue(out RunDetailDto? detail);
+
+            // 2. An unfiltered view over each half. A filter that selects everything comes back with a
+            //    null handle and the plan's own totals, at no view-build cost — so this costs two header
+            //    reads, not two passes.
+            Result<RunPlanViewResponse, IpcError> sourcesResult =
+                await _gateway.GetRunPlanViewAsync(
+                    new GetRunPlanViewRequest { RunId = planned.RunId, Side = RunPlanSide.Sources }, ct)
+                .ConfigureAwait(true);
+            Result<RunPlanViewResponse, IpcError> destinationsResult =
+                await _gateway.GetRunPlanViewAsync(
+                    new GetRunPlanViewRequest { RunId = planned.RunId, Side = RunPlanSide.Destinations }, ct)
+                .ConfigureAwait(true);
+            if (sourcesResult.IsCanceled || destinationsResult.IsCanceled)
+            {
+                Log.Debug("Preview of run {RunId} cancelled by the user", planned.RunId);
+                ErrorMessage = "Preview cancelled.";
+                return;
+            }
             if (_loadingRunId != planned.RunId)
                 return;
-            if (run.TryGetError(out IpcError? error))
+            if (sourcesResult.TryGetError(out IpcError? sourcesError))
             {
-                ErrorMessage = error.Code == "IPC_TRANSPORT"
-                    ? $"Preview failed: {error.Message}. The connection to the background service was lost unexpectedly — see the service log in %LOCALAPPDATA%\\FileManager\\logs."
-                    : $"Preview failed: {error.Message}";
+                ErrorMessage = PreviewFailure(sourcesError);
                 return;
             }
-            run.TryGetValue(out DryRunCompletion? completion);
-            RunStatusText = "Building the lists…";
-            // Completing the store and sorting both tabs is seconds of CPU at the streamed cap, so it
-            // runs on the thread pool. No ConfigureAwait(false): the continuation must resume on the
-            // UI context so ApplyPrepared raises its property changes on the UI thread.
-            // IsPreviewing spans the preparation, so the view's progress bar keeps animating instead of
-            // the window freezing.
-            long prepareAllocatedBefore = UiMemoryLog.AllocatedSnapshot();
-            PreparedReport prepared = await Task.Run(() =>
+            if (destinationsResult.TryGetError(out IpcError? destinationsError))
             {
-                store.Complete();
-                return PrepareReport(store, completion!, ct);
-            }, ct);
-            // The third phase, logged separately from the stream's two so all of a run's allocation is
-            // attributed rather than inferred. This is the one with a known shape: each tab's ComputeLoad
-            // materializes a string[] of one relative-path key per row and drops it after the sort
-            // (~147 MB at the 500k cap, measured by
-            // PrepareReport_transient_allocation_at_streamed_cap_with_realistic_deep_paths).
-            if (Log.IsEnabled(Serilog.Events.LogEventLevel.Information))
-            {
-                Log.Information(
-                    "Dry-run prepare allocation (store completion + both tabs' sort): {PrepareMb}MB",
-                    (UiMemoryLog.AllocatedSnapshot() - prepareAllocatedBefore) >> 20);
+                ErrorMessage = PreviewFailure(destinationsError);
+                return;
             }
-            // NOTE THE SAMPLE POINT: the store, both tabs' prepared loads AND the transient sort-key
-            // arrays PrepareReport just dropped are all accounted here without a collection having been
-            // forced, so this is the closest thing to the run's PEAK that can be read without
-            // perturbing it. It is the only visibility we have into the transient burst — the retained
-            // heap probes in DryRunViewModelMemoryTests measure after a forced full collection and
-            // cannot see it at all.
-            UiMemoryLog.Sample("preview-prepared (near peak)", allocatedBefore);
+            sourcesResult.TryGetValue(out RunPlanViewResponse? sourcesView);
+            destinationsResult.TryGetValue(out RunPlanViewResponse? destinationsView);
+
+            // 3. Bind. No row has been read yet and none will be until the list is scrolled.
+            PreparedReport prepared = PrepareReport(
+                _gateway, planned.RunId, detail!, sourcesView!, destinationsView!,
+                // SweepFaulted is the only thing that truncates a plan now — a tree that could not be
+                // READ. The space projection is unsound over a partial graph, so the header omits it.
+                new DryRunCompletion(planned.AtUtc, detail!.Truncated, detail.Space));
             if (_reportEpoch != epoch)
-                return;   // superseded while streaming — a stale plan must not apply
+                return;   // superseded while opening — a stale plan must not apply
             ApplyPrepared(prepared);
             // Only now: the footer must never offer to approve a run whose rows are not the ones on
             // screen, so it appears with them and not a moment earlier.
@@ -3202,7 +2812,9 @@ public sealed partial class DryRunViewModel : ViewModelBase
             // every reopened result look freshly taken.
             PreviewTakenAtUtc = planned.AtUtc;
             PendingRunId = planned.RunId;
-            // What the app now sits at with a preview on screen — the number a user reports.
+            // What the app now sits at with a preview on screen — the number a user reports. It should be
+            // barely above idle whatever the plan's size; a figure that tracks the row count means
+            // something is still holding every row.
             UiMemoryLog.Sample("preview-applied", allocatedBefore);
         }
         catch (OperationCanceledException)
@@ -3227,6 +2839,13 @@ public sealed partial class DryRunViewModel : ViewModelBase
                 _loadingRunId = null;
         }
     }
+
+    /// <summary>The banner text for a preview that could not be opened. A lost transport is called out
+    /// separately because it points somewhere specific: the service died, and its log says why.</summary>
+    private static string PreviewFailure(IpcError error) =>
+        error.Code == "IPC_TRANSPORT"
+            ? $"Preview failed: {error.Message}. The connection to the background service was lost unexpectedly — see the service log in %LOCALAPPDATA%\\FileManager\\logs."
+            : $"Preview failed: {error.Message}";
 
     /// <summary>Re-shows a retained preview by re-streaming its plan from the run's snapshot.
     ///
@@ -3399,13 +3018,9 @@ public sealed partial class DryRunViewModel : ViewModelBase
         return runId;
     }
 
-    /// <summary>Shared by every source row with no destination ops (skipped files, ~2/3 of a typical
-    /// report) — a fresh empty list per row is ~10 MB at the streamed cap.</summary>
-    private static readonly IReadOnlyList<DryRunTargetRow> EmptyTargets = [];
-
-    /// <summary>Everything <see cref="ApplyPrepared"/> assigns, precomputed by
-    /// <see cref="PrepareReport"/> — pure data (the space view-model included), safe to build off
-    /// the UI thread.</summary>
+    /// <summary>Everything <see cref="ApplyPrepared"/> assigns: each tab's handle onto its half of the
+    /// plan, plus the banner numbers. All of it comes from the run's snapshot header, so building it is
+    /// O(1) in the plan's size — there is no pass over rows here to move off the UI thread.</summary>
     internal sealed record PreparedReport(
         DryRunSourcesTab.LoadData Sources,
         DryRunDestinationsTab.LoadData Destinations,
@@ -3419,76 +3034,76 @@ public sealed partial class DryRunViewModel : ViewModelBase
         string TruncationNotice,
         DryRunSpaceViewModel? Space);
 
-    /// <summary>Synchronous prepare-and-apply from an assembled report, kept for the benchmarks and
-    /// memory tests that gauge the whole projection; the app path streams straight into a store and
-    /// runs <see cref="PrepareReport(DryRunRowStore, DryRunCompletion, CancellationToken)"/> on the
-    /// thread pool.</summary>
-    internal void ApplyReport(DryRunReport report)
-    {
-        ArgumentNullException.ThrowIfNull(report);
-        DryRunRowStore store = DryRunRowStore.FromReport(report);
-        ApplyPrepared(PrepareReport(store, new DryRunCompletion(report.GeneratedAt, report.Truncated, report.Space)));
-    }
-
-    /// <summary>The pure, thread-safe half of applying a run: turns the completed store into both
-    /// tabs' presorted key arrays, counts and facets, plus the banner numbers. O(n log n) over up to
-    /// the ~500k-file streamed cap — always run this off the UI thread for real reports.
+    /// <summary>Turns a run's snapshot header and its two opened views into both tabs' bound state.
     ///
-    /// <para>Almost all of what this used to do now happens during ingest or in
-    /// <see cref="DryRunRowStore.Complete"/>: the directory table is resolved as it arrives, the
-    /// destination operations are grouped by their source there, and the blast-radius counts fall out
-    /// of the same pass. What is left is the two sorts, which are genuinely per-tab.</para></summary>
+    /// <para><b>What used to be here.</b> Two <c>ComputeLoad</c> passes over every ingested row, run
+    /// concurrently because together they were seconds of CPU: each folded the facet and status counts
+    /// and then sorted the whole half against a materialized array of relative-path keys — ~147 MB of
+    /// transient at 500,000 files, on top of the ~72 MB the rows themselves cost, both linear in a plan
+    /// size that is no longer bounded. The service records the counts during the plan's own walk and
+    /// keeps the order in a sidecar, so all of it is now a header read.</para></summary>
     internal static PreparedReport PrepareReport(
-        DryRunRowStore store, DryRunCompletion completion, CancellationToken ct = default)
+        IIpcGateway gateway,
+        Guid runId,
+        RunDetailDto detail,
+        RunPlanViewResponse sourcesView,
+        RunPlanViewResponse destinationsView,
+        DryRunCompletion completion)
     {
-        ArgumentNullException.ThrowIfNull(store);
+        ArgumentNullException.ThrowIfNull(gateway);
+        ArgumentNullException.ThrowIfNull(detail);
+        ArgumentNullException.ThrowIfNull(sourcesView);
+        ArgumentNullException.ThrowIfNull(destinationsView);
         ArgumentNullException.ThrowIfNull(completion);
 
-        // The two tabs' loads share no mutable state (the store is immutable once completed), so run
-        // their independent O(n log n) sorts concurrently above the sync threshold. Below it they run
-        // inline (no Task/Parallel overhead) so small reports and tests stay deterministic.
-        DryRunSourcesTab.LoadData sourcesLoad;
-        DryRunDestinationsTab.LoadData destinationsLoad;
-        if (store.SourceCount <= DryRunRebuild.SyncThreshold)
-        {
-            sourcesLoad = DryRunSourcesTab.ComputeLoad(store, ct);
-            destinationsLoad = DryRunDestinationsTab.ComputeLoad(store, ct);
-        }
-        else
-        {
-            DryRunSourcesTab.LoadData? s = null;
-            DryRunDestinationsTab.LoadData? d = null;
-            Parallel.Invoke(new ParallelOptions { CancellationToken = ct },
-                () => s = DryRunSourcesTab.ComputeLoad(store, ct),
-                () => d = DryRunDestinationsTab.ComputeLoad(store, ct));
-            sourcesLoad = s!;
-            destinationsLoad = d!;
-        }
+        RunPlanPreviewAggregates preview = detail.Preview ?? new RunPlanPreviewAggregates();
+
+        // Both roots are derived HERE, from the facet keys, because the rule for reducing a set of roots
+        // to the folder they share lives in DryRunPaths — which is a UI type the service cannot
+        // reference. A service-side copy would be a second implementation free to disagree about UNC
+        // shares. O(roots), which is a handful.
+        string? sourceRoot = DryRunPaths.CommonRoot(preview.SourceRowsByRoot.Keys);
+        string? destinationRoot = DryRunPaths.CommonRoot(preview.DestinationRowsByRoot.Keys);
+
+        (int untouched, int added, int overwritten, int deleted) =
+            DryRunDestinationsTab.ChipCounts(preview.DestinationRowsByKind);
+
+        DryRunSourcesTab.LoadData sourcesLoad = new(
+            gateway, runId, sourcesView.ViewId, sourcesView.RowCount,
+            sourceRoot, destinationRoot,
+            preview.UntouchedCount, preview.ProcessedCount, detail.DisposalCount,
+            preview.SourceRowsByRoot, preview.DestinationRowsByRoot);
+
+        DryRunDestinationsTab.LoadData destinationsLoad = new(
+            gateway, runId, destinationsView.ViewId, destinationsView.RowCount,
+            sourceRoot, destinationRoot,
+            untouched, added, overwritten, deleted,
+            preview.DestinationRowsByRoot);
 
         return new PreparedReport(
             sourcesLoad,
             destinationsLoad,
-            TotalFiles: store.SourceCount,
-            OverwriteCount: store.OverwriteCount,
-            RenameCount: store.RenameCount,
-            DisposalCount: store.DisposalCount,
+            TotalFiles: detail.SourceItemCount,
+            OverwriteCount: detail.OverwriteCount,
+            RenameCount: detail.RenameCount,
+            DisposalCount: detail.DisposalCount,
             HasDestructiveActions:
-                store.OverwriteCount > 0 || store.DisposalCount > 0 || store.AnyDestinationDeleted,
+                detail.OverwriteCount > 0 || detail.DisposalCount > 0 || detail.DeleteItemCount > 0,
             GeneratedAtText: $"Generated {completion.GeneratedAt.ToLocalTime():yyyy-MM-dd HH:mm:ss}",
             WasTruncated: completion.Truncated,
             TruncationNotice: completion.Truncated
-                ? $"Report truncated: showing the first {store.SourceCount:N0} files — the scan found more. Destination deletions are not shown for a truncated report. Use the filters to narrow the view."
+                ? $"Report truncated: showing the first {detail.SourceItemCount:N0} files — the scan could not read the whole tree. Destination deletions are not shown for a truncated report."
                 : "",
             Space: completion.Space is { Volumes.Count: > 0 } projection
                 ? new DryRunSpaceViewModel(projection)
                 : null);
     }
 
-
-    /// <summary>The UI-thread half of applying a report: assigns the precomputed data to the bound
-    /// properties and hands each tab its load.</summary>
+    /// <summary>The UI-thread half of applying a report: assigns the banner properties and hands each tab
+    /// its load.</summary>
     internal void ApplyPrepared(PreparedReport prepared)
     {
+        ArgumentNullException.ThrowIfNull(prepared);
         TotalFiles = prepared.TotalFiles;
         OverwriteCount = prepared.OverwriteCount;
         RenameCount = prepared.RenameCount;

@@ -194,6 +194,23 @@ public sealed class DryRunStreamAllocationTests(ITestOutputHelper output)
     /// length or a stale tail fails here rather than becoming a malformed-frame bug in the field.</summary>
     private static async Task<long> MeasureReads(byte[][] frames, bool pooled)
     {
+        ArrayBufferWriter<byte> buffer = new();
+
+        // One unmeasured pass first. Growing an ArrayBufferWriter from empty to a multi-megabyte frame
+        // costs every intermediate capacity on the way — a one-off that the reuse this test is about
+        // exists precisely to pay once, so charging it to the measured pass would measure the opposite of
+        // the claim. It also JITs both paths and settles ArrayPool's buckets, which otherwise leaves the
+        // figure hostage to whatever allocated before this test ran.
+        await ReadAllAsync(frames, pooled, buffer);
+
+        long before = GC.GetTotalAllocatedBytes(precise: true);
+        await ReadAllAsync(frames, pooled, buffer);
+        return GC.GetTotalAllocatedBytes(precise: true) - before;
+    }
+
+    /// <summary>Reads every frame back off a fresh pipe-like stream, checking each payload as it goes.</summary>
+    private static async Task ReadAllAsync(byte[][] frames, bool pooled, ArrayBufferWriter<byte> buffer)
+    {
         using MemoryStream stream = new();
         foreach (byte[] frame in frames)
         {
@@ -204,9 +221,6 @@ public sealed class DryRunStreamAllocationTests(ITestOutputHelper output)
         }
         stream.Position = 0;
 
-        ArrayBufferWriter<byte> buffer = new();
-        // Warm: the first read grows the writer and JITs the path, which is a one-off, not per-frame.
-        long before = GC.GetTotalAllocatedBytes(precise: true);
         foreach (byte[] expected in frames)
         {
             if (pooled)
@@ -225,7 +239,6 @@ public sealed class DryRunStreamAllocationTests(ITestOutputHelper output)
                 Assert.True(payload!.AsSpan().SequenceEqual(expected), "the per-frame read did not match");
             }
         }
-        return GC.GetTotalAllocatedBytes(precise: true) - before;
     }
 
     /// <summary>Folds one chunk into a fresh store, exactly as the stream pump does.</summary>

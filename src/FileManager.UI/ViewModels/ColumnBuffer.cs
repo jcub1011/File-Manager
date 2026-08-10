@@ -23,13 +23,30 @@ namespace FileManager.UI.ViewModels;
 /// in the tabs only ever read a completed store.</para></summary>
 internal sealed class ColumnBuffer<T>
 {
-    // 8192 elements: byte 8 KB, int 32 KB, long/reference 64 KB — all below the 85,000-byte LOH line.
-    private const int SegmentShift = 13;
-    private const int SegmentSize = 1 << SegmentShift;
-    private const int SegmentMask = SegmentSize - 1;
+    /// <summary>Segment size for a store whose length is unknown when it starts filling — 8192 elements,
+    /// so the widest column here is 64 KB (<c>long</c> or a reference), comfortably below the
+    /// 85,000-byte LOH line.</summary>
+    public const int DefaultSegmentShift = 13;
+
+    // Per instance, not const. A PAGE store holds 512 rows, and a segment sized for an open-ended stream
+    // would leave 94% of every column empty — which is not a rounding error when the cache holds 128
+    // pages per tab: at ~272 KB of columns per page store that was ~70 MB of nothing. Both are readonly
+    // fields, so the shift and mask below still fold to the same two instructions a const would.
+    private readonly int _segmentShift;
+    private readonly int _segmentSize;
+    private readonly int _segmentMask;
 
     private T[][] _segments = [];
     private int _segmentCount;
+
+    public ColumnBuffer(int segmentShift = DefaultSegmentShift)
+    {
+        ArgumentOutOfRangeException.ThrowIfLessThan(segmentShift, 1);
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(segmentShift, 20);
+        _segmentShift = segmentShift;
+        _segmentSize = 1 << segmentShift;
+        _segmentMask = _segmentSize - 1;
+    }
 
     public int Count { get; private set; }
 
@@ -39,27 +56,37 @@ internal sealed class ColumnBuffer<T>
         {
             if ((uint)index >= (uint)Count)
                 throw new ArgumentOutOfRangeException(nameof(index), index, $"the column holds {Count} elements");
-            return _segments[index >> SegmentShift][index & SegmentMask];
+            return _segments[index >> _segmentShift][index & _segmentMask];
         }
         set
         {
             if ((uint)index >= (uint)Count)
                 throw new ArgumentOutOfRangeException(nameof(index), index, $"the column holds {Count} elements");
-            _segments[index >> SegmentShift][index & SegmentMask] = value;
+            _segments[index >> _segmentShift][index & _segmentMask] = value;
         }
     }
 
     public void Add(T value)
     {
         int index = Count;
-        int segment = index >> SegmentShift;
+        int segment = index >> _segmentShift;
         if (segment == _segmentCount)
         {
             if (_segmentCount == _segments.Length)
                 Array.Resize(ref _segments, _segments.Length == 0 ? 4 : _segments.Length * 2);
-            _segments[_segmentCount++] = new T[SegmentSize];
+            _segments[_segmentCount++] = new T[_segmentSize];
         }
-        _segments[segment][index & SegmentMask] = value;
+        _segments[segment][index & _segmentMask] = value;
         Count = index + 1;
+    }
+
+    /// <summary>The smallest shift whose segment holds <paramref name="rows"/> elements, bounded by the
+    /// default so a store with no useful hint is never made worse than it was.</summary>
+    public static int ShiftFor(int rows)
+    {
+        int shift = 1;
+        while (shift < DefaultSegmentShift && (1 << shift) < rows)
+            shift++;
+        return shift;
     }
 }

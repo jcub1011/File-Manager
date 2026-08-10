@@ -999,6 +999,20 @@ opposite-direction experiment (its whole premise is heap size proportional to li
 
 ## 11. Considered and rejected — do not re-raise these
 
+> **One item has moved off this list: external merge sort. It is now accepted and implemented**, as
+> `RunSnapshotOrder` (`src/FileManager.Core/Runs/RunSnapshotOrder.cs`) — runs of `RunRows` entries sorted
+> in memory, spilled, then k-way merged, with one entry resident per run.
+>
+> **Why the rejection was right and stopped being right.** It was rejected because §3.2 established that
+> the SWEEP does not need to come out sorted, and it does not — that finding still holds and Stage 3 still
+> rests on it. What changed is that a different consumer turned out to need a sorted order: the PREVIEW.
+> The client used to sort the plan itself, materializing one relative-path key per row — ~147 MB of
+> transient at 500,000 files, and linear in a plan size that is no longer bounded. Deciding the order
+> where the rows are already streaming past costs no extra read, and what the client then holds is a
+> 4-byte ordinal per row instead of a string. So the cost that made this "the expensive half" is paid
+> against a much larger saving than the sweep alone offered, and the comparator caveat two items below is
+> exactly what the implementation had to honour.
+
 - **A hashed survivor set (`HashSet<UInt128>` of XxHash128; `System.IO.Hashing` is already referenced by
   `FileManager.Core`).** Saves ~7 MB, i.e. 2% of the problem. The reason to reject is the *failure mode*,
   not the probability (~3.7e-28 at 500k): a colliding pre-existing file reads as "a source writes here"
@@ -1025,11 +1039,6 @@ opposite-direction experiment (its whole premise is heap size proportional to li
   a *display name* ("Home", `FileSystemService.cs:172`) rather than the last path segment — so
   `FullPath => Path.Join(Directory, FileName)` would silently produce a wrong path there. Its saving also
   inverts below ~3 files per directory.
-- **External merge sort of a spilled sweep.** This is Stage 3 plus the expensive half — a run-file
-  protocol, a k-way merge, tens of MB of scratch I/O, new corruption and disk-full paths, ~400 lines. You
-  only need it if the streamed sweep must come out sorted, and §3.2 says it must not. **If §3.2 turns out
-  not to hold, this is the fallback** — and the cheaper knob for extreme trees is a configurable sweep
-  bound below `MaxStreamedFiles` (`DryRunEngine.cs:73`), trading completeness for memory.
 - **Sorting schemes that don't reproduce the comparator.** If a sorted stream is ever needed, note that
   `(directory, fileName)` tuple order is **not** `string.Compare(fullA, fullB, OrdinalIgnoreCase)`:
   full-path order puts `C:\a b\c.txt` before `C:\a\z.txt` (position 4, `0x20 < 0x5C`) while tuple order

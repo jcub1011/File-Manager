@@ -78,6 +78,10 @@ public sealed class DryRunOperationColumns
     /// <summary>Display string: the existing file's mtime, the suffixed rename name, the deciding filter
     /// rule, or the unchanged reason.</summary>
     public List<string?> Detail { get; set; } = [];
+    /// <summary>Source ops only: an <see cref="OperationKindMask"/> over the kinds this source's
+    /// destination operations take; <c>0</c> elsewhere. See <see cref="DryRunOperation.TargetKinds"/> for
+    /// why a paged Sources tab needs it and why it is a set rather than a chosen glyph.</summary>
+    public List<int> TargetKinds { get; set; } = [];
 
     /// <summary>Operations in this group. See <see cref="DryRunFileColumns.Count"/> on ordering versus
     /// the raggedness check.</summary>
@@ -94,11 +98,13 @@ public sealed class DryRunOperationColumns
         SubjectIndex.Clear();
         SourceDisposition.Clear();
         Detail.Clear();
+        TargetKinds.Clear();
     }
 
     public void Add(
         int dirIndex, string fileName, int rootDirIndex, OperationKind kind,
-        int sourceIndex, int subjectIndex, OnSuccessAction? sourceDisposition, string? detail)
+        int sourceIndex, int subjectIndex, OnSuccessAction? sourceDisposition, string? detail,
+        int targetKinds = 0)
     {
         DirIndex.Add(dirIndex);
         FileName.Add(fileName);
@@ -108,6 +114,7 @@ public sealed class DryRunOperationColumns
         SubjectIndex.Add(subjectIndex);
         SourceDisposition.Add(sourceDisposition);
         Detail.Add(detail);
+        TargetKinds.Add(targetKinds);
     }
 }
 
@@ -192,6 +199,7 @@ public static class DryRunColumns
                 SubjectIndex = columns.SubjectIndex[i],
                 SourceDisposition = columns.SourceDisposition[i],
                 Detail = columns.Detail[i],
+                TargetKinds = columns.TargetKinds[i],
             };
         }
     }
@@ -220,7 +228,7 @@ public static class DryRunColumns
         if (operations is null)
             return;
         foreach (DryRunOperation o in operations)
-            columns.Add(o.DirIndex, o.FileName, o.RootDirIndex, o.Kind, o.SourceIndex, o.SubjectIndex, o.SourceDisposition, o.Detail);
+            columns.Add(o.DirIndex, o.FileName, o.RootDirIndex, o.Kind, o.SourceIndex, o.SubjectIndex, o.SourceDisposition, o.Detail, o.TargetKinds);
     }
 
     /// <summary>The first column in the chunk whose length disagrees with its group's reference column,
@@ -255,7 +263,8 @@ public static class DryRunColumns
             ?? Check(group, nameof(ops.SourceIndex), ops.SourceIndex.Count, n)
             ?? Check(group, nameof(ops.SubjectIndex), ops.SubjectIndex.Count, n)
             ?? Check(group, nameof(ops.SourceDisposition), ops.SourceDisposition.Count, n)
-            ?? Check(group, nameof(ops.Detail), ops.Detail.Count, n);
+            ?? Check(group, nameof(ops.Detail), ops.Detail.Count, n)
+            ?? Check(group, nameof(ops.TargetKinds), ops.TargetKinds.Count, n);
     }
 
     private static string? Check(string group, string column, int actual, int expected) =>
